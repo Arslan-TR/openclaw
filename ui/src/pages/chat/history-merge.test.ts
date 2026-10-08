@@ -13,6 +13,7 @@ import {
   getChatRunOwner,
   getChatSessionProjection as projectionFor,
   readChatSessionProjectionScope as scopeFor,
+  reconcileChatInputCustody,
   reduceChatSessionProjection as reduceChat,
   setChatRunOwner,
   publishChatSessionProjection as publish,
@@ -484,3 +485,52 @@ it("keeps a retained live prefix across a later empty snapshot", () => {
 
   expect(owner.chatMessages).toEqual([prefix, tail]);
 });
+
+it.each(["page", "receipt", "custody-first"] as const)(
+  "retires optimistic steering only for deferred %s custody",
+  (source) => {
+    const { client, chatSubmissions, owner, sessionKey, initial } =
+      initialFixture(false);
+    const message = {
+      ...initial.message,
+      __openclaw: { ...initial.message["__openclaw"], steerTargetRunId: "active-run" },
+    };
+    const delivered = expectDefined(
+      chatSubmissions.retain({
+        kind: "delivered",
+        owner: client,
+        sessionKey,
+        sessionId: owner.currentSessionId,
+        deliveryKey: chatOutboxDeliveryKey(owner, { sessionKey, agentId: "main" }, "initial-run"),
+        pendingRunId: "initial-run",
+        message,
+      }),
+      "delivered steer",
+    );
+    const input = {
+      id: "deferred-input",
+      runId: "initial-run",
+      acceptedAt: 123,
+      state: "queued" as const,
+      message,
+      queued: true as const,
+    };
+    if (source === "custody-first") {
+      expect(admitChatSubmission(owner, [input], delivered)).toBe(false);
+    } else {
+      expect(admitChatSubmission(owner, undefined, delivered)).toBe(true);
+      reconcileChatInputCustody(owner, { items: [{ ...input, queued: undefined }], total: 1 });
+      expect(owner.chatMessages).toEqual([message]);
+      reconcileChatInputCustody(
+        owner,
+        source === "page" ? { items: [input], total: 1 } : undefined,
+        source === "receipt" ? [{ runId: "initial-run", state: "pending", queued: true }] : [],
+      );
+    }
+    expect(delivered.pending).toBe(false);
+    expect(delivered.message).toBe(message);
+    expect(owner.chatMessages).toEqual([]);
+    expect(admitChatSubmission(owner, undefined, delivered)).toBe(false);
+  },
+);
+
