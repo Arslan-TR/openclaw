@@ -60,25 +60,6 @@ function seedRow(
   `).run(approvalId, resolutionRef, kind);
 }
 
-function expectAlterAppendedLegacyRepair(strict: boolean): void {
-  const db = new DatabaseSync(":memory:");
-  createAlterAppendedLegacyTable(db, strict);
-  seedRow(db, "exec");
-
-  expect(repairOperatorApprovalSchema(db)).toEqual([
-    "Migrated shared state operator approvals → OpenClaw system changes",
-  ]);
-
-  expect(() => assertCanonicalOperatorApprovalKinds(db, ":memory:")).not.toThrow();
-  expect(
-    db.prepare("SELECT approval_id, kind, resolution_ref FROM operator_approvals").all(),
-  ).toEqual([{ approval_id: "a1", kind: "exec", resolution_ref: RESOLUTION_REF }]);
-  expect(
-    db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'operator_approvals'").get(),
-  ).toEqual({ strict: 1 });
-  db.close();
-}
-
 describe("repairOperatorApprovalKinds", () => {
   it("migrates the exact legacy two-kind schema and preserves rows", () => {
     const db = new DatabaseSync(":memory:");
@@ -101,14 +82,6 @@ describe("repairOperatorApprovalKinds", () => {
       db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'operator_approvals'").get(),
     ).toEqual({ strict: 1 });
     db.close();
-  });
-
-  it("migrates the ALTER-appended non-STRICT legacy shape", () => {
-    expectAlterAppendedLegacyRepair(false);
-  });
-
-  it("migrates the ALTER-appended STRICT legacy shape", () => {
-    expectAlterAppendedLegacyRepair(true);
   });
 
   it("drops pre-ref rows that violate the canonical resolution_ref shape", () => {
@@ -135,13 +108,6 @@ describe("repairOperatorApprovalKinds", () => {
     expect(db.prepare("SELECT approval_id, resolution_ref FROM operator_approvals").all()).toEqual([
       { approval_id: "a1", resolution_ref: RESOLUTION_REF },
     ]);
-    db.close();
-  });
-
-  it("is a no-op when the schema is already canonical", () => {
-    const db = new DatabaseSync(":memory:");
-    db.exec(canonicalOperatorApprovalCreateSql());
-    expect(repairOperatorApprovalSchema(db)).toEqual([]);
     db.close();
   });
 

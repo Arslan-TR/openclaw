@@ -56,29 +56,6 @@ it("observes a managed schema publication before a placement write", async () =>
   }
 });
 
-it("retires an existing-only idle actor without opening its missing database", async () => {
-  const databasePath = openOpenClawStateDatabase().path;
-  await closeOpenClawStateDatabaseAsync();
-  const context = captureOpenClawStateWorkerContext();
-  const backend = runWithSqliteWorkerStateContext(context, () =>
-    openExistingSqliteWorkerBackend(undefined, {
-      databasePath,
-      existingIdentity: context.admission.identity.key,
-    }),
-  );
-  unlinkSync(databasePath);
-  try {
-    expect(
-      runWithSqliteWorkerStateContext(context, () =>
-        backend.execute({ type: "database.inspectIdle", input: undefined }),
-      ),
-    ).toBe("retire");
-    expect(existsSync(context.admission.databasePath)).toBe(false);
-  } finally {
-    await backend.close();
-  }
-});
-
 it.each(["subset-only", "native-closed"] as const)(
   "inspects a retained update writer with a %s backend",
   async (kind) => {

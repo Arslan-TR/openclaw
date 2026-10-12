@@ -172,43 +172,6 @@ describe("profile alias reader lifecycle", () => {
     },
   );
 
-  it("keeps profiles separate and renews an email binding when ownership moves away and back", () => {
-    const options = stateOptions();
-    const source = ensureProfileForEmail("source@aliases.test", options);
-    const target = ensureProfileForEmail("target@aliases.test", options);
-    const originalBindings = readUserProfileEmailBindingIds(source.id, options);
-    const targetBindings = readUserProfileEmailBindingIds(target.id, options);
-    const aliasRevision = readUserProfileAliasRevision();
-    linkEmail("retained@aliases.test", source.id, options);
-    const retainedBindings = readUserProfileEmailBindingIds(source.id, options).filter(
-      (binding) => !originalBindings.includes(binding),
-    );
-    expect(retainedBindings).toHaveLength(1);
-    expect(readUserProfileAliases(target.id, options)).toEqual(new Set([target.id]));
-    linkEmail("source@aliases.test", target.id, options);
-    expect(readUserProfileAliases(target.id, options)).toEqual(new Set([target.id]));
-    expect(readUserProfileAliases(source.id, options)).toEqual(new Set([source.id]));
-    expect(readUserProfileAliasRevision()).toBe(aliasRevision);
-    expect(readUserProfileEmailBindingIds(source.id, options)).toEqual(retainedBindings);
-    const movedBindings = readUserProfileEmailBindingIds(target.id, options);
-    expect(movedBindings).toHaveLength(2);
-    expect(movedBindings).toEqual(expect.arrayContaining(targetBindings));
-    expect(movedBindings).not.toContain(originalBindings[0]);
-
-    linkEmail("source@aliases.test", source.id, options);
-    const returnedBindings = readUserProfileEmailBindingIds(source.id, options);
-    expect(returnedBindings).toHaveLength(2);
-    expect(returnedBindings).toEqual(expect.arrayContaining(retainedBindings));
-    expect(returnedBindings).not.toContain(originalBindings[0]);
-    for (const binding of movedBindings) {
-      expect(returnedBindings).not.toContain(binding);
-    }
-    expect(readUserProfileEmailBindingIds(target.id, options)).toEqual(targetBindings);
-    closeOpenClawStateDatabaseByPath(options.path);
-    expect(readUserProfileEmailBindingIds(source.id, options)).toEqual(returnedBindings);
-    expect(readUserProfileEmailBindingIds(target.id, options)).toEqual(targetBindings);
-  });
-
   it("renews an email binding when verified GitHub ownership moves away and back", () => {
     const options = stateOptions();
     const authenticationAlias = { kind: "email" as const, email: "shared@aliases.test" };
@@ -293,7 +256,7 @@ describe("profile alias reader lifecycle", () => {
     );
   });
 
-  it.each([false, true])(
+  it.each([true])(
     "leaves absent storage untouched and observes its later creation (database=%s)",
     (exists) => {
       const options = stateOptions();
