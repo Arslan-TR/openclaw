@@ -467,50 +467,53 @@ describe("browser tab routes", () => {
     });
   });
 
-  it("explains unavailable URLs without leaking policy details in tab action listings", async () => {
-    const failedTab = publicTab({ targetId: "T3", url: "https://unresolved.example" });
-    const blankTab = publicTab({ targetId: "T4", url: "" });
-    const tabs = [publicTab(), internalTab(), failedTab, blankTab];
-    navigationGuardMocks.assertBrowserNavigationResultAllowed.mockImplementation(async (opts) => {
-      if (opts?.url === internalTab().url) {
-        throw Object.assign(new Error(`Blocked address: ${opts.url}`), {
-          name: "SsrFBlockedError",
-        });
-      }
-      if (opts?.url === failedTab.url) {
-        throw new Error(`getaddrinfo EAI_AGAIN ${opts.url}`);
-      }
-    });
-    const profileCtx = createProfileWithTabs(tabs);
-    const request = {
-      method: "post" as const,
-      path: "/tabs/action" as const,
-      body: { action: "list" },
-      profileCtx,
-      ssrfPolicy: {},
-    };
-    const response = await callTabsRoute(request);
+  it.each(["get", "post"] as const)(
+    "explains unavailable URLs without leaking policy details in %s tab listings",
+    async (method) => {
+      const failedTab = publicTab({ targetId: "T3", url: "https://unresolved.example" });
+      const blankTab = publicTab({ targetId: "T4", url: "" });
+      const tabs = [publicTab(), internalTab(), failedTab, blankTab];
+      navigationGuardMocks.assertBrowserNavigationResultAllowed.mockImplementation(async (opts) => {
+        if (opts?.url === internalTab().url) {
+          throw Object.assign(new Error(`Blocked address: ${opts.url}`), {
+            name: "SsrFBlockedError",
+          });
+        }
+        if (opts?.url === failedTab.url) {
+          throw new Error(`getaddrinfo EAI_AGAIN ${opts.url}`);
+        }
+      });
+      const profileCtx = createProfileWithTabs(tabs);
+      const request = {
+        method,
+        path: method === "get" ? ("/tabs" as const) : ("/tabs/action" as const),
+        body: { action: "list" },
+        profileCtx,
+        ssrfPolicy: {},
+      };
+      const response = await callTabsRoute(request);
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({
-      ok: true,
-      tabs: [
-        publicTab(),
-        { ...internalTab(), url: "", urlUnavailableReason: "navigation_blocked" },
-        { ...failedTab, url: "", urlUnavailableReason: "navigation_check_failed" },
-        blankTab,
-      ],
-    });
-    expect(JSON.stringify(response.body)).not.toContain(internalTab().url);
-    expect(JSON.stringify(response.body)).not.toContain(failedTab.url);
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toEqual({
+        ...(method === "get" ? { running: true } : { ok: true }),
+        tabs: [
+          publicTab(),
+          { ...internalTab(), url: "", urlUnavailableReason: "navigation_blocked" },
+          { ...failedTab, url: "", urlUnavailableReason: "navigation_check_failed" },
+          blankTab,
+        ],
+      });
+      expect(JSON.stringify(response.body)).not.toContain(internalTab().url);
+      expect(JSON.stringify(response.body)).not.toContain(failedTab.url);
 
-    navigationGuardMocks.assertBrowserNavigationResultAllowed.mockResolvedValue(undefined);
-    const recovered = await callTabsRoute(request);
-    expect(recovered.body).toEqual({
-      ok: true,
-      tabs,
-    });
-  });
+      navigationGuardMocks.assertBrowserNavigationResultAllowed.mockResolvedValue(undefined);
+      const recovered = await callTabsRoute(request);
+      expect(recovered.body).toEqual({
+        ...(method === "get" ? { running: true } : { ok: true }),
+        tabs,
+      });
+    },
+  );
 
   it("blocks /tabs/focus when target tab URL fails SSRF checks", async () => {
     navigationGuardMocks.assertBrowserNavigationResultAllowed.mockRejectedValueOnce(
