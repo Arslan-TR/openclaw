@@ -11,6 +11,11 @@ import {
   type QaEvidenceStatus,
   type QaEvidenceSummaryJson,
 } from "../../extensions/qa-lab/src/evidence-summary.js";
+import { readQaScenarioPack } from "../../extensions/qa-lab/src/scenario-catalog.js";
+import {
+  buildQaScorecardGapReport,
+  renderQaScorecardGapMarkdownReport,
+} from "../../extensions/qa-lab/src/scorecard-gap-report.js";
 import {
   QA_MATURITY_SCORE_LABEL_BANDS,
   activeQaMaturityTaxonomySurfaces,
@@ -55,6 +60,7 @@ type Args = {
 };
 
 type EvidenceSummary = {
+  evidence: QaEvidenceSummaryJson;
   sourcePath: string;
   path: string;
   generatedAt: string;
@@ -884,6 +890,7 @@ function readEvidenceSummaries(
       (item) => item.status === null,
     );
     return {
+      evidence: payload,
       sourcePath: filePath,
       path: path.relative(process.cwd(), filePath),
       generatedAt: payload.generatedAt,
@@ -1270,6 +1277,22 @@ function renderMaturityScorecard({
     );
   }
   lines.push(...renderEvidenceSection(evidenceSummaries, surfaceNames));
+  // Use the coverage owner's exact selection. Report-only gaps must not alter
+  // numeric scores, blocking evidence checks or strict-input warnings.
+  const selected = latestCoverageScorecard(
+    evidenceSummaries.filter((item) => item.taxonomyStatus === "current"),
+  );
+  if (selected) {
+    lines.push(
+      renderQaScorecardGapMarkdownReport(
+        buildQaScorecardGapReport({
+          taxonomy,
+          scenarios: readQaScenarioPack().scenarios,
+          evidence: selected.evidence,
+        }),
+      ),
+    );
+  }
   if (updatedDate) {
     lines.push(`> Last updated: ${updatedDate}`, "");
   }

@@ -24,12 +24,6 @@ import {
   renderQaConfidenceMarkdownReport,
 } from "./confidence-report.js";
 import { writeQaConfidenceSelfTestArtifacts } from "./confidence-self-test.js";
-import {
-  buildQaCoverageInventory,
-  findQaScenarioMatches,
-  renderQaCoverageMarkdownReport,
-  renderQaScenarioMatchesMarkdownReport,
-} from "./coverage-report.js";
 import { buildQaDockerHarnessImage, writeQaDockerHarnessFiles } from "./docker-harness.js";
 import { runQaDockerUp } from "./docker-up.runtime.js";
 import {
@@ -115,10 +109,8 @@ import {
   buildTokenEfficiencyReport,
   renderTokenEfficiencyMarkdownReport,
 } from "./token-efficiency-report.js";
-import {
-  buildQaToolCoverageReport,
-  renderQaToolCoverageMarkdownReport,
-} from "./tool-coverage-report.js";
+
+export { runQaCoverageReportCommand } from "./cli-coverage.runtime.js";
 
 const QA_CREDENTIAL_PAYLOAD_MAX_BYTES_ENV = "OPENCLAW_QA_CREDENTIAL_PAYLOAD_MAX_BYTES";
 const DEFAULT_QA_CREDENTIAL_PAYLOAD_MAX_BYTES = 64 * 1024 * 1024;
@@ -1266,65 +1258,6 @@ export async function runQaConfidenceSelfTestCommand(opts: {
   if (!result.summary.pass) {
     process.exitCode = 1;
   }
-}
-
-export async function runQaCoverageReportCommand(opts: {
-  repoRoot?: string;
-  output?: string;
-  json?: boolean;
-  tools?: boolean;
-  summary?: string;
-  match?: string[];
-}) {
-  const repoRoot = path.resolve(opts.repoRoot ?? process.cwd());
-  const outputPath = opts.output ? path.resolve(repoRoot, opts.output) : undefined;
-  const scenarios = readQaScenarioPack().scenarios;
-  let body: string;
-  let outputLabel = "QA coverage report";
-  if (opts.tools === true) {
-    if (opts.match && opts.match.length > 0) {
-      throw new Error("--match cannot be combined with --tools.");
-    }
-    const summary = opts.summary?.trim()
-      ? ((await readCompletedQaSuiteSummaryFile(
-          path.resolve(repoRoot, opts.summary),
-        )) as QaParitySuiteSummary)
-      : undefined;
-    const report = buildQaToolCoverageReport({ scenarios, summary });
-    body = opts.json
-      ? `${JSON.stringify(report, null, 2)}\n`
-      : renderQaToolCoverageMarkdownReport(report);
-    outputLabel = "QA tool coverage report";
-    if (summary && !report.pass) {
-      process.exitCode = 1;
-    }
-  } else {
-    if (opts.summary?.trim()) {
-      throw new Error("--summary requires --tools.");
-    }
-    const query = opts.match?.join(" ").trim();
-    if (query) {
-      const matches = findQaScenarioMatches(scenarios, query);
-      body = opts.json
-        ? `${JSON.stringify({ query, matches }, null, 2)}\n`
-        : renderQaScenarioMatchesMarkdownReport({ query, matches });
-      outputLabel = "QA scenario match report";
-    } else {
-      const inventory = buildQaCoverageInventory(scenarios);
-      body = opts.json
-        ? `${JSON.stringify(inventory, null, 2)}\n`
-        : renderQaCoverageMarkdownReport(inventory);
-    }
-  }
-
-  if (outputPath) {
-    await fs.mkdir(path.dirname(outputPath), { recursive: true });
-    await fs.writeFile(outputPath, body, "utf8");
-    process.stdout.write(`${outputLabel}: ${outputPath}\n`);
-    return;
-  }
-
-  process.stdout.write(body);
 }
 
 export async function runQaJsonlReplayCommand(opts: {
