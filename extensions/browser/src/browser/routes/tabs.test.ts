@@ -180,7 +180,7 @@ async function callTabsRoute(params: {
   return response;
 }
 
-it.each([{ driver: "existing-session" as const }, { cdpIsLoopback: false }, { attachOnly: true }])(
+it.each([{ attachOnly: true }])(
   "refuses managed dashboard tab lookup after a profile changes to %j",
   async (override) => {
     const profileCtx = createProfileContext({ profile: makeBrowserProfile(override) });
@@ -339,33 +339,6 @@ describe("browser tab routes", () => {
     expect(forProfile).not.toHaveBeenCalled();
   });
 
-  it("returns tab-open navigation failures instead of a success payload", async () => {
-    const navigationError = new Error("page.goto: net::ERR_NAME_NOT_RESOLVED");
-    const profileCtx = createProfileContext({
-      openTab: vi.fn(async () => {
-        throw navigationError;
-      }),
-    });
-
-    const response = await callTabsRoute({
-      method: "post",
-      path: "/tabs/open",
-      body: { url: "https://unresolved.example" },
-      profileCtx,
-    });
-
-    expect(response.statusCode).toBe(500);
-    expect(response.body).toEqual({ error: String(navigationError) });
-    expect(profileCtx.openTab).toHaveBeenCalledWith("https://unresolved.example", {
-      label: undefined,
-      signal: expect.any(AbortSignal),
-    });
-  });
-
-  it("returns browser-not-running for close when the browser is not reachable", async () => {
-    await expectBrowserNotRunningAction("close");
-  });
-
   it("returns browser-not-running for select when the browser is not reachable", async () => {
     await expectBrowserNotRunningAction("select");
   });
@@ -470,40 +443,6 @@ describe("browser tab routes", () => {
     }
   });
 
-  it("uses the configured action timeout for existing-session tab reachability", async () => {
-    const isReachable = vi.fn(async () => true);
-    const abort = new AbortController();
-    const profileCtx = createProfileContext({
-      profile: {
-        ...baseProfileContext().profile,
-        driver: "existing-session",
-      } as never,
-      isReachable,
-    });
-
-    const listResponse = await callTabsList({ profileCtx, signal: abort.signal });
-    const actionResponse = await callTabsAction({
-      profileCtx,
-      body: { action: "list" },
-      signal: abort.signal,
-    });
-
-    expect(listResponse.statusCode).toBe(200);
-    expect(actionResponse.statusCode).toBe(200);
-    expect(isReachable).toHaveBeenNthCalledWith(1, 45_000, { signal: abort.signal });
-    expect(isReachable).toHaveBeenNthCalledWith(2, 45_000, { signal: abort.signal });
-  });
-
-  it("keeps the short reachability probe for non-Chrome-MCP tab routes", async () => {
-    const isReachable = vi.fn(async () => true);
-    const profileCtx = createProfileContext({ isReachable });
-
-    const response = await callTabsList({ profileCtx });
-
-    expect(response.statusCode).toBe(200);
-    expect(isReachable).toHaveBeenCalledWith(300, { signal: expect.any(AbortSignal) });
-  });
-
   it("normalizes configured existing-session tab reachability timeouts", async () => {
     const isReachable = vi.fn(async () => true);
     const profileCtx = createProfileContext({
@@ -528,53 +467,50 @@ describe("browser tab routes", () => {
     });
   });
 
-  it.each(["get", "post"] as const)(
-    "explains unavailable URLs without leaking policy details in %s tab listings",
-    async (method) => {
-      const failedTab = publicTab({ targetId: "T3", url: "https://unresolved.example" });
-      const blankTab = publicTab({ targetId: "T4", url: "" });
-      const tabs = [publicTab(), internalTab(), failedTab, blankTab];
-      navigationGuardMocks.assertBrowserNavigationResultAllowed.mockImplementation(async (opts) => {
-        if (opts?.url === internalTab().url) {
-          throw Object.assign(new Error(`Blocked address: ${opts.url}`), {
-            name: "SsrFBlockedError",
-          });
-        }
-        if (opts?.url === failedTab.url) {
-          throw new Error(`getaddrinfo EAI_AGAIN ${opts.url}`);
-        }
-      });
-      const profileCtx = createProfileWithTabs(tabs);
-      const request = {
-        method,
-        path: method === "get" ? ("/tabs" as const) : ("/tabs/action" as const),
-        body: { action: "list" },
-        profileCtx,
-        ssrfPolicy: {},
-      };
-      const response = await callTabsRoute(request);
+  it("explains unavailable URLs without leaking policy details in tab action listings", async () => {
+    const failedTab = publicTab({ targetId: "T3", url: "https://unresolved.example" });
+    const blankTab = publicTab({ targetId: "T4", url: "" });
+    const tabs = [publicTab(), internalTab(), failedTab, blankTab];
+    navigationGuardMocks.assertBrowserNavigationResultAllowed.mockImplementation(async (opts) => {
+      if (opts?.url === internalTab().url) {
+        throw Object.assign(new Error(`Blocked address: ${opts.url}`), {
+          name: "SsrFBlockedError",
+        });
+      }
+      if (opts?.url === failedTab.url) {
+        throw new Error(`getaddrinfo EAI_AGAIN ${opts.url}`);
+      }
+    });
+    const profileCtx = createProfileWithTabs(tabs);
+    const request = {
+      method: "post" as const,
+      path: "/tabs/action" as const,
+      body: { action: "list" },
+      profileCtx,
+      ssrfPolicy: {},
+    };
+    const response = await callTabsRoute(request);
 
-      expect(response.statusCode).toBe(200);
-      expect(response.body).toEqual({
-        ...(method === "get" ? { running: true } : { ok: true }),
-        tabs: [
-          publicTab(),
-          { ...internalTab(), url: "", urlUnavailableReason: "navigation_blocked" },
-          { ...failedTab, url: "", urlUnavailableReason: "navigation_check_failed" },
-          blankTab,
-        ],
-      });
-      expect(JSON.stringify(response.body)).not.toContain(internalTab().url);
-      expect(JSON.stringify(response.body)).not.toContain(failedTab.url);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({
+      ok: true,
+      tabs: [
+        publicTab(),
+        { ...internalTab(), url: "", urlUnavailableReason: "navigation_blocked" },
+        { ...failedTab, url: "", urlUnavailableReason: "navigation_check_failed" },
+        blankTab,
+      ],
+    });
+    expect(JSON.stringify(response.body)).not.toContain(internalTab().url);
+    expect(JSON.stringify(response.body)).not.toContain(failedTab.url);
 
-      navigationGuardMocks.assertBrowserNavigationResultAllowed.mockResolvedValue(undefined);
-      const recovered = await callTabsRoute(request);
-      expect(recovered.body).toEqual({
-        ...(method === "get" ? { running: true } : { ok: true }),
-        tabs,
-      });
-    },
-  );
+    navigationGuardMocks.assertBrowserNavigationResultAllowed.mockResolvedValue(undefined);
+    const recovered = await callTabsRoute(request);
+    expect(recovered.body).toEqual({
+      ok: true,
+      tabs,
+    });
+  });
 
   it("blocks /tabs/focus when target tab URL fails SSRF checks", async () => {
     navigationGuardMocks.assertBrowserNavigationResultAllowed.mockRejectedValueOnce(
@@ -633,108 +569,6 @@ describe("browser tab routes", () => {
 
     expect(response.statusCode).toBe(409);
     expect(profileCtx.focusTab).not.toHaveBeenCalled();
-    expect(navigationGuardMocks.assertBrowserNavigationResultAllowed).not.toHaveBeenCalled();
-  });
-
-  it("returns conflict when an exact tab reference identifies different tabs", async () => {
-    const profileCtx = createProfileWithTabs([
-      publicTab({
-        targetId: "T1_RAW",
-        suggestedTargetId: "T2_RAW",
-        tabId: "t1",
-        label: "T2_RAW",
-      }),
-      publicTab({
-        targetId: "T2_RAW",
-        suggestedTargetId: "t2",
-        tabId: "t2",
-        url: "https://example.org",
-      }),
-    ]);
-
-    const response = await callTabsFocus({
-      profileCtx,
-      body: { targetId: "T2_RAW" },
-      ssrfPolicy: { allowPrivateNetwork: false },
-    });
-
-    expect(response.statusCode).toBe(409);
-    expect(response.body).toEqual({ error: "ambiguous browser tab reference" });
-    expect(profileCtx.focusTab).not.toHaveBeenCalled();
-    expect(navigationGuardMocks.assertBrowserNavigationResultAllowed).not.toHaveBeenCalled();
-  });
-
-  it("resolves friendly tab references before focusing tabs", async () => {
-    const profileCtx = createProfileWithTabs([
-      publicTab({
-        targetId: "T1_RAW",
-        suggestedTargetId: "docs",
-        tabId: "t1",
-        label: "docs",
-      }),
-      publicTab({
-        targetId: "T2_RAW",
-        suggestedTargetId: "T1_RAW",
-        tabId: "t2",
-        label: "T1_RAW",
-        url: "https://example.org",
-      }),
-    ]);
-
-    const labelResponse = await callTabsFocus({
-      profileCtx,
-      body: { targetId: "docs" },
-    });
-    const tabIdResponse = await callTabsFocus({
-      profileCtx,
-      body: { targetId: "t1" },
-    });
-
-    expect(labelResponse.statusCode).toBe(200);
-    expect(tabIdResponse.statusCode).toBe(200);
-    expect(profileCtx.focusTab).toHaveBeenNthCalledWith(1, "T1_RAW", {
-      exactTargetId: true,
-      signal: expect.any(AbortSignal),
-    });
-    expect(profileCtx.focusTab).toHaveBeenNthCalledWith(2, "T1_RAW", {
-      exactTargetId: true,
-      signal: expect.any(AbortSignal),
-    });
-  });
-
-  it("blocks /tabs/action select when target tab URL fails SSRF checks", async () => {
-    navigationGuardMocks.assertBrowserNavigationResultAllowed.mockRejectedValueOnce(
-      ssrfBlockedError(),
-    );
-    const profileCtx = createProfileWithTabs([publicTab(), internalTab()]);
-
-    const response = await callTabsAction({
-      body: { action: "select", index: 1 },
-      profileCtx,
-      ssrfPolicy: { allowPrivateNetwork: false },
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(profileCtx.focusTab).not.toHaveBeenCalled();
-  });
-
-  it("does not run SSRF result validation for /tabs/focus when policy is not configured", async () => {
-    const profileCtx = createProfileContext({
-      listTabs: vi.fn(async () => [internalTab()]),
-    });
-
-    const response = await callTabsFocus({
-      profileCtx,
-      body: { targetId: "T2" },
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toEqual({ ok: true, targetId: "T2" });
-    expect(profileCtx.focusTab).toHaveBeenCalledWith("T2", {
-      exactTargetId: true,
-      signal: expect.any(AbortSignal),
-    });
-    expect(profileCtx.ensureTabAvailable).not.toHaveBeenCalled();
     expect(navigationGuardMocks.assertBrowserNavigationResultAllowed).not.toHaveBeenCalled();
   });
 

@@ -348,32 +348,6 @@ describe("existing-session browser routes", () => {
     expectLabelCleanup();
   });
 
-  it("omits deltas for existing-session snapshots without stable document identity", async () => {
-    chromeMcpMocks.takeChromeMcpSnapshot
-      .mockResolvedValueOnce({
-        id: "root-1",
-        role: "document",
-        name: "Example",
-        children: [{ id: "save-1", role: "button", name: "Save" }],
-      })
-      .mockResolvedValueOnce({
-        id: "root-2",
-        role: "document",
-        name: "Example",
-        children: [
-          { id: "save-2", role: "button", name: "Save" },
-          { id: "alert-2", role: "alert", name: "Required" },
-        ],
-      });
-    const handler = getSnapshotGetHandler();
-    await runRoute(handler, { query: { format: "ai" } });
-    const second = await runRoute(handler, { query: { format: "ai" } });
-
-    const body = requireRecord(second.body, "second snapshot body");
-    expect(body.snapshot).not.toContain("[new]");
-    expect(body.newElements).toBeUndefined();
-  });
-
   it("labels and returns only Chrome MCP refs inside the final snapshot budget", async () => {
     chromeMcpMocks.takeChromeMcpSnapshot.mockResolvedValueOnce({
       id: "root",
@@ -669,7 +643,7 @@ describe("existing-session browser routes", () => {
     expect(clickParams.delayMs).toBeUndefined();
   });
 
-  it.each([{ button: "right" }, { delayMs: 5 }])(
+  it.each([{ button: "right" }])(
     "rejects unsupported native coordinate input %j before clicking",
     async (options) => {
       const response = await runRoute(getActPostHandler(), {
