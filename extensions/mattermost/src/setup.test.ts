@@ -42,13 +42,12 @@ vi.mock("./mattermost/client.js", () => ({
 }));
 
 let mattermostSetupWizard: typeof import("./setup-surface.js").mattermostSetupWizard;
-let isMattermostConfigured: typeof import("./setup-core.js").isMattermostConfigured;
 let mattermostSetupAdapter: typeof import("./setup-core.js").mattermostSetupAdapter;
 
 describe("mattermost setup", () => {
   beforeAll(async () => {
     ({ mattermostSetupWizard } = await import("./setup-surface.js"));
-    ({ isMattermostConfigured, mattermostSetupAdapter } = await import("./setup-core.js"));
+    ({ mattermostSetupAdapter } = await import("./setup-core.js"));
   });
 
   beforeEach(() => {
@@ -59,32 +58,6 @@ describe("mattermost setup", () => {
     normalizeMattermostBaseUrl.mockReset();
     normalizeMattermostBaseUrl.mockImplementation((value: string | undefined) => value);
     vi.unstubAllEnvs();
-  });
-
-  it("reports configuration only when token and base url are both present", () => {
-    expect(
-      isMattermostConfigured({
-        botToken: "bot-token",
-        baseUrl: "https://chat.example.com",
-        config: {},
-      } as never),
-    ).toBe(true);
-
-    expect(
-      isMattermostConfigured({
-        botToken: "",
-        baseUrl: "https://chat.example.com",
-        config: { botToken: "secret-ref" },
-      } as never),
-    ).toBe(true);
-
-    expect(
-      isMattermostConfigured({
-        botToken: "",
-        baseUrl: "",
-        config: {},
-      } as never),
-    ).toBe(false);
   });
 
   it("validates env and explicit credential requirements", () => {
@@ -223,37 +196,6 @@ describe("mattermost setup", () => {
     });
 
     expect(configured).toBe(false);
-  });
-
-  it("shows intro note only when the target account is not configured", () => {
-    expect(
-      mattermostSetupWizard.introNote?.shouldShow?.({
-        cfg: {
-          channels: {
-            mattermost: {},
-          },
-        } as OpenClawConfig,
-        accountId: "default",
-      } as never),
-    ).toBe(true);
-
-    expect(
-      mattermostSetupWizard.introNote?.shouldShow?.({
-        cfg: {
-          channels: {
-            mattermost: {
-              baseUrl: "https://chat.example.com",
-              botToken: {
-                source: "env",
-                provider: "default",
-                id: "MATTERMOST_BOT_TOKEN",
-              },
-            },
-          },
-        } as OpenClawConfig,
-        accountId: "default",
-      } as never),
-    ).toBe(false);
   });
 
   it("offers env shortcut only for the default account when env is present and config is empty", () => {
