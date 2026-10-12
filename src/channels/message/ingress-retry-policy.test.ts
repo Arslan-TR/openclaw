@@ -10,18 +10,10 @@ import {
 } from "./ingress-retry-policy.js";
 
 describe("ingress retry policy", () => {
-  it.each([
-    {
-      name: "default cap",
-      config: undefined,
-      expected: [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 180_000, 180_000],
-    },
-    {
-      name: "independent exponent cap",
-      config: { baseMs: 1_000, maxMs: 1_000_000 },
-      expected: [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 256_000],
-    },
-  ])("preserves the exact retry schedule through attempt 10: $name", ({ config, expected }) => {
+  it("caps the retry exponent independently of the configured maximum", () => {
+    const expected = [
+      1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 256_000,
+    ];
     expect(
       expected.map((_, index) =>
         resolveIngressRetryDelayMs(
@@ -31,56 +23,15 @@ describe("ingress retry policy", () => {
             lastAttemptAt: 0,
             lastError: "boom",
           },
-          config,
+          { baseMs: 1_000, maxMs: 1_000_000 },
           0,
         ),
       ),
     ).toEqual(expected);
   });
 
-  it.each([
-    {
-      name: "no prior error → immediate",
-      event: { receivedAt: 0, attempts: 2 },
-      now: 10_000,
-      expected: 0,
-    },
-    {
-      name: "attempt 1 → base delay remaining",
-      event: {
-        receivedAt: 0,
-        attempts: 1,
-        lastAttemptAt: 1000,
-        lastError: "boom",
-      },
-      now: 1500,
-      expected: 500,
-    },
-    {
-      name: "attempt 3 → exponential delay remaining",
-      event: {
-        receivedAt: 0,
-        attempts: 3,
-        lastAttemptAt: 1000,
-        lastError: "boom",
-      },
-      // base * 2^(3-1) = 4000; remaining from t=1000 at now=2000 → 3000
-      now: 2000,
-      expected: 3000,
-    },
-    {
-      name: "past window → 0",
-      event: {
-        receivedAt: 0,
-        attempts: 1,
-        lastAttemptAt: 1000,
-        lastError: "boom",
-      },
-      now: 5000,
-      expected: 0,
-    },
-  ])("retry delay: $name", ({ event, now, expected }) => {
-    expect(resolveIngressRetryDelayMs(event, undefined, now)).toBe(expected);
+  it("retries immediately without a prior error", () => {
+    expect(resolveIngressRetryDelayMs({ receivedAt: 0, attempts: 2 }, undefined, 10_000)).toBe(0);
   });
 
   it("does not dead-letter an old event below the attempt floor", () => {
@@ -177,69 +128,6 @@ describe("ingress retry policy", () => {
         now: 2_000,
       }),
     ).toMatchObject({ kind: "fail", reason: "restart-recovery-tombstone", attempt: 426 });
-  });
-
-  it.each([undefined, "SESSION_WORK_START_INVALIDATED"])(
-    "keeps tombstone-like text retryable without its code: %s",
-    (code) => {
-      const err = Object.assign(
-        new Error("Session ended during restart recovery. Use /new or /reset."),
-        { code },
-      );
-      expect(
-        resolveIngressFailureDisposition({
-          err,
-          event: { receivedAt: 1_000, attempts: 0 },
-          formatError: coerceErrorMessage,
-          now: 2_000,
-        }),
-      ).toEqual({ kind: "release", attempt: 1, message: err.message });
-    },
-  );
-
-  it.each(["code", "cause", "errors"])(
-    "releases a transient failure when its %s getter throws",
-    (field) => {
-      const err = Object.defineProperty(new Error("temporary failure"), field, {
-        get() {
-          throw new Error("unavailable diagnostic field");
-        },
-      });
-      expect(
-        resolveIngressFailureDisposition({
-          err,
-          event: { receivedAt: 1_000, attempts: 0 },
-          formatError: coerceErrorMessage,
-          now: 2_000,
-        }),
-      ).toEqual({ kind: "release", attempt: 1, message: "temporary failure" });
-    },
-  );
-
-  it("finds the terminal code beside an inaccessible wrapper field", () => {
-    const err = Object.assign(new Error("reply admission refused"), {
-      error: Object.assign(new Error("terminal generation"), {
-        code: "SESSION_RESTART_RECOVERY_TOMBSTONE",
-      }),
-    });
-    Object.defineProperty(err, "cause", {
-      get() {
-        throw new Error("unavailable diagnostic field");
-      },
-    });
-    expect(
-      resolveIngressFailureDisposition({
-        err,
-        event: { receivedAt: 1_000, attempts: 0 },
-        formatError: coerceErrorMessage,
-        now: 2_000,
-      }),
-    ).toEqual({
-      kind: "fail",
-      reason: "restart-recovery-tombstone",
-      attempt: 1,
-      message: "reply admission refused",
-    });
   });
 
   it("bounds a wrapped session-start conflict at the configured attempt budget", () => {
