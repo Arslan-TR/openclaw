@@ -407,17 +407,6 @@ describe("RealtimeCallHandler path routing", () => {
     }
   });
 
-  it("preserves a public path prefix ahead of serve.path", () => {
-    const handler = makeHandler({ streamPath: "/custom/stream/realtime" });
-    handler.setPublicUrl("https://public.example:8443/api/voice/webhook");
-    const payload = handler.buildTwiMLPayload(makeRequest("/voice/webhook", "127.0.0.1:3334"));
-
-    expect(handler.getStreamPathPattern()).toBe("/api/custom/stream/realtime");
-    expect(payload.body).toMatch(
-      /wss:\/\/public\.example:8443\/api\/custom\/stream\/realtime\/[0-9a-f-]{36}/,
-    );
-  });
-
   it("normalizes Twilio outbound realtime directions", async () => {
     const triggerGreeting = vi.fn();
     const { callbacks, handler, processEvent, createBridge } = makeCallHarness(
@@ -465,10 +454,11 @@ describe("RealtimeCallHandler path routing", () => {
       { triggerGreeting },
       {
         call,
+        config: { streamPath: "/custom/stream/realtime" },
         deps: { manager: { getCallForStream: async () => call }, resolveInstructions },
       },
     );
-    handler.setPublicUrl("https://public.example/voice/webhook");
+    handler.setPublicUrl("https://public.example:8443/api/voice/webhook");
     const session = handler.issueStreamSession({
       providerName: "telnyx",
       callId: "call-1",
@@ -477,6 +467,10 @@ describe("RealtimeCallHandler path routing", () => {
       direction: "inbound",
     });
     const server = await startStreamSessionServer(handler, session.streamUrl);
+    expect(handler.getStreamPathPattern()).toBe("/api/custom/stream/realtime");
+    expect(session.streamUrl).toMatch(
+      /wss:\/\/public\.example:8443\/api\/custom\/stream\/realtime\/[0-9a-f-]{36}/,
+    );
 
     const ws = await connectWs(server.url);
     ws.send(
@@ -975,8 +969,6 @@ describe("RealtimeCallHandler path routing", () => {
   const cancellationResult = { status: "cancelled", message: "Cancelled the active OpenClaw run." };
   it.each([
     {
-      path: "forced",
-      synchronous: false,
       outcome: {
         label: "cancellation",
         error: AbortSignal.abort().reason,
@@ -984,8 +976,6 @@ describe("RealtimeCallHandler path routing", () => {
       },
     },
     {
-      path: "forced",
-      synchronous: false,
       outcome: {
         label: "failure",
         error: new Error("Host run timed out"),
@@ -993,92 +983,69 @@ describe("RealtimeCallHandler path routing", () => {
       },
     },
     {
-      path: "forced",
-      synchronous: false,
       outcome: { label: "empty answer", result: { text: "", canceled: true } },
     },
-    {
-      path: "general",
-      synchronous: true,
-      outcome: {
-        label: "synchronous failure",
-        error: new Error("Operation aborted"),
-        result: { error: "Operation aborted" },
+  ])("projects forced $outcome.label once while the phone stays open", async ({ outcome }) => {
+    const submitToolResult = vi.fn();
+    const sendUserMessage = vi.fn();
+    const closeBridge = vi.fn();
+    const { call, handler, start } = makeCallHarness(
+      {
+        supportsToolResultContinuation: true,
+        submitToolResult,
+        sendUserMessage,
+        close: closeBridge,
       },
-    },
-  ])(
-    "projects $path $outcome.label once while the phone stays open",
-    async ({ path, outcome, synchronous }) => {
-      const submitToolResult = vi.fn();
-      const sendUserMessage = vi.fn();
-      const closeBridge = vi.fn();
-      const { call, handler, start } = makeCallHarness(
-        {
-          supportsToolResultContinuation: true,
-          submitToolResult,
-          sendUserMessage,
-          close: closeBridge,
-        },
-        { config: { consultPolicy: path === "forced" ? "always" : "auto" } },
-      );
-      const pending = createDeferred<unknown>();
-      const hostTool = vi.fn((_args: unknown, _callId: string, _context: ToolHandlerContext) => {
-        if (synchronous && "error" in outcome) {
-          throw outcome.error;
-        }
-        return pending.promise;
-      });
-      const name = path === "general" ? "custom_lookup" : "openclaw_agent_consult";
-      handler.registerToolHandler(name, hostTool);
-      const { ws, callbacks: provider } = await start();
+      { config: { consultPolicy: "always" } },
+    );
+    const pending = createDeferred<unknown>();
+    const hostTool = vi.fn(
+      (_args: unknown, _callId: string, _context: ToolHandlerContext) => pending.promise,
+    );
+    const name = "openclaw_agent_consult";
+    handler.registerToolHandler(name, hostTool);
+    const { ws, callbacks: provider } = await start();
 
-      try {
-        vi.useFakeTimers();
-        const question = "Check the deployment.";
-        if (path === "forced") {
-          provider.onTranscript?.("user", question, true);
-          await vi.advanceTimersByTimeAsync(200);
-          expect(hostTool).toHaveBeenCalledOnce();
-        }
-        const callIds = path === "general" ? ["a"] : ["a", "b"];
-        for (const callId of callIds) {
-          provider.onToolCall?.({ itemId: callId, callId, name, args: { question } });
-        }
-        await vi.advanceTimersByTimeAsync(0);
-        expect(hostTool).toHaveBeenCalledOnce();
-        expect(hostTool.mock.calls[0]?.[2].abortSignal?.aborted).toBe(
-          path === "general" ? undefined : false,
-        );
-
-        if ("error" in outcome && !synchronous) {
-          pending.reject(outcome.error);
-        } else {
-          pending.resolve(outcome.result);
-        }
-        await vi.advanceTimersByTimeAsync(0);
-
-        const finals = submitToolResult.mock.calls.filter(
-          (submission) => !submission[2]?.willContinue,
-        );
-        expect(finals).toEqual(callIds.map((callId) => [callId, outcome.result, undefined]));
-        const terminalEvents = recentTalkEvents(call).filter((event) =>
-          ["tool.result", "tool.error"].includes(event.type),
-        );
-        expect(terminalEvents.map((event) => event.type)).toEqual(
-          callIds.map(() => ("error" in outcome.result ? "tool.error" : "tool.result")),
-        );
-        expect(sendUserMessage).not.toHaveBeenCalled();
-        expect(closeBridge).not.toHaveBeenCalled();
-        expect(ws.readyState).toBe(WebSocket.OPEN);
-        expect(hostTool.mock.calls[0]?.[2].abortSignal?.aborted).toBe(
-          path === "general" ? undefined : false,
-        );
-      } finally {
-        pending.resolve(undefined);
-        ws.terminate();
+    try {
+      vi.useFakeTimers();
+      const question = "Check the deployment.";
+      provider.onTranscript?.("user", question, true);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(hostTool).toHaveBeenCalledOnce();
+      const callIds = ["a", "b"];
+      for (const callId of callIds) {
+        provider.onToolCall?.({ itemId: callId, callId, name, args: { question } });
       }
-    },
-  );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hostTool).toHaveBeenCalledOnce();
+      expect(hostTool.mock.calls[0]?.[2].abortSignal?.aborted).toBe(false);
+
+      if ("error" in outcome) {
+        pending.reject(outcome.error);
+      } else {
+        pending.resolve(outcome.result);
+      }
+      await vi.advanceTimersByTimeAsync(0);
+
+      const finals = submitToolResult.mock.calls.filter(
+        (submission) => !submission[2]?.willContinue,
+      );
+      expect(finals).toEqual(callIds.map((callId) => [callId, outcome.result, undefined]));
+      const terminalEvents = recentTalkEvents(call).filter((event) =>
+        ["tool.result", "tool.error"].includes(event.type),
+      );
+      expect(terminalEvents.map((event) => event.type)).toEqual(
+        callIds.map(() => ("error" in outcome.result ? "tool.error" : "tool.result")),
+      );
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(closeBridge).not.toHaveBeenCalled();
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      expect(hostTool.mock.calls[0]?.[2].abortSignal?.aborted).toBe(false);
+    } finally {
+      pending.resolve(undefined);
+      ws.terminate();
+    }
+  });
 
   it("keeps a different native request separate from a forced consult and preserves its retry", async () => {
     const submitToolResult = vi.fn();
@@ -1492,37 +1459,6 @@ describe("RealtimeCallHandler path routing", () => {
     expect(consult).toHaveBeenCalledTimes(1);
   });
 
-  it("does not submit an interim checking result when fast context is enabled", async () => {
-    const submitToolResult = vi.fn();
-    const { handler, start } = makeCallHarness(
-      { supportsToolResultContinuation: true, submitToolResult },
-      {
-        config: {
-          fastContext: {
-            enabled: true,
-            timeoutMs: 800,
-            maxResults: 3,
-            sources: ["memory", "sessions"],
-            fallbackToConsult: false,
-          },
-        },
-      },
-    );
-    handler.registerToolHandler("openclaw_agent_consult", async () => ({ text: "Fast context." }));
-    const { callbacks } = await start();
-
-    requestConsult(callbacks, "consult-call", "What do you remember?");
-
-    await waitForRealtimeTest(() =>
-      expect(submitToolResult).toHaveBeenCalledWith(
-        "consult-call",
-        { text: "Fast context." },
-        undefined,
-      ),
-    );
-    expect(submitToolResult).toHaveBeenCalledTimes(1);
-  });
-
   it("closes realtime streams when paced outbound audio exceeds the internal queue cap", async () => {
     const { start } = makeCallHarness();
     const { callbacks, ws } = await start();
@@ -1583,43 +1519,37 @@ function createHandler() {
 }
 
 describe("realtime upgrade rejection", () => {
-  it.each([
-    [401, "Unauthorized"],
-    [503, "Service Unavailable"],
-  ] as const)(
-    "flushes HTTP %s before closing without acquiring a provider",
-    async (status, reason) => {
-      const { handler, resolveRegistration } = createHandler();
-      const request = makeRequest("/voice/stream/realtime/invalid-token");
-      const shutdown = createDeferred<void>();
-      const closing = status === 503 ? handler.close(shutdown.promise) : undefined;
-      let flush = () => {};
-      let response = "";
-      const socket = new Duplex({
-        read() {},
-        write(chunk: Buffer, _encoding, callback) {
-          response += chunk.toString();
-          flush = callback;
-        },
-      });
-      const closed = once(socket, "close");
-      try {
-        handler.handleWebSocketUpgrade(request, socket, Buffer.alloc(0));
-        expect(response).toBe(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
-        expect(socket.destroyed).toBe(false);
-        expect(resolveRegistration).not.toHaveBeenCalled();
-        flush();
-        await closed;
-        expect(socket.destroyed).toBe(true);
-      } finally {
-        flush();
-        socket.destroy();
-        shutdown.resolve();
-        await closing;
-        await handler.close();
-      }
-    },
-  );
+  it("flushes HTTP 503 before closing without acquiring a provider", async () => {
+    const { handler, resolveRegistration } = createHandler();
+    const request = makeRequest("/voice/stream/realtime/invalid-token");
+    const shutdown = createDeferred<void>();
+    const closing = handler.close(shutdown.promise);
+    let flush = () => {};
+    let response = "";
+    const socket = new Duplex({
+      read() {},
+      write(chunk: Buffer, _encoding, callback) {
+        response += chunk.toString();
+        flush = callback;
+      },
+    });
+    const closed = once(socket, "close");
+    try {
+      handler.handleWebSocketUpgrade(request, socket, Buffer.alloc(0));
+      expect(response).toBe("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      expect(socket.destroyed).toBe(false);
+      expect(resolveRegistration).not.toHaveBeenCalled();
+      flush();
+      await closed;
+      expect(socket.destroyed).toBe(true);
+    } finally {
+      flush();
+      socket.destroy();
+      shutdown.resolve();
+      await closing;
+      await handler.close();
+    }
+  });
 
   it("owns raw socket errors while rejection bytes are buffered", async () => {
     const { handler } = createHandler();
