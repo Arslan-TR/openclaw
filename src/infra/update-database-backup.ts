@@ -1,8 +1,16 @@
+import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { sameFileIdentity } from "@openclaw/fs-safe/advanced";
 import { z } from "zod";
+import type { DoctorRehearsalDatabaseCoverage } from "../commands/doctor-rehearsal-databases.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { openClawStateDatabaseCache } from "../state/openclaw-state-db-cache.js";
+import {
+  getOpenClawDatabaseMaintenanceScope,
+  maintenanceOwnerHasSourceCustody,
+  maintenanceOwnerMayCopySourcesInProcess,
+} from "../state/openclaw-state-maintenance-context.js";
 import { resolvePathViaExistingAncestorSync } from "./boundary-path.js";
 import {
   ensureDurableDirectory,
@@ -11,8 +19,10 @@ import {
 } from "./directory-durability.js";
 import { formatDiskSpaceBytes, tryReadDiskSpace } from "./disk-space.js";
 import { formatErrorMessageWithCode } from "./errors.js";
+import { sameFileMutationFingerprint } from "./file-descriptor.js";
 import { hasNodeErrorCode } from "./path-guards.js";
 import { isSqliteSnapshotFile } from "./sqlite-file-header.js";
+import { resolveSqliteDatabaseFilePaths } from "./sqlite-files.js";
 import { createPrivateSqliteDirectory } from "./sqlite-private-directory.js";
 import { retainSnapshotWork } from "./sqlite-readonly-location-cleanup.js";
 import { measureUpdateStateFiles } from "./update-candidate-io.js";
@@ -26,10 +36,14 @@ import {
   discoverUpdateStateSchemaInspectionInProcess,
   UpdateStateSchemaInspectionPlanSchema,
 } from "./update-candidate-state.js";
-import { readUpdateStateDatabaseSizes } from "./update-candidate-state.sizes.js";
+import {
+  readUpdateStateDatabaseSizes,
+  readUpdateStateDatabaseSizesInProcess,
+} from "./update-candidate-state.sizes.js";
 import { readUpdateDatabaseGenerations } from "./update-database-generations.js";
+import type { UpdateRecoveryCaptureAcquisition } from "./update-recovery-capture-acquisition.js";
 
-const UpdateDatabaseBackupSchema = z.object({
+export const UpdateDatabaseBackupSchema = z.object({
   directory: z.string(),
   databases: z.array(
     z.object({
@@ -66,37 +80,51 @@ type BackupInput = {
   additionalPaths?: readonly string[];
   additionalFiles?: readonly string[];
   preserveSourceArtifacts?: boolean;
+  /** Native migration owns the stopped Gateway until Doctor takes custody. */
+  stopped?: boolean;
 };
 type InspectionPlan = z.infer<typeof UpdateStateSchemaInspectionPlanSchema>;
 
 async function inspectRestorableDatabaseFiles(
   databases: readonly string[],
-  previous?: ReadonlyMap<string, Awaited<ReturnType<typeof fs.lstat>>>,
+  previous?: ReadonlyMap<string, BigIntStats>,
+  stopped = false,
 ) {
-  const identities = new Map<string, Awaited<ReturnType<typeof fs.lstat>>>();
+  const identities = new Map<string, BigIntStats>();
   for (const database of databases) {
     for (const suffix of ["", "-wal", "-shm", "-journal"]) {
       const file = `${database}${suffix}`;
       let info;
       try {
-        info = await fs.lstat(file);
+        info = await fs.lstat(file, { bigint: true });
       } catch (error) {
         if (suffix && hasNodeErrorCode(error, "ENOENT")) {
           continue;
         }
         throw error;
       }
-      if (!info.isFile() || info.nlink !== 1) {
+      if (!info.isFile() || info.nlink !== 1n) {
         throw new Error(
           `Update database rollback requires a regular file with one link: ${file}. Resolve database aliases before retrying; the databases have not been migrated.`,
         );
       }
       const before = previous?.get(file);
-      if (before && !sameFileIdentity(before, info)) {
+      if (
+        before &&
+        !(stopped ? sameFileMutationFingerprint(before, info) : sameFileIdentity(before, info))
+      ) {
         throw new Error(`Update database file changed during backup: ${file}.`);
       }
       identities.set(file, info);
     }
+  }
+  if (
+    stopped &&
+    previous &&
+    (identities.size !== previous.size ||
+      [...identities.keys()].some((file) => !previous.has(file)))
+  ) {
+    throw new Error("Update database journal state changed during stopped backup.");
   }
   return identities;
 }
@@ -155,13 +183,21 @@ async function canonicalDatabaseInventory(
   includeOwners: boolean,
   additionalPaths: readonly string[] = [],
   additionalFiles: readonly string[] = [],
+  excludedDatabasePaths: readonly string[] = [],
 ) {
   const present = new Set<string>();
   const missing = new Set<string>();
   const owners = new Map<string, NonNullable<UpdateDatabaseBackup["databaseOwners"]>[number]>();
-  const selectedPaths = new Set(additionalPaths.map((file) => path.resolve(file)));
+  const excluded = new Set(excludedDatabasePaths.flatMap(resolveSqliteDatabaseFilePaths));
+  const isExcluded = (file: string) => excluded.has(resolvePathViaExistingAncestorSync(file));
+  const selectedPaths = new Set(
+    additionalPaths.filter((file) => !isExcluded(file)).map((file) => path.resolve(file)),
+  );
   // Header readers close only in this backup child, outside the updater's SQLite lock lifetime.
   for (const file of additionalFiles) {
+    if (isExcluded(file)) {
+      continue;
+    }
     const resolved = path.resolve(file);
     if (!selectedPaths.has(resolved) && (await isSqliteSnapshotFile(resolved))) {
       selectedPaths.add(resolved);
@@ -173,6 +209,9 @@ async function canonicalDatabaseInventory(
   ];
   for (const database of sources) {
     for (const spelling of database.spellings) {
+      if (isExcluded(spelling)) {
+        continue;
+      }
       let canonical: string;
       try {
         canonical = await fs.realpath(spelling);
@@ -203,7 +242,11 @@ async function canonicalDatabaseInventory(
   return {
     present: [...present].toSorted(),
     missing: [...missing].toSorted(),
-    sourcePaths: [...new Set(sources.flatMap((database) => database.spellings))].toSorted(),
+    sourcePaths: [
+      ...new Set(
+        sources.flatMap((database) => database.spellings).filter((file) => !isExcluded(file)),
+      ),
+    ].toSorted(),
     databaseOwners: includeOwners
       ? [...owners]
           .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
@@ -217,25 +260,30 @@ export async function createUpdateDatabaseBackupInProcess(
   input: BackupInput & {
     stagingRoot: string;
     inspectionPlan: InspectionPlan;
+    /** Exact families admitted by the owning Doctor before launching this backup child. */
+    excludedDatabasePaths?: readonly string[];
     onProgress?: (progress: UpdateStateInspectionProgress) => void;
   },
 ): Promise<UpdateDatabaseBackup> {
   const directory = await fs.realpath(`${input.backupRoot}.databases`);
   // Older parents strip owners from discovery before calling the candidate worker.
   // Compare the same admitted dialect; absent metadata must not become an inventory change.
-  const includeOwners = input.inspectionPlan.files.some(
-    ([, database]) => database.owners !== undefined,
-  );
-  const inventory = await canonicalDatabaseInventory(
-    input.inspectionPlan,
-    includeOwners,
-    input.additionalPaths,
-    input.additionalFiles,
-  );
+  const inspectionPlan = input.inspectionPlan;
+  const includeOwners = inspectionPlan.files.some(([, database]) => database.owners !== undefined);
+  const inventoryFor = (plan: InspectionPlan) =>
+    canonicalDatabaseInventory(
+      plan,
+      includeOwners,
+      input.additionalPaths,
+      input.additionalFiles,
+      input.excludedDatabasePaths,
+    );
+  const inventory = await inventoryFor(inspectionPlan);
   const identities = await inspectRestorableDatabaseFiles(inventory.present);
   const warnings = await checkDatabaseBackupSpace(directory, inventory.present);
   const { buildBackupArchivePath } = await import("../commands/backup-shared.js");
-  const { createVerifiedSqliteSnapshot } = await import("./sqlite-snapshot.js");
+  const { createStoppedSqliteSnapshot, createVerifiedSqliteSnapshot } =
+    await import("./sqlite-snapshot.js");
   const databases: UpdateDatabaseBackup["databases"] = [];
   const sourceGenerations: UpdateDatabaseBackup["sourceGenerations"] = Object.fromEntries(
     inventory.missing.map((file) => [file, null]),
@@ -259,25 +307,38 @@ export async function createUpdateDatabaseBackupInProcess(
       await ensureDurableDirectory({ directoryPath: parent, create: createPrivateSqliteDirectory });
     }
     const snapshotPath = path.join(directory, archivePath);
-    const before = readGeneration(sourcePath);
-    const snapshot = await createVerifiedSqliteSnapshot({
-      sourcePath,
-      targetPath: snapshotPath,
-      sourceAcquisition: {
-        mode: "isolated-process",
-        stagingRoot: input.stagingRoot,
-        preserveSourceArtifacts: input.preserveSourceArtifacts,
-      },
-      preserveRowIds: true,
-      requireNonEmptySource: true,
-    });
-    const after = readGeneration(sourcePath);
-    if (after !== undefined && before === after) {
-      sourceGenerations[sourcePath] = after;
-    } else {
-      warnings.push(
-        `Database changed during capture; its snapshot requires manual recovery: ${sourcePath}`,
-      );
+    const stopped =
+      input.stopped &&
+      !identities.has(`${sourcePath}-journal`) &&
+      (identities.get(`${sourcePath}-wal`)?.size ?? 0n) === 0n;
+    const before = input.stopped ? undefined : readGeneration(sourcePath);
+    const snapshot = stopped
+      ? await createStoppedSqliteSnapshot({
+          sourcePath,
+          targetPath: snapshotPath,
+          sourceIdentity: identities.get(sourcePath)!,
+        })
+      : await createVerifiedSqliteSnapshot({
+          sourcePath,
+          targetPath: snapshotPath,
+          sourceAcquisition: {
+            mode: "isolated-process",
+            stagingRoot: input.stagingRoot,
+            preserveSourceArtifacts: input.stopped || input.preserveSourceArtifacts,
+          },
+          preserveRowIds: true,
+          requireNonEmptySource: true,
+        });
+    // Native restore uses its supervisor's stopped-state fence, not live-writer generations.
+    if (!input.stopped) {
+      const after = readGeneration(sourcePath);
+      if (after !== undefined && before === after) {
+        sourceGenerations[sourcePath] = after;
+      } else {
+        warnings.push(
+          `Database changed during capture; its snapshot requires manual recovery: ${sourcePath}`,
+        );
+      }
     }
     databases.push({
       path: sourcePath,
@@ -287,16 +348,16 @@ export async function createUpdateDatabaseBackupInProcess(
       sizeBytes: snapshot.sizeBytes,
     });
   }
-  const current = await canonicalDatabaseInventory(
-    await discoverUpdateStateSchemaInspectionInProcess(input),
-    includeOwners,
-    input.additionalPaths,
-    input.additionalFiles,
+  const current = await inventoryFor(
+    await discoverUpdateStateSchemaInspectionInProcess({
+      ...input,
+      preserveSourceArtifacts: input.stopped || input.preserveSourceArtifacts,
+    }),
   );
   if (JSON.stringify(current) !== JSON.stringify(inventory)) {
     throw new Error("Update database inventory changed during backup; retry after writers stop.");
   }
-  await inspectRestorableDatabaseFiles(inventory.present, identities);
+  await inspectRestorableDatabaseFiles(inventory.present, identities, input.stopped);
   return {
     directory,
     databases,
@@ -310,14 +371,18 @@ export async function createUpdateDatabaseBackupInProcess(
 
 /** Retain raw, verified database files separately from the old package fingerprint. */
 export async function createUpdateDatabaseBackup({
+  acquisition,
   nodeRunner = process.execPath,
   timeoutMs,
   signal: callerSignal,
+  rehearsal,
   ...input
 }: BackupInput & {
+  acquisition?: UpdateRecoveryCaptureAcquisition;
   nodeRunner?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  rehearsal?: DoctorRehearsalDatabaseCoverage;
 }): Promise<UpdateDatabaseBackup> {
   const controller = new AbortController();
   const additionalPaths = input.additionalPaths?.map((file) => path.resolve(file));
@@ -330,41 +395,66 @@ export async function createUpdateDatabaseBackup({
     const backupRoot = path.resolve(input.backupRoot);
     const directory = `${backupRoot}.databases`;
     await createPrivateSqliteDirectory(directory);
-    const identity = await fs.lstat(directory);
+    const identity = await fs.lstat(directory, { bigint: true });
     try {
       const sourceEnv = input.env ?? process.env;
       const worker = { nodeRunner, timeoutMs, signal, sourceEnv, stagingRoot: directory };
       // Each SQLite reader owns its token-protected scratch beneath this private backup directory.
       const workerInput = {
         ...input,
+        preserveSourceArtifacts: input.stopped || input.preserveSourceArtifacts,
         additionalPaths,
         additionalFiles,
         backupRoot,
         stagingRoot: directory,
       };
       const shared = path.resolve(input.stateDir, "state", "openclaw.sqlite");
-      const inspectionPlan = parseUpdateStateInspectionWorker(
-        await runUpdateStateInspectionWorker({
-          ...worker,
-          input: { ...workerInput, mode: "discover" },
-          databases: await readUpdateStateDatabaseSizes([shared], worker),
-        }),
-        UpdateStateSchemaInspectionPlanSchema,
+      const scope = getOpenClawDatabaseMaintenanceScope();
+      const custody =
+        acquisition?.mode === "maintenance-owner" &&
+        maintenanceOwnerHasSourceCustody(scope, shared) &&
+        !openClawStateDatabaseCache.isOpenClawStateDatabaseOpen(shared);
+      const inspectionPlan =
+        custody && maintenanceOwnerMayCopySourcesInProcess(scope, shared)
+          ? await discoverUpdateStateSchemaInspectionInProcess({
+              ...workerInput,
+              stagingRoot: directory,
+              preserveSourceArtifacts: true,
+            })
+          : parseUpdateStateInspectionWorker(
+              await runUpdateStateInspectionWorker({
+                ...worker,
+                input: { ...workerInput, mode: "discover" },
+                databases: custody
+                  ? await readUpdateStateDatabaseSizesInProcess([shared], signal)
+                  : await readUpdateStateDatabaseSizes([shared], worker),
+              }),
+              UpdateStateSchemaInspectionPlanSchema,
+            );
+      rehearsal?.assertCurrent();
+      const excludedDatabasePaths = rehearsal?.admit(
+        inspectionPlan.files.flatMap(([, database]) => database.spellings),
       );
+      const capturedInput = { ...workerInput, excludedDatabasePaths };
       const files = [
         ...inspectionPlan.files.flatMap(([, database]) => database.spellings),
         ...(additionalPaths ?? []),
         ...(additionalFiles ?? []),
-      ];
+      ].filter((file) => !rehearsal?.excludes(file));
+      rehearsal?.assertCurrent();
       const backup = parseUpdateStateInspectionWorker(
         await runUpdateStateInspectionWorker({
           ...worker,
-          input: { ...workerInput, mode: "database-backup", inspectionPlan },
-          databases: await readUpdateStateDatabaseSizes(files, worker),
+          input: { ...capturedInput, mode: "database-backup", inspectionPlan },
+          ...(custody ? { ioBudget: "deadline" as const } : {}),
+          databases: custody
+            ? await readUpdateStateDatabaseSizesInProcess(files, signal)
+            : await readUpdateStateDatabaseSizes(files, worker),
         }),
         UpdateDatabaseBackupSchema,
       );
-      if (!sameFileIdentity(identity, await fs.lstat(directory))) {
+      rehearsal?.assertCurrent();
+      if (!sameFileIdentity(identity, await fs.lstat(directory, { bigint: true }))) {
         throw new Error(`Database backup directory changed during capture: ${directory}.`);
       }
       requireDirectorySync(await syncDirectory(path.dirname(directory)), "Database backup parent");

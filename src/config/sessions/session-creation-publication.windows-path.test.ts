@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
@@ -13,6 +13,8 @@ import {
   withSessionEntryCreationPublication,
 } from "./session-accessor.sqlite-entry-cache-publication.js";
 
+// A shared worker may already hold the identity owner with its real filesystem imports.
+vi.hoisted(() => vi.resetModules());
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, statSync: vi.fn(actual.statSync) };
@@ -21,9 +23,52 @@ vi.mock("node:fs", async (importOriginal) => {
 afterEach(() => vi.restoreAllMocks());
 const directories = useAutoCleanupTempDirTracker(afterEach);
 
+it("binds a native creation to its prepared physical identity", async () => {
+  const databasePath = path.join(directories.make("session-publication-native-"), "agent.sqlite");
+  const db = new DatabaseSync(databasePath);
+  const database = { agentId: "main", path: databasePath, db };
+  const target = {
+    agentId: database.agentId,
+    sessionKey: "agent:main:native-publication",
+    paths: new Set([databasePath]),
+  };
+  try {
+    registerOpenClawAgentDatabaseIdentity(db);
+    const identity = readOpenClawAgentDatabaseIdentity(database).identity;
+    if (typeof identity !== "string") {
+      throw new Error("Expected a file-backed native creation fixture");
+    }
+    await withSessionEntryCreationPublication(
+      { agentId: target.agentId, sessionKey: target.sessionKey, database },
+      async (operation) => {
+        expect(() =>
+          assertSessionEntryCreationPublication(operation, {
+            ...target,
+            paths: new Set(),
+            databaseIdentity: `file:${identity}`,
+          }),
+        ).not.toThrow();
+        expect(() =>
+          assertSessionEntryCreationPublication(operation, {
+            ...target,
+            databaseIdentity: "file:0:0",
+          }),
+        ).toThrow("Session creation publication owner is no longer current");
+      },
+    );
+  } finally {
+    db.close();
+  }
+});
+
 it.each([
   { name: "drive", runtimePath: String.raw`C:\OpenClaw\agents\main\agent.sqlite` },
   { name: "UNC", runtimePath: String.raw`\\Server\Share\OpenClaw\agents\main\agent.sqlite` },
+  {
+    name: "junction",
+    runtimePath: String.raw`C:\OpenClaw\agents\main\agent.sqlite`,
+    openedPath: String.raw`C:\agent-alias\agent.sqlite`,
+  },
   {
     name: "long drive",
     runtimePath: path.win32.join(
@@ -34,14 +79,14 @@ it.each([
   },
 ])(
   "retains creation publication custody across $name namespace aliases",
-  async ({ runtimePath }) => {
+  async ({ runtimePath, openedPath = runtimePath }) => {
     const databasePath = path.join(
       directories.make("session-publication-windows-"),
       "agent.sqlite",
     );
     const database = new DatabaseSync(databasePath);
     const metadata = statSync(databasePath, { bigint: true });
-    const namespacedPath = path.win32.toNamespacedPath(runtimePath);
+    const namespacedPath = path.win32.toNamespacedPath(openedPath);
     const target = {
       agentId: "main",
       sessionKey: "agent:main:windows-publication",
@@ -53,7 +98,8 @@ it.each([
       vi.spyOn(path, "resolve").mockImplementation(resolveWindowsPath);
       vi.spyOn(database, "location").mockReturnValue(namespacedPath);
       // Model the Windows native boundary while preserving the real handle's physical identity.
-      vi.mocked(statSync).mockReturnValueOnce(metadata);
+      vi.spyOn(realpathSync, "native").mockReturnValue(path.win32.toNamespacedPath(runtimePath));
+      vi.mocked(statSync).mockReturnValueOnce(metadata).mockReturnValueOnce(metadata);
       registerOpenClawAgentDatabaseIdentity(database);
       const identity = readOpenClawAgentDatabaseIdentity({ db: database });
       if (typeof identity.identity !== "string") {
@@ -64,7 +110,7 @@ it.each([
           agentId: target.agentId,
           sessionKey: target.sessionKey,
           file: {
-            path: identity.filename,
+            path: identity.canonicalPath,
             agentId: target.agentId,
             databaseIdentity: identity.identity,
             assertCurrent: () => {

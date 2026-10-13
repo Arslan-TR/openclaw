@@ -1,6 +1,6 @@
 import {
   configureAiTransportHost,
-  getAiTransportHost,
+  getDefaultAiTransportHost,
   type AiProviderRequestCapabilities,
 } from "@openclaw/ai";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -38,7 +38,7 @@ export function configureAiTransportRuntimeHost(): void {
   if (configured) {
     return;
   }
-  const host = getAiTransportHost();
+  const host = getDefaultAiTransportHost();
   configureAiTransportHost({
     ...host,
     plugin: {
@@ -66,6 +66,13 @@ export function configureAiTransportRuntimeHost(): void {
         }),
       wrapSimpleCompletionStream: (params) => {
         const config = params.config as OpenClawConfig | undefined;
+        const { defaultParams, modelParams, agentModelParams, agentParams } =
+          resolveModelExtraParamSources({
+            config,
+            provider: params.provider,
+            modelId: params.context.modelId,
+            agentId: params.context.agentId,
+          });
         const providerStreamFn = wrapProviderSimpleCompletionStreamFn({
           ...params,
           config,
@@ -74,19 +81,14 @@ export function configureAiTransportRuntimeHost(): void {
             ...params.context,
             config: params.context.config as OpenClawConfig | undefined,
             model: params.context.model as ProviderRuntimeModel,
+            modelParams: { ...modelParams, ...agentModelParams },
+            modelCallUrgency: "background",
           },
         });
         const baseStreamFn = providerStreamFn ?? params.context.streamFn;
         if ((params.context.sourceApi ?? params.context.model.api) !== "openai-completions") {
           return providerStreamFn;
         }
-        const { defaultParams, modelParams, agentModelParams, agentParams } =
-          resolveModelExtraParamSources({
-            config,
-            provider: params.provider,
-            modelId: params.context.modelId,
-            agentId: params.context.agentId,
-          });
         return createOpenAICompletionsPayloadPolicyWrapper(baseStreamFn, [
           defaultParams,
           modelParams,

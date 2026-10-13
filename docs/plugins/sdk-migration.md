@@ -23,10 +23,11 @@ from a single entry point:
 - **`openclaw/plugin-sdk/infra-runtime`** - a broad barrel mixing system
   events, heartbeat state, delivery queues, fetch/proxy helpers, file helpers,
   approval types, and unrelated utilities.
-- **`openclaw/plugin-sdk/config-runtime`** - a broad config barrel retained
-  for compatibility, including deprecated direct `loadConfig` and
-  `writeConfigFile` exports. Those methods were removed from the injected
-  plugin runtime, not from this retained barrel.
+- **`openclaw/plugin-sdk/config-runtime`** - a removed broad config barrel,
+  including its deprecated direct `loadConfig` and `writeConfigFile` exports.
+- **`openclaw/plugin-sdk/channel-lifecycle`**, **`channel-message`**, and
+  **`channel-reply-pipeline`** - removed channel compatibility facades. Use
+  the focused outbound and inbound contracts, checking each named export.
 - **`openclaw/extension-api`** - a removed bridge that gave plugins direct
   access to host-side helpers like the embedded agent runner.
 - **`api.registerEmbeddedExtensionFactory(...)`** - a removed embedded-runner-only
@@ -34,12 +35,13 @@ from a single entry point:
   tool-result middleware instead (see [Migrate embedded tool-result extensions
   to middleware](/plugins/sdk-migration/how-to-migrate#how-to-migrate)).
 
-The root SDK, compat barrel, extension bridge, and embedded extension factory
-have been removed. `infra-runtime` and `config-runtime` remain only for their
-separately recorded later windows. New plugins should use focused subpaths.
+The root SDK, compat barrel, extension bridge, embedded extension factory, and
+five channel/config/infrastructure compatibility facades have been removed.
+The latter retirement received explicit SDK-owner approval on September 30,
+2026; see the [removal timeline](/plugins/sdk-migration/removal-timeline).
 
 <Warning>
-  Plugins importing the removed root, compat, or extension surfaces no longer
+  Plugins importing the removed SDK or extension surfaces no longer
   load. Follow the [import path mappings](/plugins/sdk-migration/import-paths) before upgrading.
 </Warning>
 
@@ -72,9 +74,89 @@ deprecated for runtime use. Ordinary ACP manager and Gateway callers use
 `readAcpSessionEntryAsync` and `getAcpSessionManager().resolveSessionAsync()`.
 Discord and Telegram startup binding cleanup retain their existing synchronous
 reader until conditional deletion can validate metadata at the mutation owner.
-That cleanup migration remains unfinished. Removing the synchronous contracts
+Their inactive incognito composition accepts a prepared session reader whose
+current-source assertion reaches the binding transaction and commit grants.
+The preparation retains the original actor revision and ACP metadata publication
+fence until cleanup releases it. The local `prepareAcpSessionEntryRead` helper captures an existing private actor
+binding and supplies that retained reader; it returns `undefined` without a binding.
+Discord and Telegram startup cleanup use it by default. Ordinary production
+acquisition stays native until atomic incognito activation; guarded durable
+cleanup remains separate work.
+`IncognitoSessionEndedError` and `IncognitoSessionSyncAccessError`, exposed through
+the local `openclaw/plugin-sdk/acp-runtime` facade, must propagate through cleanup and status
+probes. Use `rethrowIncognitoSessionError(error)` before treating other failures
+as an absent session or an uncertain probe; it also recognizes nested refusals.
+Removing the synchronous contracts
 requires a separately announced breaking SDK release. Incognito reads retain
 their existing native in-memory owner until that owner's worker migration.
+
+### Session and command preparation
+
+Use `getSessionEntryAsync`, `readSessionUpdatedAtAsync`,
+`getConversationSessionAsync`, `readAmbientTranscriptWatermarkAsync`,
+`loadTranscriptEvents`, and `readTranscriptStatsAsync` from
+`openclaw/plugin-sdk/session-store-runtime` for ordinary session reads. The
+runtime equivalent is `api.runtime.agent.session.getSessionEntryAsync`. These
+operations read through the existing session worker and observe committed
+in-process writes. Missing entries remain `undefined`; read failures propagate.
+`loadTranscriptEventsSync` and `readTranscriptStatsSync` are deprecated; their
+awaited replacements preserve ordered events and transcript statistics while
+keeping durable reads off the Gateway thread.
+
+Await `UserTurnTranscriptRecorder.completeProcessingAsync(outcome)` to settle an
+accepted input through its session owner. The deprecated `completeProcessing`
+method preserves synchronous completion and returns after the terminal outcome
+commits, with a migration warning, until the next Plugin SDK major. Recorders
+without an accepted input keep their existing no-op behavior.
+
+Use `readSessionTranscriptCatalogTitleAsync` from
+`openclaw/plugin-sdk/session-transcript-runtime` for catalog titles. The
+synchronous `readSessionTranscriptCatalogTitle` remains deprecated until the
+next Plugin SDK major.
+
+Use `resolveStoredModelOverrideAsync` and `resolveCommandArgMenuAsync` from
+`openclaw/plugin-sdk/command-auth-native` when preparing native commands.
+`resolveCommandArgMenuAsync` is also exported by
+`openclaw/plugin-sdk/native-command-registry`. An inherited-model loader may
+return a promise; direct overrides still need no parent read. Menu preparation
+reads the current session's verbose setting before returning its choices.
+
+The corresponding synchronous APIs are deprecated for ordinary runtime use.
+Released signatures remain supported until the next Plugin SDK major. New
+legacy calls emit a bounded deprecation warning. Bundled callers use the awaited
+operations; final tool, disclosure, and mutation authority checks retain their
+current owner and timing.
+
+For a complete cross-session store view, await
+`loadCombinedSessionStoreForGatewayAsync` from
+`openclaw/plugin-sdk/session-transcript-hit`. It preserves full session entries
+and excludes incognito sessions while reading durable stores through the existing
+database worker. The synchronous `loadCombinedSessionStoreForGateway` retains its
+return value and emits a bounded deprecation warning; it remains supported until
+the next Plugin SDK major.
+
+### Exec approval reads
+
+Await `loadExecApprovalsReadOnlyAsync` or `readExecApprovalsSnapshotAsync` from
+`openclaw/plugin-sdk/exec-approvals-runtime`. Both use the existing shared-state
+read worker. The synchronous `loadExecApprovals` and `readExecApprovalsSnapshot`
+exports retain their signatures for the current Plugin SDK major, emit a bounded
+deprecation warning, and are scheduled for removal in the next major. Bundled
+runtime callers use the awaited reads. The execution owner still checks current
+approval policy immediately before command execution using committed in-process
+policy publications; that final check does not query SQLite.
+
+### Session reset freshness
+
+Channel runtime consumers should await
+`runtime.channel.session.resolveEntryResetFreshnessAsync(...)` when deciding
+whether a session needs reset. File-backed entries and transcript lifecycle
+timestamps are read from the same worker snapshot, with the original database
+owner retained through validation and cleanup. The synchronous
+`resolveEntryResetFreshness(...)` method shipped in `v2026.9.8` remains available
+for existing JavaScript consumers and is deprecated for runtime use; removal
+requires the next Plugin SDK major and explicit breaking-release approval. Both methods retain the
+existing reset policy and process-held incognito behavior.
 
 ### Why
 
@@ -86,14 +168,14 @@ their existing native in-memory owner until that owner's worker migration.
 The typed public SDK is organized into focused subpaths with documented
 contracts. Not every SDK build entrypoint is a public plugin API.
 
-Legacy provider convenience seams for bundled channels are gone too -
+Legacy provider convenience interfaces for bundled channels are gone too -
 channel-branded helper shortcuts were private mono-repo conveniences, not
 stable plugin contracts. Use narrow generic SDK subpaths instead. Inside the
 bundled plugin workspace, keep provider-owned helpers in that plugin's own
 `api.ts` or `runtime-api.ts`:
 
 - Anthropic keeps Claude-specific stream helpers in its own `api.ts` /
-  `contract-api.ts` seam.
+  `contract-api.ts` interface.
 - OpenAI keeps provider builders, default-model helpers, and realtime provider
   builders in its own `api.ts`.
 - OpenRouter keeps provider builder and onboarding/config helpers in its own
@@ -108,6 +190,10 @@ The anchors from the single-page version still resolve here.
 
 [How to migrate a plugin](/plugins/sdk-migration/how-to-migrate) — the ordered migration steps.
 
+- [Await personal model-account operations](/plugins/sdk-migration/how-to-migrate#await-personal-model-account-operations)
+- [Await session transcript persistence](/plugins/sdk-migration/how-to-migrate#await-session-transcript-persistence)
+- [Await extension session changes](/plugins/sdk-migration/how-to-migrate#await-extension-session-changes)
+- [Await provider replay metadata](/plugins/sdk-migration/how-to-migrate#await-provider-replay-metadata)
 - <a id="how-to-migrate"></a>[How to migrate](/plugins/sdk-migration/how-to-migrate#how-to-migrate)
 - <a id="migrate-runtime-config-load%2Fwrite-helpers"></a>[Migrate runtime config load/write helpers](/plugins/sdk-migration/how-to-migrate#migrate-runtime-config-load%2Fwrite-helpers)
 - <a id="migrate-embedded-tool-result-extensions-to-middleware"></a>[Migrate embedded tool-result extensions to middleware](/plugins/sdk-migration/how-to-migrate#migrate-embedded-tool-result-extensions-to-middleware)
@@ -124,7 +210,7 @@ The anchors from the single-page version still resolve here.
 [Import path reference](/plugins/sdk-migration/import-paths) — which typed-public subpath replaces each legacy import.
 
 - <a id="import-path-reference"></a>[Import path reference](/plugins/sdk-migration/import-paths#import-path-reference)
-- <a id="retained-channel-facade-mappings"></a>[Retained channel facade mappings](/plugins/sdk-migration/import-paths#retained-channel-facade-mappings)
+- <a id="retained-channel-facade-mappings"></a>[Removed channel facade mappings](/plugins/sdk-migration/import-paths#retained-channel-facade-mappings)
 
 ### Removed surfaces and replacements
 

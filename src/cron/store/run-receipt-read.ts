@@ -8,6 +8,7 @@ import {
 import { runSqliteDeferredTransactionSync } from "../../infra/sqlite-transaction.js";
 import { readAgentDeletionJournalInDatabase } from "../../state/agent-deletion-journal.js";
 import type { DB as OpenClawStateDatabase } from "../../state/openclaw-state-db.generated.js";
+import { hasCanonicalCronDeliveryMode } from "./delivery-codec.js";
 import { loadedCronStoreFromRows, loadCronRows } from "./row-codec.js";
 import type {
   CronRunReceipt,
@@ -66,7 +67,7 @@ export function receiptHandle(receipt: CronRunReceipt): CronRunReceiptHandle {
   };
 }
 
-export function matchesCronRunReceiptOwner(
+function matchesCronRunReceiptOwner(
   current: CronRunReceiptHandle | undefined,
   expected: CronRunReceiptCurrentReadCommand["handle"],
 ): boolean {
@@ -103,7 +104,13 @@ export function readCronRunReceiptCurrentFactsInDatabase(
         : undefined;
     return {
       receipt,
-      job: job ? { agentId: job.agentId, sessionKey: job.sessionKey } : undefined,
+      job: job
+        ? {
+            agentId: job.agentId,
+            sessionKey: job.sessionKey,
+            hasCanonicalDeliveryMode: hasCanonicalCronDeliveryMode(job.delivery),
+          }
+        : undefined,
       deletionBlocked,
     };
   });

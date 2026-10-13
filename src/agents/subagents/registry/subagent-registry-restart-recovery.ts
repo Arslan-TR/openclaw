@@ -7,13 +7,13 @@ import {
   getGatewayContextResolver,
 } from "../../../plugins/runtime/gateway-request-scope.js";
 import { isSessionWorkAdmissionActive } from "../../../sessions/session-lifecycle-admission.js";
+import { resolveSubagentChildAuthority } from "./subagent-child-owner-match.js";
+import { isQuietSubagentRestartContinuation } from "./subagent-recovery-state.js";
 import {
   getSubagentRunsForRequesterSession,
   getSubagentRunsForChildSession,
 } from "./subagent-registry-memory.js";
-import { getLatestSubagentRunByChildSessionKeyFromRuns } from "./subagent-registry-queries.js";
 import {
-  getRestartRecoveryReplayError,
   isRestartRecoveryLifecycleCurrent,
   ownsSubagentSessionExecution,
 } from "./subagent-registry-restart-recovery-helpers.js";
@@ -23,15 +23,28 @@ import type {
   RestartRecoveryResult,
 } from "./subagent-registry-restart-recovery-types.js";
 import type { SubagentSessionEffects } from "./subagent-registry.types.js";
-import { isRequesterSettleWakeForRun } from "./subagent-requester-settle-identity.js";
+import {
+  hasRequesterCompletionCohort,
+  isRequesterCompletionCohortCurrent,
+  isRequesterSettleWakeForRun,
+} from "./subagent-requester-settle-identity.js";
+import { latestSubagentRun } from "./subagent-run-generation.js";
 import { resolveCompletionFromSessionEntry } from "./subagent-session-reconciliation.js";
-
-export type { RestartRecoveryParams, RestartRecoveryResult };
 
 export async function recoverInterruptedSubagentRow(
   params: RestartRecoveryParams,
 ): Promise<RestartRecoveryResult> {
   const { entry, runId } = params;
+  const authority = resolveSubagentChildAuthority(entry);
+  if (authority.status === "mismatch") {
+    params.warn("retained subagent record cannot be recovered", {
+      runId,
+      childSessionKey: entry.childSessionKey,
+      error: new Error(authority.error),
+    });
+    return { status: "deferred" };
+  }
+  let expectedObservation = entry;
   const childSessionKey = entry.childSessionKey.trim();
   const lifecycleGeneration = agentEvents.getAgentEventLifecycleGeneration();
   const isGatewayCurrent = () =>
@@ -39,16 +52,24 @@ export async function recoverInterruptedSubagentRow(
     params.isGatewayCurrent?.() !== false;
   const isCurrent = () =>
     isGatewayCurrent() &&
-    params.isCurrent(runId, entry) &&
-    entry.pauseReason !== "sessions_yield" &&
-    entry.suppressAnnounceReason !== "steer-restart" &&
-    !entry.killIntent &&
-    !entry.killReconciliation &&
-    entry.execution.status !== "queued";
+    params.isCurrent(runId, expectedObservation) &&
+    expectedObservation.pauseReason !== "sessions_yield" &&
+    expectedObservation.suppressAnnounceReason !== "steer-restart" &&
+    !expectedObservation.killIntent &&
+    !expectedObservation.killReconciliation &&
+    expectedObservation.execution.status !== "queued";
   if (!childSessionKey || !isCurrent()) {
     return { status: "ignored" };
   }
-  const terminalError = getRestartRecoveryReplayError(entry);
+  const terminalError =
+    entry.terminalOwner === "interrupted-recovery" &&
+    entry.pauseReason !== "sessions_yield" &&
+    entry.execution.status === "terminal" &&
+    typeof entry.execution.endedAt === "number" &&
+    entry.execution.outcome?.status === "error" &&
+    entry.endedReason === "subagent-error"
+      ? (entry.execution.outcome.error ?? "subagent run interrupted by gateway restart")
+      : undefined;
   const replayTerminal = terminalError !== undefined;
   if (!replayTerminal && typeof entry.execution.endedAt === "number") {
     return { status: "ignored" };
@@ -70,6 +91,22 @@ export async function recoverInterruptedSubagentRow(
     if ((!session && !replayTerminal) || !isCurrent()) {
       return { status: "deferred" };
     }
+    if (session?.replacementReason) {
+      return {
+        status: "terminal",
+        recoveryCurrent: {
+          isHostCurrent: isCurrent,
+          prepare: async () => isCurrent(),
+          onPublished: (published) => {
+            expectedObservation = published;
+          },
+        },
+        error: terminalError ?? session.replacementReason,
+        endedAt: replayTerminal ? entry.execution.endedAt : undefined,
+        suppressSessionEffects: true,
+      };
+    }
+    const legacy = authority.status === "legacy-unverified";
     if (!replayTerminal && session?.retained?.isCurrent()) {
       return { status: "handled", retained: session.retained };
     }
@@ -92,7 +129,7 @@ export async function recoverInterruptedSubagentRow(
     const lifecycleRunId = sessionEntry?.lifecycleRunId;
     const sessionAgentId = session?.agentId;
     const target = { sessionKey: childSessionKey, sessionId };
-    // A yielded requester can itself be a subagent. Its incoming frozen batch,
+    // A requester can itself be a subagent. Its incoming continuation batch,
     // not the requester's outgoing parent notice, owns this exact saved attempt.
     // This only defers orphan settlement; the wake still owns replay admission,
     // failure/cancellation, and removal of the continuation obligation.
@@ -107,22 +144,16 @@ export async function recoverInterruptedSubagentRow(
         return false;
       }
       const children = new Map(
-        [...getSubagentRunsForRequesterSession(childSessionKey)]
-          .filter(
-            (child) =>
-              getLatestSubagentRunByChildSessionKeyFromRuns(
-                getSubagentRunsForChildSession(child.childSessionKey),
-                child.childSessionKey,
-              ) === child,
-          )
-          .map((child) => [child.runId, child]),
+        [...getSubagentRunsForRequesterSession(childSessionKey)].map((child) => [
+          child.runId,
+          child,
+        ]),
       );
       return [...children.values()].some((child) => {
         const wake = child.requesterSettleWake;
         return (
           wake?.status === "dispatching" &&
-          wake.requesterYieldBatch === true &&
-          wake.rearmGeneration !== undefined &&
+          (hasRequesterCompletionCohort(child) || isQuietSubagentRestartContinuation(child)) &&
           isRequesterSettleWakeForRun({
             entry: child,
             runId,
@@ -133,9 +164,18 @@ export async function recoverInterruptedSubagentRow(
           wake.batchRunIds?.every((id) => {
             const member = children.get(id);
             return (
-              member?.expectsCompletionMessage === true &&
+              member !== undefined &&
+              isRequesterCompletionCohortCurrent(
+                member,
+                (key, matches, agentId) =>
+                  latestSubagentRun(getSubagentRunsForChildSession(key, agentId), matches) ?? null,
+              ) &&
+              (member.expectsCompletionMessage === true ||
+                isQuietSubagentRestartContinuation(member)) &&
               !member.collect &&
               member.completionRequesterSessionId === sessionId &&
+              (member.completionTarget !== "parent" ||
+                member.completionRequesterLifecycleRevision === lifecycleRevision) &&
               member.requesterStorePath === physicalStorePath &&
               member.requesterAgentId === sessionAgentId &&
               !member.suppressCompletionDelivery &&
@@ -208,7 +248,7 @@ export async function recoverInterruptedSubagentRow(
           }
         : {}),
     };
-    if (!replayTerminal && !(await sessionEffects.isCurrent())) {
+    if (!legacy && !replayTerminal && !(await sessionEffects.isCurrent())) {
       return { status: "handled" };
     }
     if (!isCurrent()) {
@@ -217,7 +257,9 @@ export async function recoverInterruptedSubagentRow(
     if (
       !replayTerminal &&
       sessionEntry?.lifecycleRunId &&
-      ownsSubagentSessionExecution(entry, sessionEntry) &&
+      (legacy
+        ? sessionEntry.lifecycleRunId === runId
+        : ownsSubagentSessionExecution(entry, sessionEntry)) &&
       resolveCompletionFromSessionEntry(sessionEntry, Date.now(), {
         notBeforeMs: entry.execution.startedAt ?? entry.createdAt,
       })
@@ -226,6 +268,7 @@ export async function recoverInterruptedSubagentRow(
     }
     const receipt = entry.execution.restartRecovery;
     if (
+      !legacy &&
       !replayTerminal &&
       !receipt &&
       sessionEntry?.abortedLastRun !== true &&
@@ -236,6 +279,7 @@ export async function recoverInterruptedSubagentRow(
     // Old launch receipts are evidence of uncertain effects, never permission
     // to replay a child. The requester decides whether to continue its history.
     const suppressSessionEffects =
+      legacy ||
       currentRead?.kind === "missing" ||
       (receipt !== undefined && !isRestartRecoveryLifecycleCurrent(receipt)) ||
       (sessionEntry?.lifecycleRunId !== undefined &&
@@ -250,7 +294,7 @@ export async function recoverInterruptedSubagentRow(
       if (!isCurrent() || (!replayTerminal && hasPendingRequesterSettleWake())) {
         return false;
       }
-      if (!replayTerminal) {
+      if (!legacy && !replayTerminal) {
         try {
           sessionEffects.assertHostCurrent();
         } catch {
@@ -265,10 +309,13 @@ export async function recoverInterruptedSubagentRow(
         isHostCurrent: isRecoveryHostCurrent,
         prepare: async () =>
           isRecoveryHostCurrent() &&
-          (replayTerminal || (await sessionEffects.isCurrent())) &&
+          (legacy || replayTerminal || (await sessionEffects.isCurrent())) &&
           isRecoveryHostCurrent(),
+        onPublished: (published) => {
+          expectedObservation = published;
+        },
       },
-      sessionEffects,
+      sessionEffects: legacy ? undefined : sessionEffects,
       error:
         terminalError ??
         "Subagent execution was interrupted by a Gateway restart. " +

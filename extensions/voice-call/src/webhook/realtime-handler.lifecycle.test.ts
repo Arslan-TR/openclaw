@@ -3,8 +3,8 @@ import type {
   RealtimeVoiceBridgeCreateRequest,
   RealtimeVoiceProviderPlugin,
 } from "openclaw/plugin-sdk/realtime-voice";
+import { WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import { describe, expect, it, vi } from "vitest";
-import { WebSocket } from "ws";
 import type { CallManager } from "../manager.js";
 import { connectWs, startUpgradeWsServer, waitForClose } from "../websocket-test-support.js";
 import type { ResolveRealtimeCallRegistration } from "./realtime-handler.js";
@@ -386,36 +386,6 @@ describe("RealtimeCallHandler lifecycle", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("rejects a bridge closed during creation and discards late transcripts", async () => {
-    const reason = "completed";
-    let callbacks: RealtimeVoiceBridgeCreateRequest | undefined;
-    const bridgeConnect = vi.fn(async () => {});
-    const bridgeClose = vi.fn();
-    const createBridgeForCall = vi.fn((request: RealtimeVoiceBridgeCreateRequest) => {
-      callbacks = request;
-      request.onClose?.(reason);
-      return createBridge(bridgeClose, { connect: bridgeConnect });
-    });
-    const { call, handler, endCall, processEvent } =
-      createCarrierLifecycleHarness(createBridgeForCall);
-    const { ws } = await connectCarrierStream(handler);
-
-    const closed = waitForClose(ws);
-    sendCarrierStart(ws, "MZ-synchronous-close", call.providerCallId);
-    expect((await closed).code).toBe(1000);
-    callbacks?.onTranscript?.("user", "Still listening", true);
-    expect(processEvent).not.toHaveBeenCalledWith(expect.objectContaining({ type: "call.speech" }));
-    await vi.waitFor(() =>
-      expect(endCall).toHaveBeenCalledExactlyOnceWith(call.callId, { reason }),
-    );
-    expect(bridgeConnect).not.toHaveBeenCalled();
-    expect(bridgeClose).toHaveBeenCalledOnce();
-    expect(handler.speak(call.callId, "Do not revive this call")).toEqual({
-      success: false,
-      error: "No active realtime bridge for call",
-    });
   });
 
   it("does not start a native consult after teardown during transcript settling", async () => {

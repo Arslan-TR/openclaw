@@ -2,25 +2,40 @@ import fs from "node:fs";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createEmptyCostUsageTotals } from "../../infra/session-cost-usage-totals.js";
 import type { SessionCostSummary } from "../../infra/session-cost-usage.types.js";
+import { buildUsageOverview } from "../../shared/usage-overview.js";
 import type { SessionsUsageResult } from "../../shared/usage-types.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { bumpGatewayAccessRevision } from "../gateway-access-revision.js";
 
 vi.mock("../../config/config.js", () => ({ getRuntimeConfig: vi.fn(() => TEST_RUNTIME_CONFIG) }));
-vi.mock("../session-utils.js", async () => {
-  const actual = await vi.importActual<typeof import("../session-utils.js")>("../session-utils.js");
+vi.mock("../../config/sessions/combined-store-gateway-read.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../config/sessions/combined-store-gateway-read.js")
+  >("../../config/sessions/combined-store-gateway-read.js");
   return {
     ...actual,
-    loadGatewaySessionEntryReadOnly: vi.fn(actual.loadGatewaySessionEntryReadOnly),
-    loadCombinedSessionStoreForGatewayCore: vi.fn(() => ({
+    loadCombinedSessionStoreForGatewayCoreAsync: vi.fn(() => ({
       targetsBySessionKey: new Map(),
       durableTargets: [],
       storePath: "(multiple)",
       store: {},
     })),
+  };
+});
+vi.mock("../session-utils-store-worker.js", async () => {
+  const actual = await vi.importActual<typeof import("../session-utils-store-worker.js")>(
+    "../session-utils-store-worker.js",
+  );
+  return {
+    resolveGatewaySessionStoreTargetInWorker: vi.fn(
+      actual.resolveGatewaySessionStoreTargetInWorker,
+    ),
   };
 });
 vi.mock("../../infra/session-cost-usage.js", async () => {
@@ -29,7 +44,8 @@ vi.mock("../../infra/session-cost-usage.js", async () => {
   );
   return {
     ...actual,
-    resolveExistingUsageSessionFile: vi.fn(actual.resolveExistingUsageSessionFile),
+    resolveUsageSessionSource: vi.fn(actual.resolveUsageSessionSource),
+    loadSessionCostOverviewFromCache: vi.fn(actual.loadSessionCostOverviewFromCache),
     discoverAllSessions: vi.fn(async ({ agentId }: { agentId?: string }) =>
       ["main", "opus"].includes(agentId ?? "")
         ? [
@@ -54,21 +70,25 @@ vi.mock("../../infra/session-cost-usage.js", async () => {
     loadSessionLogs: vi.fn(async () => []),
   };
 });
+import { loadCombinedSessionStoreForGatewayCoreAsync } from "../../config/sessions/combined-store-gateway-read.js";
 import {
   discoverAllSessions,
   loadSessionCostSummariesFromCache,
+  loadSessionCostOverviewFromCache,
+  loadSessionLogs,
   loadSessionUsageTimeSeries,
-  resolveExistingUsageSessionFile,
+  resolveUsageSessionSource,
 } from "../../infra/session-cost-usage.js";
-import {
-  loadCombinedSessionStoreForGatewayCore,
-  loadGatewaySessionEntryReadOnly,
-} from "../session-utils.js";
+import { resolveGatewaySessionStoreTargetInWorker } from "../session-utils-store-worker.js";
 import { usageHandlers } from "./usage.js";
 
-let TEST_RUNTIME_CONFIG = {
+let TEST_RUNTIME_CONFIG: OpenClawConfig = {
   session: {},
-  agents: { list: [{ id: "main", default: true }, { id: "opus" }] },
+  agents: {
+    ownership: "explicit",
+    defaults: { systemAgent: { agentId: "main" } },
+    entries: { main: {}, opus: {} },
+  },
 };
 const BASE_USAGE_RANGE = { startDate: "2026-02-01", endDate: "2026-02-02", limit: 10 };
 async function runSessionsUsageMethod(
@@ -95,7 +115,7 @@ function mockCombinedStore(
   store: Record<string, SessionEntry>,
   owners: ReadonlyArray<readonly [string, string]>,
 ) {
-  vi.mocked(loadCombinedSessionStoreForGatewayCore).mockReturnValue({
+  vi.mocked(loadCombinedSessionStoreForGatewayCoreAsync).mockResolvedValue({
     durableTargets: [],
     storePath: "(multiple)",
     store,
@@ -115,23 +135,21 @@ function mockCombinedStore(
 }
 function mockStoredSession(
   key: string,
-  sessionId: string,
+  entry: SessionEntry,
   resolution: "valid" | "missing" = "valid",
 ) {
-  const entry = { sessionId, updatedAt: 1_000 };
   const storePath = "/tmp/agents/opus/agent/openclaw-agent.sqlite";
-  vi.mocked(loadGatewaySessionEntryReadOnly).mockReturnValueOnce({
-    cfg: TEST_RUNTIME_CONFIG,
+  vi.mocked(resolveGatewaySessionStoreTargetInWorker).mockResolvedValueOnce({
     agentId: "opus",
     canonicalKey: key,
-    entry,
-    legacyKey: undefined,
     store: { [key]: entry },
     storeKeys: [key],
     storePath,
   });
-  vi.mocked(resolveExistingUsageSessionFile).mockReturnValueOnce(
-    resolution === "missing" ? undefined : `sqlite:opus:${sessionId}:${storePath}`,
+  vi.mocked(resolveUsageSessionSource).mockResolvedValueOnce(
+    resolution === "missing"
+      ? undefined
+      : { entry, sessionFile: `sqlite:opus:${entry.sessionId}:${storePath}` },
   );
 }
 
@@ -139,6 +157,113 @@ describe("sessions.usage", () => {
   beforeEach(() => {
     TEST_RUNTIME_CONFIG = { ...TEST_RUNTIME_CONFIG };
     vi.clearAllMocks();
+  });
+
+  it.each(["sharing", "configuration"])(
+    "withholds a report when %s changes during its worker read",
+    async (change) => {
+      const started = createDeferred();
+      const released = createDeferred();
+      vi.mocked(loadSessionCostSummariesFromCache).mockImplementationOnce(async () => {
+        started.resolve();
+        await released.promise;
+        return {
+          summaries: [{ ...createEmptyCostUsageTotals(), totalTokens: 123 }],
+          cacheStatus: { status: "fresh", cachedFiles: 1, pendingFiles: 0, staleFiles: 0 },
+        };
+      });
+      const pending = runSessionsUsage(BASE_USAGE_RANGE);
+      await started.promise;
+      if (change === "sharing") {
+        bumpGatewayAccessRevision();
+      } else {
+        TEST_RUNTIME_CONFIG = { ...TEST_RUNTIME_CONFIG };
+      }
+      released.resolve();
+      const respond = await pending;
+      expect(respond).toHaveBeenCalledExactlyOnceWith(
+        false,
+        undefined,
+        expect.objectContaining({
+          code: "UNAVAILABLE",
+          message: expect.stringContaining("Refresh"),
+        }),
+      );
+    },
+  );
+
+  it("filters all overview candidates before pagination and keeps canonical filtered exports complete", async () => {
+    const discovered = Array.from({ length: 1001 }, (_, index) => ({
+      sessionId: `row-${index}`,
+      sessionFile: `/tmp/row-${index}.jsonl`,
+      mtime: index + 1,
+    }));
+    vi.mocked(discoverAllSessions)
+      .mockResolvedValueOnce(discovered)
+      .mockResolvedValueOnce(discovered);
+    vi.mocked(loadSessionCostOverviewFromCache).mockImplementation(async (params) => ({
+      ...buildUsageOverview({
+        sessions: params.sessions,
+        summaries: params.sessions.flatMap((session) =>
+          session.instances.map(({ sessionId }) => ({
+            ...createEmptyCostUsageTotals(),
+            sessionId,
+            totalTokens: 7,
+            firstActivity: 1,
+            activityDates: ["2026-02-01"],
+            dailyBreakdown: [
+              {
+                ...createEmptyCostUsageTotals(),
+                date: "2026-02-01",
+                totalTokens: 7,
+                tokens: 7,
+                cost: 0,
+              },
+            ],
+          })),
+        ),
+        options: params.options,
+        dayBucket: { mode: "utc-offset", utcOffsetMinutes: 0 },
+        compact: params.projection === "overview",
+      }),
+      cacheStatus: {
+        status: "fresh",
+        cachedFiles: params.sessions.length,
+        staleFiles: 0,
+        pendingFiles: 0,
+      },
+    }));
+    const overview = readResult(
+      await runSessionsUsage({
+        ...BASE_USAGE_RANGE,
+        projection: "overview",
+        offset: 50,
+        query: "row-",
+        sort: "recent",
+        selectedSessions: ["agent:main:row-0"],
+      }),
+    );
+    expect(overview.overview).toMatchObject({
+      total: 1001,
+      offset: 50,
+      limit: 50,
+      selectedSessionCount: 1,
+    });
+    expect(overview.sessions).toHaveLength(50);
+    expect(overview.sessions[0]?.key).toBe("agent:main:row-950");
+    expect(overview.totals.totalTokens).toBe(7);
+    expect(overview.sessions[0]?.usage?.dailyBreakdown).toBeUndefined();
+    const exported = readResult(
+      await runSessionsUsage({
+        ...BASE_USAGE_RANGE,
+        query: "row-",
+        limit: Number.MAX_SAFE_INTEGER,
+      }),
+    );
+    expect(exported.sessions).toHaveLength(1001);
+    expect(exported.totals.totalTokens).toBe(7007);
+    expect(exported.sessions[0]?.usage?.dailyBreakdown).toHaveLength(1);
+    expect(loadSessionCostSummariesFromCache).not.toHaveBeenCalled();
   });
 
   it("rejects all-agent scope with a specific agent or key", async () => {
@@ -233,6 +358,19 @@ describe("sessions.usage", () => {
           ]),
         }),
       );
+      for (const method of ["sessions.usage.timeseries", "sessions.usage.logs"] as const) {
+        const respond = await runSessionsUsageMethod(method, { key: "shared", agentId: "opus" });
+        expect(respond.mock.calls[0]?.[0]).toBe(true);
+        expect(
+          method === "sessions.usage.timeseries" ? loadSessionUsageTimeSeries : loadSessionLogs,
+        ).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            agentId: "opus",
+            sessionId: "shared",
+            sessionFile: fs.realpathSync(sessionFile),
+          }),
+        );
+      }
     });
   });
   it("rolls up known session family ids when historical usage is requested", async () => {
@@ -242,23 +380,19 @@ describe("sessions.usage", () => {
 
     const oldSessionFile = "/tmp/old.jsonl.reset.2026-02-01T00-00-00.000Z";
     const oldestSessionFile = "/tmp/oldest.jsonl.reset.2026-01-31T00-00-00.000Z";
-    mockStoredSession(storeKey, "current");
+    const entry: SessionEntry = {
+      sessionId: "current",
+      updatedAt: 1_000,
+      usageFamilyKey: storeKey,
+      usageFamilySessionIds: ["old", "current", "oldest"],
+    };
+    mockStoredSession(storeKey, entry);
     vi.mocked(discoverAllSessions).mockResolvedValueOnce([
       { sessionId: "old", sessionFile: oldSessionFile, mtime: 1_000 },
       { sessionId: "oldest", sessionFile: oldestSessionFile, mtime: 900 },
     ]);
 
-    mockCombinedStore(
-      {
-        [storeKey]: {
-          sessionId: "current",
-          updatedAt: 1_000,
-          usageFamilyKey: storeKey,
-          usageFamilySessionIds: ["old", "current", "oldest"],
-        },
-      },
-      [[storeKey, "opus"]],
-    );
+    mockCombinedStore({ [storeKey]: entry }, [[storeKey, "opus"]]);
     vi.mocked(loadSessionCostSummariesFromCache).mockImplementation(async ({ sessions }) => ({
       summaries: sessions.map((session) => {
         const historical = session.sessionId === "old";
@@ -425,7 +559,7 @@ describe("sessions.usage", () => {
 
   it("prefers the deterministic store key when duplicate sessionIds exist", async () => {
     const preferredKey = "agent:opus:acp:run-dup";
-    mockStoredSession(preferredKey, "run-dup");
+    mockStoredSession(preferredKey, { sessionId: "run-dup", updatedAt: 1_000 });
     mockCombinedStore(
       {
         [preferredKey]: { sessionId: "run-dup", sessionFile: "run-dup.jsonl", updatedAt: 1_000 },
@@ -466,7 +600,7 @@ describe("sessions.usage", () => {
 
   it("fails closed when a canonical stored target no longer matches", async () => {
     const key = "agent:opus:stale";
-    mockStoredSession(key, "stale", "missing");
+    mockStoredSession(key, { sessionId: "stale", updatedAt: 1_000 }, "missing");
     const respond = await runSessionsUsageMethod("sessions.usage.timeseries", { key });
     expect(respond.mock.calls[0]?.[0]).toBe(false);
     expect(loadSessionUsageTimeSeries).not.toHaveBeenCalled();

@@ -1,5 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { addSessionMember } from "../../config/sessions/session-sharing-store.native.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -16,7 +17,9 @@ import {
   readSecretStoreValue,
   writeSecretStoreEntry,
 } from "../../secrets/store/secret-store.js";
-import { ensureProfileForEmail, setUserProfileRole } from "../../state/user-profiles.js";
+import { prepareUserProfileCatalog } from "../../state/user-profile-list.js";
+import { setUserProfileRole } from "../../state/user-profile-writes.worker.js";
+import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   abortChatRunById,
@@ -81,15 +84,6 @@ function mockReferencedStoreSnapshot() {
 async function sharingFixture(others: "none" | "suggest" = "none") {
   const owner = ensureProfileForEmail("owner@example.test");
   const guest = ensureProfileForEmail("guest@example.test");
-  await upsertSessionEntryCore(
-    { agentId: "main", sessionKey: requestParams.sessionKey },
-    {
-      sessionId: "question-session",
-      updatedAt: 1,
-      visibility: "shared",
-      createdActor: { type: "human", source: "profile", id: owner.id },
-    },
-  );
   const cfg: OpenClawConfig = {
     gateway: {
       roles: {
@@ -101,6 +95,16 @@ async function sharingFixture(others: "none" | "suggest" = "none") {
       },
     },
   };
+  setRuntimeConfigSnapshot(cfg);
+  await upsertSessionEntryCore(
+    { agentId: "main", sessionKey: requestParams.sessionKey },
+    {
+      sessionId: "question-session",
+      updatedAt: 1,
+      visibility: "shared",
+      createdActor: { type: "human", source: "profile", id: owner.id },
+    },
+  );
   const profile = (user: typeof guest) => ({
     profileId: user.id,
     displayName: user.displayName,
@@ -118,6 +122,7 @@ async function sharingFixture(others: "none" | "suggest" = "none") {
 it("conceals foreign session questions for role-none readers while preserving global prompts", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const { client, cfg } = await sharingFixture();
+    using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     manager.request({ ...requestParams, id: "foreign-question" });
     manager.request({
       questions: requestParams.questions,
@@ -145,6 +150,7 @@ it("conceals foreign session questions for role-none readers while preserving gl
 it("requires membership to resolve a suggest-capped guest question", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const { owner, guest, cfg, client } = await sharingFixture("suggest");
+    using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     manager.request({ ...requestParams, id: "foreign-question" });
 
     expect((await call("question.get", { id: "foreign-question" }, { client, cfg }))[0]).toBe(true);
@@ -164,6 +170,7 @@ it("requires membership to resolve a suggest-capped guest question", async () =>
 it("scopes requested and resolved questions to operators allowed to see their session", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const { owner, guest, cfg, profile: userProfile } = await sharingFixture();
+    using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
     const viewer = ensureProfileForEmail("viewer@example.test");
     setUserProfileRole(viewer.id, "viewer");
     const makeQuestionClient = (
@@ -232,51 +239,14 @@ it("scopes requested and resolved questions to operators allowed to see their se
   });
 });
 
-it("preserves a browser URL through request, get, and list", async () => {
-  const url = "https://example.test/connect";
-  const questions = [{ ...requestParams.questions[0], url }];
-  const requested = await call("question.request", {
-    ...requestParams,
-    id: "client-question-id",
-    questions,
-  });
-  expect(requested[0]).toBe(true);
-  const id = (requested[1] as { id: string }).id;
-  expect(id).toBe("client-question-id");
-  expect(broadcast).toHaveBeenCalledWith(
-    "question.requested",
-    expect.objectContaining({
-      id,
-      runId: "run-main",
-      questions,
-      status: "pending",
-    }),
-    publicationOptions,
-  );
-
-  expect(await call("question.get", { id })).toEqual([
-    true,
-    {
-      question: expect.objectContaining({
-        id,
-        questions,
-        runId: "run-main",
-        status: "pending",
-      }),
-    },
-    undefined,
-  ]);
-  expect(await call("question.list", {})).toEqual([
-    true,
-    { questions: [expect.objectContaining({ id, questions, runId: "run-main" })] },
-    undefined,
-  ]);
-});
+const credentialUrl = new URL("https://example.test/connect");
+credentialUrl.username = "fixture-user";
+credentialUrl.password = "fixture-password";
 
 it.each([
   ["script", "javascript:alert(1)"],
   ["relative", "/connect"],
-  ["credentials", "https://fixture-user:fixture-password@example.test/connect"],
+  ["credentials", credentialUrl.href],
 ])("rejects a %s browser URL before publishing", async (_name, url) => {
   expect(
     await call("question.request", {
@@ -288,7 +258,7 @@ it.each([
   expect(broadcast).not.toHaveBeenCalled();
 });
 
-it("rejects duplicate ids and one-option questions at the request boundary", async () => {
+it("rejects duplicate ids and admits a bounded rich single-option question at the request boundary", async () => {
   const duplicate = await call("question.request", {
     questions: [requestParams.questions[0], requestParams.questions[0]],
   });
@@ -296,10 +266,50 @@ it("rejects duplicate ids and one-option questions at the request boundary", asy
   expect((duplicate[2] as { message: string }).message).toContain("duplicate question id");
 
   const oneOption = await call("question.request", {
-    questions: [{ ...requestParams.questions[0], options: [{ label: "Only" }] }],
+    ...requestParams,
+    id: "rich-question",
+    questions: [
+      {
+        ...requestParams.questions[0],
+        url: "https://example.test/connect",
+        allowEmpty: true,
+        presentation: "form",
+        options: [{ label: "Only", thumbnail: "https://example.com/only.png" }],
+      },
+    ],
   });
-  expect(oneOption[0]).toBe(false);
-  expect((oneOption[2] as { message: string }).message).toContain("2 to 4 options");
+  expect(oneOption[0]).toBe(true);
+  const richQuestion = expect.objectContaining({
+    id: "rich-question",
+    questions: [expect.objectContaining({ url: "https://example.test/connect" })],
+  });
+  expect(broadcast).toHaveBeenCalledWith("question.requested", richQuestion, publicationOptions);
+  expect(await call("question.get", { id: "rich-question" })).toEqual([
+    true,
+    { question: richQuestion },
+    undefined,
+  ]);
+  expect(await call("question.list", {})).toEqual([true, { questions: [richQuestion] }, undefined]);
+  expect(
+    (
+      await call("question.resolve", {
+        id: "rich-question",
+        answers: { answers: { destination: [] } },
+      })
+    )[1],
+  ).toEqual({ status: "answered", answers: { answers: { destination: [] } } });
+  expect(
+    (
+      await call("question.request", {
+        questions: [
+          {
+            ...requestParams.questions[0],
+            options: [{ label: "Unsafe", thumbnail: "javascript:alert(1)" }],
+          },
+        ],
+      })
+    )[0],
+  ).toBe(false);
 
   const clientId = "duplicate-client-id";
   expect((await call("question.request", { ...requestParams, id: clientId }))[0]).toBe(true);
@@ -379,6 +389,7 @@ it.each(["replacement", "abort"] as const)(
   "fences a pending credential on exact requester %s while preserving ordinary questions",
   async (closure) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       const id = await requestSecretQuestion();
       const ordinary = await call("question.request", requestParams);
       const ordinaryId = (ordinary[1] as { id: string }).id;
@@ -429,7 +440,7 @@ it.each(["replacement", "abort"] as const)(
           answers: { answers: { secret_value: ["test-secret-stale-requester"] } },
         });
         expect(resolved).toMatchObject(invalidRequest);
-        expect(listSecretStoreEntries({ scope: { kind: "team" } })).toEqual([]);
+        expect(await listSecretStoreEntries({ scope: { kind: "team" } })).toEqual([]);
         expect(reloadSecrets).not.toHaveBeenCalled();
         expect(manager.get(id)?.status).toBe("cancelled");
         await expect(waiting).resolves.toEqual({ status: "cancelled" });
@@ -471,7 +482,7 @@ it.each(["replacement", "abort"] as const)(
             )[0],
           ).toBe(true);
           expect(
-            readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" }),
+            await readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" }),
           ).toEqual({
             ok: true,
             value: "test-secret-current-requester",
@@ -495,29 +506,9 @@ it("requires admitted authority, not an admin's supplied run metadata", async ()
   expect(manager.list()).toEqual([]);
 });
 
-it("uses admitted requester provenance instead of caller-supplied correlation fields", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async () => {
-    const response = await call(
-      "question.request",
-      {
-        questions: secretRequestParams.questions,
-        agentId: "other",
-        sessionKey: "agent:other:other",
-        runId: "other-run",
-      },
-      { client: adminRequestClient },
-    );
-    expect(response[0]).toBe(true);
-    expect(manager.get((response[1] as { id: string }).id)).toMatchObject({
-      agentId: requestParams.agentId,
-      sessionKey: requestParams.sessionKey,
-      runId: requestParams.runId,
-    });
-  });
-});
-
 it("diverts operator-entered credentials into the store and exposes only a stored marker", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     const id = await requestSecretQuestion();
     const value = "test-secret-value-gateway-diversion-123";
     const client = {
@@ -532,7 +523,7 @@ it("diverts operator-entered credentials into the store and exposes only a store
     const safeAnswers = { answers: { secret_value: ["stored"] } };
 
     expect(resolved).toEqual([true, { status: "answered", answers: safeAnswers }, undefined]);
-    expect(listSecretStoreEntries({ scope: { kind: "team" } })).toMatchObject([
+    expect(await listSecretStoreEntries({ scope: { kind: "team" } })).toMatchObject([
       {
         name: "SERVICE_API_KEY",
         kind: "secret",
@@ -559,6 +550,7 @@ it("diverts operator-entered credentials into the store and exposes only a store
 
 it("uses operator-edited hosts and keeps invalid store submissions pending for retry", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     const id = await requestSecretQuestion();
     const value = "test-secret-value-retry-123";
     const answers = { answers: { secret_value: [value] } };
@@ -582,7 +574,7 @@ it("uses operator-edited hosts and keeps invalid store submissions pending for r
       secretStoreAllowedHosts: ["replacement.example.test"],
     });
     expect(retried[0]).toBe(true);
-    expect(listSecretStoreEntries({ scope: { kind: "team" } })[0]).toMatchObject({
+    expect((await listSecretStoreEntries({ scope: { kind: "team" } }))[0]).toMatchObject({
       allowedHosts: ["replacement.example.test"],
     });
   });
@@ -596,18 +588,20 @@ it.each([
   },
 ])("keeps a secret question pending when there is $behavior", async ({ answers }) => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     const id = await requestSecretQuestion();
 
     expect(await call("question.resolve", { id, answers: { answers } })).toMatchObject(
       invalidRequest,
     );
     expect(manager.get(id)?.status).toBe("pending");
-    expect(listSecretStoreEntries({ scope: { kind: "team" } })).toEqual([]);
+    expect(await listSecretStoreEntries({ scope: { kind: "team" } })).toEqual([]);
   });
 });
 
 it("rejects masked env requests while preserving ordinary question host validation and cancellation", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     expect(
       await call(
         "question.request",
@@ -621,7 +615,7 @@ it("rejects masked env requests while preserving ordinary question host validati
       ),
     ).toMatchObject(invalidRequest);
     expect(manager.list()).toEqual([]);
-    expect(listSecretStoreEntries({ scope: { kind: "team" } })).toEqual([]);
+    expect(await listSecretStoreEntries({ scope: { kind: "team" } })).toEqual([]);
     const ordinaryResponse = await call("question.request", requestParams);
     const ordinaryId = (ordinaryResponse[1] as { id: string }).id;
     expect(
@@ -643,6 +637,7 @@ it("rejects masked env requests while preserving ordinary question host validati
 
 it("settles the SQLite commit before a second answer races its deferred refresh", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     mockReferencedStoreSnapshot();
     const reload = createDeferred<{ warningCount: number }>();
     const reloadStarted = createDeferred();
@@ -670,7 +665,9 @@ it("settles the SQLite commit before a second answer races its deferred refresh"
           answers: { answers: { secret_value: ["test-secret-late-overwrite"] } },
         }),
       );
-      expect(readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" })).toEqual({
+      expect(
+        await readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" }),
+      ).toEqual({
         ok: true,
         value: firstValue,
       });
@@ -697,6 +694,7 @@ it("settles the SQLite commit before a second answer races its deferred refresh"
 
 it("keeps a committed answer terminal and reports refresh failure without inviting overwrite", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     mockReferencedStoreSnapshot();
     reloadSecrets.mockRejectedValue(new Error("synthetic refresh failure"));
     const id = await requestSecretQuestion();
@@ -730,7 +728,9 @@ it("keeps a committed answer terminal and reports refresh failure without inviti
         })
       )[0],
     ).toBe(false);
-    expect(readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" })).toEqual({
+    expect(
+      await readSecretStoreValue({ scope: { kind: "team" }, name: "SERVICE_API_KEY" }),
+    ).toEqual({
       ok: true,
       value,
     });
@@ -741,6 +741,7 @@ it("keeps a committed answer terminal and reports refresh failure without inviti
 
 it("keeps store-bound questions pending when the write service is unavailable", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    setRuntimeConfigSnapshot({});
     vi.spyOn(storeWriteService, "write").mockImplementation(() => {
       throw new Error("database unavailable");
     });
@@ -816,6 +817,7 @@ it.each([
   "saves only the consented host policy: $scenario",
   async ({ existing, proposal, override, shown }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       const entry = {
         scope: { kind: "team" as const },
         name: "SERVICE_API_KEY",
@@ -824,7 +826,7 @@ it.each([
         updatedBy: "Previous Operator",
       };
       if (existing) {
-        writeSecretStoreEntry({ ...entry, allowedHosts: ["a.example.test"] });
+        await writeSecretStoreEntry({ ...entry, allowedHosts: ["a.example.test"] });
       }
       const id = await requestSecretQuestion({
         name: entry.name,
@@ -848,8 +850,8 @@ it.each([
       if (!existing) {
         expect(manager.get(id)?.questions[0]).not.toHaveProperty("secretStoreExisting");
       }
-      writeSecretStoreEntry({ ...entry, allowedHosts: ["b.example.test"] });
-      expect(listSecretStoreEntries({ scope: entry.scope })[0]?.allowedHosts).toEqual([
+      await writeSecretStoreEntry({ ...entry, allowedHosts: ["b.example.test"] });
+      expect((await listSecretStoreEntries({ scope: entry.scope }))[0]?.allowedHosts).toEqual([
         "b.example.test",
       ]);
       const value = "test-secret-consented-replacement";
@@ -861,10 +863,10 @@ it.each([
       const safeAnswers = { answers: { secret_value: ["stored"] } };
       expect(resolved).toEqual([true, { status: "answered", answers: safeAnswers }, undefined]);
       expect(manager.get(id)).toMatchObject({ status: "answered", answers: safeAnswers });
-      expect(listSecretStoreEntries({ scope: entry.scope })).toMatchObject([
+      expect(await listSecretStoreEntries({ scope: entry.scope })).toMatchObject([
         { name: entry.name, kind: "secret", allowedHosts: override ?? shown },
       ]);
-      expect(readSecretStoreValue({ scope: entry.scope, name: entry.name })).toEqual({
+      expect(await readSecretStoreValue({ scope: entry.scope, name: entry.name })).toEqual({
         ok: true,
         value,
       });

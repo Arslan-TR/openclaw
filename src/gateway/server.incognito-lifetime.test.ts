@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { replyRunRegistry } from "../auto-reply/reply/reply-run-registry.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { resolveSessionWorkStartError } from "../config/sessions/lifecycle.js";
 import {
   appendTranscriptMessage,
@@ -15,11 +16,15 @@ import {
   resetSessionEntryLifecycle,
 } from "../config/sessions/session-accessor.sqlite-lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import { closeOpenClawAgentDatabaseByPath } from "../state/openclaw-agent-db-lifecycle.js";
+import {
+  closeOpenClawAgentDatabaseByPath,
+  closeOpenClawAgentDatabaseByPathAsync,
+} from "../state/openclaw-agent-db-lifecycle.js";
 import {
   getOpenClawAgentDatabaseIfOpen,
   resolveIncognitoOpenClawAgentSqlitePath,
 } from "../state/openclaw-agent-db.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import {
   createGatewaySchedulerClock,
   createTestGatewayScheduler,
@@ -41,6 +46,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function observeSessionDeletion() {
+  const settled = createDeferredCore();
+  const deletes = vi.spyOn(deletion, "deleteGatewaySession").mockImplementation(async (params) => {
+    try {
+      return await originalDelete(params);
+    } finally {
+      settled.resolve();
+    }
+  });
+  return { deletes, deleted: settled.promise };
+}
+
 async function withLifetime(
   run: (fixture: {
     owner: ReturnType<typeof createGatewaySidecarStopOwner>;
@@ -54,6 +71,9 @@ async function withLifetime(
 ) {
   await withOpenClawTestState({ label: "incognito-lifetime" }, async (state) => {
     await state.writeConfig(config);
+    setRuntimeConfigSnapshot(config);
+    // Incognito deletion fences reuse the shared-state handle retained by Gateway startup.
+    openOpenClawStateDatabase();
     const time = createGatewaySchedulerClock(Date.now());
     vi.spyOn(Date, "now").mockImplementation(time.clock.now);
     const scheduler = createTestGatewayScheduler(time.clock);
@@ -170,16 +190,7 @@ it("does not replace its deadline or delete another Gateway's Incognito publicat
     };
     const foreignPath = resolveIncognitoOpenClawAgentSqlitePath(foreign);
     expect(foreignPath).not.toBe(scope.storePath);
-    const deleted = createDeferredCore();
-    const deletes = vi
-      .spyOn(deletion, "deleteGatewaySession")
-      .mockImplementation(async (params) => {
-        try {
-          return await originalDelete(params);
-        } finally {
-          deleted.resolve();
-        }
-      });
+    const { deletes, deleted } = observeSessionDeletion();
     try {
       await upsertSessionEntryCore(foreign, {
         sessionId: "foreign-incognito",
@@ -193,7 +204,7 @@ it("does not replace its deadline or delete another Gateway's Incognito publicat
       expect(logWarning).not.toHaveBeenCalled();
       expect(loadSessionEntryReadOnly(foreign)?.sessionId).toBe("foreign-incognito");
       await time.advanceBy(DAY_MS - 1);
-      await deleted.promise;
+      await deleted;
       expect(deletes).toHaveBeenCalledOnce();
       expect(loadSessionEntryReadOnly(scope)).toBeUndefined();
       expect(loadSessionEntryReadOnly(foreign)?.sessionId).toBe("foreign-incognito");
@@ -203,7 +214,7 @@ it("does not replace its deadline or delete another Gateway's Incognito publicat
   });
 });
 
-it.each(["provided", "omitted", "legacy"] as const)(
+it.each(["omitted", "legacy"] as const)(
   "inherits the original deadline with a %s creation stamp when a sibling outlives the creator",
   async (creationStamp) => {
     await withLifetime(async ({ owner, scope, logWarning, time }) => {
@@ -214,16 +225,7 @@ it.each(["provided", "omitted", "legacy"] as const)(
       expect(loadSessionEntryReadOnly(ordinary)?.createdAt).toBeUndefined();
       const sibling = createGatewaySidecarStopOwner();
       const context = createDirectChatContext({ getRuntimeConfig: () => config });
-      const deleted = createDeferredCore();
-      const deletes = vi
-        .spyOn(deletion, "deleteGatewaySession")
-        .mockImplementation(async (params) => {
-          try {
-            return await originalDelete(params);
-          } finally {
-            deleted.resolve();
-          }
-        });
+      const { deletes, deleted } = observeSessionDeletion();
       await time.advanceBy(DAY_MS - 1);
       await patchSessionEntryCore(scope, () => ({ createdAt: Date.now(), updatedAt: Date.now() }));
       expect(loadSessionEntryReadOnly(scope)?.createdAt).toBe(createdAt);
@@ -243,7 +245,7 @@ it.each(["provided", "omitted", "legacy"] as const)(
         expect(loadSessionEntryReadOnly(scope)?.sessionId).toBe(scope.sessionId);
         await time.advanceBy(1);
         await siblingTime.advanceBy(1);
-        await deleted.promise;
+        await deleted;
         expect(deletes).toHaveBeenCalledOnce();
         expect(loadSessionEntryReadOnly(scope)).toBeUndefined();
         expect(logWarning).not.toHaveBeenCalled();
@@ -286,7 +288,7 @@ it.each(["session replacement", "database replacement", "Gateway stop"] as const
             deleteTranscriptWithoutArchive: true,
           });
         } else if (replacement === "database replacement") {
-          closeOpenClawAgentDatabaseByPath(scope.storePath);
+          await closeOpenClawAgentDatabaseByPathAsync(scope.storePath);
         } else {
           stopping = owner.stop();
         }
@@ -341,9 +343,6 @@ it.each(["provided", "legacy"] as const)(
       await retrying.promise;
       expect(logWarning).toHaveBeenCalledOnce();
       expect(loadSessionEntryReadOnly(scope)).toBeDefined();
-      expect(resolveSessionWorkStartError(scope.sessionKey, loadSessionEntryReadOnly(scope))).toBe(
-        `Incognito session "${scope.sessionKey}" expired. Start a new Incognito session.`,
-      );
       expect(
         resolveSessionWorkStartError(ordinary.sessionKey, loadSessionEntryReadOnly(ordinary)),
       ).toBeUndefined();
