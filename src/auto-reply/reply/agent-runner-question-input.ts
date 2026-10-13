@@ -27,7 +27,7 @@ type ReplyQuestionInputParams = Pick<
 >;
 
 type ReplyQuestionInputResult =
-  | { handled: false }
+  | { handled: false; requesterMismatch?: true }
   | { handled: true; payload: ReplyPayload | undefined };
 
 function questionErrorReply(text: string): ReplyQuestionInputResult {
@@ -95,6 +95,9 @@ export async function runReplyQuestionInput(
         }
       },
     });
+    if (claimed === "requester-mismatch") {
+      return { handled: false, requesterMismatch: true };
+    }
     if (!claimed) {
       return { handled: false };
     }

@@ -34,6 +34,7 @@ import type { ReplyPayload } from "../../reply-payload.js";
 import type { OriginatingChannelType } from "../../templating.js";
 import type { ThinkingCatalogEntry } from "../../thinking.js";
 import type { ElevatedLevel, ThinkLevel, TraceLevel, VerboseLevel } from "../directives.js";
+import type { FollowupQueueDisposition } from "../queue-policy.js";
 import type { ReplyOperationRunState } from "../reply-operation-run-state.js";
 import type { SessionEventExecution } from "../session-event-contract.js";
 
@@ -63,10 +64,6 @@ export type EnqueueFollowupRunOptions = {
   position?: QueueInsertPosition;
   steerCandidate?: boolean;
 };
-
-type FollowupQueueDisposition = Parameters<
-  NonNullable<GetReplyOptions["onFollowupQueueDisposition"]>
->[0];
 
 export type QueuedFollowupReplyBatch = {
   kind: "queued-followup";
@@ -111,6 +108,8 @@ type FollowupRunObservers = Pick<
 };
 
 export type FollowupRun = {
+  /** Original config owner, read only when this input receives a new execution admission. */
+  readAdmissionConfig?: () => OpenClawConfig;
   /** External-turn eligibility; queued execution refreshes the session-selected profile. */
   personalBootstrapEligible?: boolean;
   prompt: string;
@@ -221,6 +220,10 @@ export type FollowupRun = {
     | "agentAccountId"
     | "conversationRoutePeerId"
     | "conversationToolPolicy"
+    | "requesterOrigin"
+    | "operatorProfileId"
+    | "conversationId"
+    | "messageThreadId"
     | "memberRoleIds"
     | "channelContext"
     | "senderIsOwner"
@@ -315,6 +318,9 @@ export function bindReplyOperationQueueDisposition(
 ): void {
   const observe = run.onQueueDisposition;
   run.onQueueDisposition = (disposition) => {
+    if (state) {
+      state.followupQueueDisposition = disposition;
+    }
     observe?.(disposition);
     if (state && (disposition !== "queue-cap-old" || state.admission?.status !== "accepted")) {
       state.admission = { status: "skipped", reason: "queue-cap" };

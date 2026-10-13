@@ -37,6 +37,7 @@ import type { TypingSignaler } from "./typing-mode.js";
 
 type ActiveReplySteerFallbackReason =
   | ReplyMessageInjectionRejectionReason
+  | "requester-mismatch"
   | "admission-changed"
   | "reply-owner-ended"
   | "model-fallback-changed";
@@ -139,7 +140,11 @@ export async function runActiveReplySteer(
       replyOperationRunState?.admission?.status === "skipped" &&
       replyOperationRunState.admission.reason === "queue-cap";
     if (replyOperationRunState && !queueCapRejected) {
-      replyOperationRunState.admission = { status: "accepted", mode: "followup" };
+      replyOperationRunState.admission = {
+        status: "accepted",
+        mode: "followup",
+        ...(reason === "requester-mismatch" ? { reason } : {}),
+      };
     }
     diagnosticLogger.warn("steering rejected; applying follow-up policy", {
       reason,
@@ -200,7 +205,10 @@ export async function runActiveReplySteer(
     releaseToolAuthority = steeringAuthority.toolAuthority.release;
     assertReadCurrent();
     if (steeringAuthority.shouldQueueAuthorityMismatch) {
-      return await fallback("tool_authority_mismatch", injectionTarget.runId);
+      return await fallback(
+        steeringAuthority.requesterMismatch ? "requester-mismatch" : "tool_authority_mismatch",
+        injectionTarget.runId,
+      );
     }
     const automaticFallbackRoute = steeringAuthority.automaticFallbackRoute;
     const isCurrentFallback = () =>

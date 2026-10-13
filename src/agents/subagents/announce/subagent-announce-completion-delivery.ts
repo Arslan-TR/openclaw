@@ -54,6 +54,7 @@ export async function runAnnounceAgentCall(params: {
   agentParams: Record<string, unknown>;
   privateCompletion?: true;
   replyExpectation?: ReplyExpectation;
+  agentToolCaller?: import("../../../gateway/server-methods/client-types.js").TrustedAgentToolCaller;
   typing?: Omit<GatewayRecoveryTypingParams, "isCurrent">;
   settleWakeSourceSessionKeys?: readonly string[];
   delegatedToolPolicyHandoff?: SubagentCompletionToolHandoffRegistration;
@@ -96,6 +97,7 @@ export async function runAnnounceAgentCall(params: {
       cancelOnDeadline: true,
       privateCompletion: params.privateCompletion,
       replyExpectation: params.replyExpectation,
+      agentToolCaller: params.agentToolCaller,
       settleWakeReplay: params.settleWakeSourceSessionKeys
         ? {
             sourceSessionKeys: params.settleWakeSourceSessionKeys,
