@@ -1,5 +1,6 @@
 import os from "node:os";
 import type { ChatType } from "../channels/chat-type.js";
+import type { InternalSessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { prepareActiveNodeContext } from "../infra/active-node-context.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
@@ -17,6 +18,7 @@ export async function resolveAgentRuntimePrompt(params: {
   cwd?: string;
   preparedRepoRoot?: string | null;
   preparedGitCoauthorPrompt?: string | null;
+  preparedSessionEntry?: InternalSessionEntry;
   sessionKey?: string;
   sessionId?: string;
   model: string;
@@ -56,6 +58,7 @@ export async function resolveAgentRuntimePrompt(params: {
         ? { preparedRepoRoot: params.preparedRepoRoot }
         : {}),
     preparedGitCoauthorPrompt,
+    preparedSessionEntry: params.preparedSessionEntry,
     requesterProfileId: params.requesterProfileId,
     runtime: {
       sessionKey: params.sessionKey,
