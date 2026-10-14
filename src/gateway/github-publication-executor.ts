@@ -466,7 +466,7 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
       storePath: loaded.storePath,
       accountId: identity.account.accountId,
       assertCurrent: assertPublicationAction,
-      readSessionEntry: () => currentWorktree().loaded.entry,
+      readCurrentEntry: () => currentWorktree().loaded.entry,
       description:
         row.body?.trim() ||
         "Published by the Gateway after authoritative workspace reconciliation.",

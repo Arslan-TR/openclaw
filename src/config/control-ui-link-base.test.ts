@@ -109,7 +109,7 @@ describe("resolveControlUiPublicSessionUrl", () => {
   it.each([
     { name: "missing", entry: undefined },
     { name: "private", entry: { ...entry, publicShare: undefined } },
-    { name: "incognito", entry: { ...entry, incognito: true } },
+    { name: "incognito", entry: { ...entry, incognito: true as const } },
     { name: "stale", entry: { ...entry, sessionId: "session-2" } },
   ])("omits $name sessions", ({ entry: current }) => {
     expect(

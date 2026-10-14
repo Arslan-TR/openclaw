@@ -130,7 +130,7 @@ export async function executeRepositoryGitHubPublication(params: {
   snapshotRoot: string;
   storePath: string;
   assertWorkspace: () => void;
-  readSessionEntry: () => InternalSessionEntry | undefined;
+  readCurrentEntry: () => InternalSessionEntry | undefined;
   validateAuthority: () => boolean;
   assertWorkflowChangesAllowed: () => void;
   identity?: GitHubPublicationIdentityOwner;
@@ -347,7 +347,7 @@ export async function executeRepositoryGitHubPublication(params: {
       storePath: params.storePath,
       accountId: identity.account.accountId,
       assertCurrent: assertPublicationAction,
-      readSessionEntry: params.readSessionEntry,
+      readCurrentEntry: params.readCurrentEntry,
       description:
         row.body?.trim() || "Published by the Gateway from the accepted repository checkpoint.",
     });

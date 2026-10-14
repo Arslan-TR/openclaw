@@ -15,12 +15,13 @@ export async function prepareGitHubPublicationContent(params: {
   storePath: string;
   accountId: number;
   assertCurrent: () => void;
-  readSessionEntry: () => InternalSessionEntry | undefined;
+  // Reuse the retained publication owner; do not open another session read.
+  readCurrentEntry: () => InternalSessionEntry | undefined;
   description: string;
 }) {
   const { row } = params;
   const config = currentGitHubPublicationConfig();
-  const initialEntry = params.readSessionEntry();
+  const initialEntry = params.readCurrentEntry();
   const initialShare = resolveSessionPublicShare(initialEntry);
   const sessionUrl = resolveControlUiPublicSessionUrl(config, {
     sessionKey: row.session_key,
@@ -60,7 +61,7 @@ export async function prepareGitHubPublicationContent(params: {
       }
     },
     pullRequestBody() {
-      const currentShare = resolveSessionPublicShare(params.readSessionEntry());
+      const currentShare = resolveSessionPublicShare(params.readCurrentEntry());
       const participants = credit ? `\n\n## Worked on by\n\n${credit}` : "";
       // A late revoke only removes optional disclosure; a new grant cannot add it to this request.
       const footer =

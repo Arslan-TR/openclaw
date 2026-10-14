@@ -472,7 +472,9 @@ describe("Gateway GitHub publication attribution", () => {
               ...params.execution,
               recordEffect: async (effect, observed) => {
                 await params.execution.recordEffect(effect, observed);
-                if (effect === "pull_request" && observed === undefined) onEffect();
+                if (effect === "pull_request" && observed === undefined) {
+                  onEffect();
+                }
               },
             },
           }),
@@ -487,7 +489,9 @@ describe("Gateway GitHub publication attribution", () => {
             ...params,
             recordEffect: async (effect, observed) => {
               await params.recordEffect?.(effect, observed);
-              if (effect === "pull_request" && observed === undefined) onEffect();
+              if (effect === "pull_request" && observed === undefined) {
+                onEffect();
+              }
             },
           }),
         );
@@ -513,7 +517,9 @@ describe("Gateway GitHub publication attribution", () => {
     expect(body).toContain(`<!-- openclaw-publication:${result.requestId} -->`);
     expect(body).not.toContain("stale.example");
     expect(body.includes("[View the OpenClaw team session]")).toBe(state === "public");
-    if (state === "public") expect(body).toContain("https://team.example/chat/");
+    if (state === "public") {
+      expect(body).toContain("https://team.example/chat/");
+    }
   });
 
   it("publishes without a session footer when the configured URL is not external HTTPS", async () => {
