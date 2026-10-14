@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { expect, it, vi } from "vitest";
 import type { ChatPendingInputsPage } from "../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { acquireGatewayTestClient } from "../../test/helpers/gateway-client.js";
@@ -11,6 +11,42 @@ import { createOpenClawTestInstance } from "../../test/helpers/openclaw-test-ins
 import { runQaGatewayTestFixture } from "../../test/helpers/qa-gateway-test-lifetime.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { buildMockOpenAiResponsesProvider } from "./test-openai-responses-model.js";
+
+function writeToolCall(response: ServerResponse, name: string, params: Record<string, unknown>) {
+  const id = randomUUID();
+  const args = JSON.stringify(params);
+  const item = {
+    type: "function_call",
+    id: "fc_" + id,
+    call_id: "call_" + id,
+    name,
+    arguments: args,
+    status: "completed",
+  };
+  writeOpenAiResponsesSse(response, [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...item, arguments: "", status: "in_progress" },
+    },
+    {
+      type: "response.function_call_arguments.done",
+      item_id: item.id,
+      output_index: 0,
+      arguments: args,
+    },
+    { type: "response.output_item.done", output_index: 0, item },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp_" + id,
+        status: "completed",
+        output: [item],
+        usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+      },
+    },
+  ]);
+}
 
 // Real public sessions_send, real provider socket, cold Gateway process restart.
 // The provider deliberately holds only the first target turn before restart.
@@ -25,6 +61,7 @@ it(
       const target = "agent:main:dashboard:peer-target";
       let hold = true;
       let held = false;
+      let recoveredThemeCalls = 0;
       const providerServer = createServer((request, response) => {
         void (async () => {
           const chunks: Buffer[] = [];
@@ -49,11 +86,11 @@ it(
           );
           const text = JSON.stringify(input[userIndex]?.content ?? "");
           requests.push(text.slice(0, 500));
+          const outputIndex = input.findLastIndex((item) => item.type === "function_call_output");
           const sendMarker = text.match(
             /SEND_(PEER_UPDATE_[0-9]+|CANCELLED_UPDATE|RESET_SOURCE_UPDATE|REVOKED_UPDATE|ARCHIVED_SOURCE_UPDATE)/u,
           )?.[1];
           if (sendMarker) {
-            const outputIndex = input.findLastIndex((item) => item.type === "function_call_output");
             if (outputIndex > userIndex) {
               const output = JSON.parse(input[outputIndex]!.output!) as {
                 status?: string;
@@ -69,43 +106,11 @@ it(
               });
             } else {
               expect(body.tools?.some((tool) => tool.name === "sessions_send")).toBe(true);
-              const id = randomUUID();
-              const args = JSON.stringify({
+              writeToolCall(response, "sessions_send", {
                 sessionKey: target,
                 message: sendMarker,
                 timeoutSeconds: 0,
               });
-              const item = {
-                type: "function_call",
-                id: "fc_" + id,
-                call_id: "call_" + id,
-                name: "sessions_send",
-                arguments: args,
-                status: "completed",
-              };
-              writeOpenAiResponsesSse(response, [
-                {
-                  type: "response.output_item.added",
-                  output_index: 0,
-                  item: { ...item, arguments: "", status: "in_progress" },
-                },
-                {
-                  type: "response.function_call_arguments.done",
-                  item_id: item.id,
-                  output_index: 0,
-                  arguments: args,
-                },
-                { type: "response.output_item.done", output_index: 0, item },
-                {
-                  type: "response.completed",
-                  response: {
-                    id: "resp_" + id,
-                    status: "completed",
-                    output: [item],
-                    usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
-                  },
-                },
-              ]);
             }
             return;
           }
@@ -118,6 +123,21 @@ it(
               /PEER_UPDATE_[0-9]+|CANCELLED_UPDATE|RESET_SOURCE_UPDATE|REVOKED_UPDATE|ARCHIVED_SOURCE_UPDATE/gu,
             )
             ?.at(-1);
+          if (marker === "PEER_UPDATE_1") {
+            if (outputIndex > userIndex) {
+              const output: unknown = JSON.parse(input[outputIndex]!.output!);
+              expect(output).toMatchObject({
+                current: { mode: "dark", scope: "profile" },
+                application: "saved",
+              });
+            } else {
+              expect(body.tools?.some((tool) => tool.name === "theme")).toBe(true);
+              recoveredThemeCalls++;
+              expect(recoveredThemeCalls).toBe(1);
+              writeToolCall(response, "theme", { action: "set", mode: "dark" });
+              return;
+            }
+          }
           if (marker) {
             observed.push(marker);
           }
@@ -227,6 +247,17 @@ it(
         await gateway.state.writeConfig(config);
         await gateway.startGateway();
         client = await connect();
+        const requester = await client.request<{ profile: { id: string } }>(
+          "users.self",
+          {},
+          { signal },
+        );
+        const preferencesBefore = await client.request(
+          "users.prefs.get",
+          { keys: ["ui.themeMode"] },
+          { signal },
+        );
+        expect(preferencesBefore).toEqual({ status: "ok", entries: {} });
         const sessionIds = new Map<string, string>();
         for (const key of [target, source, resetSource, revokedSource, archivedSource]) {
           const created = await client.request<{ sessionId: string }>(
@@ -323,6 +354,14 @@ it(
           () => expect(gateway.logs()).toContain("Session delivery recovery blocked for "),
           { timeout: 30_000 },
         );
+        expect(recoveredThemeCalls).toBe(1);
+        expect(await client.request("users.self", {}, { signal })).toMatchObject({
+          profile: { id: requester.profile.id },
+        });
+        // Read the exact original person's durable effect independently of model output.
+        expect(
+          await client.request("users.prefs.get", { keys: ["ui.themeMode"] }, { signal }),
+        ).toEqual({ status: "ok", entries: { "ui.themeMode": "dark" } });
         const after = await client.request<{ pendingInputs: ChatPendingInputsPage }>(
           "chat.history",
           { sessionKey: target },
@@ -386,6 +425,7 @@ it(
             firstPid,
             finalPid: gateway.child?.pid,
             observed,
+            recoveredThemeCalls,
           }),
         );
       } catch (error) {
