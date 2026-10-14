@@ -44,18 +44,21 @@ describe("Crabline WhatsApp fixture authentication", () => {
       const transport = await createQaCrablineTransportAdapter({ outputDir, selection });
       let authDir: string | undefined;
       try {
-        authDir = await vi.mocked(createWhatsAppQaAuthState).mock.results[0].value;
+        const authResult = vi.mocked(createWhatsAppQaAuthState).mock.results[0];
+        if (!authResult || authResult.type !== "return") {
+          throw new Error("WhatsApp fixture did not initialize auth state");
+        }
+        authDir = await authResult.value;
         const config = transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" });
         const whatsapp = WhatsAppConfigSchema.parse(config.channels?.whatsapp);
-        const cfg = { channels: { whatsapp } };
         expect(whatsapp.accounts?.[transport.accountId]?.authDir).toBe(authDir);
-        expect(resolveWhatsAppAuthDir({ cfg, accountId: transport.accountId })).toEqual({
+        expect(resolveWhatsAppAuthDir({ cfg: config, accountId: transport.accountId })).toEqual({
           authDir,
           isLegacy: false,
         });
-        expect(resolveWhatsAppAccount({ cfg, accountId: transport.accountId }).authDir).toBe(
-          authDir,
-        );
+        expect(
+          resolveWhatsAppAccount({ cfg: config, accountId: transport.accountId }).authDir,
+        ).toBe(authDir);
         expect(authDir).toEqual(expect.any(String));
         if (!authDir) {
           throw new Error("WhatsApp fixture auth directory is missing");
@@ -112,10 +115,16 @@ describe("Crabline WhatsApp fixture authentication", () => {
       await expect(createQaCrablineTransportAdapter({ outputDir, selection })).rejects.toThrow(
         "state initialization failed",
       );
-      const authDir = await vi.mocked(createWhatsAppQaAuthState).mock.results[0].value;
-      const adapter: Awaited<ReturnType<typeof startOpenClawCrablineAdapter>> = await vi.mocked(
-        startOpenClawCrablineAdapter,
-      ).mock.results[0].value;
+      const authResult = vi.mocked(createWhatsAppQaAuthState).mock.results[0];
+      const adapterResult = vi.mocked(startOpenClawCrablineAdapter).mock.results[0];
+      if (!authResult || authResult.type !== "return") {
+        throw new Error("WhatsApp fixture did not initialize auth state");
+      }
+      if (!adapterResult || adapterResult.type !== "return") {
+        throw new Error("WhatsApp fixture did not start its provider");
+      }
+      const authDir = await authResult.value;
+      const adapter = await adapterResult.value;
       await expect(fs.lstat(authDir)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(adapter.probe()).rejects.toThrow();
     });
@@ -124,10 +133,16 @@ describe("Crabline WhatsApp fixture authentication", () => {
   it("attempts both provider and auth cleanup and reports both failures after Gateway stop", async () => {
     await withTempDir("qa-crabline-whatsapp-cleanup-", async (outputDir) => {
       const transport = await createQaCrablineTransportAdapter({ outputDir, selection });
-      const adapter: Awaited<ReturnType<typeof startOpenClawCrablineAdapter>> = await vi.mocked(
-        startOpenClawCrablineAdapter,
-      ).mock.results[0].value;
-      const authDir = await vi.mocked(createWhatsAppQaAuthState).mock.results[0].value;
+      const adapterResult = vi.mocked(startOpenClawCrablineAdapter).mock.results[0];
+      const authResult = vi.mocked(createWhatsAppQaAuthState).mock.results[0];
+      if (!adapterResult || adapterResult.type !== "return") {
+        throw new Error("WhatsApp fixture did not start its provider");
+      }
+      if (!authResult || authResult.type !== "return") {
+        throw new Error("WhatsApp fixture did not initialize auth state");
+      }
+      const adapter = await adapterResult.value;
+      const authDir = await authResult.value;
       const close = adapter.close.bind(adapter);
       const providerFailure = new Error("provider close failed");
       const authFailure = new Error("auth removal failed");

@@ -470,7 +470,7 @@ function createQaCrablineTransport(params: {
             ...config.channels,
             whatsapp: { ...whatsapp, accounts },
           },
-        } as QaTransportGatewayConfig;
+        };
       }
       let channels: OpenClawConfig["channels"];
       if (selection.channel === "discord") {
