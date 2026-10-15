@@ -14,21 +14,21 @@ const transcript = vi.hoisted(() => ({
   lockCalls: 0,
 }));
 
+// mock-isolation: Exercise catalog import ordering without opening the SQLite transcript owner.
 vi.mock("../plugin-sdk/session-transcript-runtime.js", () => ({
-  withSessionTranscriptWriteLock: async (
+  withSessionTranscriptWrite: async (
     _params: unknown,
     run: (context: {
       appendMessage: (params: {
         message: Record<string, unknown>;
         idempotencyLookup?: string;
-        beforeCommitInTransaction?: () => void;
+        preparation?: { source?: () => void };
       }) => Promise<void>;
     }) => Promise<void>,
   ) => {
     transcript.lockCalls += 1;
     await run({
-      appendMessage: async ({ message, idempotencyLookup, beforeCommitInTransaction }) => {
-        beforeCommitInTransaction?.();
+      appendMessage: async ({ message, idempotencyLookup, preparation }) => {
         const key = message.idempotencyKey;
         if (
           idempotencyLookup === "scan" &&
@@ -37,6 +37,7 @@ vi.mock("../plugin-sdk/session-transcript-runtime.js", () => ({
         ) {
           return;
         }
+        preparation?.source?.();
         transcript.messages.push(message);
       },
     });
@@ -102,10 +103,10 @@ function messageText(message: Record<string, unknown>): string | undefined {
 }
 
 describe("listSessionCatalogEntries", () => {
-  it("scans the retained compatibility owner first", () => {
+  it("does not select a runtime catalog owner from retained migration metadata", () => {
     const config = retainLegacyDefaultAgentId(
       {
-        agents: { list: [{ id: "alpha" }, { id: "beta" }] },
+        agents: { entries: { alpha: {}, beta: {} } },
       } as OpenClawConfig,
       "beta",
     );
@@ -114,18 +115,17 @@ describe("listSessionCatalogEntries", () => {
       agent: { session: { listSessionEntries } },
     } as unknown as PluginRuntime;
 
-    expect(listSessionCatalogEntries({ config, runtime })).toEqual([]);
-    expect(listSessionEntries.mock.calls.map(([params]) => params.agentId)).toEqual([
-      "beta",
-      "alpha",
-    ]);
+    expect(() => listSessionCatalogEntries({ config, runtime })).toThrow(
+      "session agent resolution has no explicit owner",
+    );
+    expect(listSessionEntries).not.toHaveBeenCalled();
   });
 
   it("requires and scopes an owner under explicit multi-agent ownership", () => {
     const config = {
       agents: {
         ownership: "explicit",
-        list: [{ id: "alpha" }, { id: "beta" }],
+        entries: { alpha: {}, beta: {} },
       },
     } as OpenClawConfig;
     const listSessionEntries = vi.fn(() => []);
@@ -164,7 +164,13 @@ describe("importSessionCatalogHistory", () => {
             text: "careful",
             timestamp: "1969-12-31T23:59:59.000Z",
           },
-          { id: "a-1", type: "agentMessage", text: "answer", model: "anthropic/claude" },
+          {
+            id: "a-1",
+            type: "agentMessage",
+            text: "answer",
+            model: "anthropic/claude",
+            raw: "x".repeat(600 * 1024),
+          },
           { id: "t-1", type: "toolCall", text: "bash" },
           { id: "o-1", type: "other", text: "checkpoint" },
         ],
@@ -256,19 +262,6 @@ describe("importSessionCatalogHistory", () => {
     expect(Buffer.byteLength(text ?? "", "utf8")).toBeLessThan(512 * 1024);
   });
 
-  it("does not let an unused raw payload hide visible history", async () => {
-    await importHistory([
-      {
-        id: "raw-heavy",
-        type: "agentMessage",
-        text: "visible answer",
-        raw: "x".repeat(600 * 1024),
-      },
-    ]).result;
-
-    expect(transcript.messages.map(messageText)).toEqual(["visible answer"]);
-  });
-
   it("does not open the transcript write lock when a paged read fails", async () => {
     const read = vi
       .fn<Parameters<typeof importSessionCatalogHistory>[0]["read"]>()
@@ -293,7 +286,9 @@ describe("importSessionCatalogHistory", () => {
     };
 
     await importHistory([{ id: "u-1", type: "userMessage", text: "Continue" }], options).result;
+    expect(commitGuard).toHaveBeenCalledTimes(2);
     await importHistory([{ id: "u-1", type: "userMessage", text: "Continue" }], options).result;
+    expect(commitGuard).toHaveBeenCalledTimes(2);
 
     expect(transcript.messages.map(messageText)).toEqual([
       "Continue",
@@ -304,7 +299,13 @@ describe("importSessionCatalogHistory", () => {
       model: "session-catalog",
       idempotencyKey: "pi-catalog:thread-1:continuation-notice",
     });
-    expect(commitGuard).toHaveBeenCalledTimes(4);
+    commitGuard.mockImplementation(() => {
+      throw new Error("Catalog source revoked");
+    });
+    await expect(
+      importHistory([{ id: "u-2", type: "userMessage", text: "Refused" }], options).result,
+    ).rejects.toThrow("Catalog source revoked");
+    expect(transcript.messages).toHaveLength(2);
   });
 });
 

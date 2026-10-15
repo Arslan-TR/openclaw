@@ -2,16 +2,16 @@
 // oxfmt-ignore
 import { useChatAbortRegistryFixture } from "./chat.abort-registry.test-support.js";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { resolveEmbeddedSessionLane } from "../../agents/embedded-agent-runner/lanes.js";
 import {
   createQueueSettings,
   createQueueTestRun,
 } from "../../auto-reply/reply/queue.test-helpers.js";
-import { clearSessionQueues } from "../../auto-reply/reply/queue/cleanup.js";
+import { clearFollowupDrainCallback } from "../../auto-reply/reply/queue/drain.js";
 import { enqueueFollowupRun } from "../../auto-reply/reply/queue/enqueue.js";
-import { FOLLOWUP_QUEUES } from "../../auto-reply/reply/queue/state.js";
+import { clearFollowupQueue, FOLLOWUP_QUEUES } from "../../auto-reply/reply/queue/state.js";
 import { getRuntimeConfig, setRuntimeConfigSnapshot } from "../../config/config.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import {
@@ -19,6 +19,8 @@ import {
   enqueueCommandInLane,
   getQueueSize,
 } from "../../process/command-queue.js";
+import { prepareUserProfileCatalog } from "../../state/user-profile-list.js";
+import { ensureUserProfilesSchema } from "../../state/user-profiles-schema.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { handleGatewayRequest } from "../server-methods.js";
 import {
@@ -32,9 +34,17 @@ import { sessionAbortHandlers } from "./sessions-abort.js";
 useChatAbortRegistryFixture();
 const key = "agent:main:queued-stop";
 const sessionId = "original-stop-session";
-afterEach(() => clearSessionQueues([key, sessionId]));
+afterEach(() => {
+  for (const queueKey of [key, sessionId]) {
+    clearFollowupQueue(queueKey);
+    clearFollowupDrainCallback(queueKey);
+    clearCommandLane(resolveEmbeddedSessionLane(queueKey));
+  }
+});
 
 async function setup() {
+  ensureUserProfilesSchema({});
+  onTestFinished((await prepareUserProfileCatalog()).release);
   const client = roleClient("view", "queued-stop-owner");
   client.connId = "queued-stop-connection";
   client.connect.scopes = ["operator.sessions.write"];
@@ -282,7 +292,10 @@ it.each([true, false])(
       ]);
     } finally {
       release.resolve();
-      clearSessionQueues([sharedKey, canonicalKey, researchSessionId]);
+      for (const queueKey of [sharedKey, canonicalKey, researchSessionId]) {
+        clearFollowupQueue(queueKey);
+        clearFollowupDrainCallback(queueKey);
+      }
       clearCommandLane(lane);
       await Promise.allSettled([blocker, settled]);
     }

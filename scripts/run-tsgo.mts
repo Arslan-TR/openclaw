@@ -89,7 +89,7 @@ export function prepareTsgoCommand(
 /** The caller holds artifact ownership until this compiler and its output are joined. */
 export async function runPreparedTsgoCommand(
   command: NonNullable<ReturnType<typeof prepareTsgoCommand>>,
-  evidence: { evidenceId?: string; onEvidence?: () => void } = {},
+  evidence: { evidenceId?: string; onEvidence?: () => void; onTimeout?: () => void } = {},
 ): Promise<number> {
   try {
     await ensureKyselyTypes(findRepoRoot(command.cwd) ?? command.cwd);
@@ -110,7 +110,7 @@ export async function runPreparedTsgoCommand(
     let capturedBytes = 0;
     let overflow = false;
     let interrupted = false;
-    const code = await runManagedCommand({
+    const managedCommand = {
       ...command,
       args: capture ? [...command.args, "--pretty", "false"] : command.args,
       requireProcessTreeExit: process.platform !== "win32",
@@ -145,7 +145,14 @@ export async function runPreparedTsgoCommand(
             },
           }
         : {}),
-    });
+    };
+    const metricsDir = command.env.OPENCLAW_TSGO_METRICS_DIR?.trim();
+    // Keep CI output capture and cleanup callbacks on the same managed invocation.
+    const code = metricsDir
+      ? await (
+          await import("./lib/tsgo-performance.mts")
+        ).runMeasuredTsgoCommand(managedCommand, metricsDir)
+      : await runManagedCommand(managedCommand);
     await Promise.all(forwarding);
     const stdout = Buffer.concat(outputs[0]!).toString("utf8");
     const stderr = Buffer.concat(outputs[1]!).toString("utf8");
@@ -168,6 +175,7 @@ export async function runPreparedTsgoCommand(
     if ((error as { code?: string } | undefined)?.code !== "ETIMEDOUT") {
       throw error;
     }
+    evidence.onTimeout?.();
     console.error(
       `[tsgo] no completion after ${command.timeoutMs}ms; killed the tsgo process tree. Raise OPENCLAW_TSGO_TIMEOUT_MS for intentionally longer builds, or unset it to disable the watchdog.`,
     );

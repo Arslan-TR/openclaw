@@ -1,3 +1,4 @@
+import "../test-utils/prepare-compiled-subprocesses.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -20,8 +21,12 @@ vi.mock("../plugins/provider-setup-availability.js", () => ({
 
 let root: string | undefined;
 afterEach(async () => {
-  const { closeOpenClawStateDatabaseForTest } = await import("../state/openclaw-state-db.js");
-  const { closeOpenClawAgentDatabasesForTest } = await import("../state/openclaw-agent-db.js");
+  const { closeOpenClawStateDatabaseAsync, closeOpenClawStateDatabaseForTest } =
+    await import("../state/openclaw-state-db.js");
+  const { closeOpenClawAgentDatabasesAsync, closeOpenClawAgentDatabasesForTest } =
+    await import("../state/openclaw-agent-db.js");
+  await closeOpenClawAgentDatabasesAsync();
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawAgentDatabasesForTest();
   closeOpenClawStateDatabaseForTest();
   vi.unstubAllEnvs();

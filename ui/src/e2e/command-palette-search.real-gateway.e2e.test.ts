@@ -6,6 +6,10 @@ import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
 import { waitForControlUiDocument } from "../../../src/commands/control-ui-handoff.ts";
 import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../../src/config/runtime-snapshot.js";
+import {
   appendTranscriptMessages,
   createSessionEntryWithTranscript,
 } from "../../../src/config/sessions/session-accessor.js";
@@ -21,7 +25,9 @@ import { createRequireRecord } from "../../../test/helpers/record.js";
 import { COMMUNITY_INVITE_KEY } from "../components/community-invite-state.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
 import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
+import { enterControlUiSession } from "../test-helpers/control-ui-session-entry.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
+import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
 
 const requireRecord = createRequireRecord("record", "expected-object-value");
 const agentIds = ["main", "second", "third", "fourth", "fifth"];
@@ -30,9 +36,9 @@ const commonMatchCount = 30;
 const commonQuery = "orchardglow";
 const uniqueQuery = "copperfinch";
 const targetKey = "agent:fifth:search-proof-12345678-0000-4000-8000-000000000001";
-const targetLabel = "Older fifth-agent conversation";
+const targetLabel = "Per-session communication controls in UI";
 const targetMessage =
-  "The copperfinch observatory has a violet lantern beside the northern window.";
+  "The copperfinch observatory uses cross-agent message routing beside the violet lantern.";
 const scope = {
   includeGlobal: false,
   includeUnknown: false,
@@ -40,6 +46,7 @@ const scope = {
   excludeSubagents: true,
   excludeCron: true,
   excludeSystem: true,
+  excludeDock: true,
 };
 const captureEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
 let instance: OpenClawTestInstance | undefined;
@@ -226,7 +233,12 @@ const suite = createControlUiE2eSuite({
         },
       };
       await owner.state.writeConfig(config);
-      await seedSessions(owner, config);
+      setRuntimeConfigSnapshot(config);
+      try {
+        await seedSessions(owner, config);
+      } finally {
+        clearRuntimeConfigSnapshot();
+      }
       await owner.startGateway();
       return {
         baseUrl: `http://127.0.0.1:${owner.port}/`,
@@ -360,13 +372,21 @@ suite.define(() => {
       const url = new URL("/chat/main", suite.server.baseUrl);
       url.hash = new URL(browserUrl).hash;
       await suite.withPage(
-        { serviceWorkers: "block", locale: "en-US", viewport: { width: 1280, height: 900 } },
+        {
+          serviceWorkers: "block",
+          locale: "en-US",
+          viewport: { width: 1280, height: 900 },
+          ...(captureEnabled
+            ? { recordVideo: { dir: artifactDir, size: { width: 1280, height: 900 } } }
+            : {}),
+        },
         async ({ page }) => {
           await page.addInitScript((key) => {
             localStorage.setItem(key, JSON.stringify({ dismissedAtMs: 1770000000000 }));
           }, COMMUNITY_INVITE_KEY);
           observeSearchTraffic(page, rpc);
-          expect((await page.goto(url.href))?.status()).toBe(200);
+          expect((await page.goto(url.href))?.status()).toBe(404);
+          await enterControlUiSession(page);
           await waitForControlUiGatewayReady(page);
           await page.locator(".shell").waitFor({ state: "visible" });
           await expect
@@ -480,7 +500,13 @@ suite.define(() => {
             // The query owns one bounded metadata lookup. The scoped transcript
             // request above cannot be limited by any background roster window.
             expect(metadata).toHaveLength(1);
-            expect(metadata[0]?.params).toEqual({ ...scope, search: query, limit: 10 });
+            expect(metadata[0]?.params).toEqual({
+              ...scope,
+              search: query,
+              limit: 10,
+              rowMode: "compact",
+              source: "command-palette",
+            });
             expect(metadata[0]?.ok).toBe(true);
             expect(metadata[0]?.sessionKeys).toEqual(metadataKeys);
             expect(notices).toEqual(noMatches ? [expect.stringContaining("No results found")] : []);
@@ -491,6 +517,19 @@ suite.define(() => {
             ).toBe(0);
             return response;
           };
+
+          await search("per session communi", 0, "00-title-punctuation-prefix.png", [targetKey]);
+          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
+          expect(await results.getByRole("option").count()).toBe(1);
+
+          const partial = await search(
+            "cross agent message rout",
+            1,
+            "00-message-punctuation-prefix.png",
+          );
+          expect(partial.resultKeys).toEqual([targetKey]);
+          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
+          expect(await results.textContent()).toContain(targetMessage);
 
           const common = await search(commonQuery, 25, "01-common-limited-search.png");
           expect(common.truncated).toBe(true);
@@ -567,6 +606,8 @@ suite.define(() => {
             pane.locator(".chat-thread"),
           ]);
 
+          // Category membership spans accessible owners, beyond the default Mine scope.
+          await selectAllSidebarSessions(page);
           const otherKey = "agent:fifth:search-roster-4";
           await page
             .locator(

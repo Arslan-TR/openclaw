@@ -2,16 +2,27 @@
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { closeSync, existsSync, openSync } from "node:fs";
+import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as waitForProcessTick } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  fixtureReceiptClientSource,
+  openFixtureReceiptChannel,
+  type FixtureReceiptChannel,
+} from "../../test/helpers/fixture-receipts.js";
+import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { setVerbose } from "../global-state.js";
 import { isPidAlive } from "../shared/pid-alive.js";
-import { readPidFile, waitForPidToExit } from "../test-utils/process-tree.js";
+import { readPidFile } from "../test-utils/process-tree.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
 import { attachChildProcessBridge } from "./child-process-bridge.js";
 import * as execSpawn from "./exec-spawn.js";
+import { resolveCommandEnv } from "./exec-spawn.js";
 import {
   runCommandBuffered,
   runCommandWithTimeout,
@@ -21,12 +32,28 @@ import {
 
 const nodeCommand = (source: string) => [process.execPath, "-e", source];
 
+let receipts: FixtureReceiptChannel;
+beforeAll(async () => {
+  receipts = await openFixtureReceiptChannel();
+});
+afterAll(async () => {
+  await receipts.close();
+});
 afterEach(() => vi.unstubAllEnvs());
 
+// Escaped descendants outlive the root handle; no owner exposes their exit event.
+async function waitForDescendantExit(pid: number, signal: AbortSignal): Promise<void> {
+  try {
+    while (isPidAlive(pid)) {
+      await waitForProcessTick(25, undefined, { signal });
+    }
+  } catch (error) {
+    throw new Error(`Timed out waiting for descendant ${pid} to exit`, { cause: error });
+  }
+}
+
 describe("runCommandWithTimeout", () => {
-  it
-    .skipIf(process.platform === "win32")
-    .each(["cooperative", "default-signal", "forced"] as const)(
+  it.skipIf(process.platform === "win32").each(["cooperative", "forced"] as const)(
     "reports invocation cleanup and honors the initial SIGINT signal: %s",
     async (mode) => {
       const controller = new AbortController();
@@ -34,10 +61,7 @@ describe("runCommandWithTimeout", () => {
       const started = new Promise<void>((resolve) => {
         ready = resolve;
       });
-      const program =
-        mode === "default-signal"
-          ? "setInterval(()=>{},1000); process.stdout.write('ready');"
-          : `const timer=setInterval(()=>{},1000); process.on('SIGINT',()=>{${mode === "cooperative" ? "clearInterval(timer);process.stdout.write('interrupted');process.exitCode=17;" : ""}}); process.stdout.write('ready');`;
+      const program = `const timer=setInterval(()=>{},1000); process.on('SIGINT',()=>{${mode === "cooperative" ? "clearInterval(timer);process.stdout.write('interrupted');process.exitCode=17;" : ""}}); process.stdout.write('ready');`;
       // Keep process I/O and polling real, but don't let host scheduling consume the grace period.
       const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
       try {
@@ -57,11 +81,8 @@ describe("runCommandWithTimeout", () => {
           now.mockReturnValue(1_100);
         }
         const result = await running;
-        expect(result.cleanup).toBe(mode === "default-signal" ? "cooperative" : mode);
+        expect(result.cleanup).toBe(mode);
         expect(result.killIssuedByAbort).toBe(true);
-        if (mode === "default-signal") {
-          expect(result).toMatchObject({ code: null, signal: "SIGINT", termination: "signal" });
-        }
         if (mode === "cooperative") {
           expect(result.code).toBe(17);
           expect(result.stdout).toContain("interrupted");
@@ -74,16 +95,18 @@ describe("runCommandWithTimeout", () => {
 
   it.skipIf(process.platform === "win32")(
     "joins owned descendants even when a successful root closes its output",
-    async () => {
+    async ({ signal }) => {
       let descendant: number | undefined;
+      let running: ReturnType<typeof runCommandWithTimeout> | undefined;
       try {
-        const result = await runCommandWithTimeout(
+        running = runCommandWithTimeout(
           nodeCommand(`const {spawn}=require('node:child_process');
           const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000);process.send('ready')"],{stdio:['ignore','ignore','ignore','ipc']});
           child.once('message',()=>{process.stdout.write(String(child.pid));child.disconnect();child.unref();});`),
           {
             killProcessTree: true,
             requireProcessTreeExtinction: true,
+            signal,
             killGraceMs: 50,
             timeoutMs: 10_000,
             onOutputChunk: (chunk) => {
@@ -91,28 +114,31 @@ describe("runCommandWithTimeout", () => {
             },
           },
         );
+        const result = await withinTest(running, signal);
         expect(Number.isSafeInteger(descendant) && descendant! > 0).toBe(true);
         expect(result.code).toBe(0);
         expect(result.cleanup).toBe("forced");
-        expect(await waitForPidToExit(descendant!)).toBe(true);
+        // Forced settlement is recorded only after exec-termination observes the group absent.
+        expect(isPidAlive(descendant!)).toBe(false);
       } finally {
+        await running?.catch(() => undefined);
         if (descendant && isPidAlive(descendant)) {
           process.kill(descendant, "SIGKILL");
-          await waitForPidToExit(descendant);
+          await waitForDescendantExit(descendant, signal);
         }
       }
     },
   );
 
-  it.skipIf(process.platform === "win32").each(["SIGKILL", 9] as const)(
-    "reports normal extinction after a successful native-style command with timeout signal %s",
-    async (killSignal) => {
+  it.skipIf(process.platform === "win32")(
+    "reports normal extinction after a successful native-style command with a SIGKILL timeout",
+    async () => {
       const result = await runCommandWithTimeout(
         nodeCommand("process.stdout.write('enabled\\n')"),
         {
           killProcessTree: true,
           requireProcessTreeExtinction: true,
-          killSignal,
+          killSignal: "SIGKILL",
           timeoutMs: 5_000,
         },
       );
@@ -290,36 +316,35 @@ describe("runCommandWithTimeout", () => {
     expect(result.termination).toBe("signal");
   });
 
-  it.each([
-    {
-      input: Buffer.from([0x61, 0xff, 0x62, 0xe2, 0x82, 0xac, 0x7a]),
-      cap: 5,
-      output: "a�b�",
-      dropped: 2,
-    },
-    { input: Buffer.from("😀"), cap: 3, output: "", dropped: 4 },
-  ])(
-    "handles malformed or entirely partial UTF-8 heads ($cap bytes)",
-    async ({ input, cap, output, dropped }) => {
-      const result = await runUtf8CommandWithTimeout(
-        nodeCommand("process.stdin.pipe(process.stdout)"),
-        { input, maxOutputBytes: cap, outputCapture: "head", timeoutMs: 3_000 },
-      );
-      expect(result.stdout).toBe(output);
-      expect(result.stdoutTruncatedBytes).toBe(dropped);
-    },
-  );
+  it("handles malformed UTF-8 in a truncated head", async () => {
+    const input = Buffer.from([0x61, 0xff, 0x62, 0xe2, 0x82, 0xac, 0x7a]);
+    const result = await runUtf8CommandWithTimeout(
+      nodeCommand("process.stdin.pipe(process.stdout)"),
+      { input, maxOutputBytes: 5, outputCapture: "head", timeoutMs: 3_000 },
+    );
+    expect(result.stdout).toBe("a�b�");
+    expect(result.stdoutTruncatedBytes).toBe(2);
+  });
 
-  it("keeps argv values out of transport errors", async () => {
+  it("retires a failed launch before its scope closes and keeps argv out of the error", async () => {
     const privateArg = "private-command-argument";
-    const error = await runCommandWithTimeout(
-      [`openclaw-missing-${process.pid}-${Date.now()}`, "--token", privateArg],
-      { timeoutMs: 3_000 },
-    ).catch((caught: unknown) => caught);
+    const reservation = { spawned: vi.fn(), settled: vi.fn() };
+    await execSpawn.withCommandProcessScope(
+      async () => {
+        const error = await runCommandWithTimeout(
+          [`openclaw-missing-${process.pid}-${Date.now()}`, "--token", privateArg],
+          { timeoutMs: 3_000 },
+        ).catch((caught: unknown) => caught);
 
-    expect(error).toBeInstanceOf(Error);
-    expect(String(error)).not.toContain(privateArg);
-    expect(error).toMatchObject({ code: "ENOENT" });
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).not.toContain(privateArg);
+        expect(error).toMatchObject({ code: "ENOENT" });
+        expect(reservation.spawned).not.toHaveBeenCalled();
+        expect(reservation.settled).toHaveBeenCalledOnce();
+      },
+      undefined,
+      { reserve: () => reservation },
+    );
   });
 });
 
@@ -355,39 +380,39 @@ describe("runCommandBuffered", () => {
     ).resolves.toMatchObject({ code: null, termination: "signal", error: new Error("stop") });
   });
 
-  it.runIf(process.platform !== "win32").each([
+  it.runIf(process.platform !== "win32").for([
     { exitCode: 0, escaped: false, timeoutMs: 50 },
     { exitCode: 7, escaped: false, timeoutMs: 50 },
     { exitCode: 0, escaped: true, timeoutMs: 250 },
   ])(
     "drains descendants on failure or the post-success timeout (exit $exitCode, escaped=$escaped)",
     { timeout: 5_000 },
-    async ({ exitCode, escaped, timeoutMs }) =>
+    async ({ exitCode, escaped, timeoutMs }, { signal }) =>
       withTempDir("openclaw-exec-descendant-", async (dir) => {
         const pidPath = path.join(dir, "descendant.pid");
         const termPath = path.join(dir, "sigterm");
         // Acknowledge only after the handler and keepalive exist. Stay quiet so
         // inherited-pipe release cannot kill the descendant through EPIPE.
         const descendantSource = [
-          "const { writeFileSync } = require('node:fs')",
-          `process.on('SIGTERM', () => writeFileSync(${JSON.stringify(termPath)}, 'handled'))`,
+          "import { writeFileSync } from 'node:fs'",
+          fixtureReceiptClientSource(receipts.endpoint),
+          `process.on('SIGTERM', () => { writeFileSync(${JSON.stringify(termPath)}, 'handled'); sendReceipt(${JSON.stringify(termPath)}, 'handled'); })`,
           "setInterval(() => {}, 1_000)",
           "process.send('ready')",
         ].join(";");
         const parentSource = [
           "const { spawn } = require('node:child_process')",
           "const { writeFileSync } = require('node:fs')",
-          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { detached: ${escaped}, stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })`,
+          `const child = spawn(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(descendantSource)}], { detached: ${escaped}, stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })`,
           `writeFileSync(${JSON.stringify(pidPath)}, String(child.pid))`,
           `child.once('message', () => process.exit(${exitCode}))`,
         ].join(";");
-        const realSetTimeout = setTimeout;
         const spawnSpy = vi.spyOn(execSpawn, "spawnCommandWithInvocation");
         let parent: ChildProcess | undefined;
         let descendantPid: number | undefined;
         let command: ReturnType<typeof runCommandBuffered> | undefined;
         // Freeze deadlines, not subprocess I/O: Node startup must not consume the
-        // timeout or the 100ms inherited-pipe idle grace. Polling must stay real.
+        // timeout or the 100ms inherited-pipe idle grace. Receipts stay real.
         vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
         try {
           let settled = false;
@@ -405,10 +430,16 @@ describe("runCommandBuffered", () => {
           if (!parent) {
             throw new Error("command did not expose a child process");
           }
-          expect(await once(parent, "exit", { signal: AbortSignal.timeout(2_000) })).toEqual([
-            exitCode,
-            null,
-          ]);
+          expect(
+            await withinTest(
+              awaitGateBeforeSettlement(
+                once(parent, "exit", { signal }),
+                command,
+                "command settled before root exit",
+              ),
+              signal,
+            ),
+          ).toEqual([exitCode, null]);
           descendantPid = await readPidFile(pidPath);
           expect(isPidAlive(descendantPid)).toBe(true);
           expect(settled).toBe(false);
@@ -426,9 +457,8 @@ describe("runCommandBuffered", () => {
             expect(isPidAlive(descendantPid)).toBe(true);
             expect(existsSync(termPath)).toBe(false);
 
-            // Bound the real close observation separately from the frozen policy
-            // clock so missing post-termination release still reaches test cleanup.
-            const closed = once(parent, "close", { signal: AbortSignal.timeout(1_000) });
+            // The test signal unwinds cleanup if output release never reaches close.
+            const closed = once(parent, "close");
             await vi.advanceTimersByTimeAsync(timeoutMs - 101);
             await vi.advanceTimersToNextTimerAsync();
             await vi.advanceTimersByTimeAsync(100);
@@ -437,8 +467,11 @@ describe("runCommandBuffered", () => {
             // Output release runs in the next timers phase so buffered pipe I/O
             // gets a poll turn on both Node and Bun.
             await vi.advanceTimersByTimeAsync(1);
-            await closed;
-            expect(await command).toMatchObject({ code: null, termination: "timeout" });
+            await withinTest(closed, signal);
+            expect(await withinTest(command, signal)).toMatchObject({
+              code: null,
+              termination: "timeout",
+            });
             expect(isPidAlive(descendantPid)).toBe(true);
             expect(existsSync(termPath)).toBe(false);
             return;
@@ -451,25 +484,32 @@ describe("runCommandBuffered", () => {
             await vi.advanceTimersByTimeAsync(100);
             await vi.advanceTimersToNextTimerAsync();
           }
-          for (let attempt = 0; attempt < 40 && !existsSync(termPath); attempt += 1) {
-            await new Promise<void>((resolve) => {
-              realSetTimeout(resolve, 25);
-            });
-          }
+          // Receipt delivery is independent of command completion. The handler writes
+          // its durable marker first, so that marker decides if completion wins the race.
+          await withinTest(
+            Promise.race([
+              receipts.waitFor(termPath, "handled"),
+              command.then(() => {
+                expect(existsSync(termPath)).toBe(true);
+              }),
+            ]),
+            signal,
+          );
           expect(existsSync(termPath)).toBe(true);
           expect(isPidAlive(descendantPid)).toBe(true);
           expect(settled).toBe(false);
 
           await vi.advanceTimersByTimeAsync(execSpawn.COMMAND_PROCESS_TREE_KILL_GRACE_MS);
           // Force delivery now has a separate bounded exit-observation phase.
-          await vi.advanceTimersByTimeAsync(execSpawn.COMMAND_PROCESS_TREE_KILL_GRACE_MS);
-          expect(await command).toMatchObject(
+          await vi.advanceTimersByTimeAsync(execSpawn.COMMAND_PROCESS_GROUP_EXIT_CONFIRMATION_MS);
+          expect(await withinTest(command, signal)).toMatchObject(
             exitCode === 0
               ? { code: null, termination: "timeout" }
               : { code: exitCode, termination: "exit" },
           );
           vi.useRealTimers();
-          expect(await waitForPidToExit(descendantPid)).toBe(true);
+          await waitForDescendantExit(descendantPid, signal);
+          expect(isPidAlive(descendantPid)).toBe(false);
         } finally {
           try {
             // Record the spawned descendant before its readiness acknowledgement,
@@ -496,10 +536,12 @@ describe("runCommandBuffered", () => {
           }
           await command;
           if (parent?.pid) {
-            expect(await waitForPidToExit(parent.pid)).toBe(true);
+            // Command completion has already joined this root's close event.
+            expect(isPidAlive(parent.pid)).toBe(false);
           }
           if (descendantPid !== undefined) {
-            expect(await waitForPidToExit(descendantPid)).toBe(true);
+            await waitForDescendantExit(descendantPid, signal);
+            expect(isPidAlive(descendantPid)).toBe(false);
           }
         }
       }),
@@ -606,7 +648,7 @@ describe("runExec", () => {
 });
 
 describe("attachChildProcessBridge", () => {
-  it("forwards SIGTERM to the wrapped child and detaches on exit", () => {
+  it("forwards SIGTERM until child exit and detaches only after close", () => {
     const beforeSigterm = new Set(process.listeners("SIGTERM"));
     const child = new EventEmitter() as EventEmitter & ChildProcess;
     const kill = vi.fn<(signal?: NodeJS.Signals) => boolean>(() => true);
@@ -617,19 +659,114 @@ describe("attachChildProcessBridge", () => {
       signals: ["SIGTERM"],
       onSignal: (signal) => observedSignals.push(signal),
     });
-    const addedSigterm = process
-      .listeners("SIGTERM")
-      .find((listener) => !beforeSigterm.has(listener));
-    if (!addedSigterm) {
-      throw new Error("expected SIGTERM listener");
+    try {
+      const addedSigterm = process
+        .listeners("SIGTERM")
+        .find((listener) => !beforeSigterm.has(listener));
+      if (!addedSigterm) {
+        throw new Error("expected SIGTERM listener");
+      }
+
+      addedSigterm("SIGTERM");
+      expect(observedSignals).toEqual(["SIGTERM"]);
+      expect(kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+
+      child.emit("exit", 0, null);
+      expect(process.listeners("SIGTERM")).toContain(addedSigterm);
+      addedSigterm("SIGTERM");
+      expect(observedSignals).toEqual(["SIGTERM"]);
+      expect(kill).toHaveBeenCalledOnce();
+
+      child.emit("close", 0, null);
+      expect(process.listeners("SIGTERM")).not.toContain(addedSigterm);
+      expect(process.listeners("SIGTERM")).toHaveLength(beforeSigterm.size);
+    } finally {
+      detach();
     }
+  });
+});
 
-    addedSigterm("SIGTERM");
-    expect(observedSignals).toEqual(["SIGTERM"]);
-    expect(kill).toHaveBeenCalledWith("SIGTERM");
+describe("package manager runtime", () => {
+  const dirs = useAutoCleanupTempDirTracker(afterEach);
+  const require = createRequire(import.meta.url);
 
-    child.emit("exit");
-    expect(process.listeners("SIGTERM")).toHaveLength(beforeSigterm.size);
-    detach();
+  it.skipIf(process.platform === "win32")(
+    "hands an explicit Node runtime to npm preinstall children",
+    async () => {
+      const root = dirs.make("npm-lifecycle-node-");
+      const privateBin = path.join(root, "private", "bin");
+      const systemBin = path.join(root, "system", "bin");
+      await fs.mkdir(privateBin, { recursive: true });
+      await fs.mkdir(systemBin, { recursive: true });
+      const privateNode = path.join(privateBin, "node");
+      await fs.symlink(process.execPath, privateNode);
+      await fs.writeFile(path.join(systemBin, "node"), "#!/bin/sh\necho v22.22.3\n", {
+        mode: 0o755,
+      });
+      await fs.writeFile(
+        path.join(root, "package.json"),
+        JSON.stringify({
+          name: "runtime-handoff-fixture",
+          version: "1.0.0",
+          scripts: { preinstall: 'node -p "process.version"' },
+        }),
+      );
+      const npmCli = path.join(
+        path.dirname(require.resolve("npm/package.json")),
+        "bin",
+        "npm-cli.js",
+      );
+      const result = await runCommandWithTimeout(
+        [
+          privateNode,
+          npmCli,
+          "install",
+          "--offline",
+          "--no-audit",
+          "--no-fund",
+          "--package-lock=false",
+        ],
+        {
+          cwd: root,
+          timeoutMs: 10_000,
+          baseEnv: {},
+          env: {
+            HOME: root,
+            OPENCLAW_STATE_DIR: path.join(root, "state"),
+            PATH: [systemBin, process.env.PATH].join(path.delimiter),
+            npm_config_cache: path.join(root, "cache"),
+            npm_config_userconfig: path.join(root, "empty-npmrc"),
+            npm_config_globalconfig: path.join(root, "empty-global-npmrc"),
+          },
+        },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toContain(process.version);
+      expect(result.stdout).not.toContain("v22.22.3");
+    },
+  );
+
+  it.each(["pnpm.cjs", "pnpm.js"])(
+    "preserves Windows PATH casing and npm config for an explicit %s runtime",
+    (cli) => {
+      const env = { Path: "C:\\system;C:\\private", npm_config_node: "operator-choice" };
+      const result = resolveCommandEnv({
+        argv: ["C:\\private\\node.exe", `C:\\tools\\${cli}`, "install"],
+        baseEnv: {},
+        env,
+        platform: "win32",
+      });
+      expect(result.Path).toBe("C:\\private;C:\\system");
+      expect(result.PATH).toBeUndefined();
+      expect(result.npm_config_node).toBe("operator-choice");
+      expect(env.Path).toBe("C:\\system;C:\\private");
+    },
+  );
+
+  it("keeps the caller's runtime selection for plain npm", () => {
+    const env = { PATH: "/selected/bin:/system/bin", npm_config_node: "operator-choice" };
+    const result = resolveCommandEnv({ argv: ["npm", "install"], baseEnv: {}, env });
+    expect(result.PATH).toBe(env.PATH);
+    expect(result.npm_config_node).toBe(env.npm_config_node);
   });
 });

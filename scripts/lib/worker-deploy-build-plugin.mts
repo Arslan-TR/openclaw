@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { WORKER_BUNDLE_CHUNK_PATH_PATTERN } from "../../src/shared/worker-bundle-hash.ts";
 
 const WORKER_DEPLOY_BUILD_PLUGIN_NAME = "openclaw:worker-deploy";
 export const WORKER_DEPLOY_OPTIONAL_NATIVE_MODULE_ID = `${path.resolve("src/worker/worker-deploy-runtime.ts")}?optional-native`;
@@ -41,6 +42,8 @@ const TREE_SITTER_INIT = "TreeSitter.Parser.init()";
 const TREE_SITTER_BASH_WASM = 'require.resolve("tree-sitter-bash/tree-sitter-bash.wasm")';
 const PHOTON_WASM_INIT = `const path = require('path').join(__dirname, 'photon_rs_bg.wasm');
 const bytes = require('fs').readFileSync(path);`;
+const FS_SAFE_NATIVE_BATCH_BRANCH = "if (options.native) {";
+const FS_SAFE_NATIVE_BATCH_WORKER_URL = 'new URL("./owner-dacl-batch-worker.js", import.meta.url)';
 
 export function resolveWorkerDeployGeneratorInputs(rootDir = process.cwd()) {
   const playwrightRoot = fs.realpathSync(path.resolve(rootDir, "node_modules/playwright-core"));
@@ -55,12 +58,17 @@ export function resolveWorkerDeployGeneratorInputs(rootDir = process.cwd()) {
   ] as const;
 }
 
-/** The worker archive stages entry files only; emitted runtime auxiliaries have no owner. */
+/** Only named entries and build-owned chunks travel in the sealed worker archive. */
 export function isUnstagedWorkerDeployRuntimeArtifact(
   fileName: string,
   entrypoints: ReadonlySet<string>,
 ): boolean {
-  return !entrypoints.has(fileName) && /\.(?:mjs|node|wasm)$/u.test(fileName);
+  const relative = fileName.startsWith("worker/") ? fileName.slice("worker/".length) : fileName;
+  return (
+    !entrypoints.has(fileName) &&
+    !WORKER_BUNDLE_CHUNK_PATH_PATTERN.test(relative) &&
+    /\.(?:mjs|node|wasm)$/u.test(fileName)
+  );
 }
 
 /** Composes bundled-plugin runtime and removes dependency package reads from the worker build. */
@@ -72,6 +80,9 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
     ).href;
   const playwrightRoot = fs.realpathSync(path.resolve(rootDir, "node_modules/playwright-core"));
   const coreBundlePath = fs.realpathSync(path.join(playwrightRoot, "lib/coreBundle.js"));
+  const fsSafeWindowsSecurityCommandPath = fs.realpathSync(
+    path.resolve(rootDir, "node_modules/@openclaw/fs-safe/dist/windows-security-command.js"),
+  );
   const photonRuntimePath = fs.realpathSync(
     path.resolve(rootDir, "node_modules/@silvia-odwyer/photon-node/photon_rs.js"),
   );
@@ -84,6 +95,9 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
   );
   const undiciDispatcherOptionsPath = fs.realpathSync(
     path.resolve("src/infra/net/undici-dispatcher-options.ts"),
+  );
+  const highlightRuntimePath = fs.realpathSync(
+    path.resolve("src/agents/utils/syntax-highlight.ts"),
   );
   const treeSitterRuntimePath = fs.realpathSync(
     path.resolve("src/infra/command-explainer/tree-sitter-runtime.ts"),
@@ -115,7 +129,10 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
       );
       // Check the complete emitted graph: a root facade is outside the later worker-directory scan.
       for (const file of files) {
-        if (isUnstagedWorkerDeployRuntimeArtifact(file.fileName, entrypoints)) {
+        if (
+          !file.fileName.startsWith("worker/") ||
+          isUnstagedWorkerDeployRuntimeArtifact(file.fileName, entrypoints)
+        ) {
           this.error(`Worker deploy artifact emits unstaged runtime asset ${file.fileName}.`);
         }
       }
@@ -131,6 +148,17 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
         resolvedId = fs.realpathSync(path.resolve(id));
       } catch {
         return null;
+      }
+      if (resolvedId === fsSafeWindowsSecurityCommandPath) {
+        if (
+          code.split(FS_SAFE_NATIVE_BATCH_BRANCH).length !== 2 ||
+          !code.includes(FS_SAFE_NATIVE_BATCH_WORKER_URL)
+        ) {
+          this.error("fs-safe native batch bootstrap changed; update the worker deploy transform");
+        }
+        // Sealed bootstrap already fixes native mode to off. Drop only its unreachable
+        // native subprocess branch; retain Windows command-helper validation and failures.
+        return code.replace(FS_SAFE_NATIVE_BATCH_BRANCH, "if (false) {");
       }
       if (resolvedId === browserRuntimeBridgePath) {
         return WORKER_BROWSER_RUNTIME_COMPOSITION;
@@ -161,6 +189,16 @@ export function createWorkerDeployBuildPlugin(rootDir = process.cwd()) {
         return code.replace(
           PHOTON_WASM_INIT,
           `const bytes = Buffer.from(${JSON.stringify(fs.readFileSync(photonWasmPath).toString("base64"))}, "base64");`,
+        );
+      }
+      if (resolvedId === highlightRuntimePath) {
+        const load = 'createRequire(import.meta.url)("highlight.js")';
+        if (!code.includes(load)) {
+          this.error("highlight.js loader changed; update the worker deploy transform");
+        }
+        return code.replace(
+          load,
+          'createRequire(import.meta.url)("./worker-chunk-highlight.mjs").default',
         );
       }
       if (resolvedId === treeSitterRuntimePath) {

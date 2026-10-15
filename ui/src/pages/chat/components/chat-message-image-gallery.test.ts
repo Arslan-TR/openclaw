@@ -1,31 +1,87 @@
 /* @vitest-environment jsdom */
 
-import { nothing, render } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../../test/helpers/promise.js";
 import { ImageLightboxGalleryController } from "../../../components/image-lightbox-gallery.ts";
 import type { ImageLightboxItem } from "../../../components/image-lightbox.types.ts";
-import { renderMessageGroup } from "./chat-message-group.ts";
-import { renderMessageImages } from "./chat-message-images.ts";
-import { releaseChatMediaResourceSubscriber } from "./chat-message-media.ts";
+import { cleanupSolid } from "../../../test-helpers/mount-solid.ts";
+import { mountSolid } from "../../../test-helpers/solid-render.tsx";
+import { MessageGroup } from "./chat-message-group-view.tsx";
+import { MessageImages, type MessageImagesProps } from "./chat-message-images-solid.tsx";
+import {
+  releaseChatMediaResourceSubscriber,
+  type ImageBlock,
+  type ImageRenderOptions,
+} from "./chat-message-media.ts";
 import { createMessageGroup, createUserMessage } from "./chat-message.test-support.ts";
 
 let container: HTMLDivElement;
 let onRequestUpdate: () => void;
+let imageView: ReturnType<typeof mountSolid<MessageImagesProps>> | undefined;
 
 beforeEach(() => {
   container = document.createElement("div");
   document.body.append(container);
   onRequestUpdate = vi.fn();
+  imageView = undefined;
 });
 
 afterEach(() => {
-  render(nothing, container);
+  cleanupSolid();
   releaseChatMediaResourceSubscriber(onRequestUpdate);
   container.remove();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
+
+function renderImages(images: ImageBlock[], options: ImageRenderOptions) {
+  const props = { images, options };
+  if (imageView) {
+    imageView.update(props);
+  } else {
+    imageView = mountSolid(MessageImages, props, container);
+  }
+}
+
+function stubImageDecoding(blobPrefix: string, decode: () => Promise<void>) {
+  let blobIndex = 0;
+  const NativeUrl = URL;
+  vi.stubGlobal(
+    "URL",
+    class extends NativeUrl {
+      static override createObjectURL = () => `${blobPrefix}-${blobIndex++}`;
+      static override revokeObjectURL = vi.fn();
+    },
+  );
+  vi.stubGlobal(
+    "Image",
+    class {
+      src = "";
+      decode = decode;
+    },
+  );
+}
+
+function imageResponse() {
+  return new Response("png", { headers: { "Content-Type": "image/png" } });
+}
+
+function createGallery() {
+  const controller = new ImageLightboxGalleryController(vi.fn());
+  let opened: ImageLightboxItem | undefined;
+  return {
+    controller,
+    onOpenImage: vi.fn((item: ImageLightboxItem) => {
+      opened?.release?.();
+      opened = item;
+      controller.reset(item.gallery, item);
+    }),
+    dispose: () => {
+      controller.dispose();
+      opened?.release?.();
+    },
+  };
+}
 
 describe("message image gallery loading", () => {
   it("renders canonical inbound transcript images through the authenticated media route", async () => {
@@ -54,17 +110,21 @@ describe("message image gallery loading", () => {
     });
     const group = createMessageGroup(message, "user");
     const draw = () =>
-      render(
-        renderMessageGroup(group, {
-          showReasoning: true,
-          showToolCalls: false,
-          assistantName: "OpenClaw",
-          assistantAvatar: null,
-          resourceBasePath: "/openclaw",
-          assistantAttachmentAuthToken: "test-auth-token",
-          onRequestUpdate,
-          onOpenImage,
-        }),
+      mountSolid(
+        MessageGroup,
+        {
+          group,
+          options: {
+            showReasoning: true,
+            showToolCalls: false,
+            assistantName: "OpenClaw",
+            assistantAvatar: null,
+            resourceBasePath: "/openclaw",
+            assistantAttachmentAuthToken: "test-auth-token",
+            onRequestUpdate,
+            onOpenImage,
+          },
+        },
         container,
       );
     const observer = new MutationObserver(() => {
@@ -84,7 +144,7 @@ describe("message image gallery loading", () => {
     const expectedSrc = `/openclaw/__openclaw__/assistant-media?source=${encodeURIComponent(source)}&mediaTicket=ticket-inbound&${new URLSearchParams({ filename })}`;
     expect(
       container.querySelector<HTMLImageElement>(".chat-message-image")?.getAttribute("src"),
-    ).toBe(expectedSrc);
+    ).toBe(`${expectedSrc}&variant=thumbnail`);
     const tile = container.querySelector<HTMLButtonElement>(".chat-message-image-button");
     expect(tile).not.toBeNull();
     expect(tile?.getAttribute("aria-label")).toBe(`Open image ${filename}`);
@@ -105,42 +165,17 @@ describe("message image gallery loading", () => {
     const decoded = createDeferred();
     const decode = vi.fn(() => decoded.promise);
     const blobPrefix = `blob:progressive-${crypto.randomUUID()}`;
-    let blobIndex = 0;
-    const NativeUrl = URL;
-    vi.stubGlobal(
-      "URL",
-      class extends NativeUrl {
-        static override createObjectURL = () => `${blobPrefix}-${blobIndex++}`;
-        static override revokeObjectURL = vi.fn();
-      },
-    );
-    vi.stubGlobal(
-      "Image",
-      class {
-        src = "";
-        decode = decode;
-      },
-    );
-    const imageResponse = () => new Response("png", { headers: { "Content-Type": "image/png" } });
+    stubImageDecoding(blobPrefix, decode);
     const fetch = vi.fn((url: string) =>
       url === source ? full.promise : Promise.resolve(imageResponse()),
     );
     vi.stubGlobal("fetch", fetch);
-    const controller = new ImageLightboxGalleryController(vi.fn());
-    let opened: ImageLightboxItem | undefined;
-    const onOpenImage = vi.fn((item: ImageLightboxItem) => {
-      opened?.release?.();
-      opened = item;
-      controller.reset(item.gallery, item);
-    });
+    const { controller, onOpenImage, dispose } = createGallery();
     try {
-      render(
-        renderMessageImages([{ url: source, alt: "Detailed screenshot" }], {
-          onOpenImage,
-          onRequestUpdate,
-        }),
-        container,
-      );
+      renderImages([{ url: source, alt: "Detailed screenshot" }], {
+        onOpenImage,
+        onRequestUpdate,
+      });
       await vi.waitFor(() => expect(container.querySelector(".chat-message-image")).not.toBeNull());
       const tile = container.querySelector<HTMLButtonElement>(".chat-message-image-button")!;
       tile.click();
@@ -162,52 +197,25 @@ describe("message image gallery loading", () => {
     } finally {
       full.resolve(new Response(null, { status: 503 }));
       decoded.resolve();
-      controller.dispose();
-      opened?.release?.();
+      dispose();
     }
   });
 
   it("keeps the preview when reopening an original the browser cannot decode", async () => {
     const source = `/api/chat/media/outgoing/agent%3Amain%3Amain/${crypto.randomUUID()}/full`;
     const blobPrefix = `blob:unsupported-${crypto.randomUUID()}`;
-    let blobIndex = 0;
-    const NativeUrl = URL;
-    vi.stubGlobal(
-      "URL",
-      class extends NativeUrl {
-        static override createObjectURL = () => `${blobPrefix}-${blobIndex++}`;
-        static override revokeObjectURL = vi.fn();
-      },
-    );
     const decode = vi.fn(async () => {
       throw new Error("Unsupported image format");
     });
-    vi.stubGlobal(
-      "Image",
-      class {
-        src = "";
-        decode = decode;
-      },
-    );
-    const fetch = vi.fn(
-      async (_url: string) => new Response("image", { headers: { "Content-Type": "image/png" } }),
-    );
+    stubImageDecoding(blobPrefix, decode);
+    const fetch = vi.fn(async (_url: string) => imageResponse());
     vi.stubGlobal("fetch", fetch);
-    const controller = new ImageLightboxGalleryController(vi.fn());
-    let opened: ImageLightboxItem | undefined;
-    const onOpenImage = (item: ImageLightboxItem) => {
-      opened?.release?.();
-      opened = item;
-      controller.reset(item.gallery, item);
-    };
+    const { controller, onOpenImage, dispose } = createGallery();
     try {
-      render(
-        renderMessageImages([{ url: source, alt: "Original in unsupported format" }], {
-          onOpenImage,
-          onRequestUpdate,
-        }),
-        container,
-      );
+      renderImages([{ url: source, alt: "Original in unsupported format" }], {
+        onOpenImage,
+        onRequestUpdate,
+      });
       await vi.waitFor(() => expect(container.querySelector(".chat-message-image")).not.toBeNull());
       const tile = container.querySelector<HTMLButtonElement>(".chat-message-image-button")!;
       tile.click();
@@ -221,8 +229,7 @@ describe("message image gallery loading", () => {
       expect(controller.current?.src).toBe(`${blobPrefix}-0`);
       expect(fetch.mock.calls.filter(([url]) => url === source)).toHaveLength(1);
     } finally {
-      controller.dispose();
-      opened?.release?.();
+      dispose();
     }
   });
 
@@ -232,23 +239,7 @@ describe("message image gallery loading", () => {
       vi.useFakeTimers();
       const source = `/api/chat/media/outgoing/agent%3Amain%3Amain/${crypto.randomUUID()}/full`;
       const blobPrefix = `blob:gallery-${crypto.randomUUID()}`;
-      let blobIndex = 0;
-      const NativeUrl = URL;
-      vi.stubGlobal(
-        "URL",
-        class extends NativeUrl {
-          static override createObjectURL = () => `${blobPrefix}-${blobIndex++}`;
-          static override revokeObjectURL = vi.fn();
-        },
-      );
-      vi.stubGlobal(
-        "Image",
-        class {
-          src = "";
-          async decode() {}
-        },
-      );
-      const imageResponse = () => new Response("png", { headers: { "Content-Type": "image/png" } });
+      stubImageDecoding(blobPrefix, async () => {});
       const fetchFull = vi.fn(async () => new Response(null, { status: 503 }));
       vi.stubGlobal(
         "fetch",
@@ -258,15 +249,12 @@ describe("message image gallery loading", () => {
       const onOpenImage = vi.fn((item: ImageLightboxItem) => controller.reset(item.gallery, item));
       try {
         const draw = () =>
-          render(
-            renderMessageImages(
-              [
-                { url: "data:image/png;base64,cG5n", alt: "First image" },
-                { url: source, alt: "Managed neighbor", fileName: "neighbor.png" },
-              ],
-              { onOpenImage, onRequestUpdate },
-            ),
-            container,
+          renderImages(
+            [
+              { url: "data:image/png;base64,cG5n", alt: "First image" },
+              { url: source, alt: "Managed neighbor", fileName: "neighbor.png" },
+            ],
+            { onOpenImage, onRequestUpdate },
           );
         draw();
         const firstTile = container.querySelector<HTMLButtonElement>(".chat-message-image-button")!;
@@ -324,15 +312,12 @@ describe("message image gallery loading", () => {
       vi.stubGlobal("fetch", fetchMetadata);
       const localSource = `/home/node/.openclaw/media/outbound/${crypto.randomUUID()}.png`;
       const onOpenImage = vi.fn<(item: ImageLightboxItem) => void>();
-      render(
-        renderMessageImages(
-          [
-            { url: "data:image/png;base64,cG5n", alt: "First image" },
-            { url: localSource, fileName: "Local neighbor.png" },
-          ],
-          { onOpenImage, onRequestUpdate, sessionKey: "main", resourceBasePath: "/openclaw" },
-        ),
-        container,
+      renderImages(
+        [
+          { url: "data:image/png;base64,cG5n", alt: "First image" },
+          { url: localSource, fileName: "Local neighbor.png" },
+        ],
+        { onOpenImage, onRequestUpdate, sessionKey: "main", resourceBasePath: "/openclaw" },
       );
       container.querySelector<HTMLButtonElement>(".chat-message-image-button")!.click();
       const opened = onOpenImage.mock.calls[0]?.[0];
@@ -354,7 +339,7 @@ describe("message image gallery loading", () => {
       expect(fetchMetadata).toHaveBeenCalledOnce();
 
       if (removeOwner) {
-        render(nothing, container);
+        imageView?.dispose();
         releaseChatMediaResourceSubscriber(onRequestUpdate);
       }
       metadata.resolve(

@@ -1,9 +1,5 @@
 import { createMessageReceiptFromOutboundResults } from "openclaw/plugin-sdk/channel-outbound";
 import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
-import {
-  FormatCapabilityProfile,
-  renderMarkdownWithMarkers,
-} from "openclaw/plugin-sdk/text-chunking";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { readNextcloudTalkErrorBody } from "./guarded-response.js";
 import { stripNextcloudTalkTargetPrefix } from "./normalize.js";
@@ -22,19 +18,6 @@ import type { CoreConfig, NextcloudTalkSendResult } from "./types.js";
 const NEXTCLOUD_TALK_ERROR_SNIPPET_MAX_CHARS = 200;
 const NEXTCLOUD_TALK_SEND_TIMEOUT_MS = 30_000;
 
-const NEXTCLOUD_TALK_FORMAT_PROFILE = FormatCapabilityProfile.define({
-  mechanism: "markdown",
-  chunk: { limit: 4000, unit: "chars", hardCap: 32_000 },
-});
-
-function renderNextcloudTalkMarkdown(markdown: string): string {
-  return renderMarkdownWithMarkers(
-    { text: markdown, styles: [], links: [] },
-    { styleMarkers: {}, escapeText: (text) => text },
-    NEXTCLOUD_TALK_FORMAT_PROFILE,
-  );
-}
-
 /** Collapses and caps an already-redacted error body for display. */
 function collapseErrorSnippet(text: string): string {
   const collapsed = text.replace(/\s+/g, " ").trim();
@@ -46,18 +29,16 @@ function collapseErrorSnippet(text: string): string {
 
 type NextcloudTalkSendOpts = {
   cfg: CoreConfig;
-  baseUrl?: string;
   secret?: string;
   accountId?: string;
   replyTo?: string;
-  verbose?: boolean;
   timeoutMs?: number;
 };
 
 function resolveNextcloudTalkSendContext(opts: NextcloudTalkSendOpts) {
   const cfg = requireRuntimeConfig(opts.cfg, "Nextcloud Talk send") as CoreConfig;
   const account = resolveNextcloudTalkAccount({ cfg, accountId: opts.accountId });
-  const baseUrl = opts.baseUrl?.trim() ?? account.baseUrl;
+  const baseUrl = account.baseUrl;
   const secret = opts.secret?.trim() ?? account.secret;
 
   if (!baseUrl) {
@@ -104,15 +85,8 @@ export async function sendMessageNextcloudTalk(
     channel: "nextcloud-talk",
     accountId: account.accountId,
   });
-  const message = convertMarkdownTables(renderNextcloudTalkMarkdown(text.trim()), tableMode);
-
-  const body: Record<string, unknown> = {
-    message,
-  };
-  if (opts.replyTo) {
-    body.replyTo = opts.replyTo;
-  }
-  const bodyStr = JSON.stringify(body);
+  const message = convertMarkdownTables(text.trim(), tableMode);
+  const body = JSON.stringify({ message, replyTo: opts.replyTo || undefined });
 
   // Nextcloud Talk verifies signature against the extracted message text,
   // not the full JSON body. See ChecksumVerificationService.php:
@@ -137,10 +111,12 @@ export async function sendMessageNextcloudTalk(
         "X-Nextcloud-Talk-Bot-Random": random,
         "X-Nextcloud-Talk-Bot-Signature": signature,
       },
-      body: bodyStr,
+      body,
     },
     auditContext: "nextcloud-talk-send",
-    policy: ssrfPolicyFromPrivateNetworkOptIn(account.config),
+    policy: ssrfPolicyFromPrivateNetworkOptIn(
+      account.config.network?.dangerouslyAllowPrivateNetwork,
+    ),
     timeoutMs: opts.timeoutMs ?? NEXTCLOUD_TALK_SEND_TIMEOUT_MS,
   });
 
@@ -154,7 +130,7 @@ export async function sendMessageNextcloudTalk(
         errorMsg = `Nextcloud Talk: bad request - ${errorBody || "invalid message format"}`;
       } else if (status === 401) {
         errorMsg =
-          "Nextcloud Talk: bot send was rejected - check the bot secret and ensure the bot was installed with --feature response";
+          "Nextcloud Talk: bot send was rejected - check the bot secret and check that the bot was installed with --feature response";
       } else if (status === 403) {
         errorMsg = "Nextcloud Talk: forbidden - bot may not have permission in this room";
       } else if (status === 404) {
@@ -186,10 +162,6 @@ export async function sendMessageNextcloudTalk(
     } catch {
       // Response parsing failed (including an over-limit body), but the message
       // was already accepted by the server, so keep the "unknown" receipt.
-    }
-
-    if (opts.verbose) {
-      console.log(`[nextcloud-talk] Sent message ${messageId} to room ${roomToken}`);
     }
 
     getOptionalNextcloudTalkRuntime()?.channel.activity.record({
@@ -254,7 +226,9 @@ export async function sendReactionNextcloudTalk(
       body,
     },
     auditContext: "nextcloud-talk-reaction",
-    policy: ssrfPolicyFromPrivateNetworkOptIn(account.config),
+    policy: ssrfPolicyFromPrivateNetworkOptIn(
+      account.config.network?.dangerouslyAllowPrivateNetwork,
+    ),
     timeoutMs: opts.timeoutMs ?? NEXTCLOUD_TALK_SEND_TIMEOUT_MS,
   });
 

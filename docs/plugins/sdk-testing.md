@@ -24,30 +24,30 @@ plugin tests. They are not published `package.json` exports for third-party
 plugins, and they may import Vitest or other repo-only test dependencies.
 
 ```typescript
+import { AUTH_PROFILE_RUNTIME_CONTRACT } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
+import { expectChannelInboundContextContract } from "openclaw/plugin-sdk/channel-contract-testing";
 import {
   shouldAckReaction,
   removeAckReactionAfterReply,
 } from "openclaw/plugin-sdk/channel-feedback";
 import { installCommonResolveTargetErrorCases } from "openclaw/plugin-sdk/channel-target-testing";
-import { AUTH_PROFILE_RUNTIME_CONTRACT } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
-import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
-import { expectChannelInboundContextContract } from "openclaw/plugin-sdk/channel-contract-testing";
 import { createStartAccountContext } from "openclaw/plugin-sdk/channel-test-helpers";
+import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { describePluginRegistrationContract } from "openclaw/plugin-sdk/plugin-test-contracts";
 import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { describeOpenAIProviderRuntimeContract } from "openclaw/plugin-sdk/provider-test-contracts";
 import { getProviderHttpMocks } from "openclaw/plugin-sdk/provider-http-test-mocks";
-import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
+import { describeOpenAIProviderRuntimeContract } from "openclaw/plugin-sdk/provider-test-contracts";
 import { withEnv, withFetchPreconnect, withServer } from "openclaw/plugin-sdk/test-env";
-import { isLiveTestEnabled } from "openclaw/plugin-sdk/test-live";
-import { createRequestCaptureJsonFetch } from "openclaw/plugin-sdk/test-media-understanding";
 import {
   bundledPluginRoot,
   createCliRuntimeCapture,
   runDirectImportSmoke,
   typedCases,
 } from "openclaw/plugin-sdk/test-fixtures";
+import { isLiveTestEnabled } from "openclaw/plugin-sdk/test-live";
+import { createRequestCaptureJsonFetch } from "openclaw/plugin-sdk/test-media-understanding";
 import { mockNodeBuiltinModule } from "openclaw/plugin-sdk/test-node-mocks";
+import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 ```
 
 Use these focused subpaths for bundled plugin tests. The former
@@ -64,6 +64,12 @@ runners and registries. These helpers reuse their core owners; register the
 session fixture lifecycle explicitly. Use published runtime subpaths when
 they already expose the needed operation.
 
+After closing retained plugin runtime handles, call `resetPluginRuntimeStateForTest()`
+and await `waitForPluginCacheRetirement(true)` from `plugin-test-runtime` to include
+borrowed cache generations. Assert that
+its `failures` array is empty before deleting fixture files or restoring the
+environment. A rejected or failed retirement must leave the fixture intact.
+
 Await `listChannelIngressQueueAccountIdsForTests` from
 `channel-ingress-test-runtime` or `plugin-state-test-runtime`. It uses the shared
 read-only worker and leaves missing state uncreated. Join asynchronous database
@@ -72,6 +78,12 @@ cleanup before removing a fixture's state directory.
 For direct worker fixtures, pair `resolveRuntimeWorkerUrl` from `process-runtime`
 with `resolveRuntimeWorkerThreadExecArgv` from `test-env`. This keeps source and
 built workers on the runtime owner's startup arguments.
+
+When a test or hook lazily loads a compiled-subprocess declaration, preload it
+at collection with `import "openclaw/plugin-sdk/compiled-subprocess-testing";`.
+This repo-local, non-production subpath has no exports and keeps worker
+preparation outside test deadlines without binding the subject before its mocks
+or module resets. Use it only in tests that already load a declaration.
 
 ### Available exports
 
@@ -89,7 +101,7 @@ built workers on the runtime owner's startup arguments.
 | `installChannelSetupContractSuite`                                        | Install generic channel setup contract cases. Import from `plugin-sdk/channel-test-helpers`                                                 |
 | `installChannelStatusContractSuite`                                       | Install generic channel status contract cases. Import from `plugin-sdk/channel-test-helpers`                                                |
 | `expectDirectoryIds`                                                      | Assert channel directory ids from a directory-list function. Import from `plugin-sdk/channel-test-helpers`                                  |
-| `formatEnvelopeTimestamp`                                                 | Format deterministic envelope timestamps. Import from `plugin-sdk/channel-test-helpers`                                                     |
+| `formatEnvelopeTimestamp`                                                 | Format envelope timestamps consistently. Import from `plugin-sdk/channel-test-helpers`                                                      |
 | `expectPairingReplyText`                                                  | Assert channel pairing reply text and extract its code. Import from `plugin-sdk/channel-test-helpers`                                       |
 | `describePluginRegistrationContract`                                      | Install plugin registration contract checks. Import from `plugin-sdk/plugin-test-contracts`                                                 |
 | `registerSingleProviderPlugin`                                            | Register one provider plugin in loader smoke tests. Import from `plugin-sdk/plugin-test-runtime`                                            |
@@ -184,8 +196,8 @@ Use `installCommonResolveTargetErrorCases` to add standard error cases for
 channel target resolution:
 
 ```typescript
-import { describe } from "vitest";
 import { installCommonResolveTargetErrorCases } from "openclaw/plugin-sdk/channel-target-testing";
+import { describe } from "vitest";
 
 describe("my-channel target resolution", () => {
   installCommonResolveTargetErrorCases({

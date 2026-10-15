@@ -53,7 +53,6 @@ export async function startTranscriptReloadFixtureSidecars(
       isNixMode: false,
       broadcastToConnIds: vi.fn(),
       getClientConnIds: () => new Set(),
-      controlUiBasePath: "/",
       gatewayPluginConfigAtStart: config,
       activationSourceConfig: config,
       pluginManifestRecords: [],
@@ -61,7 +60,9 @@ export async function startTranscriptReloadFixtureSidecars(
       defaultWorkspaceDir: workspaceDir,
       deps: {},
       startChannels: async () => {},
+      mainSessionRecoveryStartupCheckedStorePaths: new Set<string>(),
       recoveryRuntime: {
+        prepareRestartRecovery: unusedRecovery,
         dispatchSessionMethod: unusedRecovery,
         dispatchAgent: unusedRecovery,
         waitForAgent: unusedRecovery,
