@@ -24,7 +24,6 @@ import {
   getGatewayContextResolver,
   getPluginRuntimeGatewayRequestScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
-import { observeAgentRunStart } from "../agent-run-start.js";
 import { isExplicitFollowupCommandTurn } from "../command-turn-context.js";
 import { markReplyPayloadForSourceSuppressionDelivery } from "../reply-payload.js";
 import type { OriginatingChannelType } from "../templating.js";
@@ -152,13 +151,6 @@ export async function runReplyAgent(
   const runOpts = {
     ...opts,
     runId: opts?.runId ?? randomUUID(),
-    ...(explicitFollowup
-      ? observeAgentRunStart(opts, () => {
-          if (replyOperationRunState) {
-            replyOperationRunState.explicitFollowupStarted = true;
-          }
-        })
-      : {}),
     ...(onPartialReply
       ? {
           onPartialReply: async (
