@@ -26,6 +26,8 @@ const io = vi.hoisted(() => ({
   load: vi.fn(),
   report: vi.fn(),
   withdraw: vi.fn(),
+  restoreOperator:
+    vi.fn<typeof import("./operator-run-recovery.js").restoreGatewayQueuedOperatorRecovery>(),
 }));
 vi.mock(
   "../agents/main-session-recovery/main-session-restart-recovery-shared.js",
@@ -60,6 +62,10 @@ vi.mock("../config/sessions/session-pending-input-withdrawal.js", async (importO
   >()),
   discardSessionPendingInput: io.withdraw,
 }));
+vi.mock("./operator-run-recovery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./operator-run-recovery.js")>()),
+  restoreGatewayQueuedOperatorRecovery: io.restoreOperator,
+}));
 vi.mock("./session-utils-store-worker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./session-utils-store-worker.js")>()),
   resolveGatewaySessionStoreTargetInWorker: io.load,
@@ -93,7 +99,7 @@ const input: SessionPendingInput = {
       sourceTool: "sessions_send",
       sourceSessionKey: delivery.source.sessionKey,
     },
-    __openclaw: { sessionSendDelivery: delivery },
+    __openclaw: { sessionSendDelivery: { ...delivery, operatorSource: null } },
   },
 };
 const config: OpenClawConfig = {
@@ -302,7 +308,9 @@ it("retries transient admission with the saved input and delivery identity, in o
     message: {
       ...input.message,
       idempotencyKey: "next-delivery:user",
-      __openclaw: { sessionSendDelivery: { ...delivery, runId: "next-delivery" } },
+      __openclaw: {
+        sessionSendDelivery: { ...delivery, runId: "next-delivery", operatorSource: null },
+      },
     },
   };
   io.pending.mockResolvedValue({ items: [input, next], total: 2 });
@@ -435,6 +443,7 @@ const privateDiagnostic = `Inspection failed at ${privateDatabasePath}; ${quaran
 it.each([
   {
     name: "capacity",
+    stage: "endpoint",
     error: new WorkerTaskError(privateDiagnostic, "overloaded"),
     reason: "transient-admission",
     attempts: 3,
@@ -442,6 +451,7 @@ it.each([
   },
   {
     name: "pending inspection",
+    stage: "endpoint",
     error: new AgentDatabaseAdmissionError({
       agentId: "main",
       paths: [privateDatabasePath],
@@ -455,6 +465,7 @@ it.each([
   },
   {
     name: "failed inspection",
+    stage: "endpoint",
     error: new AgentDatabaseAdmissionError({
       agentId: "main",
       paths: [privateDatabasePath],
@@ -468,18 +479,72 @@ it.each([
   },
   {
     name: "unknown",
+    stage: "endpoint",
     error: new Error(privateDiagnostic),
     reason: "unknown",
     attempts: 1,
     description: "delivery failed",
   },
+  {
+    name: "requester preparation capacity",
+    stage: "requester",
+    error: new WorkerTaskError(privateDiagnostic, "overloaded"),
+    reason: "transient-admission",
+    attempts: 3,
+    description: "the Gateway was still unavailable after 3 automatic attempts",
+  },
+  {
+    name: "requester authority refusal",
+    stage: "requester",
+    error: new Error(privateDiagnostic),
+    reason: "requester-unavailable",
+    attempts: 1,
+    description: "original requester authority is unavailable; submit a new request",
+  },
 ])(
   "keeps path-bearing $name diagnostics out of saved recovery notices",
-  async ({ error, reason, attempts, description }) => {
-    io.load.mockRejectedValue(error);
+  async ({ stage, error, reason, attempts, description }) => {
+    if (stage === "requester") {
+      const acceptedInput: SessionPendingInput = {
+        ...input,
+        message: {
+          ...input.message,
+          __openclaw: {
+            sessionSendDelivery: {
+              ...delivery,
+              operatorSource: {
+                kind: "channel",
+                snapshot: {
+                  reference: { version: 1, id: "d0ba40e9-13e6-4e6b-918f-62e8bc12ffbd" },
+                  profileId: "original-requester",
+                  scopes: ["operator.write"],
+                },
+              },
+            },
+          },
+        },
+      };
+      io.pending.mockResolvedValue({ items: [acceptedInput], total: 1 });
+      io.source.mockResolvedValue({
+        snapshot: {
+          current: true,
+          pending: {
+            input_id: input.id,
+            state: "interrupted",
+            consumed_event_id: null,
+            message_json: JSON.stringify(acceptedInput.message),
+          },
+        },
+        assertCurrent() {},
+      });
+      io.restoreOperator.mockRejectedValue(error);
+    } else {
+      io.load.mockRejectedValue(error);
+    }
     const recovery = recoverSessionSendDeliveries(context, controller().signal);
     await Promise.all([recovery, vi.runAllTimersAsync()]);
     expect(dispatch).not.toHaveBeenCalled();
+    expect(io.restoreOperator).toHaveBeenCalledTimes(stage === "requester" ? attempts : 0);
     const report = io.report.mock.calls[0]![1].selectReport(undefined);
     expect(report.details.inputs[0]).toEqual({
       inputId: input.id,
@@ -495,8 +560,10 @@ it.each([
     expect(JSON.stringify(report)).not.toContain(privateDatabasePath);
     expect(JSON.stringify(report)).not.toContain(quarantineCommand);
     const logs = warn.mock.calls.map(([line]) => line).join("\n");
-    expect(logs).toContain(privateDatabasePath);
-    expect(logs).toContain(quarantineCommand);
+    if (reason !== "requester-unavailable") {
+      expect(logs).toContain(privateDatabasePath);
+      expect(logs).toContain(quarantineCommand);
+    }
   },
 );
 
