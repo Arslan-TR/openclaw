@@ -24,6 +24,7 @@ import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { runOutsideStoreWriterContext } from "../shared/store-writer-queue.js";
 import { invalidateGatewayDeviceRevocation } from "./device-revocation.js";
 import type { StartChatDispatchParams } from "./server-methods/chat-send-agent-dispatch.types.js";
+import * as chatSendDiagnostics from "./server-methods/chat-send-diagnostics.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
 import { createGitWorkspace } from "./server.sessions.create.projects.test-support.js";
 import {
@@ -740,7 +741,31 @@ test.for([
   { id: "cli", mode: "cli", worktree: false },
 ] as const)(
   "recovers an acknowledged $id first turn (worktree=$worktree) before dispatch",
-  async ({ id, mode, worktree }) => {
+  async ({ id, mode, worktree }, { onTestFailed }) => {
+    const phases: Array<{ name: string; elapsedMs: number }> = [];
+    const startedAt = performance.now();
+    const mark = (name: string) => phases.push({ name, elapsedMs: performance.now() - startedAt });
+    const diagnostics: chatSendDiagnostics.ChatSendDiagnostics[] = [];
+    const sendTimings: string[] = [];
+    const startDiagnostics = chatSendDiagnostics.startChatSendDiagnostics;
+    vi.spyOn(chatSendDiagnostics, "startChatSendDiagnostics").mockImplementation((log) => {
+      const owner = startDiagnostics({
+        info(message) {
+          sendTimings.push(message);
+          log.info(message);
+        },
+      });
+      diagnostics.push(owner);
+      return owner;
+    });
+    onTestFailed(() => {
+      // Flush the existing phase owner even when the RPC never reaches its ACK.
+      for (const owner of diagnostics) {
+        owner.finish();
+      }
+      console.error("[first-turn-recovery]", JSON.stringify({ phases, sendTimings }));
+    });
+    mark("fixture");
     testState.agentConfig = { workspace };
     testState.gatewayControlUi = { allowedOrigins: ["http://localhost"] };
     const { storePath } = await createSessionStoreDir();
@@ -767,6 +792,7 @@ test.for([
     });
     let captured: StartChatDispatchParams | undefined;
     try {
+      mark("sessions.create");
       const created = await rpcReq<{
         key: string;
         sessionId: string;
@@ -780,6 +806,7 @@ test.for([
         worktreeName: worktree ? `durability-${id}` : undefined,
         message,
       });
+      mark("sessions.create acknowledged");
       expect(created.ok, JSON.stringify(created)).toBe(true);
       expect(created.payload?.runStarted).toBe(true);
       captured = expectDefined(dispatch.start.mock.calls[0]?.[0], "accepted dispatch");
@@ -797,6 +824,7 @@ test.for([
           events: [],
         };
         chatDiagnostics.current = recorder;
+        mark("followup chat.send");
         const sent = await rpcReq(ws, "chat.send", {
           sessionKey: key,
           message: followup,
@@ -817,7 +845,9 @@ test.for([
           .finally(() => {
             chatDiagnostics.current = undefined;
           });
+        mark("followup acknowledged");
         expect(sent.ok, JSON.stringify(sent)).toBe(true);
+        mark("pending chat.history");
         const pending = await rpcReq<{ pendingInputs: { items: unknown[] } }>(ws, "chat.history", {
           sessionKey: key,
         });
@@ -830,9 +860,12 @@ test.for([
         turn.admission.cleanupAdmittedRun();
         clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
       }
+      mark("release admission");
       await released;
       const cfg = getRuntimeConfig();
+      mark("mark recovery");
       await markStartupOrphanedMainSessionsForRecovery({ cfg });
+      mark("recover");
       const recovery = await recoverRestartAbortedMainSessions({
         cfg,
         gatewayRuntime: expectDefined(captured.context.recoveryRuntime, "Gateway recovery owner"),
@@ -851,8 +884,10 @@ test.for([
       const after = expectDefined(loadSessionEntry(target), "recovered session");
       expect(after.pendingWorktree).toBeUndefined();
       expect(after.sessionId).toBe(created.payload?.sessionId);
+      mark("read recovered transcript");
       const transcript = await loadTranscriptEvents({ ...target, sessionId: after.sessionId });
       expect(transcript.filter((event) => JSON.stringify(event).includes(message))).toHaveLength(1);
+      mark("recovered chat.history");
       const history = await rpcReq<{
         messages: unknown[];
         pendingInputs: { items: Array<{ state: string; message: unknown }> };
@@ -868,6 +903,7 @@ test.for([
       }
     } finally {
       chatDiagnostics.current = undefined;
+      mark("cleanup");
       for (const [turn] of dispatch.start.mock.calls) {
         turn.replyAdmissionTicket?.release();
         turn.admission.cleanupAdmittedRun();
@@ -883,6 +919,7 @@ test.for([
         });
       }
       testState.agentConfig = undefined;
+      mark("cleanup settled");
     }
   },
 );
