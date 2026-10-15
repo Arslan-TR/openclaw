@@ -227,6 +227,9 @@ export async function runActiveReplySteer(
     );
     releaseToolAuthority = steeringAuthority.toolAuthority.release;
     assertReadCurrent();
+    if (activeReplyOperation.result || activeReplyOperation.abortSignal.aborted) {
+      return await fallback("reply-owner-ended", injectionTarget.runId);
+    }
     if (steeringAuthority.shouldQueueAuthorityMismatch) {
       return await fallback(
         steeringAuthority.requesterMismatch ? "requester-mismatch" : "tool_authority_mismatch",
