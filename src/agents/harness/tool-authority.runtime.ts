@@ -279,6 +279,9 @@ export async function withPreparedEmbeddedRunToolAuthority<T, Attempt extends To
             personalToolParticipants,
             source: operation ? "reply" : "attempt",
             sourceTurnId: readChannelSourceTurnId(internal) ?? runId,
+            get requesterPrincipalKey() {
+              return operation?.requesterPrincipalKey ?? direct?.requesterPrincipalKey;
+            },
             assertActive: assertRegistered,
             acceptsRequesterOrigin: (incoming) => {
               assertRegistered();

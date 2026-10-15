@@ -12,6 +12,7 @@ import type {
 import { isReplyPayloadStatusNotice } from "../../auto-reply/reply-payload.js";
 import type { DispatchFromConfigResult } from "../../auto-reply/reply/dispatch-from-config.types.js";
 import { REPLY_ADMISSION_TICKET } from "../../auto-reply/reply/reply-admission-ticket.js";
+import { REPLY_OPERATION_RUN_STATE } from "../../auto-reply/reply/reply-operation-run-state.js";
 import { isInternalSourceReplyChannel } from "../../auto-reply/reply/source-reply-delivery-mode.js";
 import {
   measureDiagnosticsTimelineSpan,
@@ -36,17 +37,14 @@ import {
   resolveChatSendReturnedOutcome,
 } from "./chat-send-dispatch-errors.js";
 import {
+  createChatSendInjectionDisposition,
   finalizeAcceptedChatSendMessageInjection,
   settleChatSendMessageInjection,
 } from "./chat-send-message-injection.js";
 import { applyChatSendReplyContextFields } from "./chat-send-reply-context.js";
 import { createChatSendReplyDispatch } from "./chat-send-reply-dispatch.js";
 import { finalizeChatSendDispatchedReplies } from "./chat-send-reply-finalization.js";
-import {
-  classifyAcceptedChatSendFailure,
-  runAcceptedChatSendDispatch,
-  waitForAcceptedChatSendRetry,
-} from "./chat-send-retry.js";
+import { runAcceptedChatSendDispatch, waitForAcceptedChatSendRetry } from "./chat-send-retry.js";
 import { finalizeChatSendSourceReplies } from "./chat-send-source-finalization.js";
 import { registerChatSendToolEventRecipients } from "./chat-send-tool-event-recipients.js";
 import { createChatSendTurnAdoptionLifecycle } from "./chat-send-turn-adoption.js";
@@ -181,20 +179,22 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     armOperatorRunCancellation: admission.armOperatorRunCancellation,
     retireOperatorRunCancellation: admission.retireOperatorRunCancellation,
   });
+  const injectionDisposition = createChatSendInjectionDisposition(
+    injection.messageInjectionDisposition,
+    {
+      operatorAuthority: admission.operatorAuthority,
+      turnAdoptionLifecycle: queuedFollowup.lifecycle,
+      userTurnTranscriptRecorder: userTurnRecorder,
+    },
+  );
   let acceptedMessageInjection = false;
-  const classifyDispatchFailure = (error: unknown) =>
-    classifyAcceptedChatSendFailure({
-      error,
-      phase: "post-ack",
-      executionStarted: agentRunStarted,
-      sideEffectsObserved:
-        acceptedMessageInjection ||
-        messageInjectionAttempt !== undefined ||
-        replyDispatch.deliveredReplies.length > 0,
-    });
   const dispatchErrorLifecycle = createChatSendDispatchErrorLifecycle({
     admission,
-    classifyFailure: classifyDispatchFailure,
+    hasObservedSideEffects: () =>
+      acceptedMessageInjection ||
+      messageInjectionAttempt !== undefined ||
+      replyDispatch.deliveredReplies.length > 0,
+    injectionDisposition,
     context,
     isAgentRunStarted: () => agentRunStarted,
     isQueuedFollowupEnqueued: () => queuedFollowup.isEnqueued() || queuedFollowup.isTerminal(),
@@ -265,7 +265,11 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
           }
           const assertWorkspaceRunOwnership = workspacePreparation?.assertCurrent;
           phase?.mark("replyContext");
-          if (replyContextFieldsPromise && !preAckReplyContextPromise) {
+          if (
+            replyContextFieldsPromise &&
+            !preAckReplyContextPromise &&
+            !injectionDisposition.isRefused()
+          ) {
             const replyContextFields = await replyContextFieldsPromise;
             assertWorkspaceRunOwnership?.();
             applyChatSendReplyContextFields(ctx, replyContextFields);
@@ -274,6 +278,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
               beginCapturedMessageInjection,
             );
           }
+          messageInjectionAttempt = await injectionDisposition.observe(messageInjectionAttempt);
           if (messageInjectionAttempt) {
             const injected = await finalizeAcceptedChatSendMessageInjection({
               attempt: messageInjectionAttempt,
@@ -350,6 +355,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
                 changes.forEach((change) => emitSessionsChanged(context, change)),
               replyOptions: {
                 [REPLY_ADMISSION_TICKET]: replyAdmissionTicket,
+                [REPLY_OPERATION_RUN_STATE]: injectionDisposition.runState,
                 prepareAssistantTranscriptMessage: replyDispatch.prepareAssistantTranscriptMessage,
                 ...(isInternalSourceReplyChannel(ctx)
                   ? {
@@ -411,9 +417,11 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
                 fastModeOverride: p.fastMode,
                 queueModeOverride: p.queueMode,
                 userTurnTranscriptRecorder: userTurnRecorder,
-                ...(p.queueMode === "steer" && messageInjectionTarget
-                  ? { messageInjectionDisposition: "rejected" as const }
-                  : {}),
+                ...(injectionDisposition.isRefused()
+                  ? { messageInjectionDisposition: "collaborative-steering-disabled" as const }
+                  : p.queueMode === "steer" && messageInjectionTarget
+                    ? { messageInjectionDisposition: "rejected" as const }
+                    : {}),
                 ...(restartSafeAdmission ? { suppressNextUserMessagePersistence: true } : {}),
                 fastModeAutoOnSecondsOverride: p.fastAutoOnSeconds,
                 onAgentRunStart,
@@ -465,7 +473,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
                     withDiagnosticsTimelineObserver(diagnostics.observeSpan, () =>
                       withCurrentUserTurnInput(userTurnRecorder, dispatchInbound),
                     ),
-                  classify: classifyDispatchFailure,
+                  classify: dispatchErrorLifecycle.classifyFailure,
                   waitForRetry: (error) =>
                     waitForAcceptedChatSendRetry(
                       { agentId, sessionKey, storePath },
@@ -508,6 +516,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
     )
     .then(async (dispatchResult) => {
       diagnostics.finish(queuedFollowup);
+      await dispatchErrorLifecycle.settleRefusal(dispatchResult.collaborativeSteeringRefused);
       if (dispatchResult.deferredToActiveRun === "followup" && queuedFollowup.isEnqueued()) {
         const notices = replyDispatch.deliveredReplies
           .map(({ input }) => readChatSendReplyPayload(input))
@@ -546,6 +555,7 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
             deliveredReplies: replyDispatch.deliveredReplies,
             agentRunStarted,
             isInternalTextSlashCommandTurn,
+            collaborativeSteeringRefused: dispatchResult.collaborativeSteeringRefused,
           });
           if (
             !userTurnRecorder.hasPersisted() &&
@@ -598,9 +608,10 @@ export function startChatDispatch(params: StartChatDispatchParams): void {
             });
           }
           const hasTerminalAgentError =
-            hasReturnedAgentError && (runtimeFailed || !finalizedSourceReply);
+            dispatchResult.collaborativeSteeringRefused ||
+            (hasReturnedAgentError && (runtimeFailed || !finalizedSourceReply));
           if (!context.chatRunState.hasAbortMarker(clientRunId)) {
-            if (hasTerminalAgentError) {
+            if (hasTerminalAgentError && !dispatchResult.collaborativeSteeringRefused) {
               dispatchErrorLifecycle.broadcastError({
                 errorMessage: returnedAgentErrorMessage,
                 errorKind: runtimeClassification === "timeout" ? "timeout" : undefined,

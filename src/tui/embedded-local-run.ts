@@ -15,6 +15,7 @@ export type LocalRunState = {
   lastBroadcastText?: string;
   textUpdates?: ReturnType<typeof createDraftStreamLoop<boolean>>;
   question?: string;
+  explicitFollowup?: true;
   finishing: boolean;
   lifecycleEnded: boolean;
   lifecycleStopReason?: string;

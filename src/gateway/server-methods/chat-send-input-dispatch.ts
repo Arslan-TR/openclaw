@@ -662,6 +662,7 @@ export async function handleChatSendWithStorage(
       injection: {
         beginCapturedMessageInjection,
         messageInjectionAttempt,
+        messageInjectionDisposition: preAckInjection.disposition,
         preAckReplyContextPromise,
         replyContextFieldsPromise,
       },
