@@ -7,7 +7,6 @@ import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error
 import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { createFixtureLifetime } from "../../../test/helpers/fixture-lifetime.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { createConfigIO } from "../../config/io.js";
 import { asResolvedSourceConfig, asRuntimeConfig } from "../../config/materialize.js";
 import { appendTranscriptEventsInTransaction } from "../../config/sessions/session-accessor.sqlite-transcript-store.js";
 import { readDaemonRuntimePin } from "../../daemon/runtime-pin-state.js";
@@ -16,7 +15,6 @@ import {
   createPackageIntegrityReader,
   type PackageLauncherFingerprint,
 } from "../../infra/package-update-integrity.js";
-import { createRetainedPackageSwap } from "../../infra/package-update-swap.test-support.js";
 import { hasNodeErrorCode } from "../../infra/path-guards.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
 import {
@@ -28,7 +26,6 @@ import { readUpdateStateSchemaVersions } from "../../infra/update-candidate-stat
 import {
   adoptUpdateRun,
   createUpdateRun,
-  finishUpdateRun,
   recordUpdateRunStep,
 } from "../../infra/update-run-ledger.js";
 import {
@@ -58,13 +55,15 @@ import {
   MIGRATED_FIXTURE_NO_SERVICE,
   migratedFinalizeFixtureEntrypoint,
 } from "./update-command-migrated-fixture-entrypoint.test-support.js";
-import type { MigratedUpdateFinalizationInput } from "./update-command-migrated-types.js";
+import {
+  expectMigratedPackageFinalization,
+  type MigratedPackageFinalizationCase,
+} from "./update-command-migrated-package.test-support.js";
 import {
   continueMigratedUpdateInFreshProcess,
   inspectActivatedUpdateState,
 } from "./update-command-migrated.js";
 import { readMigratedUpdateRunRow } from "./update-command-migrated.test-support.js";
-import { taskRecovery } from "./update-command-post-update.test-support.js";
 import {
   UpdateCommandFailure,
   UpdateCommandPendingRecoveryFailure,
@@ -264,16 +263,7 @@ it.each([
   },
 );
 
-it.each<{
-  pending: boolean;
-  status: "ok" | "error" | "skipped";
-  candidateStartAttempted?: boolean;
-  backup?: boolean;
-  windows?: boolean;
-  handback?: boolean;
-  completion?: "success" | "failure";
-  recovered?: boolean;
-}>([
+it.each<MigratedPackageFinalizationCase>([
   { pending: true, status: "skipped", windows: true },
   { pending: false, status: "error", windows: true },
   { pending: true, status: "error", windows: true },
@@ -294,267 +284,8 @@ it.each<{
   },
 ])(
   "retains the backup across migrated finalization (pending=$pending, status=$status, start=$candidateStartAttempted, backup=$backup, windows=$windows, completion=$completion, recovered=$recovered)",
-  async ({
-    pending,
-    status,
-    candidateStartAttempted,
-    backup,
-    windows = false,
-    handback = false,
-    completion,
-    recovered = false,
-  }) => {
-    const exitCode = status === "error" ? 1 : 0;
-    const reason =
-      status === "ok"
-        ? "updated"
-        : status === "skipped"
-          ? "gateway-readiness-unverified"
-          : "doctor-failed";
-    const base = dirs.make("migrated-readiness-pending-");
-    const { transaction, packageRoot } = await createRetainedPackageSwap(base);
-    const env = { OPENCLAW_STATE_DIR: path.join(base, "state") };
-    const run = {
-      runId: createUpdateRun({ trigger: "cli" }, { env }).runId,
-      env,
-      activationTimeoutMs: 90_000,
-    };
-    const configSnapshot = await createConfigIO({ env, observe: false }).readConfigFileSnapshot();
-    const windowsRecovery = taskRecovery();
-    const settlePackage = transaction.complete.bind(transaction);
-    const complete = vi.spyOn(transaction, "complete");
-    const rollback = vi.spyOn(transaction, "rollback");
-    vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
-    const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-    const onResult = vi.fn();
-    if (recovered) {
-      windowsRecovery.complete.mockImplementationOnce(async () => {
-        expect(stdout).not.toHaveBeenCalled();
-        expect(onResult).not.toHaveBeenCalled();
-      });
-    }
-    let stdoutAtCompletion: number | undefined;
-    let observedAtCompletion: number | undefined;
-    let candidateRow: unknown;
-    const oldRuntimeOpens: string[] = [];
-    const databasePath = path.join(env.OPENCLAW_STATE_DIR, "state", "openclaw.sqlite");
-    const readCandidateRow = () => readMigratedUpdateRunRow(databasePath, run.runId);
-    if (completion) {
-      // Keep the successful package owner's real completion; inject only the
-      // ordinary error that the canonical completion policy must classify.
-      complete.mockImplementation(async (...args) => {
-        stdoutAtCompletion = stdout.mock.calls.length;
-        observedAtCompletion = onResult.mock.calls.length;
-        if (completion === "failure") {
-          throw new Error("fixture package completion unavailable");
-        }
-        return await settlePackage(...args);
-      });
-    }
-    // Keep the real parent and package owner; model only the completed candidate's JSON reply.
-    vi.spyOn(childCommands, "runUtf8CommandWithTimeout").mockImplementation(
-      async (_argv, options) => {
-        if (typeof options === "number" || typeof options.input !== "string") {
-          throw new Error("Expected serialized finalization input");
-        }
-        const input: MigratedUpdateFinalizationInput = JSON.parse(options.input);
-        expect(input.params).not.toHaveProperty("databaseBackup");
-        const result = {
-          ...input.params.result,
-          status,
-          reason,
-          runId: run.runId,
-          ...(recovered
-            ? { recovery: { serviceRestartSafe: true, version: "2.0.0", service: "healthy" } }
-            : {}),
-          steps: pending
-            ? [
-                {
-                  name: "gateway verification",
-                  command: "gateway verification",
-                  cwd: packageRoot,
-                  durationMs: 90_000,
-                  exitCode: 0,
-                  termination: "timeout",
-                  advisory: {
-                    kind: "recoverable-maintenance",
-                    message:
-                      "Gateway is still starting after 90000ms; left running with readiness unverified.",
-                  },
-                },
-              ]
-            : [],
-        };
-        finishUpdateRun(
-          run.runId,
-          {
-            status: status === "ok" ? "succeeded" : status === "skipped" ? "skipped" : "failed",
-            reason,
-          },
-          { env },
-        );
-        if (completion) {
-          candidateRow = readCandidateRow();
-          await closeStateDatabaseForTest();
-          const migrated = new DatabaseSync(databasePath);
-          migrated.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION + 1}`);
-          migrated.close();
-          const open = nodeSqlite.openNodeSqliteDatabase;
-          vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementation((...args) => {
-            const openedPath = args[0];
-            if (
-              (openedPath.startsWith("file:") ? fileURLToPath(openedPath) : openedPath) ===
-              databasePath
-            ) {
-              oldRuntimeOpens.push(args[0]);
-            }
-            return open(...args);
-          });
-        }
-        await fs.writeFile(
-          input.resultPath,
-          JSON.stringify({ result, exitCode, terminalRunId: run.runId, candidateStartAttempted }),
-        );
-        return {
-          stdout: "candidate finalization result\n",
-          stderr: "",
-          code: 0,
-          signal: null,
-          killed: false,
-          termination: "exit",
-          cleanup: "normal",
-        };
-      },
-    );
-
-    const continueUpdate = () =>
-      continueMigratedUpdateInFreshProcess(
-        {
-          mutationStarted: true,
-          result: { status: "ok", mode: "npm", root: packageRoot, steps: [], durationMs: 1 },
-          root: packageRoot,
-          installKindChanged: false,
-          configSnapshot,
-          requestedChannel: null,
-          storedChannel: "stable",
-          channel: "stable",
-          downgradeRisk: false,
-          shouldRestart: true,
-          opts: { json: true, run },
-          preManagedServiceStop: {
-            stopped: true,
-            inspected: true,
-            runtimeInspected: true,
-            running: true,
-            serviceEnv: env,
-            ...(windows ? { windowsTaskAutoStartRecovery: windowsRecovery } : {}),
-          },
-          packageTransaction: transaction,
-          ...(backup
-            ? {
-                databaseBackup: {
-                  directory: path.join(transaction.backupRoot, "databases"),
-                  databases: [],
-                  missingPaths: [],
-                  sourcePaths: [],
-                  sourceGenerations: {},
-                  warnings: [],
-                },
-              }
-            : {}),
-          controlPlaneUpdateSentinelMeta: null,
-          preUpdatePluginInstallRecords: {},
-          startedAt: Date.now(),
-          packageUpdateNodeRunner: process.execPath,
-          updateStepTimeoutMs: 90_000,
-        },
-        [],
-      );
-    let continuedResult: Awaited<ReturnType<typeof continueUpdate>> | undefined;
-    const operation = withUpdateCommandTerminalResult(
-      async (registerRun) => {
-        registerRun(run);
-        continuedResult = await continueUpdate();
-        if (continuedResult.preparedFailure) {
-          throw continuedResult.preparedFailure;
-        }
-        return continuedResult;
-      },
-      { json: true, onResult },
-    );
-    const settled = await operation.catch((error: unknown) => error);
-    if (completion) {
-      expect.soft(stdoutAtCompletion).toBe(0);
-      expect.soft(observedAtCompletion).toBe(0);
-      expect.soft(readCandidateRow()).toEqual(candidateRow);
-      expect.soft(candidateRow).toMatchObject({ status: "succeeded", reason: "updated" });
-      expect.soft(oldRuntimeOpens).toEqual([]);
-      expect(rollback).not.toHaveBeenCalled();
-      if (completion === "failure") {
-        expect.soft(settled).toBeInstanceOf(UpdateCommandPendingRecoveryFailure);
-        expect.soft(settled).toMatchObject({
-          cause: expect.objectContaining({
-            result: expect.objectContaining({ reason: "package-backup-retention-failed" }),
-          }),
-        });
-        expect.soft(stdout).not.toHaveBeenCalled();
-        expect(onResult).not.toHaveBeenCalled();
-        await expect(fs.access(transaction.backupRoot)).resolves.toBeUndefined();
-      } else {
-        expect(settled).toMatchObject({ exitCode: 0, result: { status: "ok" } });
-        expect(stdout).toHaveBeenCalledExactlyOnceWith("candidate finalization result\n");
-        expect(onResult).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status: "ok" }));
-      }
-      return;
-    }
-    if (exitCode !== 0 && !handback) {
-      expect(settled).toBeInstanceOf(UpdateCommandFailure);
-      expect(settled).not.toBeInstanceOf(UpdateCommandPendingRecoveryFailure);
-    } else {
-      expect(settled).toBe(continuedResult);
-    }
-    const outcome = continuedResult!;
-    expect(outcome).toMatchObject({
-      exitCode,
-      result: { status },
-    });
-    expect(outcome.result.reason).toBe(reason);
-    expect(outcome.candidateStartAttempted).toBe(candidateStartAttempted);
-    expect(outcome.databaseRollbackAvailable).toBe(handback ? true : undefined);
-    if (handback) {
-      expect(stdout).not.toHaveBeenCalled();
-      expect(onResult).not.toHaveBeenCalled();
-    } else {
-      expect(stdout).toHaveBeenCalledExactlyOnceWith("candidate finalization result\n");
-      expect(onResult).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status }));
-    }
-    if (pending || handback) {
-      expect(complete).not.toHaveBeenCalled();
-    } else {
-      expect(complete).toHaveBeenCalledExactlyOnceWith(
-        { activationVerified: false },
-        expect.any(Function),
-      );
-    }
-    expect(rollback).not.toHaveBeenCalled();
-    if (windows) {
-      expect(windowsRecovery.complete).toHaveBeenCalledWith(pending || recovered);
-      expect(windowsRecovery.complete).not.toHaveBeenCalledWith(!(pending || recovered));
-    } else {
-      expect(windowsRecovery.complete).not.toHaveBeenCalled();
-    }
-    await expect(
-      fs.readFile(path.join(transaction.backupRoot, "package.json"), "utf8"),
-    ).resolves.toContain('"version":"1.0.0"');
-    await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
-      '"version":"2.0.0"',
-    );
-    if (handback) {
-      await expect(transaction.rollback(() => {})).resolves.toMatchObject({ exitCode: 0 });
-      await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
-        '"version":"1.0.0"',
-      );
-    }
+  async (scenario) => {
+    await expectMigratedPackageFinalization(dirs.make("migrated-readiness-pending-"), scenario);
   },
 );
 
