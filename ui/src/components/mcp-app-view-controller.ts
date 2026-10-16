@@ -525,10 +525,10 @@ export class McpAppViewController {
           publish(null);
           return undefined;
         }
-        return request<{ state: McpAppContextState }>("mcp.app.modelContext", {})
-          .then((response) => response.state)
-          .catch(() => null)
-          .then(publish);
+        return request<{ state: McpAppContextState }>("mcp.app.modelContext", {}).then(
+          (response) => publish(response.state),
+          () => undefined,
+        );
       };
       const handleRequestTeardown = () => {
         void this.teardown();

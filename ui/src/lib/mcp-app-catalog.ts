@@ -68,6 +68,7 @@ export function createMcpAppCatalog(
     const changed = identity !== value || identityClient !== client;
     identity = value;
     identityClient = client;
+    preparedSessionIdentity = "";
     generation++;
     setState((draft) => {
       if (changed || (phase === "connected" && !canDiscover)) {

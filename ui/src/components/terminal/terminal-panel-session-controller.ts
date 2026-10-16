@@ -661,7 +661,8 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
 
   closeTab(tabId: string): void {
     const tab = this.tabs.find((entry) => entry.id === tabId);
-    if (!tab) {
+    // A live PTY stays recoverable until its close can reach the Gateway.
+    if (!tab || (!this.host.gatewayConnected && tab.status !== "exited")) {
       return;
     }
     tab.cancelled = "close";

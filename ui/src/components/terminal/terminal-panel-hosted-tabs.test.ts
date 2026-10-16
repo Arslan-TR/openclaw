@@ -129,19 +129,22 @@ describe("Terminal panel hosted tabs", () => {
       cwd: "/work/ops",
       status: "live",
     };
-    const tabs = terminalPanelHostedTabs([
-      base,
-      {
-        ...base,
-        id: "connecting",
-        sequence: 2,
-        shellName: null,
-        status: "connecting",
-        agentId: null,
-      },
-      { ...base, id: "exited", status: "exited", exitReason: "process_exit", exitCode: 3 },
-      { ...base, id: "agent", agentOwned: true },
-    ]);
+    const tabs = terminalPanelHostedTabs(
+      [
+        base,
+        {
+          ...base,
+          id: "connecting",
+          sequence: 2,
+          shellName: null,
+          status: "connecting",
+          agentId: null,
+        },
+        { ...base, id: "exited", status: "exited", exitReason: "process_exit", exitCode: 3 },
+        { ...base, id: "agent", agentOwned: true },
+      ],
+      true,
+    );
     expect(
       tabs.map(({ id, label, title, statusLabel, badge, className }) => [
         id,

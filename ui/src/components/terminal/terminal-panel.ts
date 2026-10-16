@@ -227,12 +227,13 @@ export class TerminalPanelController extends SolidPanelController {
     notifyPanelHostedTabsChanged(this.element, [
       this.embedded && this.tabsInHeader,
       this.terminalSessions.activeId,
-      this.hostedTabs.map(({ id, label, statusLabel, badge, className }) => [
+      this.hostedTabs.map(({ id, label, statusLabel, badge, className, closeDisabled }) => [
         id,
         label,
         statusLabel,
         badge,
         className,
+        closeDisabled,
       ]),
       this.terminalSessions.booting,
       this.terminalSessions.canHandoffSessions,
@@ -246,7 +247,7 @@ export class TerminalPanelController extends SolidPanelController {
   }
 
   get hostedTabs() {
-    return terminalPanelHostedTabs(this.terminalSessions.tabs).map((tab) =>
+    return terminalPanelHostedTabs(this.terminalSessions.tabs, this.gatewayConnected).map((tab) =>
       Object.assign(tab, { icon: hostedTabIcon.cloneNode(true) }),
     );
   }

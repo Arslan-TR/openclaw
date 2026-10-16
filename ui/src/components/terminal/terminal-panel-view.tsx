@@ -416,7 +416,7 @@ export function TerminalPanelView(props: { view: () => TerminalPanelViewState })
   const viewportId = `${idPrefix}-panel`;
   const dialogId = `${idPrefix}-session-picker-dialog`;
   const tabs = createMemo(() =>
-    terminalPanelHostedTabs(props.view().tabs).map((tab) =>
+    terminalPanelHostedTabs(props.view().tabs, props.view().connected).map((tab) =>
       Object.assign(tab, {
         icon: terminalPanelTabIcon(),
         domId: `${idPrefix}-tab-${tab.id}`,

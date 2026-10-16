@@ -90,7 +90,7 @@ describe("terminal panel pending cancellation", () => {
                 : Promise.resolve(response("unexpected-replay"))
             ) as Promise<T>;
           }
-          return Promise.resolve({}) as Promise<T>;
+          return Promise.resolve({ ok: true }) as Promise<T>;
         },
         addEventListener: () => () => {},
       };
@@ -202,7 +202,7 @@ describe("terminal panel pending cancellation", () => {
               seq: 5,
             }) as Promise<T>;
           }
-          return Promise.resolve({}) as Promise<T>;
+          return Promise.resolve({ ok: true }) as Promise<T>;
         },
         addEventListener: () => () => {},
       };

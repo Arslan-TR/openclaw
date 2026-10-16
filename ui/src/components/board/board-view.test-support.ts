@@ -3,7 +3,11 @@ import { expect, onTestFinished, vi } from "vitest";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { BoardSnapshot, BoardWidget } from "../../lib/board/types.ts";
 import type { BoardViewCallbacks } from "../../lib/board/view-types.ts";
-import { createApplicationContextProvider } from "../../test-helpers/application-context.ts";
+import {
+  createApplicationContextProvider,
+  createApplicationGateway,
+} from "../../test-helpers/application-context.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
 import { waitForSolid } from "../../test-helpers/solid-settle.ts";
 
@@ -75,12 +79,13 @@ export function gatewayContext(
   client: { request: ReturnType<typeof vi.fn> } | null,
   basePath = "",
 ) {
+  const { gateway } = createApplicationGateway();
+  gateway.connection.gatewayUrl = "";
+  gateway.snapshot.client = client ? createTestGatewayClient(client.request) : null;
+  gateway.snapshot.phase = "connected";
   return {
     basePath,
-    gateway: {
-      connection: { gatewayUrl: "" },
-      snapshot: { client, phase: "connected" },
-    },
+    gateway,
   } as unknown as ApplicationContext;
 }
 

@@ -378,7 +378,8 @@ function OpenClawApp(props: { host: HTMLElement; runtime: ApplicationRuntime }):
           }
         >
           <openclaw-terminal-panel
-            prop:client={connected() ? snapshot().client : null}
+            prop:client={snapshot().client}
+            prop:gatewayConnected={connected()}
             prop:available={available()}
             prop:agentId={agentId()}
             prop:themeMode={themeMode()}

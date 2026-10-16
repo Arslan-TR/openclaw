@@ -236,6 +236,33 @@ describe("TerminalConnection", () => {
     expect(newData).toEqual(["!"]);
   });
 
+  it("retries an unapplied resume suffix after its replay fails", async () => {
+    const { client, conn } = makeHarness();
+    const output: string[] = [];
+    let replayFailed = false;
+    await openSession(conn, {
+      onData: (data) => output.push(data),
+      onReplay: ({ data, newlyObservedFrom }) => {
+        if (!replayFailed) {
+          replayFailed = true;
+          throw new Error("emulator unavailable");
+        }
+        output.push(data.slice(newlyObservedFrom));
+      },
+    });
+    emitData(client, 5, "hello");
+    conn.suspend();
+    client.nextResponse = sessionResult({ buffer: "helloagain", seq: 10 });
+    expect((await conn.resume()).has("s1")).toBe(true);
+    expect(output.join("")).toBe("hello");
+
+    conn.suspend();
+    expect((await conn.resume()).size).toBe(0);
+    emitData(client, 11, "!");
+    expect(output.join("")).toBe("helloagain!");
+    conn.dispose();
+  });
+
   it("discards a detached exit that predates a successful recovery rebind", async () => {
     const { client, conn } = makeHarness();
     const data: string[] = [];

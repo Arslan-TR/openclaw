@@ -127,7 +127,6 @@ export class LinkReaderPanelOwner {
   private nextTabId = 0;
   private requestAbort: AbortController | null = null;
   private recoveryScope: string | undefined;
-  private reloadPending = false;
   private returnFocus: HTMLElement | null = null;
   private scrollContent = false;
   private focusAddress = false;
@@ -217,11 +216,12 @@ export class LinkReaderPanelOwner {
     }
     if (changed.has("available") && !this.available) {
       this.abortRequest();
-      this.reloadPending = true;
+      for (const tab of this.tabs) {
+        tab.reloadPending = Boolean(tabTarget(tab));
+      }
     }
     if (readersChanged && (this.available || recoveryRetired)) {
       this.abortRequest();
-      this.reloadPending = true;
       const previousTarget = this.target;
       // Disabled or replaced contributions cannot retain old data or request authority.
       this.tabs = this.tabs.flatMap((tab) => {
@@ -241,6 +241,7 @@ export class LinkReaderPanelOwner {
         if (tabTarget(tab)?.reader !== current.reader) {
           this.setTabView(tab, { status: "idle" });
         }
+        tab.reloadPending = true;
         return [tab];
       });
       if (!this.tabs.some((tab) => tab.id === this.activeId)) {
@@ -281,9 +282,8 @@ export class LinkReaderPanelOwner {
       this.panelPresented &&
       this.available &&
       this.activeTab &&
-      (this.activeTab.view.status === "idle" || this.reloadPending)
+      (this.activeTab.view.status === "idle" || this.activeTab.reloadPending)
     ) {
-      this.reloadPending = false;
       void this.loadDetail();
     }
   }
@@ -325,6 +325,10 @@ export class LinkReaderPanelOwner {
     }
   }
   private abortRequest(): void {
+    if (this.requestAbort && this.activeTab?.view.status === "ready") {
+      // An interrupted silent refresh still owes this tab fresh data.
+      this.activeTab.reloadPending = true;
+    }
     this.requestAbort?.abort();
     this.requestAbort = null;
     if (this.activeTab?.view.status === "loading") {
@@ -342,6 +346,7 @@ export class LinkReaderPanelOwner {
     this.abortRequest();
     for (const tab of this.tabs) {
       this.setTabView(tab, { status: "idle" });
+      tab.reloadPending = false;
     }
   }
   selectHostedTab(id: string): void {
@@ -368,6 +373,7 @@ export class LinkReaderPanelOwner {
       history: target ? [target] : [],
       index: target ? 0 : -1,
       view: { status: "idle" },
+      reloadPending: false,
     };
     this.tabs.push(tab);
     this.activeId = tab.id;
@@ -554,6 +560,7 @@ export class LinkReaderPanelOwner {
     }
     const request = new AbortController();
     this.requestAbort = request;
+    tab.reloadPending = false;
     if (tab.view.status !== "ready") {
       tab.view = { status: "loading" };
     }
@@ -614,6 +621,10 @@ export class LinkReaderPanelOwner {
       if (isCurrent() && tab.view.status !== "ready") {
         tab.view = { status: "error", message: linkReaderErrorMessage(error) };
         this.requestUpdate();
+      }
+    } finally {
+      if (this.requestAbort === request) {
+        this.requestAbort = null;
       }
     }
   }

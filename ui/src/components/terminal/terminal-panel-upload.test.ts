@@ -230,7 +230,7 @@ describe("OpenClawTerminalPanel upload lifecycle", () => {
             }
             return { path: "/tmp/openclaw upload/notes.txt", size: 4 } as T;
           }
-          return {} as T;
+          return { ok: true } as T;
         },
         addEventListener: () => () => {},
       };
@@ -332,7 +332,7 @@ describe("OpenClawTerminalPanel upload lifecycle", () => {
           uploadSignal = options?.signal;
           return (await pendingUpload.promise) as T;
         }
-        return {} as T;
+        return { ok: true } as T;
       },
       addEventListener: () => () => {},
     };
@@ -371,7 +371,7 @@ describe("OpenClawTerminalPanel upload lifecycle", () => {
           uploadSignal = options?.signal;
           return (await pendingUpload.promise) as T;
         }
-        return {} as T;
+        return { ok: true } as T;
       },
       addEventListener: () => () => {},
     };

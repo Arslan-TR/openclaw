@@ -173,6 +173,17 @@ describe("OpenClawTerminalPanel reconnect", () => {
     expect(panel.renderRoot.querySelector<HTMLButtonElement>(".tp-upload-retry")?.disabled).toBe(
       true,
     );
+    expect(panel.hostedTabs[0]?.closeDisabled).toBe(true);
+    expect(
+      panel.renderRoot.querySelector<HTMLButtonElement>(".tabstrip-tab__close")?.disabled,
+    ).toBe(true);
+    panel.renderRoot
+      .querySelector(".tabstrip-tab")!
+      .dispatchEvent(new MouseEvent("auxclick", { button: 1 }));
+    await panel.closeHostedTab(tab.id);
+    expect(sessions.tabs[0]).toBe(tab);
+    expect(sessionStorage.getItem("openclaw.terminal.sessions.v1")).toBe('["retained"]');
+    expect(request.mock.calls.some(([method]) => method === "terminal.close")).toBe(false);
     createGhosttyTerminalMock.mock.calls[0]![0].onData?.(new TextEncoder().encode("do not replay"));
     read.resolve(new ArrayBuffer(1));
     await read.promise;
@@ -190,6 +201,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
     expect(sessions.tabs[0]).toBe(tab);
     expect(sessions.activeId).toBe(activeId);
     expect(createGhosttyTerminalMock).toHaveBeenCalledOnce();
+    expect(panel.hostedTabs[0]?.closeDisabled).toBe(false);
     expect(terminal.write.mock.calls.map(([bytes]) => new TextDecoder().decode(bytes))).toEqual([
       "before",
       "after",

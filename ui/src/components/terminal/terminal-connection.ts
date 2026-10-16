@@ -363,7 +363,6 @@ export class TerminalConnection {
         }
         const offset = result.seq;
         const previouslyObservedThrough = stream.expectedSeq;
-        stream.expectedSeq = offset;
         // The ring may include both bytes already delivered and the gap's
         // missing suffix. Preserve that boundary so response-producing
         // emulators do not answer historical control queries twice.
@@ -386,6 +385,7 @@ export class TerminalConnection {
         if (signal.aborted) {
           return;
         }
+        stream.expectedSeq = offset;
         stream.recovering = false;
         this.flushPending(sessionId, stream, offset);
       })

@@ -21,7 +21,8 @@ import {
   type CreateGhosttyTerminalMock,
 } from "./terminal-panel.test-support.ts";
 
-vi.mock("../../app/sw-refresh.runtime.ts", () => ({
+vi.mock("../../app/sw-refresh.runtime.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../app/sw-refresh.runtime.ts")>()),
   refreshControlUiServiceWorker: vi.fn(),
 }));
 
@@ -49,8 +50,11 @@ afterEach(async () => {
 it("holds retained PTYs and queued actions behind the same-client reconnect refresh", async () => {
   const refresh = createDeferred<boolean>();
   const reattach = createDeferred<TerminalAttachResult>();
+  const terminal = createTerminalController();
   vi.mocked(refreshControlUiServiceWorker).mockReturnValue(refresh.promise);
-  createGhosttyTerminalMock.mockImplementation(async () => createTerminalController());
+  createGhosttyTerminalMock
+    .mockImplementation(async () => createTerminalController())
+    .mockResolvedValueOnce(terminal);
   let opened = 0;
   const request = createGatewayRequestMock((method) => {
     if (method === "terminal.open") {
@@ -69,7 +73,6 @@ it("holds retained PTYs and queued actions behind the same-client reconnect refr
   const sessions = terminalSessionsForTest(panel);
   await waitForFast(() => expect(sessions.tabs[0]?.gatewaySessionId).toBe("retained"));
   const tab = sessions.tabs[0]!;
-  const terminal = tab.controller;
 
   panel.gatewayConnected = false;
   await panel.updateComplete;
@@ -106,7 +109,11 @@ it("holds retained PTYs and queued actions behind the same-client reconnect refr
 
 it("exits a confirmed missing retained PTY without leaving its surviving tab read-only", async () => {
   vi.mocked(refreshControlUiServiceWorker).mockResolvedValue(false);
-  createGhosttyTerminalMock.mockImplementation(async () => createTerminalController());
+  const expiredTerminal = createTerminalController();
+  const survivingTerminal = createTerminalController();
+  createGhosttyTerminalMock
+    .mockResolvedValueOnce(expiredTerminal)
+    .mockResolvedValueOnce(survivingTerminal);
   let opened = 0;
   const request = createGatewayRequestMock((method, params) => {
     if (method === "terminal.open") {
@@ -138,21 +145,21 @@ it("exits a confirmed missing retained PTY without leaving its surviving tab rea
   panel.gatewayConnected = false;
   await panel.updateComplete;
   await waitForFast(() => {
-    expect(expired!.controller.setReadOnly).toHaveBeenLastCalledWith(true);
-    expect(survivor!.controller.setReadOnly).toHaveBeenLastCalledWith(true);
+    expect(expiredTerminal.setReadOnly).toHaveBeenLastCalledWith(true);
+    expect(survivingTerminal.setReadOnly).toHaveBeenLastCalledWith(true);
   });
   panel.gatewayConnected = true;
   await panel.updateComplete;
   await waitForFast(() => {
     expect(expired!.status).toBe("exited");
     expect(survivor!.status).toBe("live");
-    expect(survivor!.controller.setReadOnly).toHaveBeenLastCalledWith(false);
+    expect(survivingTerminal.setReadOnly).toHaveBeenLastCalledWith(false);
     expect(panel.hostedTabs.map((tab) => tab.className)).toEqual(["is-exited", "is-live"]);
   });
-  expect(expired!.controller.setReadOnly).toHaveBeenLastCalledWith(true);
+  expect(expiredTerminal.setReadOnly).toHaveBeenLastCalledWith(true);
   expect(sessions.tabs).toEqual([expired, survivor]);
-  expect(expired!.controller.dispose).not.toHaveBeenCalled();
-  expect(survivor!.controller.dispose).not.toHaveBeenCalled();
+  expect(expiredTerminal.dispose).not.toHaveBeenCalled();
+  expect(survivingTerminal.dispose).not.toHaveBeenCalled();
   expect(sessionStorage.getItem("openclaw.terminal.sessions.v1")).toBe('["survivor"]');
   expect(panel.renderRoot.querySelector(".tp-error")).toBeNull();
 });

@@ -530,6 +530,39 @@ describe("mcp-app-view localization", () => {
     );
   });
 
+  it("retains model context when its refresh fails and clears only a confirmed null", async () => {
+    const state = {
+      updateId: "retained-context",
+      content: [{ type: "text", text: "selected item" }],
+    };
+    const { view, frame, bridge, request } = await mountBridge(
+      "view-context-read-failure",
+      true,
+      true,
+      {
+        hostContext: { "openai/modelContext": state },
+      },
+    );
+    const received: McpAppContextEventDetail[] = [];
+    view.addEventListener(MCP_APP_CONTEXT_EVENT, (event: Event) => {
+      received.push((event as CustomEvent<McpAppContextEventDetail>).detail);
+    });
+    request.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("Context read interrupted"));
+    await expect(bridge.updateModelContextHandler!({ content: state.content })).resolves.toEqual(
+      {},
+    );
+    expectHost(bridge, { "openai/modelContext": state });
+    expect(received).toHaveLength(0);
+    expect(view.querySelector("iframe")).toBe(frame);
+
+    request.mockResolvedValueOnce({}).mockResolvedValueOnce({ state: null });
+    await bridge.updateModelContextHandler!({ content: state.content });
+    expectHost(bridge, { "openai/modelContext": null });
+    expect(received).toHaveLength(1);
+    expect(received[0]?.state).toBeNull();
+    expect(view.querySelector("iframe")).toBe(frame);
+  });
+
   it("does not republish consumed context when an earlier bridge refresh settles", async () => {
     const { bridge, request, view, gatewayListeners } = await mountBridge(
       `view-context-${crypto.randomUUID()}`,

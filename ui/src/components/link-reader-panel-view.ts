@@ -39,7 +39,13 @@ type PanelView =
   | { status: "idle" | "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; detail: ControlUiLinkReaderDocument; images?: LinkReaderImages };
-export type ReaderTab = { id: string; history: LinkReaderTarget[]; index: number; view: PanelView };
+export type ReaderTab = {
+  id: string;
+  history: LinkReaderTarget[];
+  index: number;
+  view: PanelView;
+  reloadPending: boolean;
+};
 export function tabTarget(tab: ReaderTab | undefined): LinkReaderTarget | null {
   return tab?.history[tab.index] ?? null;
 }
