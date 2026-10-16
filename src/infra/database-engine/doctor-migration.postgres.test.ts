@@ -12,6 +12,7 @@ import {
   readBackupEngine,
   verifyMatchedPostgresBackup,
 } from "../../snapshot/database-backup.js";
+import { restoreHistoricalTranscriptTable } from "../../state/agent-historical-transcript.postgres.test-support.js";
 import { agentEngineSchema, openAgentEngineStore } from "../../state/openclaw-agent-db-engine.js";
 import { preflightOpenClawDatabaseSchemas } from "../../state/openclaw-database-preflight.js";
 import { stateEngineSchema } from "../../state/openclaw-state-db-engine.js";
@@ -625,9 +626,8 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
       const targetAgentFingerprint = (
         await client.query(`SELECT fingerprint FROM "${agentNamespace}".openclaw_schema_meta`)
       ).rows[0].fingerprint;
+      await restoreHistoricalTranscriptTable(client, agentNamespace, installed.postgres!);
       await client.query(`
-        ALTER TABLE "${agentNamespace}".transcript_events
-          DROP COLUMN model_bytes, DROP COLUMN model_without_checkpoint_bytes;
         DROP INDEX "${agentNamespace}".idx_agent_session_windows_conversation;
         CREATE INDEX idx_agent_session_windows_conversation
           ON "${agentNamespace}".session_windows
