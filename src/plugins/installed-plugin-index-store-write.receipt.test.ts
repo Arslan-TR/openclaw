@@ -54,10 +54,10 @@ function revocableAuthority() {
   let current = true;
   return {
     refused,
-    revoke() {
+    revoke(this: void) {
       current = false;
     },
-    assertCurrent() {
+    assertCurrent(this: void) {
       if (!current) {
         throw refused;
       }

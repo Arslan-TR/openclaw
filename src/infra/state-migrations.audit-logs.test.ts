@@ -497,7 +497,12 @@ it("requires exclusive state ownership before claiming legacy audit files", asyn
   if (!gatewayLock) {
     throw new Error("expected test Gateway lock");
   }
-  const result = await audit.migrate().finally(() => gatewayLock.release());
+  let result: Awaited<ReturnType<typeof audit.migrate>>;
+  try {
+    result = await audit.migrate();
+  } finally {
+    await gatewayLock.release();
+  }
   expectIncludes(result.warnings, "exclusive state ownership is unavailable");
   await fs.access(source);
   expect(audit.systemEntries()).toEqual([]);

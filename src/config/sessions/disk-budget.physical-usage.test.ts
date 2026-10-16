@@ -10,12 +10,12 @@ import {
   closeOpenClawStateDatabaseAsync,
   withSessionHistoryBudgetSweepsForTest,
 } from "openclaw/plugin-sdk/sqlite-runtime-testing";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { resolveRuntimeProcessEntrypointUrl } from "../../infra/runtime-process-url.js";
 import { withRuntimeWorkerGeneration } from "../../infra/runtime-worker-generation.js";
 import * as workerCpu from "../../infra/worker-cpu.js";
 import { WorkerTaskPool } from "../../infra/worker-task-pool.js";
-import { createDeferredCore, type Deferred } from "../../shared/deferred.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import { drainGlobalSingletonLifecycleState } from "../../shared/global-singleton.js";
 import * as storeWriterQueue from "../../shared/store-writer-queue.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
@@ -39,56 +39,6 @@ afterEach(async () => {
   await Promise.all(workers.splice(0).map((worker) => worker.terminate()));
 });
 
-const nextTurn = () =>
-  new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
-const expectedUsage = (sessionFilesBytes: number, databaseWalBytes = 654) => ({
-  databaseMainBytes: 321,
-  databaseWalBytes,
-  sessionFilesBytes,
-  totalBytes: 321 + databaseWalBytes + sessionFilesBytes,
-});
-const archiveName = "old.jsonl.deleted.2026-01-01T00-00-00.000Z.zst";
-
-async function withDatabase(run: (storePath: string, directory: string) => Promise<void>) {
-  await withTestDir({ prefix: "openclaw-disk-usage-" }, async (directory) => {
-    const storePath = path.join(directory, "openclaw-agent.sqlite");
-    await fs.writeFile(storePath, Buffer.alloc(321));
-    await run(storePath, directory);
-  });
-}
-
-function interceptScans(
-  intercept: (input: unknown, run: (input: unknown) => Promise<unknown>) => Promise<unknown>,
-) {
-  const original = WorkerTaskPool.prototype.run;
-  return vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementation(function (
-    this: WorkerTaskPool<unknown, unknown>,
-    input,
-    options,
-  ) {
-    return intercept(input, (prepared) => original.call(this, prepared, options));
-  });
-}
-
-const afterRelease = async (release: Deferred, input: unknown) => {
-  await release.promise;
-  return input;
-};
-
-function holdRetirement(worker: Worker, entered: Deferred) {
-  const release = createDeferredCore();
-  const terminate = worker.terminate.bind(worker);
-  const spy = vi.spyOn(worker, "terminate").mockImplementationOnce(async () => {
-    const code = await terminate();
-    entered.resolve();
-    await release.promise;
-    return code;
-  });
-  return { release, spy };
-}
-
 async function addSessionArtifacts(directory: string, index: number): Promise<void> {
   const hash = index.toString(16).padStart(64, "0");
   const blobDirectory = path.join(directory, "skills-prompts", "sha256", hash.slice(0, 2));
@@ -101,7 +51,9 @@ describe("physical session disk usage", () => {
   it.each([false, true])(
     "joins a forced followup after maintenance failure (mutation fails: %s)",
     async (mutationFails) => {
-      await withDatabase(async (storePath) => {
+      await withTestDir({ prefix: "openclaw-maintenance-failure-drain-" }, async (directory) => {
+        const storePath = path.join(directory, "openclaw-agent.sqlite");
+        await fs.writeFile(storePath, Buffer.alloc(321));
         const failure = new Error("synthetic first scan preparation failure");
         const mutationFailure = new Error("synthetic mutation failure");
         const releaseFirst = createDeferredCore();
@@ -109,7 +61,15 @@ describe("physical session disk usage", () => {
         const releaseFollowup = createDeferredCore();
         const scans: Promise<unknown>[] = [];
         let followupFinished = false;
-        const spy = interceptScans((input, invoke) => {
+        let spy = vi.spyOn(WorkerTaskPool.prototype, "run");
+        spy.mockImplementation(function trackRun(
+          this: WorkerTaskPool<unknown, unknown>,
+          input,
+          options,
+        ) {
+          spy.mockRestore();
+          const invoke = this.run.bind(this);
+          spy = vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementation(trackRun);
           const first = scans.length === 0;
           const result = invoke(async () => {
             if (first) {
@@ -119,12 +79,19 @@ describe("physical session disk usage", () => {
             followupEntered.resolve();
             await releaseFollowup.promise;
             return input;
-          });
+          }, options);
           const completion = first
             ? result
-            : result.finally(() => {
-                followupFinished = true;
-              });
+            : result.then(
+                (value) => {
+                  followupFinished = true;
+                  return value;
+                },
+                (error: unknown) => {
+                  followupFinished = true;
+                  throw error;
+                },
+              );
           scans.push(completion);
           return completion;
         });
@@ -155,7 +122,10 @@ describe("physical session disk usage", () => {
           } else {
             expect(result.error).toBe(failure);
           }
-          expect(result.followupFinished, "Join already-started followup work").toBe(true);
+          expect(
+            result.followupFinished,
+            "Failure must not abandon already-started followup work",
+          ).toBe(true);
           expect(scans).toHaveLength(2);
         } finally {
           releaseFirst.resolve();
@@ -177,19 +147,37 @@ describe("physical session disk usage", () => {
     const mutationBodyFinished = createDeferredCore<boolean>();
     const secondScanAdmitted = createDeferredCore();
     const nativeRetired = createDeferredCore();
+    const releaseRetirement = createDeferredCore();
     let scans = 0;
-    const scanSpy = interceptScans((input, invoke) => {
+    let observedSdkSweeps = 0;
+    let scanSpy = vi.spyOn(WorkerTaskPool.prototype, "run");
+    scanSpy.mockImplementation(function trackScan(
+      this: WorkerTaskPool<unknown, unknown>,
+      input,
+      options,
+    ) {
+      scanSpy.mockRestore();
+      const invoke = this.run.bind(this);
+      scanSpy = vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementation(trackScan);
       if (input !== storePath) {
-        return invoke(input);
+        return invoke(input, options);
       }
       const scan = ++scans;
-      const result = invoke(scan === 1 ? () => afterRelease(releasePreparation, input) : input);
+      const result = invoke(
+        scan === 1
+          ? async () => {
+              await releasePreparation.promise;
+              return input;
+            }
+          : input,
+        options,
+      );
       if (scan === 2) {
         secondScanAdmitted.resolve();
       }
       return result;
     });
-    let retirement: ReturnType<typeof holdRetirement> | undefined;
+    let retirement: MockInstance<Worker["terminate"]> | undefined;
     const diskWorkerUrl = resolveRuntimeProcessEntrypointUrl("sessionDiskBudget");
     const stateReadUrl = resolveRuntimeProcessEntrypointUrl("stateRead");
     const ownedStateReadPath = state.path("sdk-drainage-state-read.mjs");
@@ -201,7 +189,13 @@ describe("physical session disk usage", () => {
       .mockImplementation((filename, options) => {
         const worker = createWorker(filename, options);
         if (!retirement && String(filename) === diskWorkerUrl.href) {
-          retirement = holdRetirement(worker, nativeRetired);
+          const terminate = worker.terminate.bind(worker);
+          retirement = vi.spyOn(worker, "terminate").mockImplementationOnce(async () => {
+            const code = await terminate();
+            nativeRetired.resolve();
+            await releaseRetirement.promise;
+            return code;
+          });
         }
         return worker;
       });
@@ -217,11 +211,16 @@ describe("physical session disk usage", () => {
           expect(await deleteSessionEntry({ ...scope, expectedSessionId: "fixture-session" })).toBe(
             true,
           );
-          const sweeps = vi.mocked(storeWriterQueue.runQueuedStoreWrite).mock.calls;
+          expect(vi.isMockFunction(storeWriterQueue.runQueuedStoreWrite)).toBe(true);
+          observedSdkSweeps = vi
+            .mocked(storeWriterQueue.runQueuedStoreWrite)
+            .mock.calls.filter(
+              ([params]) => params.label === "enforceSqliteSessionHistoryDiskBudget",
+            ).length;
           expect(
-            sweeps.some(([params]) => params.label === "enforceSqliteSessionHistoryDiskBudget"),
-            "SDK mutations must reach the observed queue",
-          ).toBe(true);
+            observedSdkSweeps,
+            "Actual SDK mutations must reach the canonical observed queue",
+          ).toBeGreaterThan(0);
           expect(scans).toBe(1);
           mutationBodyFinished.resolve(true);
         } catch (error) {
@@ -241,16 +240,16 @@ describe("physical session disk usage", () => {
         })();
         releasePreparation.resolve();
         await Promise.all([nativeRetired.promise, secondScanAdmitted.promise]);
-        retirement?.release.resolve();
+        releaseRetirement.resolve();
         await drainage;
         await closeOpenClawAgentDatabasesAsync();
         await closeOpenClawStateDatabaseAsync();
         expect(scans).toBe(2);
       } finally {
         releasePreparation.resolve();
-        retirement?.release.resolve();
+        releaseRetirement.resolve();
         await Promise.allSettled([mutation, drainage]);
-        retirement?.spy.mockRestore();
+        retirement?.mockRestore();
         workerCreation.mockRestore();
         scanSpy.mockRestore();
         await closeOpenClawAgentDatabasesAsync();
@@ -263,11 +262,20 @@ describe("physical session disk usage", () => {
   });
 
   it("joins a measurement admitted after drainage starts before retiring its worker", async () => {
-    await withDatabase(async (storePath) => {
+    await withTestDir({ prefix: "openclaw-disk-usage-drain-admission-" }, async (directory) => {
+      const storePath = path.join(directory, "openclaw-agent.sqlite");
+      await fs.writeFile(storePath, Buffer.alloc(321));
       const release = createDeferredCore();
-      const spy = interceptScans((input, invoke) => {
+      const spy = vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementationOnce(function (
+        this: WorkerTaskPool<unknown, unknown>,
+        input,
+        options,
+      ) {
         spy.mockRestore();
-        return invoke(() => afterRelease(release, input));
+        return this.run(async () => {
+          await release.promise;
+          return input;
+        }, options);
       });
       let completed = 0;
       const first = measureSessionPhysicalDiskUsage(storePath).then(() => completed++);
@@ -294,12 +302,23 @@ describe("physical session disk usage", () => {
   ])(
     "coalesces $owner with another teardown while a runtime scan awaits retirement",
     async ({ drain }) => {
-      await withDatabase(async (storePath) => {
+      await withTestDir({ prefix: "openclaw-disk-usage-concurrent-drain-" }, async (directory) => {
+        const storePath = path.join(directory, "openclaw-agent.sqlite");
+        await fs.writeFile(storePath, Buffer.alloc(321));
         await measureSessionPhysicalDiskUsage(storePath);
         const retiringWorker = workers[0]!;
         const entered = createDeferredCore();
+        const release = createDeferredCore();
+        const terminate = retiringWorker.terminate.bind(retiringWorker);
         // Observe the worker being drained; other pools may retire workers concurrently.
-        const { release, spy: retirement } = holdRetirement(retiringWorker, entered);
+        const retirement = vi
+          .spyOn(retiringWorker, "terminate")
+          .mockImplementationOnce(async () => {
+            const code = await terminate();
+            entered.resolve();
+            await release.promise;
+            return code;
+          });
         const firstDrain = drain();
         let secondDrain: Promise<void> | undefined;
         let measurement: ReturnType<typeof measureSessionPhysicalDiskUsage> | undefined;
@@ -311,7 +330,9 @@ describe("physical session disk usage", () => {
             return usage;
           });
           secondDrain = drainSessionDiskBudgetWorkers();
-          await nextTurn();
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
           expect(measured).toBe(false);
           expect(retiringWorker.threadId).toBe(-1);
           release.resolve();
@@ -331,12 +352,27 @@ describe("physical session disk usage", () => {
   );
 
   it("reports scan overload and retires queued scans before reusing workers", async () => {
-    await withDatabase(async (storePath, directory) => {
-      const archivePath = path.join(directory, archiveName);
+    await withTestDir({ prefix: "openclaw-disk-usage-pressure-" }, async (directory) => {
+      const storePath = path.join(directory, "openclaw-agent.sqlite");
+      const archivePath = path.join(directory, "old.jsonl.deleted.2026-01-01T00-00-00.000Z.zst");
+      await fs.writeFile(storePath, Buffer.alloc(321));
       await fs.writeFile(archivePath, Buffer.alloc(100));
       const release = createDeferredCore();
-      // Hold every slot so overload is independent of worker startup timing.
-      const spy = interceptScans((input, run) => run(() => afterRelease(release, input)));
+      let spy = vi.spyOn(WorkerTaskPool.prototype, "run");
+      spy.mockImplementation(function gateScan(
+        this: WorkerTaskPool<unknown, unknown>,
+        input,
+        options,
+      ) {
+        spy.mockRestore();
+        const run = this.run.bind(this);
+        spy = vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementation(gateScan);
+        // Hold every scan slot so overload does not depend on worker startup timing.
+        return run(async () => {
+          await release.promise;
+          return input;
+        }, options);
+      });
       let settledScans = 0;
       const accepted = Array.from({ length: 128 }, () =>
         measureSessionPhysicalDiskUsage(storePath).then((usage) => {
@@ -350,7 +386,9 @@ describe("physical session disk usage", () => {
         reported = error;
       });
       try {
-        await nextTurn();
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
         expect(reported).toMatchObject({ name: "WorkerTaskError", code: "overloaded" });
         await expect(
           pruneSessionTranscriptArchivesToHighWater({ storePath, highWaterBytes: 321 }),
@@ -360,7 +398,9 @@ describe("physical session disk usage", () => {
         drainage = drainGlobalSingletonLifecycleState().then(() => {
           drained = true;
         });
-        await nextTurn();
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
         expect(drained).toBe(false);
         release.resolve();
         await drainage;
@@ -368,9 +408,13 @@ describe("physical session disk usage", () => {
         const retiredWorkers = workers.length;
         expect(retiredWorkers).toBeGreaterThan(0);
         expect(workers.every((worker) => worker.threadId === -1)).toBe(true);
-        expect(await Promise.all(accepted)).toEqual(
-          Array.from({ length: 128 }, () => expectedUsage(100, 0)),
-        );
+        const usage = {
+          databaseMainBytes: 321,
+          databaseWalBytes: 0,
+          sessionFilesBytes: 100,
+          totalBytes: 421,
+        };
+        expect(await Promise.all(accepted)).toEqual(Array.from({ length: 128 }, () => usage));
         await expect(
           pruneSessionTranscriptArchivesToHighWater({ storePath, highWaterBytes: 321 }),
         ).resolves.toMatchObject({ removedFiles: 1, usage: { totalBytes: 321 } });
@@ -390,20 +434,29 @@ describe("physical session disk usage", () => {
     await withTestDir({ prefix: "openclaw-disk-selector-" }, async (directory) => {
       const agentDir = path.join(directory, "agents", "main");
       const sessionsDir = path.join(agentDir, "sessions");
-      const storePath = path.join(agentDir, "agent", "openclaw-agent.sqlite");
-      await fs.mkdir(path.dirname(storePath), { recursive: true });
-      await fs.writeFile(storePath, Buffer.alloc(321));
-      await fs.writeFile(`${storePath}-wal`, Buffer.alloc(654));
-      await fs.writeFile(`${storePath}-shm`, Buffer.alloc(32_768));
-      await fs.writeFile(path.join(path.dirname(storePath), "unrelated.txt"), Buffer.alloc(13));
+      const databasePath = path.join(agentDir, "agent", "openclaw-agent.sqlite");
+      await fs.mkdir(path.dirname(databasePath), { recursive: true });
+      await fs.writeFile(databasePath, Buffer.alloc(321));
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(654));
+      await fs.writeFile(`${databasePath}-shm`, Buffer.alloc(32_768));
+      await fs.writeFile(path.join(path.dirname(databasePath), "unrelated.txt"), Buffer.alloc(13));
       await addSessionArtifacts(sessionsDir, 0);
-      const archivePath = path.join(sessionsDir, archiveName);
+      const archivePath = path.join(sessionsDir, "old.jsonl.deleted.2026-01-01T00-00-00.000Z.zst");
       await fs.writeFile(archivePath, Buffer.alloc(100));
-      await expect(measureSessionPhysicalDiskUsage(storePath)).resolves.toEqual(expectedUsage(118));
+      const storePath = databasePath;
+
+      await expect(measureSessionPhysicalDiskUsage(storePath)).resolves.toEqual({
+        databaseMainBytes: 321,
+        databaseWalBytes: 654,
+        sessionFilesBytes: 118,
+        totalBytes: 1_093,
+      });
       await expect(hasRetainedSessionTranscriptArchives(storePath)).resolves.toBe(true);
-      await expect(
-        pruneSessionTranscriptArchivesToHighWater({ storePath, highWaterBytes: 993 }),
-      ).resolves.toMatchObject({
+      const pruned = await pruneSessionTranscriptArchivesToHighWater({
+        storePath,
+        highWaterBytes: 993,
+      });
+      expect(pruned).toMatchObject({
         removedFiles: 1,
         usage: { sessionFilesBytes: 18, totalBytes: 993 },
       });
@@ -413,7 +466,9 @@ describe("physical session disk usage", () => {
   });
 
   it("does not add synchronous realpath work as session artifacts grow", async () => {
-    await withDatabase(async (storePath, directory) => {
+    await withTestDir({ prefix: "openclaw-disk-scan-scaling-" }, async (directory) => {
+      const storePath = path.join(directory, "openclaw-agent.sqlite");
+      await fs.writeFile(storePath, Buffer.alloc(321));
       await fs.writeFile(`${storePath}-wal`, Buffer.alloc(654));
       await fs.writeFile(`${storePath}-shm`, Buffer.alloc(32_768));
       await addSessionArtifacts(directory, 0);
@@ -426,15 +481,28 @@ describe("physical session disk usage", () => {
       try {
         const initial = await measureSessionPhysicalDiskUsage(storePath);
         const initialSyncCalls = fixtureSyncCalls();
-        expect(initial).toEqual(expectedUsage(18));
+        expect(initial).toEqual({
+          databaseMainBytes: 321,
+          databaseWalBytes: 654,
+          sessionFilesBytes: 18,
+          totalBytes: 993,
+        });
         for (let index = 1; index <= 32; index += 1) {
           await addSessionArtifacts(directory, index);
         }
         realpath.mockClear();
 
-        expect(await measureSessionPhysicalDiskUsage(storePath)).toEqual(expectedUsage(33 * 18));
+        const expanded = await measureSessionPhysicalDiskUsage(storePath);
+        const expandedSyncCalls = fixtureSyncCalls();
+
+        expect(expanded).toEqual({
+          databaseMainBytes: 321,
+          databaseWalBytes: 654,
+          sessionFilesBytes: 33 * 18,
+          totalBytes: 975 + 33 * 18,
+        });
         // Filesystem work that grows with the directory must not block the event loop.
-        expect(fixtureSyncCalls()).toBeLessThanOrEqual(initialSyncCalls);
+        expect(expandedSyncCalls).toBeLessThanOrEqual(initialSyncCalls);
       } finally {
         realpath.mockRestore();
       }

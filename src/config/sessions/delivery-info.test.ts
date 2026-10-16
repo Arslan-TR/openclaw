@@ -85,10 +85,10 @@ const telegramDelivery = { channel: "telegram", to: "telegram:user-123", account
 const foldedDelivery = { ...matrixDelivery, to: "room:!mixedcase:example.org" };
 const MIXED_KEY = "agent:main:matrix:channel:!MixedCase:Example.Org";
 const FOLDED_KEY = "agent:main:matrix:channel:!mixedcase:example.org";
-const resultFor = (
-  deliveryContext: DeliveryContext | undefined,
-  threadId: string | undefined = undefined,
-) => ({ deliveryContext, threadId });
+const resultFor = (deliveryContext: DeliveryContext | undefined, threadId?: string) => ({
+  deliveryContext,
+  threadId,
+});
 
 async function expectDelivery(
   sessionKey: string,
