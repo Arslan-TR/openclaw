@@ -1,4 +1,3 @@
-// Health-state tests cover probe coalescing, sensitive snapshots, and broadcast version behavior.
 import "../../test-utils/prepare-compiled-subprocesses.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
@@ -50,21 +49,6 @@ function healthSnapshotCallArg(index = 0) {
   return collectGatewayHealthSnapshotMock.mock.calls.at(index)?.[0];
 }
 
-// Vitest manual mocks cannot resolve concurrent imports from one module. Enter
-// each collector separately while keeping its result pending to test overlap.
-function createPendingHealthSnapshot() {
-  const started = createDeferred();
-  const result = createDeferred<HealthSummary>();
-  return {
-    ...result,
-    started: started.promise,
-    collect: () => {
-      started.resolve();
-      return result.promise;
-    },
-  };
-}
-
 function createHealthSummary(): HealthSummary {
   return {
     ok: true,
@@ -76,11 +60,7 @@ function createHealthSummary(): HealthSummary {
     heartbeatSeconds: 0,
     defaultAgentId: "main",
     agents: [],
-    sessions: {
-      path: "/tmp/sessions.json",
-      count: 0,
-      recent: [],
-    },
+    sessions: { path: "/tmp/sessions.json", count: 0, recent: [] },
   };
 }
 
@@ -106,27 +86,27 @@ let healthState: typeof import("./health-state.js");
 
 beforeEach(async () => {
   vi.restoreAllMocks();
-  healthState = await loadHealthState();
-});
 
-async function loadHealthState() {
   vi.resetModules();
   collectGatewayHealthSnapshotMock.mockReset();
   collectGatewayHealthSnapshotMock.mockResolvedValue(createHealthSummary());
-  getUpdateAvailableMock.mockReset();
-  getUpdateAvailableMock.mockReturnValue(null);
-  getUpdateScheduleMock.mockReset();
-  getUpdateScheduleMock.mockReturnValue(null);
+  getUpdateAvailableMock.mockReset().mockReturnValue(null);
+  getUpdateScheduleMock.mockReset().mockReturnValue(null);
   getRuntimeConfigMock.mockReset().mockReturnValue({ agents: { entries: { main: {} } } });
-  return await import("./health-state.js");
-}
+  healthState = await import("./health-state.js");
+});
 
 async function startRefresh(probe: boolean, includeSensitive = false) {
-  const pending = createPendingHealthSnapshot();
+  // Enter collectors separately: Vitest manual mocks cannot resolve concurrent imports.
+  const started = createDeferred();
+  const pending = createDeferred<HealthSummary>();
   const summary = createHealthSummary();
-  collectGatewayHealthSnapshotMock.mockImplementationOnce(pending.collect);
+  collectGatewayHealthSnapshotMock.mockImplementationOnce(() => {
+    started.resolve();
+    return pending.promise;
+  });
   const result = healthState.refreshGatewayHealthSnapshot({ probe, includeSensitive });
-  await pending.started;
+  await started.promise;
   return { ...pending, summary, result, finish: () => pending.resolve(summary) };
 }
 
@@ -151,40 +131,35 @@ describe("buildGatewaySnapshot update metadata", () => {
     }
   });
 
-  it("omits the schedule and projects legacy availability without update detail access", async () => {
-    getUpdateAvailableMock.mockReturnValue(updateAvailable);
-    getUpdateScheduleMock.mockReturnValue(updateSchedule);
-
-    const snapshot = healthState.buildGatewaySnapshot({
-      client: null,
-      includeUpdateDetails: false,
-      revisionProjector,
-    });
-
-    expect(snapshot.updateAvailable).toEqual({
-      currentVersion: "2026.8.7",
-      latestVersion: "2026.8.8",
-      channel: "dev",
-    });
-    expect(snapshot.updateSchedule).toBeUndefined();
-    expect(snapshot.sessionDefaults).toMatchObject({ ownership: "sole", selectionRequired: false });
-    expect(snapshot.appliedConfigHash).toBe("resolved-token:internal-applied-hash");
-    expect(getUpdateScheduleMock).not.toHaveBeenCalled();
-  });
-
-  it("includes the full update availability and schedule with update detail access", async () => {
-    getUpdateAvailableMock.mockReturnValue(updateAvailable);
-    getUpdateScheduleMock.mockReturnValue(updateSchedule);
-
-    const snapshot = healthState.buildGatewaySnapshot({
-      client: null,
-      includeUpdateDetails: true,
-      revisionProjector,
-    });
-
-    expect(snapshot.updateAvailable).toBe(updateAvailable);
-    expect(snapshot.updateSchedule).toBe(updateSchedule);
-  });
+  it.each([false, true])(
+    "projects update metadata with detail access=%s",
+    (includeUpdateDetails) => {
+      getUpdateAvailableMock.mockReturnValue(updateAvailable);
+      getUpdateScheduleMock.mockReturnValue(updateSchedule);
+      const snapshot = healthState.buildGatewaySnapshot({
+        client: null,
+        includeUpdateDetails,
+        revisionProjector,
+      });
+      if (includeUpdateDetails) {
+        expect(snapshot.updateAvailable).toBe(updateAvailable);
+        expect(snapshot.updateSchedule).toBe(updateSchedule);
+      } else {
+        expect(snapshot.updateAvailable).toEqual({
+          currentVersion: "2026.8.7",
+          latestVersion: "2026.8.8",
+          channel: "dev",
+        });
+        expect(snapshot.updateSchedule).toBeUndefined();
+        expect(snapshot.sessionDefaults).toMatchObject({
+          ownership: "sole",
+          selectionRequired: false,
+        });
+        expect(snapshot.appliedConfigHash).toBe("resolved-token:internal-applied-hash");
+        expect(getUpdateScheduleMock).not.toHaveBeenCalled();
+      }
+    },
+  );
 });
 
 describe("refreshGatewayHealthSnapshot", () => {
