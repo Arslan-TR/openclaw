@@ -108,7 +108,6 @@ function ApplicationShell(props: { host: ShellViewHost }): SolidJSX.Element {
             "shell--settings": view().settingsTakeover,
             "shell--home-control":
               view().collapsedControls && view().homePanelAvailable && !view().railAvailable,
-            "shell--connection-status": Boolean(view().shellConnectionStatus),
             "shell--floating-attention": floatingSidebarAttentionVisible(view().floatingUpdateCard),
             "shell--nav-resizing": navResizing(),
           },
@@ -349,6 +348,9 @@ function ApplicationShell(props: { host: ShellViewHost }): SolidJSX.Element {
               kind: shellConnectionStatus()!,
               get lastError() {
                 return view().gatewaySnapshot.lastError;
+              },
+              get queuedCount() {
+                return view().sidebarProperties.storedOutboxes?.total ?? 0;
               },
               onRetry: props.host.viewCallbacks.retryGateway,
             })}

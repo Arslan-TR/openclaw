@@ -8,5 +8,5 @@ export type GatewayStatusProps = {
   kind: GatewayStatus | null;
   lastError?: string | null;
   onRetry?: () => void;
-  announce?: boolean;
+  queuedCount?: number;
 };

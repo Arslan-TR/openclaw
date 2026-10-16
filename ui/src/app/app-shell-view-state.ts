@@ -21,11 +21,7 @@ import type { ApplicationRuntime } from "./bootstrap.ts";
 import { canGoBackInNativeEmbed } from "./browser.ts";
 import type { ApplicationNavigationOptions } from "./context.ts";
 import { gatewayPresentationScope } from "./gateway-presentation-scope.ts";
-import {
-  APP_SIDEBAR_ELEMENT,
-  isOptionalElementDefined,
-  type OptionalCustomElement,
-} from "./lazy-custom-element.ts";
+import type { OptionalCustomElement } from "./lazy-custom-element.ts";
 import { isMobileNavLayout, shouldMergeChatChrome } from "./mobile-nav-layout.ts";
 import type { NativeHistoryState } from "./native-web-chrome.ts";
 import { isNativeEmbedHost, nativeEmbedHost, isNativeWebChromeHost } from "./native-web-chrome.ts";
@@ -103,7 +99,7 @@ export function readShellView(host: ShellViewHost) {
   );
   const presentationScope = gatewayPresentationScope(context.gateway);
   // Initial hello can paint the shell before recovery finishes. Keep that brief
-  // startup state in existing chrome rather than inserting and removing a row.
+  // startup state in existing chrome rather than flashing a recovery chip.
   const initialConnection =
     !presentationScope.readyOnce &&
     !gatewaySnapshot.offlineStable &&
@@ -231,7 +227,6 @@ export function readShellView(host: ShellViewHost) {
     sessionKey: host.activeSessionKey,
     connected: gatewayConnected,
     connectionStatus,
-    lastError: gatewaySnapshot.lastError,
     storedOutboxes: host.storedOutboxes,
     terminalAvailable,
     catalogOpenTarget: normalizeCatalogOpenTarget(uiSettings.catalogOpenTarget),
@@ -259,16 +254,7 @@ export function readShellView(host: ShellViewHost) {
     nativeEmbed && !(nativeEmbedHost()?.surface === "conversation" && activeRoute === "chat");
   const collapsedControls =
     !nativeEmbed && navCollapsed && !onboarding && !settingsTakeover && !mobileNavLayout;
-  const shellConnectionStatus =
-    (navigationSurfaceHidden ||
-      (settingsTakeover
-        ? host.settingsSidebar.renderer() === null
-        : !isOptionalElementDefined(APP_SIDEBAR_ELEMENT))) &&
-    !nativeEmbed &&
-    !onboarding &&
-    !initialConnection
-      ? connectionStatus
-      : null;
+  const shellConnectionStatus = !nativeEmbed && !initialConnection ? connectionStatus : null;
   const floatingUpdateCard = {
     navigationSurfaceHidden,
     mobileNavLayout,

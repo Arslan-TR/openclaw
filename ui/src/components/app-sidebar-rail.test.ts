@@ -76,6 +76,18 @@ describe("personal navigation rail", () => {
     expect(sidebar.querySelector(".sidebar-session-content")).toBeNull();
     expect(sidebar.querySelector("aside.sidebar")).toBe(frame);
     expect(sidebar.querySelector(".sidebar-rail__bottom")).toBe(bottom);
+    const identity = bottom.querySelector(".sidebar-identity-card")!;
+    expect(
+      identity.querySelector(".sidebar-identity-card__avatar .sidebar-identity-card__status"),
+    ).not.toBeNull();
+    expect(identity.getAttribute("data-connection-status")).toBe("connected");
+    expect(identity.getAttribute("aria-label")).toContain("Connected");
+    for (const status of ["connecting", "reconnecting", "offline", "reload-required"] as const) {
+      sidebar.connectionStatus = status;
+      await sidebar.updateComplete;
+      expect(identity.getAttribute("data-connection-status")).toBe(status);
+      expect(identity.querySelector(".gateway-status")).toBeNull();
+    }
   });
 
   it("keeps Home outbox attention and drafts visible with its run state when collapsed", async () => {

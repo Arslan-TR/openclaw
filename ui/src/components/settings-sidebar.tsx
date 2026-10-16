@@ -557,7 +557,7 @@ export function renderSettingsSidebar(props: SettingsSidebarProps) {
           <SettingsNavigation {...props} />
           <footer class="settings-sidebar__footer">
             <div class="settings-sidebar__connection">
-              <SettingsConnectionStatus {...props} />
+              <openclaw-settings-save-indicator prop:props={props.saveIndicator} />
             </div>
             <openclaw-sidebar-build-chip
               prop:basePath={props.basePath}

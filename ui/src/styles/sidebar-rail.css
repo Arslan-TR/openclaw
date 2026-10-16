@@ -176,11 +176,6 @@
   padding: 0;
 }
 
-.sidebar-rail .sidebar-identity-card[data-connection-status] {
-  outline: 1px solid var(--warn);
-  outline-offset: -2px;
-}
-
 .sidebar-rail .sidebar-brand__icon {
   width: 36px;
   height: 36px;

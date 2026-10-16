@@ -568,7 +568,7 @@ describe("settings sidebar search", () => {
   });
 
   it.each(["sidebar", "embed-list", "embed-page"] as const)(
-    "keeps connection recovery separate from delivery in %s",
+    "preserves save feedback in web settings and native connection recovery in %s",
     async (presentation) => {
       const onRetryConnect = vi.fn();
       const renderSidebar = (
@@ -606,6 +606,17 @@ describe("settings sidebar search", () => {
       renderSidebar(null);
       expect(container.querySelector(".gateway-status")).toBeNull();
       expect(container.querySelector("openclaw-settings-save-indicator")).not.toBeNull();
+
+      if (presentation === "sidebar") {
+        for (const status of ["suspended", "offline", "restarting"] as const) {
+          renderSidebar(status);
+          expect(container.querySelector(".gateway-status")).toBeNull();
+          expect(container.querySelector(".settings-save-indicator")?.textContent).toContain(
+            t("configView.autoSaveSaving"),
+          );
+        }
+        return;
+      }
 
       renderSidebar("suspended", "connection refused?token=settings-secret");
       const suspended = container.querySelector(".gateway-status--suspended");

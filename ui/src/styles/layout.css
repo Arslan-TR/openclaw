@@ -7,6 +7,7 @@
   background-position: center;
   background-size: cover;
   background-repeat: no-repeat;
+  anchor-scope: --shell-composer;
 
   --shell-nav-expanded-width: 258px;
   --shell-nav-width: var(--shell-nav-expanded-width);
@@ -3336,6 +3337,35 @@ openclaw-sidebar-attention {
   font-size: 10px;
 }
 
+.sidebar-identity-card__avatar {
+  position: relative;
+  display: flex;
+  flex: none;
+}
+
+.sidebar-identity-card__status {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--bg);
+  border-radius: var(--radius-full);
+  background: var(--warn);
+}
+
+.sidebar-identity-card[data-connection-status="connected"] .sidebar-identity-card__status {
+  background: var(--ok);
+}
+
+.sidebar-identity-card:is(
+    [data-connection-status="offline"],
+    [data-connection-status="reload-required"]
+  )
+  .sidebar-identity-card__status {
+  background: var(--danger);
+}
+
 .sidebar-identity-card__text,
 .sidebar-recent-session__text {
   display: flex;
@@ -3500,7 +3530,7 @@ openclaw-tooltip.sidebar-hover-tooltip {
   background: var(--ok);
 }
 
-/* One lifecycle label is shared by the identity subtitle, Settings, and collapsed navigation. */
+/* One lifecycle label is shared by the shell chip and native Settings header. */
 .gateway-status-tooltip,
 .gateway-status {
   display: inline-flex;
@@ -3557,37 +3587,30 @@ button.gateway-status:focus-visible {
   height: 12px;
 }
 
-.gateway-status--offline .gateway-status__icon {
+.gateway-status--offline .gateway-status__icon,
+.gateway-status--reload-required .gateway-status__icon {
   color: var(--danger);
 }
 
-.gateway-status--connecting .gateway-status__icon,
-.gateway-status--starting .gateway-status__icon,
-.gateway-status--restoring .gateway-status__icon {
-  color: var(--muted);
+/* The connection chip follows the visible writing surface so it never covers a composer. */
+.shell :is(.chat-footer, .creation-composer, .new-session-page__composer) {
+  anchor-name: --shell-composer;
 }
 
 .shell-connection-status {
-  grid-area: connection;
-  justify-self: start;
-  margin: 6px 12px;
-  max-width: calc(100% - 24px);
+  position: fixed;
+  z-index: 65;
+  left: calc(var(--shell-nav-width) + 16px);
+  bottom: max(
+    calc(var(--shell-dock-reserve-bottom) + var(--safe-area-bottom, 0px) + 16px),
+    calc(anchor(--shell-composer top, 0px) + 12px)
+  );
+  max-width: calc(100% - var(--shell-nav-width) - 32px);
   padding: 7px 10px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   background: var(--bg);
-}
-
-.shell:not(.shell--mobile-nav).shell--connection-status {
-  grid-template-rows: var(--shell-topbar-height) minmax(0, 1fr) auto;
-  grid-template-areas:
-    "nav topbar"
-    "nav content"
-    "nav connection";
-}
-
-.shell:not(.shell--mobile-nav) > .shell-connection-status {
-  margin-bottom: calc(6px + var(--shell-dock-reserve-bottom));
+  box-shadow: var(--shadow-sm);
 }
 
 .sidebar-session-group-running {
@@ -4122,11 +4145,6 @@ button.gateway-status:focus-visible {
   transition:
     margin-bottom 0.16s ease,
     margin-right 0.16s ease;
-}
-
-/* The separate status row owns bottom-dock clearance while navigation is hidden. */
-.shell:not(.shell--mobile-nav).shell--connection-status > .content {
-  margin-bottom: 0;
 }
 
 /* Programmatic focus anchor (tabindex="-1") used when collapsing the sidebar

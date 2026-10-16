@@ -343,6 +343,27 @@ it("keeps the focused gateway retry button across shell and error updates", asyn
   );
   expect(tooltip?.content).toBe("Connection refused");
 
+  let queuedCount = 2;
+  owner.outboxStoreRuntime = {
+    read: () => ({
+      total: queuedCount,
+      sessions: [],
+      attentionCountForSession: () => 0,
+      hasSessionDraft: () => false,
+    }),
+    subscribe: () => () => {},
+    invalidate: () => {},
+  };
+  owner.invalidate();
+  flush();
+  expect(view.getByRole("button", { name: "Disconnected · 2 queued — Retry now" })).toBe(retry);
+  expect(document.activeElement).toBe(retry);
+  queuedCount = 1;
+  owner.invalidate();
+  flush();
+  expect(view.getByRole("button", { name: "Disconnected · 1 queued — Retry now" })).toBe(retry);
+  queuedCount = 0;
+
   snapshot.mockReturnValue({ ...disconnected, phase: "connecting" });
   owner.invalidate();
   flush();
@@ -350,6 +371,53 @@ it("keeps the focused gateway retry button across shell and error updates", asyn
     "Connecting…",
   );
   expect(view.queryByRole("button", { name: "Disconnected — Retry now" })).toBeNull();
+});
+
+it("shows one recovery chip across web layouts without changing the content frame", async () => {
+  let mobile = false;
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn(() => ({ matches: mobile })),
+  );
+  const { owner, runtime, view } = await mountShell();
+  const snapshot = vi.spyOn(runtime.context.gateway, "snapshot", "get");
+  const initial = runtime.context.gateway.snapshot;
+  const content = view.container.querySelector("main.content");
+  const chip = () => view.container.querySelector(".shell-connection-status");
+  for (const phase of ["connecting", "starting", "connected", "offline"] as const) {
+    snapshot.mockReturnValue({ ...initial, phase, offlineStable: false });
+    owner.invalidate();
+    flush();
+    expect(chip(), phase).toBeNull();
+  }
+  snapshot.mockReturnValue({ ...initial, phase: "offline", offlineStable: true });
+  for (const layout of [
+    { mobile: false, collapsed: false, drawer: false, routeId: "chat" },
+    { mobile: false, collapsed: true, drawer: false, routeId: "chat" },
+    { mobile: false, collapsed: false, drawer: false, routeId: "appearance" },
+    { mobile: true, collapsed: false, drawer: false, routeId: "chat" },
+    { mobile: true, collapsed: false, drawer: true, routeId: "chat" },
+    { mobile: true, collapsed: false, drawer: true, routeId: "appearance" },
+  ] as const) {
+    mobile = layout.mobile;
+    runtime.context.navigation.update({ navCollapsed: layout.collapsed });
+    owner.navDrawerOpen = layout.drawer;
+    owner.routeState = { routeId: layout.routeId };
+    owner.invalidate();
+    flush();
+    expect(
+      view.container.querySelectorAll(".shell-connection-status"),
+      JSON.stringify(layout),
+    ).toHaveLength(1);
+    expect(chip()?.textContent).toContain("Disconnected");
+    expect(view.container.querySelector("main.content")).toBe(content);
+    expect(view.container.querySelector(".shell--connection-status")).toBeNull();
+  }
+
+  vi.stubGlobal("__OPENCLAW_NATIVE_EMBED__", { platform: "ios", formFactor: "phone" });
+  owner.invalidate();
+  flush();
+  expect(chip()).toBeNull();
 });
 
 it("restores the delegated shell after a pending update and can select another workspace", async () => {

@@ -197,11 +197,16 @@ page reload does not persist a widget’s unsaved local interaction state.
 ## Connection loss and reconnect
 
 Once a session is established, a dropped Gateway connection does not log you out. The dashboard
-stays visible, and one connection status in its sidebar footer explains whether the Gateway is
-suspending, suspended, restarting, reconnecting, or finishing recovery. Planned transitions and
-automatic reconnect use a calm presentation; authentication and other failures that need your
-attention keep their explanation and recovery action. The same status appears in the macOS app's
-embedded dashboard. Connection status does not replace the Gateway name in the account menu.
+stays visible. The sidebar avatar has a green connection dot when healthy, amber during recovery
+or suspension, and red when disconnected or a refresh is required. A bottom-left status chip
+explains the interruption without moving the page. On mobile, it stays above the composer.
+Brief disconnects keep the existing two-second grace before showing the chip.
+
+The chip includes the number of queued messages and **Retry now** when an immediate connection
+attempt is available. Hover for the redacted connection error. Settings keeps its save feedback
+visible alongside this global connection status. Native embedded views keep their own connection
+chrome, including the status in the embedded Settings header. Connection status does not replace
+the Gateway name in the account menu.
 
 The client retries ordinary connection loss automatically with randomized backoff: the first
 retry waits 800–960 ms, and sustained failures spread retries across 12.5–15 seconds.

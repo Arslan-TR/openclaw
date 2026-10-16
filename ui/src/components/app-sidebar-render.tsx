@@ -27,7 +27,6 @@ import { HOME_PANEL_TOGGLE_EVENT } from "./panel-toggle-contract.ts";
 import { SidebarAgentCard } from "./sidebar-agent-card.tsx";
 import { SidebarAttention } from "./sidebar-attention.tsx";
 import { formatSidebarBuildSubtitle } from "./sidebar-build-chip-format.ts";
-import { renderGatewayStatus } from "./solid/gateway-status.tsx";
 import { Icon } from "./solid/icon.tsx";
 import { ShortcutHint } from "./solid/kbd.tsx";
 import { renderSessionLeadingState, SessionRowBadges } from "./solid/session-presentation.tsx";
@@ -265,22 +264,28 @@ export function renderAppSidebarFooterBar(host: AppSidebarRenderHost): JSX.Eleme
   const buildSubtitle = () => formatSidebarBuildSubtitle(CONTROL_UI_BUILD_INFO);
   const gatewayPrimaryTag = () => (gateway()?.isPrimary ? t("nav.gateway.primaryTag") : null);
   const identityMenuLabel = () => t("profilePage.identity.menuButtonLabel", { name: selfLabel() });
-  const statusLabel = () => (connectionStatus() ? t(`connection.${connectionStatus()}`) : null);
+  const statusLabel = () =>
+    connectionStatus()
+      ? t(`connection.${connectionStatus()}`)
+      : host.connected
+        ? t("nav.gateway.connected")
+        : t("connection.offline");
   const identityDetail = () => {
     const status = statusLabel();
     const selectedGateway = gateway();
-    return (
-      status ??
-      (selectedGateway
+    return [
+      status,
+      selectedGateway
         ? `${selectedGateway.name}${gatewayPrimaryTag() ? `, ${gatewayPrimaryTag()}` : ""}`
-        : buildSubtitle())
-    );
+        : buildSubtitle(),
+    ]
+      .filter(Boolean)
+      .join(" — ");
   };
-  const announcement = () => statusLabel() ?? (host.connected ? t("nav.gateway.connected") : "");
   return (
     <div class="sidebar-footer-bar sidebar-footer-bar--one-action">
       <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {announcement()}
+        {statusLabel()}
       </span>
       <span class="sidebar-footer-actions">
         <openclaw-tooltip>
@@ -347,30 +352,23 @@ export function renderAppSidebarFooterBar(host: AppSidebarRenderHost): JSX.Eleme
         title={
           identityDetail() ? `${identityMenuLabel()}: ${identityDetail()}` : identityMenuLabel()
         }
-        data-connection-status={connectionStatus() ?? undefined}
+        data-connection-status={connectionStatus() ?? (host.connected ? "connected" : "offline")}
         aria-label={
           identityDetail() ? `${identityMenuLabel()}: ${identityDetail()}` : identityMenuLabel()
         }
         onClick={(event) => host.sidebarMenus.toggleIdentityMenu(event.currentTarget)}
       >
-        <openclaw-viewer-avatar prop:user={avatarUser()} variant="footer" />
+        <span class="sidebar-identity-card__avatar">
+          <openclaw-viewer-avatar prop:user={avatarUser()} variant="footer" />
+          <span class="sidebar-identity-card__status" aria-hidden="true" />
+        </span>
         <span class="sidebar-identity-card__text">
           <HoverMarquee
             content={selfLabel()}
             class="sidebar-identity-card__name"
             options={{ loop: true, delay: 300, speed: 35 }}
           />
-          {connectionStatus() ? (
-            renderGatewayStatus({
-              get kind() {
-                return connectionStatus();
-              },
-              get lastError() {
-                return host.lastError;
-              },
-              announce: false,
-            })
-          ) : gateway() ? (
+          {gateway() ? (
             <span class="sidebar-identity-card__gateway" aria-hidden="true">
               <span class="sidebar-gateway-name">{gateway()?.name}</span>
               {gatewayPrimaryTag() ? (

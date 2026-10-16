@@ -29,7 +29,6 @@ export type AppSidebarProps = {
   enabledRouteIds: readonly NavigationRouteId[] | undefined;
   connected: boolean;
   connectionStatus: GatewayStatus | null;
-  lastError: string | null;
   storedOutboxes: SidebarOutboxSummary | undefined;
   terminalAvailable: boolean;
   catalogOpenTarget: CatalogOpenTarget;
@@ -66,7 +65,6 @@ export const appSidebarProperties = {
   enabledRouteIds: { default: undefined, attribute: false },
   connected: { default: false, attribute: false },
   connectionStatus: { default: null, attribute: false },
-  lastError: { default: null, attribute: false },
   storedOutboxes: { default: undefined, attribute: false },
   terminalAvailable: { default: false, attribute: false },
   catalogOpenTarget: { default: "viewer", attribute: false },
@@ -108,7 +106,6 @@ export abstract class AppSidebarBase {
   declare enabledRouteIds: AppSidebarProps["enabledRouteIds"];
   declare connected: AppSidebarProps["connected"];
   declare connectionStatus: AppSidebarProps["connectionStatus"];
-  declare lastError: AppSidebarProps["lastError"];
   declare storedOutboxes: AppSidebarProps["storedOutboxes"];
   declare terminalAvailable: AppSidebarProps["terminalAvailable"];
   declare catalogOpenTarget: AppSidebarProps["catalogOpenTarget"];

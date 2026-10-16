@@ -10,7 +10,12 @@ export function renderGatewayStatus(params: GatewayStatusProps): JSX.Element {
   if (!kind) {
     return null;
   }
-  const label = t(`connection.${kind}`);
+  const label = () => {
+    const status = t(`connection.${kind}`);
+    return params.queuedCount
+      ? `${status} · ${t("connection.queued", { count: String(params.queuedCount) })}`
+      : status;
+  };
   const content = () => (
     <span class="gateway-status__state">
       <span class="gateway-status__icon" aria-hidden="true">
@@ -24,28 +29,21 @@ export function renderGatewayStatus(params: GatewayStatusProps): JSX.Element {
           }
         />
       </span>
-      <span class="gateway-status__label">{label}</span>
+      <span class="gateway-status__label">{label()}</span>
     </span>
   );
   const className = `gateway-status gateway-status--${kind}`;
   return (
     <openclaw-tooltip
       class="gateway-status-tooltip"
-      prop:content={
-        params.lastError && canRetryGatewayStatus(kind)
-          ? redactLoginFailureError(params.lastError)
-          : ""
-      }
+      prop:content={params.lastError ? redactLoginFailureError(params.lastError) : ""}
     >
-      <span
-        role={params.announce === false ? undefined : "status"}
-        aria-live={params.announce === false ? undefined : "polite"}
-      >
+      <span role="status" aria-live="polite">
         {params.onRetry && canRetryGatewayStatus(kind) ? (
           <button
             type="button"
             class={className}
-            aria-label={[label, t("connection.retryNow")].filter(Boolean).join(" — ")}
+            aria-label={`${label()} — ${t("connection.retryNow")}`}
             onClick={params.onRetry}
           >
             {content()}
