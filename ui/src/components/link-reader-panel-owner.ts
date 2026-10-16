@@ -210,15 +210,16 @@ export class LinkReaderPanelOwner {
       changed.has("client") ||
       changed.has("agentId") ||
       this.recoveryScope !== this.client?.recoveryScope;
+    const recoveryRetired = this.client?.offlineRecoveryRetired;
     this.recoveryScope = this.client?.recoveryScope;
-    if (identityChanged) {
+    if (identityChanged || recoveryRetired) {
       this.resetTabViews();
     }
     if (changed.has("available") && !this.available) {
       this.abortRequest();
       this.reloadPending = true;
     }
-    if (readersChanged && this.available) {
+    if (readersChanged && (this.available || recoveryRetired)) {
       this.abortRequest();
       this.reloadPending = true;
       const previousTarget = this.target;

@@ -4,6 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { createDeferred } from "../../../../test/helpers/promise.ts";
 import { refreshControlUiServiceWorker } from "../../app/sw-refresh.runtime.ts";
 import { i18n } from "../../i18n/index.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import type { TerminalGatewayClient } from "./terminal-connection.ts";
@@ -206,6 +207,85 @@ describe("OpenClawTerminalPanel reconnect", () => {
     expect(sessions.tabs).toEqual([]);
     expect(panel.terminalPanelUploadController.hasPendingBatch()).toBe(false);
   });
+
+  it.each([
+    ["input", false],
+    ["resize", false],
+    ["input", true],
+    ["resize", true],
+  ] as const)(
+    "reports interrupted %s delivery only to its retained identity (replaced=%s)",
+    async (action, replaced) => {
+      const terminal = createTerminalController();
+      createGhosttyTerminalMock.mockResolvedValue(terminal);
+      const delivery = createDeferred<{ ok: boolean }>();
+      const dispatched = createDeferred<void>();
+      let armed = false;
+      const client = createTestGatewayClient((method) => {
+        if (armed && method === `terminal.${action}`) {
+          dispatched.resolve();
+          return delivery.promise;
+        }
+        if (method === "terminal.attach") {
+          return { ...terminalOpenResult("interrupted"), buffer: "", seq: 0 };
+        }
+        return method === "terminal.open" ? terminalOpenResult("interrupted") : { ok: true };
+      });
+      const recoveryScope = vi.spyOn(client, "recoveryScope", "get").mockReturnValue("account-a");
+      vi.spyOn(client, "forceReconnect").mockImplementation(() => {});
+      vi.spyOn(client, "addEventListener").mockReturnValue(() => {});
+      const panel = createTestTerminalPanel(TERMINAL_PANEL_ELEMENT_NAME);
+      panel.client = client;
+      panel.available = true;
+      document.body.append(panel);
+      panel.toggle();
+      const sessions = terminalSessionsForTest(panel);
+      await waitForFast(() => expect(sessions.tabs[0]?.gatewaySessionId).toBe("interrupted"));
+      await panel.updateComplete;
+      const tab = sessions.tabs[0]!;
+      armed = true;
+      const callbacks = createGhosttyTerminalMock.mock.calls[0]![0];
+      if (action === "input") {
+        callbacks.onData?.(new TextEncoder().encode("uncertain input"));
+      } else {
+        callbacks.onResize?.({ columns: 120, rows: 40 });
+      }
+      await dispatched.promise;
+
+      panel.gatewayConnected = false;
+      await panel.updateComplete;
+      await waitForFast(() => expect(terminal.setReadOnly).toHaveBeenCalledWith(true));
+      if (replaced) {
+        recoveryScope.mockReturnValue("account-b");
+        panel.available = false;
+        await panel.updateComplete;
+        await waitForFast(() => expect(sessions.tabs).toEqual([]));
+      }
+      delivery.reject(new Error("connection lost"));
+      await delivery.promise.catch(() => undefined);
+      await panel.updateComplete;
+
+      if (replaced) {
+        expect(sessions.error).toBeNull();
+      } else {
+        expect(sessions.tabs[0]).toBe(tab);
+        await waitForFast(() =>
+          expect(panel.renderRoot.querySelector('.tp-error[role="alert"]')?.textContent).toContain(
+            "Terminal delivery could not be confirmed",
+          ),
+        );
+        armed = false;
+        panel.gatewayConnected = true;
+        await panel.updateComplete;
+        await waitForFast(() => expect(terminal.setReadOnly).toHaveBeenLastCalledWith(false));
+        await panel.updateComplete;
+        expect(sessions.tabs[0]).toBe(tab);
+        expect(panel.renderRoot.querySelector('.tp-error[role="alert"]')?.textContent).toContain(
+          "Terminal delivery could not be confirmed",
+        );
+      }
+    },
+  );
 
   it.each(["agent:agent:main:background-task"] as const)(
     "attaches a %s session with its native title and actual owner",

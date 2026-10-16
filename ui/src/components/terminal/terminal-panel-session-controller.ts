@@ -332,11 +332,9 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
         tab.controller.setReadOnly(tab.status === "exited");
         if (tab.status !== "exited") {
           const { cols, rows } = tab.controller.terminal;
-          void this.connection?.resize(tab.gatewaySessionId, cols || 80, rows || 24).catch(() => {
-            if (this.isTerminalOperationCurrent(operation)) {
-              this.setError(t("terminal.deliveryFailed"));
-            }
-          });
+          void this.connection
+            ?.resize(tab.gatewaySessionId, cols || 80, rows || 24)
+            .catch(this.captureDeliveryError(tab));
         }
       }
       if (this.host.terminalPanelOpen) {
@@ -419,14 +417,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       shouldFocusOnOpen: restore && (() => !restore.input.interacted),
       onReady: (tab) => this.readiness.markReady(tab),
       onExit: (tab, info) => this.handleExit(tab.id, info),
-      captureDeliveryError: () => {
-        const delivery = this.captureTerminalOperation();
-        return () => {
-          if (delivery && this.isTerminalOperationCurrent(delivery)) {
-            this.setError(t("terminal.deliveryFailed"));
-          }
-        };
-      },
+      captureDeliveryError: (tab) => this.captureDeliveryError(tab),
     });
     if (!this.isTerminalOperationCurrent(operation, options.restore?.batch)) {
       disposeTerminalController(boot.tab.controller, boot.tab.host);
@@ -446,12 +437,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     result: TerminalOpenResult,
     agentOwned = false,
   ): void {
-    const generation = this.lifecycleGeneration;
-    const reportDeliveryError = () => {
-      if (generation === this.lifecycleGeneration && this.tabs.includes(tab)) {
-        this.setError(t("terminal.deliveryFailed"));
-      }
-    };
+    const reportDeliveryError = this.captureDeliveryError(tab);
     this.recovery.retireTab(tab);
     adoptTerminalPanelSession({
       tab,
@@ -472,6 +458,23 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       tabs,
       activeId: this.activeId === tab.id ? (tabs.at(-1)?.id ?? null) : this.activeId,
     });
+  }
+
+  private captureDeliveryError(tab: TerminalPanelSessionTab): () => void {
+    // Delivery uncertainty belongs to the retained tab and identity, not the transport epoch.
+    const client = this.activeClient;
+    const recoveryScope = client?.recoveryScope;
+    return () => {
+      if (
+        this.host.isConnected &&
+        this.host.client === client &&
+        client?.recoveryScope === recoveryScope &&
+        !client?.offlineRecoveryRetired &&
+        this.tabs.includes(tab)
+      ) {
+        this.setError(t("terminal.deliveryFailed"));
+      }
+    };
   }
 
   openSession(): Promise<void> {

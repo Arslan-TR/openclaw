@@ -82,7 +82,7 @@ export async function bootTerminalPanelSession(params: {
   shouldFocusOnOpen?: () => boolean;
   onReady: (tab: TerminalPanelSessionTab) => void;
   onExit: (tab: TerminalPanelSessionTab, info: Parameters<TerminalSink["onExit"]>[0]) => void;
-  captureDeliveryError: () => (error: unknown) => void;
+  captureDeliveryError: (tab: TerminalPanelSessionTab) => (error: unknown) => void;
 }) {
   const { panel, connection } = params;
   const host = document.createElement("div");
@@ -104,7 +104,7 @@ export async function bootTerminalPanelSession(params: {
       tabReference.current?.status === "exited"
         ? undefined
         : tabReference.current?.gatewaySessionId,
-    params.captureDeliveryError,
+    () => (tabReference.current ? params.captureDeliveryError(tabReference.current) : () => {}),
     () => panel.gatewayConnected && panel.available && !tabReference.current?.controller.readOnly,
   );
   const { createTerminalDefaultColorQueryResponder } =

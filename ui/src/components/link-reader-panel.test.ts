@@ -3,6 +3,7 @@ import type {
   ControlUiLinkReaderDocument,
   ControlUiLinkReaderDescriptor,
 } from "../../../src/shared/control-ui-link-reader.js";
+import { createDeferred } from "../../../test/helpers/promise.ts";
 import { GatewayRequestError, type GatewayBrowserClient } from "../api/gateway.ts";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
 import { waitForSolid as waitForFast } from "../test-helpers/solid-settle.ts";
@@ -775,6 +776,65 @@ describe("Plugin link reader panel", () => {
     replacement.resolve({ ...item(), title: "Replacement identity" });
     await expectTitle(panel, "Replacement identity");
   });
+  it("retires loaded documents and images when offline recovery is revoked on the same client", async () => {
+    const loadedUrl = "https://images.example/loaded.png";
+    const pendingUrl = "https://images.example/pending.png";
+    const dataUrl = "data:image/png;base64,aW1hZ2U=";
+    const pending = createDeferred<{ url: string; dataUrl: string }>();
+    const imageRequest = vi
+      .fn<
+        (
+          _params: unknown,
+          options?: { signal?: AbortSignal },
+        ) => Promise<{
+          url: string;
+          dataUrl: string;
+        }>
+      >()
+      .mockResolvedValueOnce({ url: loadedUrl, dataUrl })
+      .mockReturnValue(pending.promise);
+    const panel = await mount((method, params, options) =>
+      method === "forge.image"
+        ? imageRequest(params, options)
+        : Promise.resolve({
+            ...item(),
+            body: `![Loaded](${loadedUrl})\n\n![Pending](${pendingUrl})`,
+          }),
+    );
+    panel.readers = [
+      { ...reader, linkReader: { ...reader.linkReader, imageMethod: "forge.image" } },
+    ];
+    await panel.updateComplete;
+    open(panel);
+    await waitForFast(() => expect(imageRequest).toHaveBeenCalledTimes(2));
+    await waitForFast(() => expect(panel.querySelector("img")?.src).toBe(dataUrl));
+    const title = panel.querySelector("h1");
+    const image = panel.querySelector("img");
+    const imageSignal = imageRequest.mock.calls[1]?.[1]?.signal;
+    expect(imageSignal?.aborted).toBe(false);
+
+    panel.available = false;
+    await panel.updateComplete;
+    expect(panel.querySelector("h1")).toBe(title);
+    expect(panel.querySelector("img")).toBe(image);
+    expect(imageSignal?.aborted).toBe(false);
+
+    Object.defineProperty(panel.client, "offlineRecoveryRetired", { value: true });
+    panel.readers = [];
+    await panel.updateComplete;
+    expect(imageSignal?.aborted).toBe(true);
+    expect(panel.hostedTabs).toEqual([]);
+    expect(panel.querySelector("h1")).toBeNull();
+    expect(panel.querySelector("img")).toBeNull();
+    expect(image?.isConnected).toBe(false);
+
+    pending.resolve({ url: pendingUrl, dataUrl });
+    await pending.promise;
+    await panel.updateComplete;
+    expect(panel.querySelector("h1")).toBeNull();
+    expect(panel.querySelector("img")).toBeNull();
+  });
+
   it("drops disabled plugin tabs and fences a response that resolves after removal", async () => {
     const pending = deferredDetail();
     const request = vi.fn(
