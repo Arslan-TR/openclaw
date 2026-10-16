@@ -329,7 +329,7 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
       changes:
         queueDefaults === state.candidate
           ? []
-          : ["Set messages.queue.allowCollaborativeSteering to true (default)."],
+          : ["Set messages.queue.allowCollaborativeSteering to false (default)."],
     },
     `Run "${doctorFixCommand}" to persist the collaborative steering default.`,
   );

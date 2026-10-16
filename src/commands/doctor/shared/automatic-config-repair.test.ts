@@ -272,7 +272,7 @@ describe("automatic config repair", () => {
             await commitAutomaticConfigRepair(plan, snapshot);
             const saved = JSON.parse(await fs.readFile(configPath, "utf8"));
             expect(saved.browser).toEqual({ executablePath: "${BROWSER_BIN}" });
-            expect(saved.messages.queue.allowCollaborativeSteering).toBe(true);
+            expect(saved.messages.queue.allowCollaborativeSteering).toBe(false);
             const reloaded = await readConfigFileSnapshot();
             expect(reloaded.valid).toBe(true);
             expect(reloaded.sourceConfig.browser?.executablePath).toBe(

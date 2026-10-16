@@ -250,6 +250,7 @@ describe("createChatSendMessageInjectionStarter admission fence", () => {
         const entered = createDeferred();
         const resume = createDeferred();
         const params = makeStarterParams({ entry: initial });
+        params.session.cfg = { messages: { queue: { allowCollaborativeSteering: true } } };
         params.abortSignal = source.signal;
         params.session.sessionKey = sessionKey;
         params.session.storePath = storePath;

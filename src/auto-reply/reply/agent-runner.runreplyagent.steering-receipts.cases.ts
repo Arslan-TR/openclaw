@@ -58,9 +58,13 @@ export function registerSteeringReceiptCases({
   makeSessionFixture,
   state,
 }: SteeringReceiptFixture): void {
-  it.each([false, true])(
-    "refuses another human's steer without leaving drainable work (explicit command: %s)",
-    async (explicitCommand) => {
+  it.each(
+    [undefined, false].flatMap((allowCollaborativeSteering) =>
+      [false, true].map((explicitCommand) => ({ allowCollaborativeSteering, explicitCommand })),
+    ),
+  )(
+    "refuses another human's steer without leaving drainable work (collaboration: $allowCollaborativeSteering, explicit command: $explicitCommand)",
+    async ({ allowCollaborativeSteering, explicitCommand }) => {
       const actualQueue = await vi.importActual<typeof import("./queue.js")>("./queue.js");
       vi.mocked(parkSteerCandidate).mockImplementation(actualQueue.parkSteerCandidate);
       const runState: ReplyOperationRunState = {};
@@ -86,7 +90,10 @@ export function registerSteeringReceiptCases({
         },
         runOverrides: {
           messageProvider: "telegram",
-          config: { messages: { queue: { allowCollaborativeSteering: false } } },
+          config:
+            allowCollaborativeSteering === undefined
+              ? {}
+              : { messages: { queue: { allowCollaborativeSteering } } },
         },
         opts: {
           [REPLY_OPERATION_RUN_STATE]: runState,

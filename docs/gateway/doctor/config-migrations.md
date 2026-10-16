@@ -20,7 +20,7 @@ the flow ends, including failed runs.
 
 ## Collaborative steering default
 
-Doctor writes `messages.queue.allowCollaborativeSteering: true` when the setting is
+Doctor writes `messages.queue.allowCollaborativeSteering: false` when the setting is
 absent, creating missing parent objects. New configuration files contain the same
 explicit default. Existing `true` and `false` values, including values supplied
 through config includes, stay unchanged.
@@ -43,7 +43,7 @@ container-image replacement can bypass Doctor entirely. These installations use
 the runtime default immediately; run `openclaw doctor --fix` to persist it.
 Ordinary configuration reads and Gateway startup do not write this setting.
 
-See [Queue steering](/concepts/queue-steering) for the default-on authority tradeoff.
+See [Queue steering](/concepts/queue-steering) for the opt-in authority tradeoff.
 
 ## Cloud setup secret migration
 
