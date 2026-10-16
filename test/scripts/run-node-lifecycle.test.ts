@@ -277,7 +277,6 @@ it.runIf(process.platform !== "win32")(
       for (const filename of [
         "openclaw.mjs",
         "cli-invocation.mjs",
-        "cli-parent-lifetime.mjs",
         "node-host-launcher.mjs",
         "node-compile-cache.mjs",
         "node-version.mjs",
