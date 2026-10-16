@@ -35,17 +35,28 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   }),
 );
 const stateKey = "plugins.installedIndex";
-const priorJson = `{ "revision": 41, "index": {
-  "version": 1, "hostContractVersion": "2026.4.25", "compatRegistryVersion": "compat-v1",
-  "migrationVersion": 1, "policyHash": "prior", "generatedAtMs": 123,
-  "installRecords": {}, "plugins": [], "diagnostics": []
-} }`;
 
 function makeEnv() {
   return {
     ...process.env,
     OPENCLAW_STATE_DIR: tempDirs.make("openclaw-plugin-row-receipt"),
     OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
+  };
+}
+
+function revocableAuthority() {
+  const refused = new Error("plugin caller authority revoked");
+  let current = true;
+  return {
+    refused,
+    revoke() {
+      current = false;
+    },
+    assertCurrent() {
+      if (!current) {
+        throw refused;
+      }
+    },
   };
 }
 
@@ -141,13 +152,12 @@ describe("installed plugin index mutation receipts", () => {
     const config = { plugins: { enabled: false } };
     const configBytes = JSON.stringify(config);
     fs.writeFileSync(configPath, configBytes);
-    const refused = new Error("plugin administrator authority revoked after index commit");
-    let current = true;
+    const { refused, revoke, assertCurrent } = revocableAuthority();
     let acknowledgedWrites = 0;
     afterAcknowledgedIndexCommand("plugins.metadata.index.refresh", () => {
       expect(readRow(databasePath)).not.toBeNull();
       acknowledgedWrites++;
-      current = false;
+      revoke();
     });
     await withEnvAsync({ ...env, OPENCLAW_CONFIG_PATH: configPath }, async () => {
       await expect(
@@ -155,13 +165,7 @@ describe("installed plugin index mutation receipts", () => {
           previousInstallRecords: {},
           nextInstallRecords: {},
           nextConfig: { ...config, gateway: { port: 18792 } },
-          writeOptions: {
-            assertConfigPathForWrite: () => {
-              if (!current) {
-                throw refused;
-              }
-            },
-          },
+          writeOptions: { assertConfigPathForWrite: assertCurrent },
         }),
       ).rejects.toBe(refused);
       expect(acknowledgedWrites).toBe(1);
@@ -184,38 +188,27 @@ describe("installed plugin index mutation receipts", () => {
         throw new Error("Expected an initial installed-index revision");
       }
       const revision = before.updated_at_ms;
-      const refused = new Error("plugin caller revoked after acknowledged mutation");
-      let current = true;
+      const { refused, revoke, assertCurrent } = revocableAuthority();
       let acknowledgedWrites = 0;
       afterAcknowledgedIndexCommand(`plugins.metadata.index.${operation}`, () => {
         expect(readRow(databasePath)).not.toEqual(before);
         acknowledgedWrites++;
-        current = false;
+        revoke();
       });
       await expect(
-        withPluginLifecycleLease(
-          {
-            env,
-            assertCurrent() {
-              if (!current) {
-                throw refused;
-              }
-            },
-          },
-          async (lease) => {
-            if (operation === "restore") {
-              await restorePersistedInstalledPluginIndexIfCurrent(null, revision, {
-                env,
-                lease,
-              });
-            } else {
-              await writePersistedInstalledPluginIndex(
-                createInstalledPluginIndex({ policyHash: "after", plugins: [] }),
-                { env },
-              );
-            }
-          },
-        ),
+        withPluginLifecycleLease({ env, assertCurrent }, async (lease) => {
+          if (operation === "restore") {
+            await restorePersistedInstalledPluginIndexIfCurrent(null, revision, {
+              env,
+              lease,
+            });
+          } else {
+            await writePersistedInstalledPluginIndex(
+              createInstalledPluginIndex({ policyHash: "after", plugins: [] }),
+              { env },
+            );
+          }
+        }),
       ).rejects.toBe(refused);
       expect(acknowledgedWrites).toBe(1);
       const fresh = await readPersistedInstalledPluginIndex({ env });
@@ -357,16 +350,10 @@ describe("installed plugin index mutation receipts", () => {
     "preserves the committed row when $operation loses caller authority at $stage",
     async ({ operation, stage }) => {
       const env = makeEnv();
-      const refused = new Error("plugin administrator authority revoked");
-      let current = true;
+      const { refused, revoke, assertCurrent } = revocableAuthority();
       let observedBoundary = false;
       let before;
       let databasePath = "";
-      const assertCurrent = () => {
-        if (!current) {
-          throw refused;
-        }
-      };
       await expect(
         withPluginLifecycleLease(
           {
@@ -391,7 +378,7 @@ describe("installed plugin index mutation receipts", () => {
                     request.facts.kind === "state-lease"
                   ) {
                     observedBoundary = true;
-                    current = false;
+                    revoke();
                   }
                   admit(request, grant);
                 }, attachment),

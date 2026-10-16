@@ -19,6 +19,7 @@ import {
 } from "./installed-plugin-index-store.js";
 import * as metadataWorker from "./plugin-metadata-state-worker.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
+import { createInstalledPluginIndex } from "./test-helpers/installed-plugin-index.js";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -116,17 +117,12 @@ describe("installed plugin index read state", () => {
       } as const;
       const valueJson = JSON.stringify({
         revision: 123,
-        index: {
-          version: 1,
-          hostContractVersion: "2026.4.25",
-          compatRegistryVersion: "compat-v1",
-          migrationVersion: 1,
+        index: createInstalledPluginIndex({
           policyHash: "policy-hash",
           generatedAtMs: 123,
           installRecords,
           plugins: [],
-          diagnostics: [],
-        },
+        }),
       });
       insertPersistedIndexRow(stateDir, valueJson);
       const filePath = resolveInstalledPluginIndexStorePath({ stateDir });
@@ -165,27 +161,22 @@ describe("installed plugin index read state", () => {
   );
 
   it.each([
-    { label: "malformed JSON", valueJson: "{", recordStatus: "invalid" },
-    { label: "missing records", valueJson: '{"revision":123,"index":{}}', recordStatus: "invalid" },
-    {
-      label: "malformed records",
-      valueJson: '{"revision":123,"index":{"installRecords":{"demo":{"source":"bogus"}}}}',
-      recordStatus: "invalid",
-    },
-    {
-      label: "invalid index metadata",
-      valueJson:
-        '{"revision":123,"index":{"version":999,"installRecords":{"demo":{"source":"npm"}}}}',
-      recordStatus: "valid",
-    },
-    {
-      label: "missing revision",
-      valueJson: '{"index":{"installRecords":{"demo":{"source":"npm"}}}}',
-      recordStatus: "valid",
-    },
+    ["malformed JSON", "{", "invalid"],
+    ["missing records", '{"revision":123,"index":{}}', "invalid"],
+    [
+      "malformed records",
+      '{"revision":123,"index":{"installRecords":{"demo":{"source":"bogus"}}}}',
+      "invalid",
+    ],
+    [
+      "invalid index metadata",
+      '{"revision":123,"index":{"version":999,"installRecords":{"demo":{"source":"npm"}}}}',
+      "valid",
+    ],
+    ["missing revision", '{"index":{"installRecords":{"demo":{"source":"npm"}}}}', "valid"],
   ] as const)(
-    "keeps record parsing independent of full-index parsing: $label",
-    async ({ valueJson, recordStatus }) => {
+    "keeps record parsing independent of full-index parsing: %s",
+    async (_label, valueJson, recordStatus) => {
       const stateDir = makeTempDir();
       insertPersistedIndexRow(stateDir, valueJson);
       const records = recordStatus === "valid" ? { demo: { source: "npm" } } : null;

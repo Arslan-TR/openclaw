@@ -12,7 +12,7 @@ import { buildInstalledPluginIndexRecords } from "./installed-plugin-index-recor
 import {
   diffInstalledPluginIndexInvalidationReasons,
   isInstalledPluginEnabled,
-  loadInstalledPluginIndex,
+  loadInstalledPluginIndex as loadIndex,
 } from "./installed-plugin-index.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
 import type { OpenClawPackageManifest } from "./manifest.js";
@@ -33,7 +33,11 @@ function makeTempDir() {
 }
 
 function writePluginManifest(rootDir: string, manifest: Record<string, unknown>) {
-  fs.writeFileSync(path.join(rootDir, "openclaw.plugin.json"), JSON.stringify(manifest), "utf-8");
+  fs.writeFileSync(
+    path.join(rootDir, "openclaw.plugin.json"),
+    JSON.stringify({ configSchema: { type: "object" }, ...manifest }),
+    "utf-8",
+  );
 }
 
 function writePackageJson(rootDir: string, packageJson: Record<string, unknown>) {
@@ -69,6 +73,14 @@ function hermeticEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     VITEST: "true",
     ...overrides,
   };
+}
+
+function loadInstalledPluginIndex(params: Parameters<typeof loadIndex>[0]) {
+  return loadIndex({ env: hermeticEnv(), ...params });
+}
+
+function entryConfig(id: string, enabled: boolean): OpenClawConfig {
+  return { plugins: { entries: { [id]: { enabled } } } };
 }
 
 function createPluginCandidate(params: {
@@ -113,33 +125,20 @@ function createRichPluginFixture(
   writePluginManifest(rootDir, {
     id,
     name: "Demo",
-    configSchema: { type: "object" },
     providers: ["demo"],
     channels: ["demo-chat"],
     cliBackends: ["demo-cli"],
-    channelConfigs: {
-      "demo-chat": {
-        schema: { type: "object" },
-      },
-    },
+    channelConfigs: { "demo-chat": { schema: { type: "object" } } },
     modelCatalog: {
-      providers: {
-        demo: {
-          models: [{ id: "demo-model" }],
-        },
-      },
-      discovery: {
-        demo: "static",
-      },
+      providers: { demo: { models: [{ id: "demo-model" }] } },
+      discovery: { demo: "static" },
     },
     setup: {
       providers: [{ id: "demo", envVars: ["DEMO_API_KEY"] }],
       cliBackends: ["setup-cli"],
     },
     commandAliases: [{ name: "demo-command" }],
-    contracts: {
-      tools: ["demo-tool"],
-    },
+    contracts: { tools: ["demo-tool"] },
     syntheticAuthRefs: ["demo", "demo-cli"],
     activation: {
       onAgentHarnesses: ["codex"],
@@ -147,32 +146,35 @@ function createRichPluginFixture(
       onChannels: ["demo-chat"],
     },
   });
-  return {
+  const candidate = createPluginCandidate({
     rootDir,
-    candidate: createPluginCandidate({
-      rootDir,
-      packageName: "@vendor/demo-plugin",
-      packageVersion: params.packageVersion ?? "1.2.3",
-      packageManifest: {
-        build: { bundledDist: false },
-        channel: {
-          id: "demo",
-          label: "Demo",
-          blurb: "Demo channel",
-          preferOver: ["legacy-demo"],
-          commands: {
-            nativeCommandsAutoEnabled: true,
-            nativeSkillsAutoEnabled: false,
-          },
-        },
-        install: {
-          npmSpec: "@vendor/demo-plugin@1.2.3",
-          expectedIntegrity: "sha512-demo",
-          defaultChoice: "npm",
+    packageName: "@vendor/demo-plugin",
+    packageVersion: params.packageVersion ?? "1.2.3",
+    packageManifest: {
+      build: { bundledDist: false },
+      channel: {
+        id: "demo",
+        label: "Demo",
+        blurb: "Demo channel",
+        preferOver: ["legacy-demo"],
+        commands: {
+          nativeCommandsAutoEnabled: true,
+          nativeSkillsAutoEnabled: false,
         },
       },
-      installOwner: params.installOwner,
-    }),
+      install: {
+        npmSpec: "@vendor/demo-plugin@1.2.3",
+        expectedIntegrity: "sha512-demo",
+        defaultChoice: "npm",
+      },
+    },
+    installOwner: params.installOwner,
+  });
+  return {
+    rootDir,
+    candidate,
+    load: (overrides: Parameters<typeof loadIndex>[0] = {}) =>
+      loadInstalledPluginIndex({ candidates: [candidate], ...overrides }),
   };
 }
 
@@ -180,13 +182,11 @@ describe("installed plugin index", () => {
   it("builds a runtime-free installed plugin snapshot from manifest and package metadata", () => {
     const fixture = createRichPluginFixture();
 
-    const index = loadInstalledPluginIndex({
-      candidates: [fixture.candidate],
-      env: hermeticEnv(),
+    const index = fixture.load({
       now: () => new Date("2026-04-25T12:00:00.000Z"),
     });
 
-    expectRecordFields(index as unknown as Record<string, unknown>, {
+    expectRecordFields(requireRecord(index, "index"), {
       version: 1,
       migrationVersion: 1,
       generatedAtMs: 1777118400000,
@@ -230,14 +230,10 @@ describe("installed plugin index", () => {
         nativeSkillsAutoEnabled: false,
       },
     });
-    expectRecordFields(requireRecord(plugin.packageBuild, "package build"), {
-      bundledDist: false,
-    });
+    expectRecordFields(requireRecord(plugin.packageBuild, "package build"), { bundledDist: false });
     expectSha256(plugin.manifestHash);
     const packageJson = requireRecord(index.plugins[0]?.packageJson, "package json");
-    expectRecordFields(packageJson, {
-      path: "package.json",
-    });
+    expectRecordFields(packageJson, { path: "package.json" });
     expectSha256(packageJson.hash);
     expect(resolveInstalledPluginIndexInstallOwner(plugin)).toBeUndefined();
     expect(index.plugins[0]?.installRecordHash).toBeUndefined();
@@ -263,11 +259,10 @@ describe("installed plugin index", () => {
   ])("$name", ({ manifest, expected, sidecar }) => {
     const rootDir = makeTempDir();
     writeRuntimeEntry(rootDir);
-    writePluginManifest(rootDir, { ...manifest, configSchema: { type: "object" } });
+    writePluginManifest(rootDir, manifest);
 
     const index = loadInstalledPluginIndex({
       candidates: [createPluginCandidate({ rootDir })],
-      env: hermeticEnv(),
     });
 
     expectRecordFields(requireRecord(index.plugins[0], "installed plugin record"), {
@@ -328,8 +323,7 @@ describe("installed plugin index", () => {
   it("changes manifestless Claude bundle hashes when derived metadata changes", () => {
     const rootDir = path.join(makeTempDir(), "workspace");
     writeManifestlessClaudeBundle(rootDir, ["skills"]);
-
-    const first = loadInstalledPluginIndex({
+    const params = {
       candidates: [
         createPluginCandidate({
           rootDir,
@@ -339,24 +333,10 @@ describe("installed plugin index", () => {
           origin: "config",
         }),
       ],
-      env: hermeticEnv(),
-    });
-
+    };
+    const first = loadInstalledPluginIndex(params);
     writeManifestlessClaudeBundle(rootDir, ["commands"]);
-    const second = withPluginCache(createPluginCache(), () =>
-      loadInstalledPluginIndex({
-        candidates: [
-          createPluginCandidate({
-            rootDir,
-            idHint: "workspace",
-            format: "bundle",
-            bundleFormat: "claude",
-            origin: "config",
-          }),
-        ],
-        env: hermeticEnv(),
-      }),
-    );
+    const second = withPluginCache(createPluginCache(), () => loadInstalledPluginIndex(params));
 
     expect(second.plugins[0]?.manifestHash).not.toBe(first.plugins[0]?.manifestHash);
   });
@@ -380,7 +360,6 @@ describe("installed plugin index", () => {
           packageVersion: "1.2.3",
         }),
       ],
-      env: hermeticEnv(),
     });
 
     expect(index.plugins[0]?.packageJson?.path).toBe("package.json");
@@ -401,10 +380,7 @@ describe("installed plugin index", () => {
       );
       fs.symlinkSync(outsidePackageJsonPath, packageJsonPath);
 
-      const index = loadInstalledPluginIndex({
-        candidates: [fixture.candidate],
-        env: hermeticEnv(),
-      });
+      const index = fixture.load();
 
       expect(index.plugins[0]?.packageJson).toBeUndefined();
     },
@@ -413,19 +389,10 @@ describe("installed plugin index", () => {
   it("retains disabled plugin metadata while evaluating live enablement", () => {
     const enabledFixture = createRichPluginFixture({ id: "enabled-demo" });
     const disabledFixture = createRichPluginFixture({ id: "disabled-demo" });
-    const config = {
-      plugins: {
-        entries: {
-          "disabled-demo": {
-            enabled: false,
-          },
-        },
-      },
-    };
+    const config = entryConfig("disabled-demo", false);
     const index = loadInstalledPluginIndex({
       candidates: [enabledFixture.candidate, disabledFixture.candidate],
       config,
-      env: hermeticEnv(),
     });
 
     const disabled = index.plugins.find((plugin) => plugin.pluginId === "disabled-demo");
@@ -442,15 +409,7 @@ describe("installed plugin index", () => {
     );
     expect(isInstalledPluginEnabled(index, "disabled-demo", config)).toBe(false);
     expect(
-      isInstalledPluginEnabled(index, "disabled-demo", {
-        plugins: {
-          entries: {
-            "enabled-demo": {
-              enabled: true,
-            },
-          },
-        },
-      }),
+      isInstalledPluginEnabled(index, "disabled-demo", entryConfig("enabled-demo", true)),
     ).toBe(true);
     expect(isInstalledPluginEnabled(index, "disabled-demo")).toBe(false);
     expect(
@@ -468,11 +427,7 @@ describe("installed plugin index", () => {
     ({ channelEnabled, expected }) => {
       // The rich fixture's plugin id is `demo` while it owns `channels.demo-chat`.
       const fixture = createRichPluginFixture({ id: "demo" });
-      const index = loadInstalledPluginIndex({
-        candidates: [fixture.candidate],
-        config: {},
-        env: hermeticEnv(),
-      });
+      const index = fixture.load({ config: {} });
 
       expect(
         isInstalledPluginEnabled(index, "demo", {
@@ -488,14 +443,9 @@ describe("installed plugin index", () => {
     const globalDir = makeTempDir();
     writeRuntimeEntry(bundledDir);
     writeRuntimeEntry(globalDir);
-    writePluginManifest(bundledDir, {
-      id: "duplicate-demo",
-      configSchema: { type: "object" },
-    });
-    writePluginManifest(globalDir, {
-      id: "duplicate-demo",
-      configSchema: { type: "object" },
-    });
+    writePluginManifest(bundledDir, { id: "duplicate-demo" });
+    writePluginManifest(globalDir, { id: "duplicate-demo" });
+    const installRecords = { "duplicate-demo": { source: "npm" as const, installPath: globalDir } };
 
     const index = loadInstalledPluginIndex({
       candidates: [
@@ -511,21 +461,10 @@ describe("installed plugin index", () => {
           installOwner: "duplicate-demo",
         }),
       ],
-      installRecords: {
-        "duplicate-demo": {
-          source: "npm",
-          installPath: globalDir,
-        },
-      },
-      env: hermeticEnv(),
+      installRecords,
     });
 
-    expect(index.installRecords).toEqual({
-      "duplicate-demo": {
-        source: "npm",
-        installPath: globalDir,
-      },
-    });
+    expect(index.installRecords).toEqual(installRecords);
     expect(index.plugins).toHaveLength(1);
     const plugin = requireRecord(index.plugins[0], "installed plugin record");
     expectRecordFields(plugin, {
@@ -539,18 +478,16 @@ describe("installed plugin index", () => {
   it("discovers installed plugin packages from persisted install records", async () => {
     const fixture = createRichPluginFixture();
     const stateDir = makeTempDir();
-    await seedInstalledPluginIndex(
-      {
-        demo: {
-          source: "git",
-          spec: "git:file:///tmp/demo.git@abc123",
-          installPath: fixture.rootDir,
-          gitUrl: "file:///tmp/demo.git",
-          gitCommit: "abc123",
-        },
+    const installRecords = {
+      demo: {
+        source: "git" as const,
+        spec: "git:file:///tmp/demo.git@abc123",
+        installPath: fixture.rootDir,
+        gitUrl: "file:///tmp/demo.git",
+        gitCommit: "abc123",
       },
-      { stateDir },
-    );
+    };
+    await seedInstalledPluginIndex(installRecords, { stateDir });
 
     const index = loadInstalledPluginIndex({
       env: hermeticEnv({
@@ -567,15 +504,7 @@ describe("installed plugin index", () => {
       rootDir: fs.realpathSync.native(fixture.rootDir),
     });
     expectSha256(plugin.installRecordHash);
-    expect(index.installRecords).toEqual({
-      demo: {
-        source: "git",
-        spec: "git:file:///tmp/demo.git@abc123",
-        installPath: fixture.rootDir,
-        gitUrl: "file:///tmp/demo.git",
-        gitCommit: "abc123",
-      },
-    });
+    expect(index.installRecords).toEqual(installRecords);
   });
 
   it("treats legacy config-path startup metadata as migration invalidation", () => {
@@ -583,16 +512,10 @@ describe("installed plugin index", () => {
     writePluginManifest(fixture.rootDir, {
       id: "demo",
       name: "Demo",
-      configSchema: { type: "object" },
       providers: ["demo"],
-      activation: {
-        onConfigPaths: ["browser"],
-      },
+      activation: { onConfigPaths: ["browser"] },
     });
-    const current = loadInstalledPluginIndex({
-      candidates: [fixture.candidate],
-      env: hermeticEnv(),
-    });
+    const current = fixture.load();
     const previous = {
       ...current,
       plugins: current.plugins.map((plugin) => ({
@@ -614,7 +537,6 @@ describe("installed plugin index", () => {
     writePluginManifest(disabledFixture.rootDir, {
       id: "disabled-demo",
       name: "Disabled Demo",
-      configSchema: { type: "object" },
       providers: ["disabled-demo"],
     });
     const current = loadInstalledPluginIndex({
@@ -625,16 +547,7 @@ describe("installed plugin index", () => {
           idHint: "disabled-demo",
         },
       ],
-      config: {
-        plugins: {
-          entries: {
-            "disabled-demo": {
-              enabled: false,
-            },
-          },
-        },
-      },
-      env: hermeticEnv(),
+      config: entryConfig("disabled-demo", false),
     });
     const migratedEnabledOnly = {
       ...current,
@@ -649,8 +562,7 @@ describe("installed plugin index", () => {
 
   it("diffs invalidation reasons for manifest, package, source, host, compat, and migration changes", () => {
     const fixture = createRichPluginFixture({ installOwner: "demo" });
-    const previous = loadInstalledPluginIndex({
-      candidates: [fixture.candidate],
+    const previous = fixture.load({
       config: {
         plugins: {
           installs: {
@@ -661,7 +573,6 @@ describe("installed plugin index", () => {
           },
         },
       },
-      env: hermeticEnv({ OPENCLAW_VERSION: "2026.4.25" }),
     });
 
     writePackageJson(fixture.rootDir, {
@@ -670,7 +581,6 @@ describe("installed plugin index", () => {
     });
     writePluginManifest(fixture.rootDir, {
       id: "demo",
-      configSchema: { type: "object" },
       providers: ["demo", "demo-next"],
     });
     const current = {
@@ -716,18 +626,10 @@ describe("installed plugin index", () => {
     const fixture = createRichPluginFixture();
     const contractPath = path.join(fixture.rootDir, "doctor-contract-api.ts");
     fs.writeFileSync(contractPath, "export const stateMigrations = [];\n", "utf8");
-    const previous = loadInstalledPluginIndex({
-      candidates: [fixture.candidate],
-      env: hermeticEnv(),
-    });
+    const previous = fixture.load();
 
     fs.writeFileSync(contractPath, "export const stateMigrations = [{ id: 'changed' }];\n", "utf8");
-    const current = withPluginCache(createPluginCache(), () =>
-      loadInstalledPluginIndex({
-        candidates: [fixture.candidate],
-        env: hermeticEnv(),
-      }),
-    );
+    const current = withPluginCache(createPluginCache(), () => fixture.load());
 
     expect(current.plugins[0]?.manifestHash).toBe(previous.plugins[0]?.manifestHash);
     expect(current.plugins[0]?.packageJson?.hash).toBe(previous.plugins[0]?.packageJson?.hash);
