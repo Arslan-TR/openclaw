@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getEnvironmentData } from "node:worker_threads";
 import { zstdCompressSync } from "node:zlib";
+import { sql } from "kysely";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -13,7 +14,11 @@ import {
 } from "../../../packages/memory-host-sdk/src/host/memory-search-schema.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { resolveSessionColdArchivePath } from "../../config/sessions/session-cold-storage-codec.js";
-import { prepareTranscriptPayload } from "../../config/sessions/transcript-payload.js";
+import {
+  createTranscriptPayloadUpdater,
+  prepareTranscriptPayload,
+  transcriptEventModelBytesSql,
+} from "../../config/sessions/transcript-payload.js";
 import {
   capturePostgresBackup,
   preparePostgresRestore,
@@ -22,9 +27,15 @@ import {
 import { createLocalSnapshotProvider } from "../../snapshot/local-repository.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../../state/openclaw-agent-db-contract.js";
 import { openAgentEngineStore } from "../../state/openclaw-agent-db-engine.js";
+import type { DB } from "../../state/openclaw-agent-db.generated.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../../state/openclaw-state-db-contract.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../kysely-sync.js";
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
-import { isPostgresSqlConnection } from "../sql-connection.js";
+import {
+  isPostgresSqlConnection,
+  type EngineConnection,
+  type PostgresSqlConnection,
+} from "../sql-connection.js";
 import { admitSqliteSchema } from "../sqlite-schema-facts.js";
 import { createUpdateDatabaseBackup } from "../update-database-backup.js";
 import { admitStoreSearch } from "./adapters.js";
@@ -99,25 +110,45 @@ describe.skipIf(!connection)("agent database port", () => {
       INSERT INTO memory_session_tombstones VALUES ('forgotten-session', 'main', 'deleted', 1);
       INSERT INTO cache_entries VALUES ('retained', 'binary', NULL, X'00ff80', NULL, 1);`);
     admitSqliteSchema(source);
-    const event = JSON.stringify({
+    const legacyEvent = JSON.stringify({ type: "session", id: "session", version: 3 });
+    source
+      .prepare(`INSERT INTO transcript_events
+      (session_id, seq, event_json, model_bytes, model_without_checkpoint_bytes, created_at)
+      VALUES ('session', 0, ?, NULL, NULL, 1)`)
+      .run(legacyEvent);
+    const message = {
+      role: "user",
+      content: [{ type: "text", text: "café sentinel ".repeat(200) }],
+    };
+    const eventFields = {
       type: "message",
       id: "message",
       parentId: null,
       timestamp: "2026-10-16T00:00:00.000Z",
-      message: { role: "user", content: [{ type: "text", text: "café sentinel ".repeat(200) }] },
+    };
+    const event = JSON.stringify({
+      ...eventFields,
+      message: { ...message, providerReplay: { type: "checkpoint", data: "retained replay" } },
     });
+    const modelBytes = Buffer.byteLength(event);
+    const modelWithoutCheckpointBytes = Buffer.byteLength(
+      JSON.stringify({ ...eventFields, message }),
+    );
     const payload = prepareTranscriptPayload(source, event);
     expect(payload.event_json).toBeNull();
     expect(payload.event_zstd).toBeInstanceOf(Uint8Array);
     source
       .prepare(`INSERT INTO transcript_events
-      (session_id, seq, event_json, event_zstd, event_utf8_bytes, navigation_json, created_at)
-      VALUES ('session', 1, ?, ?, ?, ?, 1)`)
+      (session_id, seq, event_json, event_zstd, event_utf8_bytes, navigation_json,
+       model_bytes, model_without_checkpoint_bytes, created_at)
+      VALUES ('session', 1, ?, ?, ?, ?, ?, ?, 1)`)
       .run(
         payload.event_json,
         payload.event_zstd,
         payload.event_utf8_bytes,
         payload.navigation_json,
+        modelBytes,
+        modelWithoutCheckpointBytes,
       );
     source.exec(`INSERT INTO transcript_event_identities
       (session_id, event_id, seq, event_type, message_idempotency_key, created_at)
@@ -163,9 +194,24 @@ describe.skipIf(!connection)("agent database port", () => {
       assertCurrent() {},
     });
     expect(
-      (await client.query(`SELECT event_json, event_zstd FROM "${namespace}".transcript_events`))
-        .rows,
-    ).toEqual([{ event_json: event, event_zstd: null }]);
+      (
+        await client.query(`SELECT event_json, event_zstd, model_bytes,
+          model_without_checkpoint_bytes FROM "${namespace}".transcript_events ORDER BY seq`)
+      ).rows,
+    ).toEqual([
+      {
+        event_json: legacyEvent,
+        event_zstd: null,
+        model_bytes: null,
+        model_without_checkpoint_bytes: null,
+      },
+      {
+        event_json: event,
+        event_zstd: null,
+        model_bytes: String(modelBytes),
+        model_without_checkpoint_bytes: String(modelWithoutCheckpointBytes),
+      },
+    ]);
     expect(
       (
         await client.query(
@@ -214,41 +260,70 @@ describe.skipIf(!connection)("agent database port", () => {
     }
     await descriptor.admit!(anchorPath, { connection: connection!, schemaPrefix: "test" });
     const config = { database: { engine: "postgres" as const, postgres: { connection } } };
-    withDatabaseEngineSelection(
-      {
-        effectiveEngines: resolveDatabaseFamilyEngines(config),
-        postgres: { connection: connection!, schemaPrefix: "test" },
-      },
-      () =>
-        withEngineStoreAdmission(() => {
-          using anchor = openNodeSqliteDatabase(anchorPath);
-          const db = openAgentEngineStore(anchor, "main", anchorPath, true);
-          if (!isPostgresSqlConnection(db)) {
-            throw new Error("Expected the admitted PostgreSQL agent owner");
-          }
-          try {
-            admitStoreSearch(db, memoryTextSearchSchema("unicode61"), { extension: "memory.text" });
-            admitStoreSearch(db, memoryStandingIntentSearchSchema, {
-              extension: "memory.standing-intents",
-            });
-            db.runTransaction(() => {
-              db.prepare(`INSERT INTO memory_index_chunks
+    const readModelBudgets = (db: EngineConnection) =>
+      executeSqliteQuerySync(
+        db,
+        getNodeSqliteKysely<DB>(db)
+          .selectFrom("transcript_events")
+          .select([
+            transcriptEventModelBytesSql(db, sql.lit(0)).as("budget_bytes"),
+            transcriptEventModelBytesSql(db, sql.lit(1)).as("budget_without_checkpoint_bytes"),
+          ])
+          .where("session_id", "=", "session")
+          .where("seq", "=", 1),
+      ).rows;
+    const nativeModelBudgets = (
+      await client.query<{ budget_bytes: number; budget_without_checkpoint_bytes: number }>(
+        `SELECT octet_length(event_json::jsonb::text) AS budget_bytes,
+          octet_length((event_json::jsonb #- '{message,providerReplay}')::text)
+            AS budget_without_checkpoint_bytes
+          FROM "${namespace}".transcript_events WHERE seq = 1`,
+      )
+    ).rows;
+    expect(nativeModelBudgets[0]!.budget_bytes).toBeGreaterThan(modelBytes);
+    expect(nativeModelBudgets[0]!.budget_without_checkpoint_bytes).toBeGreaterThan(
+      modelWithoutCheckpointBytes,
+    );
+    const withAgentOwner = (run: (db: PostgresSqlConnection) => void) =>
+      withDatabaseEngineSelection(
+        {
+          effectiveEngines: resolveDatabaseFamilyEngines(config),
+          postgres: { connection: connection!, schemaPrefix: "test" },
+        },
+        () =>
+          withEngineStoreAdmission(() => {
+            using anchor = openNodeSqliteDatabase(anchorPath);
+            const db = openAgentEngineStore(anchor, "main", anchorPath, true);
+            if (!isPostgresSqlConnection(db)) {
+              throw new Error("Expected the admitted PostgreSQL agent owner");
+            }
+            try {
+              run(db);
+            } finally {
+              db.close();
+            }
+          }),
+      );
+    withAgentOwner((db) => {
+      expect(readModelBudgets(db)).toEqual(nativeModelBudgets);
+      admitStoreSearch(db, memoryTextSearchSchema("unicode61"), { extension: "memory.text" });
+      admitStoreSearch(db, memoryStandingIntentSearchSchema, {
+        extension: "memory.standing-intents",
+      });
+      db.runTransaction(() => {
+        db.prepare(`INSERT INTO memory_index_chunks
             (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
             VALUES ('derived-chunk', 'memory/example.md', 'memory', 1, 1, 'hash', 'none', 'derived search sentinel', ?, 1)`).run(
-                Buffer.alloc(0),
-              );
-            });
-            expect(
-              db
-                .prepare(`SELECT id FROM memory_index_chunks
+          Buffer.alloc(0),
+        );
+      });
+      expect(
+        db
+          .prepare(`SELECT id FROM memory_index_chunks
           WHERE openclaw_search @@ plainto_tsquery('"${namespace}".openclaw_simple_unaccent', 'sentinel')`)
-                .all(),
-            ).toEqual([{ id: "derived-chunk" }]);
-          } finally {
-            db.close();
-          }
-        }),
-    );
+          .all(),
+      ).toEqual([{ id: "derived-chunk" }]);
+    });
     {
       using roundtrip = openNodeSqliteDatabase(path.join(directory, "roundtrip.sqlite"));
       expect(
@@ -261,8 +336,24 @@ describe.skipIf(!connection)("agent database port", () => {
         }),
       ).toEqual(copied);
       expect(
-        roundtrip.prepare("SELECT event_json, event_zstd FROM transcript_events").get(),
-      ).toEqual({ event_json: event, event_zstd: null });
+        roundtrip
+          .prepare(`SELECT event_json, event_zstd, model_bytes,
+            model_without_checkpoint_bytes FROM transcript_events ORDER BY seq`)
+          .all(),
+      ).toEqual([
+        {
+          event_json: legacyEvent,
+          event_zstd: null,
+          model_bytes: null,
+          model_without_checkpoint_bytes: null,
+        },
+        {
+          event_json: event,
+          event_zstd: null,
+          model_bytes: modelBytes,
+          model_without_checkpoint_bytes: modelWithoutCheckpointBytes,
+        },
+      ]);
       expect(
         roundtrip.prepare("SELECT entry_key, origin_class FROM memory_entry_origins").all(),
       ).toEqual([{ entry_key: "retained-memory", origin_class: "owner" }]);
@@ -297,6 +388,22 @@ describe.skipIf(!connection)("agent database port", () => {
           .get(),
       ).toEqual({ enqueue_sequence: 10 });
     }
+    withAgentOwner((db) => {
+      const updatePayload = createTranscriptPayloadUpdater(db, "session");
+      db.runTransaction(() => updatePayload({ ...prepareTranscriptPayload(db, event), seq: 1 }));
+      expect(
+        db
+          .prepare(`SELECT event_json, model_bytes, model_without_checkpoint_bytes,
+          navigation_json FROM transcript_events WHERE seq = 1`)
+          .get(),
+      ).toEqual({
+        event_json: event,
+        model_bytes: null,
+        model_without_checkpoint_bytes: null,
+        navigation_json: null,
+      });
+      expect(readModelBudgets(db)).toEqual(nativeModelBudgets);
+    });
     const anchorBytes = fs.readFileSync(anchorPath);
     for (const registryEngine of ["sqlite", "postgres"]) {
       const stateDir = path.join(directory, `update-state-${registryEngine}`);
@@ -362,9 +469,18 @@ describe.skipIf(!connection)("agent database port", () => {
           readOnly: true,
         },
       );
-      expect(updateExport.prepare("SELECT event_json FROM transcript_events").get()).toEqual({
-        event_json: event,
-      });
+      expect(
+        updateExport.prepare("SELECT event_json FROM transcript_events ORDER BY seq").all(),
+      ).toEqual([{ event_json: legacyEvent }, { event_json: event }]);
+      expect(
+        updateExport
+          .prepare(`SELECT model_bytes, model_without_checkpoint_bytes
+          FROM transcript_events WHERE seq = 1`)
+          .get(),
+      ).toEqual({ model_bytes: null, model_without_checkpoint_bytes: null });
+      expect(readModelBudgets(updateExport)).toEqual([
+        { budget_bytes: modelBytes, budget_without_checkpoint_bytes: modelWithoutCheckpointBytes },
+      ]);
     }
     for (const profile of ["exact", "user-backup"] as const) {
       const backupDirectory = path.join(directory, profile);

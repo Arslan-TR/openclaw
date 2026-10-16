@@ -105,7 +105,10 @@ import {
   isPersistentOpenClawAgentDatabasePath,
   resolveOpenClawAgentSqlitePath,
 } from "./openclaw-agent-db.paths.js";
-import { AGENT_INDEX_RETIREMENT_SQL } from "./openclaw-agent-index-retirement-migration.js";
+import {
+  AGENT_INDEX_RETIREMENT_SQL,
+  AGENT_MODEL_BYTE_SQLITE_MIGRATION_SQL,
+} from "./openclaw-agent-index-retirement-migration.js";
 import { migrateAgentJsonPredicatesInTransaction } from "./openclaw-agent-json-predicate-schema.js";
 import { migrateOutboxEnqueueSequenceInTransaction } from "./openclaw-agent-outbox-sequence-migration.js";
 import { migrateSessionParticipantsSchema } from "./openclaw-agent-participants-migration.js";
@@ -400,7 +403,7 @@ function ensureAgentSchema(
           previousVersion < AGENT_INDEX_RETIREMENT_SCHEMA_VERSION &&
           targetVersion >= AGENT_INDEX_RETIREMENT_SCHEMA_VERSION
         ) {
-          db.exec(AGENT_INDEX_RETIREMENT_SQL);
+          db.exec(`${AGENT_INDEX_RETIREMENT_SQL}${AGENT_MODEL_BYTE_SQLITE_MIGRATION_SQL}`);
         }
         // Historical rebuilds also converge indexes. Later version steps own
         // only their declared tables; additive index repair stays at admission.

@@ -626,6 +626,8 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         await client.query(`SELECT fingerprint FROM "${agentNamespace}".openclaw_schema_meta`)
       ).rows[0].fingerprint;
       await client.query(`
+        ALTER TABLE "${agentNamespace}".transcript_events
+          DROP COLUMN model_bytes, DROP COLUMN model_without_checkpoint_bytes;
         DROP INDEX "${agentNamespace}".idx_agent_session_windows_conversation;
         CREATE INDEX idx_agent_session_windows_conversation
           ON "${agentNamespace}".session_windows
@@ -658,6 +660,16 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           VALUES ('retained-memory', 'main', 'session', 'agent:main:main', 'owner', 1);
         SELECT setval('"${agentNamespace}".context_engine_turn_outbox_enqueue_sequence_seq', 71, true);
       `);
+      const retainedEvent = JSON.stringify({
+        type: "message",
+        id: "retained-message",
+        message: { role: "user", content: "Preserve café 🦞 through migration and rollback." },
+      });
+      await client.query(
+        `INSERT INTO "${agentNamespace}".transcript_events
+          (session_id, seq, event_json, created_at) VALUES ('session', 0, $1, 1)`,
+        [retainedEvent],
+      );
       {
         using anchor = openNodeSqliteDatabase(agentPath);
         publishSqliteDatabaseSchemaChange(anchor);
@@ -687,6 +699,16 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           await client.query(`SELECT last_value, is_called
           FROM "${agentNamespace}".context_engine_turn_outbox_enqueue_sequence_seq`)
         ).rows;
+      const readModelByteColumns = async () =>
+        (
+          await client.query<{ column_name: string }>(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = 'transcript_events'
+               AND column_name IN ('model_bytes', 'model_without_checkpoint_bytes')
+             ORDER BY column_name`,
+            [agentNamespace],
+          )
+        ).rows;
       const readIndexes = async () =>
         (
           await client.query<{ indexname: string; indexdef: string }>(
@@ -702,6 +724,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           indexdef: indexdef.replaceAll(agentNamespace, "fixture_namespace"),
         }));
       const beforeIndexes = await readIndexes();
+      expect(await readModelByteColumns()).toEqual([]);
       expect(beforeIndexes).toEqual([
         {
           indexname: "idx_agent_session_nodes_last_interaction_at",
@@ -752,6 +775,15 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
               path.join(agentBackup.exportDirectory!, "database.sqlite"),
             );
             expect(image.prepare("PRAGMA user_version").get()?.user_version).toBe(27);
+            expect(
+              image
+                .prepare(`SELECT name FROM pragma_table_info('transcript_events')
+                  WHERE name IN ('model_bytes', 'model_without_checkpoint_bytes')`)
+                .all(),
+            ).toEqual([]);
+            expect(image.prepare("SELECT event_json FROM transcript_events").all()).toEqual([
+              { event_json: retainedEvent },
+            ]);
             expect(
               image
                 .prepare("SELECT wr FROM pragma_table_list WHERE name = 'memory_entry_origins'")
@@ -821,6 +853,18 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
             ).rows,
           ).toEqual([{ version: String(candidate.version), fingerprint: targetAgentFingerprint }]);
           expect(await readAllocation()).toEqual([{ last_value: "72", is_called: true }]);
+          expect(
+            (
+              await client.query(`SELECT event_json, model_bytes, model_without_checkpoint_bytes
+                FROM "${agentNamespace}".transcript_events`)
+            ).rows,
+          ).toEqual([
+            {
+              event_json: retainedEvent,
+              model_bytes: null,
+              model_without_checkpoint_bytes: null,
+            },
+          ]);
           expect(await readIndexes()).toEqual([
             {
               indexname: "idx_agent_session_windows_conversation",
@@ -881,6 +925,10 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         ).toEqual([{ version: String(installed.version) }]);
         expect(await readAllocation()).toEqual([{ last_value: "71", is_called: true }]);
         expect(await readIndexes()).toEqual(beforeIndexes);
+        expect(await readModelByteColumns()).toEqual([]);
+        expect(
+          (await client.query(`SELECT event_json FROM "${agentNamespace}".transcript_events`)).rows,
+        ).toEqual([{ event_json: retainedEvent }]);
         expect(
           (
             await client.query(`SELECT enqueue_sequence, advancement_key

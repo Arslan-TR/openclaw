@@ -78,7 +78,7 @@ import {
   sqliteSessionTranscriptTurnRebound,
 } from "./session-turn.kernel.js";
 import { resolveSessionWorkStartError } from "./session-work-start.js";
-import { prepareTranscriptPayload, transcriptEventJsonSql } from "./transcript-payload.js";
+import { createTranscriptEventInserter, transcriptEventJsonSql } from "./transcript-payload.js";
 
 export type SessionColdPreparationWorkerData = {
   type: "sqlite-transcript-archive-v2";
@@ -605,21 +605,18 @@ export function mutateSessionColdTranscriptInWorker(
         }
         const session_id = plan.sessionId;
         const insertFts = createSessionTranscriptFtsInserter(database.db, session_id);
+        const insertEvent = createTranscriptEventInserter(database.db, session_id);
         withSqliteDatabaseWriteScope(database.db, [sqliteSessionIdWriteScope(session_id)], () => {
           for (const record of records) {
             switch (record.kind) {
               case "header":
                 break;
               case "event":
-                executeSqliteQuerySync(
-                  database.db,
-                  db.insertInto("transcript_events").values({
-                    session_id,
-                    seq: record.row.seq,
-                    created_at: record.row.created_at,
-                    ...prepareTranscriptPayload(database.db, record.row.event_json),
-                  }),
-                );
+                insertEvent({
+                  seq: record.row.seq,
+                  createdAt: record.row.created_at,
+                  eventJson: record.row.event_json,
+                });
                 break;
               case "identity":
                 executeSqliteQuerySync(

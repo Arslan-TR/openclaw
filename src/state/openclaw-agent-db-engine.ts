@@ -25,7 +25,9 @@ import {
 import { assertCurrentAgentSchemaMetadata } from "./openclaw-agent-db-schema-read.js";
 import {
   AGENT_INDEX_RETIREMENT_SQL,
+  AGENT_MODEL_BYTE_POSTGRES_MIGRATION_SQL,
   withLegacyAgentPostgresIndexes,
+  withoutAgentModelByteColumns,
 } from "./openclaw-agent-index-retirement-migration.js";
 import { agentTranscriptSearchSchema } from "./openclaw-agent-search-schema.js";
 import {
@@ -65,7 +67,9 @@ export function admitAgentEngineSearchExtensions(
 }
 
 const agentPostgresSql = `${agentPostgresRuntime.sql}\n${agentSearchPostgresRuntime.sql}`;
-const agentPostgresV28Sql = withLegacyAgentPostgresIndexes(agentPostgresSql);
+const agentPostgresV28Sql = withLegacyAgentPostgresIndexes(
+  withoutAgentModelByteColumns(agentPostgresSql),
+);
 
 export const agentEngineSchema: StoreSchema = {
   id: "agent",
@@ -90,6 +94,7 @@ export const agentEngineSchema: StoreSchema = {
       fromSchema: { postgres: agentPostgresV28Sql },
       schema: { postgres: agentPostgresSql },
       sql: `${AGENT_INDEX_RETIREMENT_SQL}
+        ${AGENT_MODEL_BYTE_POSTGRES_MIGRATION_SQL}
         UPDATE schema_meta
         SET schema_version = ${AGENT_INDEX_RETIREMENT_SCHEMA_VERSION},
           app_version = '${VERSION.replaceAll("'", "''")}',

@@ -8,6 +8,7 @@ import { assertSqliteSchemaContains } from "../infra/sqlite-schema-contract.js";
 import { extractSqliteTableSchema, quoteSqliteIdentifier } from "../infra/sqlite-schema-sql.js";
 import { resolveZstdCodec } from "../infra/zstd-codec.js";
 import { renewAgentDatabaseMaintenanceAuthorityIfPresent } from "./openclaw-agent-db-lease.js";
+import { withoutAgentModelByteColumns } from "./openclaw-agent-index-retirement-migration.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "./openclaw-agent-schema.js";
 import { withLegacyAgentStorageSchema } from "./openclaw-agent-storage-schema.js";
 
@@ -77,10 +78,10 @@ export function migrateTranscriptPayloadStorageInTransaction(database: DatabaseS
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const codec = resolveZstdCodec();
   database.exec(
-    extractSqliteTableSchema(OPENCLAW_AGENT_SCHEMA_SQL, "transcript_events").replace(
-      "IF NOT EXISTS transcript_events",
-      MIGRATION_TABLE,
-    ),
+    extractSqliteTableSchema(
+      withoutAgentModelByteColumns(OPENCLAW_AGENT_SCHEMA_SQL),
+      "transcript_events",
+    ).replace("IF NOT EXISTS transcript_events", MIGRATION_TABLE),
   );
   const copyIdentity = database.prepare(`
     INSERT INTO ${MIGRATION_TABLE}

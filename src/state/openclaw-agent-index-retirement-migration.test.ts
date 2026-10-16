@@ -8,6 +8,7 @@ import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
 import { withAgentDatabaseMaintenanceLease } from "./openclaw-agent-db-maintenance-lease.js";
 import { getOpenClawAgentMigrationSchema } from "./openclaw-agent-db-schema-helpers.js";
 import { ensureOpenClawAgentDatabaseSchema } from "./openclaw-agent-db-schema.js";
+import { AGENT_V14_CORE_SCHEMA_SQL } from "./openclaw-agent-schema-history.js";
 import {
   assertOpenClawMigrationWitnessPreserved,
   captureOpenClawMigrationWitness,
@@ -37,7 +38,14 @@ const schemaV28 = fs
     /(CREATE TABLE IF NOT EXISTS memory_entry_origins \([\s\S]*?\n\) STRICT);/u,
     "$1, WITHOUT ROWID;",
   );
-const scope = ["schema_meta", "session_nodes", "session_reactions", "sqlite_stat1", "sqlite_stat4"];
+const scope = [
+  "schema_meta",
+  "session_nodes",
+  "session_reactions",
+  "sqlite_stat1",
+  "sqlite_stat4",
+  "transcript_events",
+];
 
 function seed(database: DatabaseSync): void {
   database.exec(schemaV28);
@@ -75,6 +83,11 @@ function retained(database: DatabaseSync) {
   return {
     nodes: database.prepare("SELECT * FROM session_nodes ORDER BY session_key").all(),
     reactions: database.prepare("SELECT * FROM session_reactions ORDER BY identity_id").all(),
+    events: database
+      .prepare(`SELECT session_id, seq, event_json, created_at,
+        event_zstd, event_utf8_bytes, navigation_json
+        FROM transcript_events ORDER BY session_id, seq`)
+      .all(),
   };
 }
 
@@ -83,8 +96,18 @@ describe("agent index retirement migration", () => {
     expect(getOpenClawAgentMigrationSchema(28)).toBe(schemaV28);
   });
 
+  it("keeps future model byte columns out of historical admission", () => {
+    for (const schema of [AGENT_V14_CORE_SCHEMA_SQL, getOpenClawAgentMigrationSchema(24)]) {
+      using database = new DatabaseSync(":memory:");
+      database.exec(schema);
+      const columns = database.prepare("PRAGMA table_info(transcript_events)").all();
+      expect(columns.map(({ name }) => name)).not.toContain("model_bytes");
+      expect(columns.map(({ name }) => name)).not.toContain("model_without_checkpoint_bytes");
+    }
+  });
+
   it.each(["commit", "rollback"] as const)(
-    "preserves rows and publishes the two index removals atomically (%s)",
+    "preserves rows and publishes index removals and nullable model bytes atomically (%s)",
     async (outcome) => {
       await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
         const pathname = state.path("index-retirement.sqlite");
@@ -92,6 +115,7 @@ describe("agent index retirement migration", () => {
         seed(database);
         const before = retained(database);
         const indexes = indexDefinitions(database);
+        const transcriptColumns = database.prepare("PRAGMA table_info(transcript_events)").all();
         const captureWitness = () =>
           captureOpenClawMigrationWitness(database, { role: "agent", agentId: "main" });
         const originalWitness = captureWitness();
@@ -139,8 +163,39 @@ describe("agent index retirement migration", () => {
               ),
         );
         if (outcome === "rollback") {
+          expect(database.prepare("PRAGMA table_info(transcript_events)").all()).toEqual(
+            transcriptColumns,
+          );
           return;
         }
+        expect(
+          database
+            .prepare("PRAGMA table_info(transcript_events)")
+            .all()
+            .slice(transcriptColumns.length),
+        ).toEqual([
+          {
+            cid: transcriptColumns.length,
+            name: "model_bytes",
+            type: "INTEGER",
+            notnull: 0,
+            dflt_value: null,
+            pk: 0,
+          },
+          {
+            cid: transcriptColumns.length + 1,
+            name: "model_without_checkpoint_bytes",
+            type: "INTEGER",
+            notnull: 0,
+            dflt_value: null,
+            pk: 0,
+          },
+        ]);
+        expect(
+          database
+            .prepare("SELECT model_bytes, model_without_checkpoint_bytes FROM transcript_events")
+            .all(),
+        ).toEqual([{ model_bytes: null, model_without_checkpoint_bytes: null }]);
         const currentWitness = captureWitness();
         // Migration normalization never permits unrelated index loss or same-version drift.
         database.exec("SAVEPOINT witness_drift; DROP INDEX local_reaction_identity");
@@ -156,6 +211,12 @@ describe("agent index retirement migration", () => {
         ).toThrow(/changed or lost/u);
         expect(() =>
           assertOpenClawMigrationWitnessPreserved(originalWitness, captureWitness()),
+        ).toThrow(/changed or lost/u);
+        database.exec("ROLLBACK TO witness_drift; RELEASE witness_drift");
+
+        database.exec("SAVEPOINT witness_drift; UPDATE transcript_events SET model_bytes = 1");
+        expect(() =>
+          assertOpenClawMigrationWitnessPreserved(currentWitness, captureWitness()),
         ).toThrow(/changed or lost/u);
         database.exec("ROLLBACK TO witness_drift; RELEASE witness_drift");
 
@@ -189,7 +250,7 @@ describe("agent index retirement migration", () => {
     },
   );
 
-  it("restores the scoped indexes and rows without overwriting later unrelated writes", async () => {
+  it("restores scoped columns, indexes and rows without overwriting later unrelated writes", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const pathname = state.statePath("index-retirement-restore.sqlite");
       const backupPath = state.statePath("index-retirement.scoped.bak");
@@ -197,6 +258,7 @@ describe("agent index retirement migration", () => {
       seed(database);
       const before = retained(database);
       const indexes = indexDefinitions(database);
+      const transcriptColumns = database.prepare("PRAGMA table_info(transcript_events)").all();
       const statistics = database.prepare("SELECT * FROM sqlite_stat1 ORDER BY tbl, idx").all();
       expect(
         resolveSchemaMigrationBackupTables({
@@ -219,11 +281,17 @@ describe("agent index retirement migration", () => {
         });
       });
       database.exec("UPDATE cache_entries SET blob = X'BEEF' WHERE scope = 'unrelated'");
+      database.exec(
+        "UPDATE transcript_events SET model_bytes = 123, model_without_checkpoint_bytes = 123",
+      );
       await assertSqliteMigrationScopePreserved(database, scope, () =>
         restoreDoctorMigrationBackup({ sourcePath: pathname, backupPath, env: state.env }),
       );
       expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(28);
       expect(retained(database)).toEqual(before);
+      expect(database.prepare("PRAGMA table_info(transcript_events)").all()).toEqual(
+        transcriptColumns,
+      );
       expect(indexDefinitions(database)).toEqual(indexes);
       expect(database.prepare("SELECT * FROM sqlite_stat1 ORDER BY tbl, idx").all()).toEqual(
         statistics,
