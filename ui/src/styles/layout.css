@@ -3615,23 +3615,16 @@ button.gateway-status:focus-visible {
   position: fixed;
   z-index: 65;
   left: calc(var(--shell-nav-width) + 16px);
-  /* Without anchor positioning, clear a typical composer on every page. */
-  bottom: calc(var(--shell-dock-reserve-bottom) + var(--safe-area-bottom, 0px) + 128px);
+  bottom: max(
+    calc(var(--shell-dock-reserve-bottom) + var(--safe-area-bottom, 0px) + 16px),
+    calc(anchor(--shell-composer top, 0px) + 12px)
+  );
   max-width: calc(100% - var(--shell-nav-width) - 32px);
   padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg);
   box-shadow: var(--shadow-sm);
-}
-
-@supports (anchor-name: --shell-composer) {
-  .shell-connection-status {
-    bottom: max(
-      calc(var(--shell-dock-reserve-bottom) + var(--safe-area-bottom, 0px) + 16px),
-      calc(anchor(--shell-composer top, 0px) + 12px)
-    );
-  }
 }
 
 .sidebar-session-group-running {
