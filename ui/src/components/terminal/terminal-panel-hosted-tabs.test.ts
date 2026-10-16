@@ -33,7 +33,7 @@ async function mount(embedded = true, tabsInHeader = true) {
         ? terminalOpenResult(`session-${++sequence}`)
         : method === "terminal.list"
           ? { sessions: [] }
-          : {}) as T,
+          : { ok: true }) as T,
     addEventListener: () => () => {},
   };
   const panel = createTestTerminalPanel(tagName);

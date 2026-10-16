@@ -3,9 +3,9 @@
 import type { RouterState } from "@openclaw/uirouter";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { resolveThemeBranding } from "../../../packages/gateway-protocol/src/theme.ts";
-import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { GatewaySessionRow } from "../api/types.ts";
 import { createApplicationRouter, type RouteId } from "../app-routes.ts";
+import { createTestGatewayClient } from "../test-helpers/gateway-client.ts";
 import { createStorageMock } from "../test-helpers/storage.ts";
 import { selectShellRouteState } from "./app-host-route-state.ts";
 import {
@@ -32,7 +32,7 @@ describe("OpenClaw shell dock suppression", () => {
       "matchMedia",
       vi.fn(() => ({ matches: false })),
     );
-    const client = {} as GatewayBrowserClient;
+    const client = createTestGatewayClient(vi.fn());
     const context = {
       basePath: "",
       gateway: {

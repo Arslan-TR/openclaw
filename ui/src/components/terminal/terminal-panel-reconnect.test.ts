@@ -63,7 +63,9 @@ describe("OpenClawTerminalPanel reconnect", () => {
       forceReconnect: () => {},
       request: async <T>(method: string, params?: unknown) => {
         requests.push({ method, params });
-        return terminalOpenResult("upgraded-session") as T;
+        return (
+          method === "terminal.open" ? terminalOpenResult("upgraded-session") : { ok: true }
+        ) as T;
       },
       addEventListener: () => () => {},
     };
@@ -219,7 +221,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
       const terminal = createTerminalController();
       createGhosttyTerminalMock.mockResolvedValue(terminal);
       const delivery = createDeferred<{ ok: boolean }>();
-      const dispatched = createDeferred<void>();
+      const dispatched = createDeferred();
       let armed = false;
       const client = createTestGatewayClient((method) => {
         if (armed && method === `terminal.${action}`) {
@@ -341,7 +343,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
               seq: "detached history".length,
             } as T;
           }
-          return {} as T;
+          return { ok: true } as T;
         },
         addEventListener: () => () => {},
       };
@@ -446,7 +448,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
             seq: buffer.length,
           } as T;
         }
-        return {} as T;
+        return { ok: true } as T;
       },
       addEventListener: (nextListener) => {
         listener = nextListener;
@@ -550,7 +552,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
           opened += 1;
           return terminalOpenResult(`opened-terminal-${opened}`) as T;
         }
-        return {} as T;
+        return { ok: true } as T;
       },
       addEventListener: () => () => {},
     };
@@ -627,7 +629,9 @@ describe("OpenClawTerminalPanel reconnect", () => {
       forceReconnect: () => {},
       request: async <T>(method: string, params?: unknown) => {
         requests.push({ method, params });
-        return terminalOpenResult("initial-terminal") as T;
+        return (
+          method === "terminal.open" ? terminalOpenResult("initial-terminal") : { ok: true }
+        ) as T;
       },
       addEventListener: () => () => {},
     };
@@ -685,7 +689,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
             seq: 5,
           } as T;
         }
-        return {} as T;
+        return { ok: true } as T;
       },
       addEventListener: () => () => {},
     };
@@ -740,8 +744,10 @@ describe("OpenClawTerminalPanel reconnect", () => {
     createGhosttyTerminalMock.mockResolvedValue(createTerminalController());
     const client: TerminalGatewayClient = {
       forceReconnect: () => {},
-      request: async <T>() =>
-        ({ ...terminalOpenResult("stalled-terminal"), buffer: "ready", seq: 5 }) as T,
+      request: async <T>(method: string) =>
+        (method === "terminal.attach"
+          ? { ...terminalOpenResult("stalled-terminal"), buffer: "ready", seq: 5 }
+          : { ok: true }) as T,
       addEventListener: () => () => {},
     };
     let releaseRefresh: ((replacementActivated: boolean) => void) | undefined;
@@ -804,7 +810,7 @@ describe("OpenClawTerminalPanel reconnect", () => {
             seq: 23,
           } as T;
         }
-        return {} as T;
+        return { ok: true } as T;
       },
       addEventListener: () => () => {},
     };

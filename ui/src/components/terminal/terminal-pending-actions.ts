@@ -154,23 +154,24 @@ export class TerminalIntentQueue {
     host: TerminalIntentHost,
     isConnected: () => boolean,
     restore?: () => void,
+    resume?: () => Promise<void>,
   ): void {
     const generation = host.currentGeneration();
     this.beginRefreshFence(host, generation);
     restore?.();
-    const release = () => {
+    const release = async () => {
       if (generation !== host.currentGeneration() || !isConnected()) {
         return;
       }
-      this.releaseRefreshFence(host);
+      // Retained streams recover under the fence before queued work uses their connection.
+      await resume?.();
+      if (generation === host.currentGeneration() && isConnected()) {
+        this.releaseRefreshFence(host);
+      }
     };
     void import("../../app/sw-refresh.runtime.ts")
       .then(({ refreshControlUiServiceWorker }) => refreshControlUiServiceWorker())
-      .then((replacementActivated) => {
-        if (!replacementActivated) {
-          release();
-        }
-      }, release);
+      .then((replacementActivated) => (replacementActivated ? undefined : release()), release);
   }
 
   beginRefreshFence(host: TerminalIntentHost, generation: number): void {
@@ -182,7 +183,7 @@ export class TerminalIntentQueue {
     this.armRefreshTimer();
   }
 
-  releaseRefreshFence(host: TerminalIntentHost): void {
+  private releaseRefreshFence(host: TerminalIntentHost): void {
     if (this.fenceHost !== host) {
       return;
     }

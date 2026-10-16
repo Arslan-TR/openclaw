@@ -65,7 +65,7 @@ function createGateway(sessionIds = ["session-a", "session-b"]) {
         return reply.promise as Promise<T>;
       }
       return Promise.resolve(
-        method === "terminal.open" ? terminalOpenResult("replacement") : {},
+        method === "terminal.open" ? terminalOpenResult("replacement") : { ok: true },
       ) as Promise<T>;
     },
     addEventListener: (listener) => {

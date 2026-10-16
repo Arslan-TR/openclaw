@@ -256,10 +256,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       this.suspendTransport();
       return;
     }
-    if (!clientChanged && connectionChanged && this.host.available) {
-      void this.resumeTransport();
-      return;
-    }
+    const resuming = !clientChanged && connectionChanged && this.host.available;
     const becameAvailable = availabilityChanged && this.host.available && this.hadAvailable;
     const priorEpoch = (clientChanged && this.hadClient) || becameAvailable;
     const reconnecting = this.host.client !== null && priorEpoch;
@@ -277,7 +274,8 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     if (clientChanged || becameUnavailable) {
       this.disposeAllTabs();
     }
-    let shouldRestore = clientChanged && this.host.available && this.host.terminalPanelOpen;
+    let shouldRestore =
+      (clientChanged || resuming) && this.host.available && this.host.terminalPanelOpen;
     if (availabilityChanged) {
       if (!this.host.available) {
         this.host.hideTerminalPanelForUnavailableSurface();
@@ -285,11 +283,13 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
         shouldRestore = true;
       }
     }
-    if (reconnecting) {
+    if (reconnecting || resuming) {
+      const operation = resuming ? this.captureTerminalOperation() : null;
       this.intentQueue.refreshBeforeReconnect(
         this.intentHost,
         () => this.host.isConnected,
         shouldRestore ? () => void this.restoreSessions() : undefined,
+        operation ? () => this.resumeTransport(operation) : undefined,
       );
     } else if (shouldRestore) {
       void this.restoreSessions();
@@ -317,8 +317,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     this.updateControllerState({ booting: false });
   }
 
-  private async resumeTransport(): Promise<void> {
-    const operation = this.captureTerminalOperation();
+  private async resumeTransport(operation = this.captureTerminalOperation()): Promise<void> {
     if (!operation) {
       return;
     }
