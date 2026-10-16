@@ -42,6 +42,7 @@ type OpenAICompletionsCompatDefaults = {
   requiresReasoningContentOnAssistantMessages: boolean;
   requiresNonEmptyUserOrAssistantMessage: boolean;
   cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
+  cacheControlSystemOnly: boolean;
   sessionAffinityFormat: Exclude<OpenAICompletionsSessionAffinity, "none">;
   supportsLongCacheRetention: boolean;
 };
@@ -56,6 +57,7 @@ export type ResolvedOpenAICompletionsCompat = Omit<
 > &
   Pick<OpenAICompletionsCompat, "reasoningEffortMap" | "supportedReasoningEfforts"> & {
     cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
+    cacheControlSystemOnly: boolean;
     openRouterRouting?: OpenAICompletionsCompat["openRouterRouting"];
     sessionAffinity: OpenAICompletionsSessionAffinity;
     visibleReasoningDetailTypes: string[];
@@ -190,6 +192,10 @@ function resolveOpenAICompletionsCompatDefaults(
     (isDefaultRoute &&
       isDefaultRouteProvider(input.provider, "cerebras", "chutes", "deepseek", "opencode", "xai"));
   const isOpenRouterLike = input.provider === "openrouter" || endpointClass === "openrouter";
+  const openRouterModelId = normalizeOpenRouterModelFamilyId(modelId);
+  const isOpenRouterGemini =
+    (endpointClass === "openrouter" || (isDefaultRoute && provider === "openrouter")) &&
+    openRouterModelId?.startsWith("google/gemini") === true;
   const isLocalEndpoint = endpointClass === "local";
   const isMistral = knownProviderFamily === "mistral" || endpointClass === "mistral-public";
   const usesMaxTokens =
@@ -237,15 +243,18 @@ function resolveOpenAICompletionsCompatDefaults(
     requiresReasoningContentOnAssistantMessages: isDeepSeek || isXiaomi,
     requiresNonEmptyUserOrAssistantMessage: isModelStudioLike,
     cacheControlFormat:
+      isOpenRouterGemini ||
       (isModelStudioLike && endpointClass !== "custom") ||
-      (normalizeOpenRouterModelFamilyId(modelId)?.startsWith("anthropic/") === true &&
+      (openRouterModelId?.startsWith("anthropic/") === true &&
         (endpointClass === "openrouter" ||
           (isDefaultRoute && provider === "openrouter") ||
           provider === "deepinfra"))
         ? "anthropic"
         : undefined,
+    cacheControlSystemOnly: isOpenRouterGemini,
     sessionAffinityFormat: isOpenRouterLike ? "openrouter" : "openai",
     supportsLongCacheRetention:
+      !isOpenRouterGemini &&
       !isModelStudioLike &&
       provider !== "cloudflare-workers-ai" &&
       provider !== "cloudflare-ai-gateway" &&
@@ -356,6 +365,7 @@ export function resolveOpenAICompletionsCompat(
     supportsJsonSchemaResponseFormat:
       configured?.supportsJsonSchemaResponseFormat ?? defaults.supportsJsonSchemaResponseFormat,
     cacheControlFormat: configured?.cacheControlFormat ?? defaults.cacheControlFormat,
+    cacheControlSystemOnly: defaults.cacheControlSystemOnly,
     sessionAffinity: resolveSessionAffinity(model, defaults.sessionAffinityFormat),
     supportsPromptCacheKey: resolveOpenAIPromptCacheKeySupport(model),
     supportsLongCacheRetention:
