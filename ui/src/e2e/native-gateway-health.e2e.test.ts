@@ -140,7 +140,8 @@ suite.define(() => {
         expect(await teamHealth.getAttribute("aria-label")).toBe("Connected");
         const identity = page.locator(".sidebar-identity-card");
         expect(await identity.locator(".sidebar-gateway-health").count()).toBe(0);
-        await expect.poll(() => identity.locator(".gateway-status__label").count()).toBe(0);
+        await expect.poll(() => identity.getAttribute("data-connection-status")).toBe("connected");
+        await expect.poll(() => page.locator(".shell-connection-status").count()).toBe(0);
         await assertSelectionUnchanged(page);
         await page.mouse.move(1100, 850);
         if (proof) {
@@ -154,6 +155,13 @@ suite.define(() => {
         await gateway.setOnline(false);
         await expect.poll(() => teamHealth.getAttribute("data-health")).toBe("error");
         expect(await teamHealth.getAttribute("aria-label")).toBe("Unreachable");
+        await expect
+          .poll(() => identity.getAttribute("data-connection-status"))
+          .toBe("reconnecting");
+        await page
+          .locator(".shell-connection-status")
+          .getByRole("button", { name: "Reconnecting… — Retry now", exact: true })
+          .waitFor();
         await assertSelectionUnchanged(page);
         if (proof) {
           await page.screenshot({
@@ -169,7 +177,8 @@ suite.define(() => {
         expect(await teamHealth.getAttribute("aria-label")).toBe("Connected");
         await assertSelectionUnchanged(page);
         expect(await identity.locator(".sidebar-gateway-health").count()).toBe(0);
-        await expect.poll(() => identity.locator(".gateway-status__label").count()).toBe(0);
+        await expect.poll(() => identity.getAttribute("data-connection-status")).toBe("connected");
+        await expect.poll(() => page.locator(".shell-connection-status").count()).toBe(0);
         const reportedHealth = await page.evaluate(() => {
           const reports = Reflect.get(window, "nativeHealthReports") as Array<{ health: string }>;
           return reports.map((report) => report.health);

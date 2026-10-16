@@ -205,7 +205,9 @@ suite.define(() => {
               return window.openclawControlUi?.snapshot().gatewayPhase === "reconnecting";
             });
             await expect
-              .poll(() => page.locator(".gateway-status__label").textContent())
+              .poll(() =>
+                page.locator(".shell-connection-status .gateway-status__label").textContent(),
+              )
               .toContain("Reconnecting…");
             await expect.poll(() => visibleMessages(page)).toHaveLength(3);
             signal.throwIfAborted();
@@ -225,7 +227,7 @@ suite.define(() => {
               .toEqual([messageBRestartPrefix, "source B restart tail"]);
             // The preview build differs from this cross-origin source Gateway; reloading
             // the preview cannot change that, so the status must settle as connected.
-            await expect.poll(() => page.locator(".gateway-status__label").count()).toBe(0);
+            await expect.poll(() => page.locator(".shell-connection-status").count()).toBe(0);
             await appendFile(sourceB, `${lineBAfterReconnect}\n`, "utf8");
             await expect
               .poll(() => visibleMessages(page))

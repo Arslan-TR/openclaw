@@ -18,25 +18,20 @@ const withPage = (
     run,
   );
 
-async function connectionStatusOverlapsComposer(page: Page): Promise<boolean> {
-  return page.evaluate(() => {
-    const status =
-      document.querySelector(".shell-connection-status") ??
-      document.querySelector(".sidebar-identity-card[data-connection-status]");
-    if (!status) {
-      throw new Error("Expected a visible Gateway connection status surface");
-    }
-    const statusBounds = status.getBoundingClientRect();
-    const composerBounds = document
-      .querySelector(".agent-chat__composer-shell")!
-      .getBoundingClientRect();
-    return (
-      statusBounds.left < composerBounds.right &&
-      statusBounds.right > composerBounds.left &&
-      statusBounds.top < composerBounds.bottom &&
-      statusBounds.bottom > composerBounds.top
-    );
-  });
+async function expectChipAboveComposer(page: Page): Promise<void> {
+  const chip = page.locator(".shell-connection-status");
+  await chip.waitFor({ state: "visible" });
+  const chipBounds = await chip.boundingBox();
+  const composerBounds = await page.locator(".agent-chat__composer-shell").boundingBox();
+  const footerBounds = await page.locator(".chat-footer").boundingBox();
+  expect(chipBounds).not.toBeNull();
+  expect(composerBounds).not.toBeNull();
+  expect(footerBounds).not.toBeNull();
+  expect(chipBounds!.y).toBeGreaterThanOrEqual(0);
+  expect(chipBounds!.y + chipBounds!.height).toBeLessThanOrEqual(composerBounds!.y);
+  expect(chipBounds!.y + chipBounds!.height).toBeGreaterThanOrEqual(footerBounds!.y - 32);
+  expect(chipBounds!.x).toBeGreaterThanOrEqual(0);
+  expect(chipBounds!.x + chipBounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
 }
 
 suite.define(() => {
@@ -140,6 +135,9 @@ suite.define(() => {
           (element) => element.getBoundingClientRect().y,
         );
         const connectionStatus = page.locator(".shell-connection-status");
+        const content = page.locator("main.content");
+        const initialContentBounds = await content.boundingBox();
+        expect(initialContentBounds).not.toBeNull();
         expect(await connectionStatus.count()).toBe(0);
 
         await page.evaluate(() => window.dispatchEvent(new Event("test-release-status-recovery")));
@@ -147,6 +145,7 @@ suite.define(() => {
         expect(await connectionStatus.count()).toBe(0);
         const readyHeaderY = await header.evaluate((element) => element.getBoundingClientRect().y);
         expect(Math.abs(readyHeaderY - initialHeaderY)).toBeLessThanOrEqual(0.1);
+        expect(await content.boundingBox()).toEqual(initialContentBounds);
 
         const connectCount = (await gateway.getRequests("connect")).length;
         await gateway.closeLatest(1001, "synthetic recovery");
@@ -157,9 +156,13 @@ suite.define(() => {
           .locator(".gateway-status__label")
           .getByText("Restoring…", { exact: true })
           .waitFor({ state: "visible" });
+        expect(await content.boundingBox()).toEqual(initialContentBounds);
+        await expectChipAboveComposer(page);
+        expect((await connectionStatus.boundingBox())!.x).toBeLessThanOrEqual(32);
         await page.evaluate(() => window.dispatchEvent(new Event("test-release-status-recovery")));
         await waitForGatewayRecoveryScope(page);
         await expect.poll(() => connectionStatus.count()).toBe(0);
+        expect(await content.boundingBox()).toEqual(initialContentBounds);
       },
       { colorScheme: "dark", reducedMotion: "no-preference" },
     );
@@ -182,7 +185,11 @@ suite.define(() => {
       );
       await retainedStatus.waitFor({ state: "visible" });
       expect(await retainedStatus.getAttribute("aria-label")).toContain("Reconnecting…");
-      await expect.poll(() => connectionStatusOverlapsComposer(page)).toBe(false);
+      await expectChipAboveComposer(page);
+      await page
+        .locator(".shell-connection-status")
+        .getByRole("button", { name: "Reconnecting… — Retry now", exact: true })
+        .waitFor();
     });
   });
 
@@ -216,6 +223,9 @@ suite.define(() => {
         expect((await gateway.getRequests("connect")).length).toBeGreaterThan(0);
         const composer = page.locator(".agent-chat__composer-combobox textarea");
         await composer.waitFor({ state: "visible" });
+        const content = page.locator("main.content");
+        const connectedContentBounds = await content.boundingBox();
+        expect(connectedContentBounds).not.toBeNull();
         await gateway.setOnline(false);
         for (const message of ["First synthetic draft", "Second synthetic draft"]) {
           await composer.fill(message);
@@ -223,10 +233,24 @@ suite.define(() => {
           await expect.poll(() => composer.inputValue()).toBe("");
         }
         const footer = page.locator(".sidebar-footer-bar");
+        const chip = page.locator(".shell-connection-status");
         await expect.poll(() => page.locator(".chat-queue__item").count()).toBe(2);
-        await expect.poll(() => footer.textContent()).toContain("Reconnecting…");
+        await chip
+          .getByRole("button", { name: "Reconnecting… · 2 queued — Retry now", exact: true })
+          .waitFor();
+        expect(await chip.count()).toBe(1);
+        expect(await chip.locator(".gateway-status__label").textContent()).toBe(
+          "Reconnecting… · 2 queued",
+        );
+        expect(await content.boundingBox()).toEqual(connectedContentBounds);
+        await expectChipAboveComposer(page);
         const identityStatus = footer.locator(".sidebar-identity-card");
         expect(await identityStatus.isVisible()).toBe(true);
+        expect(await identityStatus.getAttribute("data-connection-status")).toBe("reconnecting");
+        expect(await identityStatus.locator(".sidebar-identity-card__status").isVisible()).toBe(
+          true,
+        );
+        expect(await footer.locator(".gateway-status").count()).toBe(0);
         expect(await identityStatus.getAttribute("aria-label")).toContain("Reconnecting…");
         expect(await identityStatus.textContent()).toContain("Alex");
         expect(await identityStatus.locator("[role=status]").count()).toBe(0);
@@ -240,8 +264,11 @@ suite.define(() => {
         await page.setViewportSize({ width: 390, height: 844 });
         const mobileStatus = page.locator(".shell-connection-status");
         await mobileStatus.waitFor({ state: "visible" });
-        await expect.poll(() => connectionStatusOverlapsComposer(page)).toBe(false);
-        expect(await mobileStatus.textContent()).not.toContain("in outbox");
+        await expectChipAboveComposer(page);
+        expect((await mobileStatus.boundingBox())!.x).toBeLessThanOrEqual(32);
+        expect(await mobileStatus.locator(".gateway-status__label").textContent()).toBe(
+          "Reconnecting… · 2 queued",
+        );
         await page.setViewportSize({ width: 1280, height: 900 });
         await footer.waitFor({ state: "visible" });
 
@@ -256,6 +283,8 @@ suite.define(() => {
         await menu.waitFor({ state: "hidden" });
         await page.setViewportSize({ width: 390, height: 844 });
         await page.getByRole("button", { name: "Expand sidebar" }).click();
+        await expectChipAboveComposer(page);
+        expect(await chip.count()).toBe(1);
         await identityStatus.click();
         await menu.getByText("Alex", { exact: true }).waitFor();
         const retry = menu.locator('[data-value="command:retry-connect"]');
@@ -271,7 +300,11 @@ suite.define(() => {
         await expect.poll(() => gateway.getSocketCount()).toBeGreaterThan(socketCount);
         await gateway.setOnline(true);
         await waitForControlUiGatewayReady(page);
-        await expect.poll(() => footer.textContent()).not.toContain("Reconnecting…");
+        await expect.poll(() => chip.count()).toBe(0);
+        await expect
+          .poll(() => identityStatus.getAttribute("data-connection-status"))
+          .toBe("connected");
+        expect(await announcement.textContent()).toBe("Connected");
         expect(await identityStatus.textContent()).toContain("Alex");
       },
       { colorScheme: "dark" },

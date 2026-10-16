@@ -81,7 +81,10 @@ describe("personal navigation rail", () => {
       identity.querySelector(".sidebar-identity-card__avatar .sidebar-identity-card__status"),
     ).not.toBeNull();
     expect(identity.getAttribute("data-connection-status")).toBe("connected");
-    expect(identity.getAttribute("aria-label")).toContain("Connected");
+    expect(identity.getAttribute("aria-label")).toContain("Identity and app menu for Self");
+    expect(bottom.querySelector(".sidebar-footer-bar > [role=status]")?.textContent).toBe(
+      "Connected",
+    );
     for (const status of ["connecting", "reconnecting", "offline", "reload-required"] as const) {
       sidebar.connectionStatus = status;
       await sidebar.updateComplete;
