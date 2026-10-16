@@ -21,6 +21,24 @@ import { DEFAULT_DEPS } from "./manager.types.js";
 type Fixture = Parameters<Parameters<typeof withAcpCancellationFixture>[0]>[0];
 type TurnOptions = Partial<Parameters<Fixture["manager"]["runTurn"]>[0]>;
 
+function cancelOwned(
+  f: Fixture,
+  options: Partial<Parameters<Fixture["manager"]["cancelSession"]>[0]> = {},
+) {
+  return f.manager.cancelSession({ ...f.target, expectedOwnerKey: "agent:main:main", ...options });
+}
+
+function holdEnsure(f: Fixture, runtimeSessionName: string) {
+  const entered = createDeferred();
+  const release = createDeferred();
+  f.ensureSession.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return { sessionKey: f.target.sessionKey, backend: "cancellation-proof", runtimeSessionName };
+  });
+  return { entered, release };
+}
+
 function startTurn(f: Fixture, requestId: string, text: string, options: TurnOptions = {}) {
   return f.manager.runTurn({
     ...f.target,
@@ -53,9 +71,7 @@ it("refuses inline-only idle ACP metadata without host data SQL", async () => {
     async (f) => {
       const sql = observeHostDataSql();
       try {
-        await expect(
-          f.manager.cancelSession({ ...f.target, expectedOwnerKey: "agent:main:main" }),
-        ).rejects.toMatchObject({ code: "ACP_TURN_FAILED" });
+        await expect(cancelOwned(f)).rejects.toMatchObject({ code: "ACP_TURN_FAILED" });
         sql.restore();
         expect(f.ensureSession).not.toHaveBeenCalled();
         expect(f.cancel).not.toHaveBeenCalled();
@@ -71,21 +87,10 @@ it("refuses inline-only idle ACP metadata without host data SQL", async () => {
 
 it("does not admit durable runtime cancellation from an inherited discovery snapshot", async () => {
   await withAcpCancellationFixture(async (f) => {
-    const entered = createDeferred();
-    const release = createDeferred();
-    f.ensureSession.mockImplementationOnce(async () => {
-      entered.resolve();
-      await release.promise;
-      return {
-        sessionKey: f.target.sessionKey,
-        backend: "cancellation-proof",
-        runtimeSessionName: "retained-runtime",
-      };
+    const { entered, release } = holdEnsure(f, "retained-runtime");
+    const cancellation = withOpenClawStateDatabaseReadSnapshot(() => cancelOwned(f), {
+      env: f.state.env,
     });
-    const cancellation = withOpenClawStateDatabaseReadSnapshot(
-      () => f.manager.cancelSession({ ...f.target, expectedOwnerKey: "agent:main:main" }),
-      { env: f.state.env },
-    );
     const result = Promise.allSettled([cancellation]);
     try {
       await awaitGate(entered.promise, result, "Cancellation ended before runtime preparation.");
@@ -152,10 +157,7 @@ it("joins a failing accepted sibling while another terminal signal remains activ
     const turnResults = Promise.allSettled(turns);
     let settled = false;
     const sql = observeHostDataSql();
-    const cancellation = f.manager.cancelSession({
-      ...f.target,
-      expectedOwnerKey: "agent:main:main",
-    });
+    const cancellation = cancelOwned(f);
     const result = Promise.allSettled([cancellation]).then((value) => {
       settled = true;
       return value;
@@ -188,21 +190,8 @@ it.each(["metadata", "lifecycle"] as const)(
   async (replacement) => {
     await withAcpCancellationFixture(async (f) => {
       const close = vi.spyOn(f.runtime, "close");
-      const entered = createDeferred();
-      const release = createDeferred();
-      f.ensureSession.mockImplementationOnce(async () => {
-        entered.resolve();
-        await release.promise;
-        return {
-          sessionKey: f.target.sessionKey,
-          backend: "cancellation-proof",
-          runtimeSessionName: "late-runtime",
-        };
-      });
-      const cancellation = f.manager.cancelSession({
-        ...f.target,
-        expectedOwnerKey: "agent:main:main",
-      });
+      const { entered, release } = holdEnsure(f, "late-runtime");
+      const cancellation = cancelOwned(f);
       const result = Promise.allSettled([cancellation]);
       await awaitGate(entered.promise, result, "Cancellation ended before setup.");
       try {
@@ -261,11 +250,7 @@ it("joins only the superseded actor's late handle after post-ensure control read
         return value;
       });
     const sql = observeHostDataSql();
-    const cancellation = f.manager.cancelSession({
-      ...f.target,
-      reason: "old-actor",
-      expectedOwnerKey: "agent:main:main",
-    });
+    const cancellation = cancelOwned(f, { reason: "old-actor" });
     const result = Promise.allSettled([cancellation]).then((value) => {
       settled = true;
       return value;
@@ -277,11 +262,7 @@ it("joins only the superseded actor's late handle after post-ensure control read
         ...f.target,
         reason: "fixture-actor-replacement",
       });
-      successor = f.manager.cancelSession({
-        ...f.target,
-        reason: "successor-actor",
-        expectedOwnerKey: "agent:main:main",
-      });
+      successor = cancelOwned(f, { reason: "successor-actor" });
       await successor;
       releaseRead.resolve();
       await awaitGate(closeEntered.promise, result, "Superseded handle was not closed.");
@@ -334,11 +315,9 @@ it("refuses caller revocation while the registered cancellation read is pending"
     await awaitGate(entered.promise, turnResult, "Turn ended before runtime entry.");
     const { entered: readEntered, release: readRelease, reader } = holdControlRead();
     let callerCurrent = true;
-    const cancellation = f.manager.cancelSession({
-      ...f.target,
+    const cancellation = cancelOwned(f, {
       expectedRunId: "caller-worker",
       expectedInstanceId: context.operationalRunInstance.instanceId,
-      expectedOwnerKey: "agent:main:main",
       assertActive: () => {
         if (!callerCurrent) {
           throw new Error("Caller was revoked before admission.");
@@ -369,20 +348,10 @@ it.each(["acknowledged", "failed"] as const)(
   "retains %s late-handle cleanup after caller revocation without host data SQL",
   async (outcome) => {
     await withAcpCancellationFixture(async (f) => {
-      const ensureEntered = createDeferred();
-      const ensureRelease = createDeferred();
+      const { entered: ensureEntered, release: ensureRelease } = holdEnsure(f, "late-runtime");
       const admitted = createDeferred();
       const cancelEntered = createDeferred();
       const cancelRelease = createDeferred();
-      f.ensureSession.mockImplementationOnce(async () => {
-        ensureEntered.resolve();
-        await ensureRelease.promise;
-        return {
-          sessionKey: f.target.sessionKey,
-          backend: "cancellation-proof",
-          runtimeSessionName: "late-runtime",
-        };
-      });
       f.cancel.mockImplementationOnce(async () => {
         cancelEntered.resolve();
         await cancelRelease.promise;
@@ -412,11 +381,9 @@ it.each(["acknowledged", "failed"] as const)(
           controlPrepared = true;
           return read;
         });
-      const cancellation = f.manager.cancelSession({
-        ...f.target,
+      const cancellation = cancelOwned(f, {
         expectedRunId: "late-worker",
         expectedInstanceId: context.operationalRunInstance.instanceId,
-        expectedOwnerKey: "agent:main:main",
         assertActive: () => {
           if (!callerCurrent) {
             throw new Error("Caller was revoked.");
@@ -500,12 +467,10 @@ it("does not adopt a same-request successor after actor replacement during cance
     const firstResult = Promise.allSettled([first]);
     await awaitGate(firstEntered.promise, firstResult, "First actor ended before entry.");
     const { entered: readEntered, release: readRelease, reader } = holdControlRead();
-    const cancellation = f.manager.cancelSession({
-      ...f.target,
+    const cancellation = cancelOwned(f, {
       reason: "pending-request",
       expectedRunId: "actor-worker",
       expectedInstanceId: context.operationalRunInstance.instanceId,
-      expectedOwnerKey: "agent:main:main",
     });
     const result = Promise.allSettled([cancellation]);
     let successor: Promise<void> | undefined;
