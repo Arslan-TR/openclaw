@@ -42,8 +42,14 @@ beforeEach(() => {
 function acquireLease(options: Parameters<typeof acquireStartupMigrationLeaseWithWait>[0] = {}) {
   return acquireStartupMigrationLeaseWithWait({ env, timeoutMs: 0, ...options });
 }
-function readRow(db: import("node:sqlite").DatabaseSync, sql: string) {
+function readRow(sql: string) {
+  using db = new DatabaseSync(databasePath, { readOnly: true });
   return db.prepare(sql).get();
+}
+function seedDatabase(seed: (db: import("node:sqlite").DatabaseSync) => void) {
+  mkdirSync(path.dirname(databasePath), { recursive: true });
+  using db = new DatabaseSync(databasePath);
+  seed(db);
 }
 
 type StartupMigrationLeaseTestDatabase = Pick<
@@ -79,25 +85,19 @@ describe("startup migration lease", () => {
   it("initializes the canonical schema before acquiring the first startup lease", async () => {
     const lease = await acquireLease({ owner: "fresh-startup" });
 
-    const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      expect(readRow(database, "PRAGMA user_version")).toEqual({
-        user_version: OPENCLAW_STATE_SCHEMA_VERSION,
-      });
-      expect(
-        readRow(
-          database,
-          "SELECT role, schema_version FROM schema_meta WHERE meta_key = 'primary'",
-        ),
-      ).toEqual({ role: "global", schema_version: OPENCLAW_STATE_SCHEMA_VERSION });
-      expect(
-        readRow(
-          database,
+      expect({
+        version: readRow("PRAGMA user_version"),
+        meta: readRow("SELECT role, schema_version FROM schema_meta WHERE meta_key = 'primary'"),
+        plugin: readRow(
           "SELECT 1 AS present FROM sqlite_schema WHERE name = 'plugin_state_entries'",
         ),
-      ).toEqual({ present: 1 });
+      }).toEqual({
+        version: { user_version: OPENCLAW_STATE_SCHEMA_VERSION },
+        meta: { role: "global", schema_version: OPENCLAW_STATE_SCHEMA_VERSION },
+        plugin: { present: 1 },
+      });
     } finally {
-      database.close();
       lease.release();
     }
   });
@@ -105,42 +105,22 @@ describe("startup migration lease", () => {
   it.each([false, true])(
     "adopts native version-zero state before lease acquisition (existing lease tables: %s)",
     async (hasExistingLeaseTables) => {
-      mkdirSync(path.dirname(databasePath), { recursive: true });
-      const native = new DatabaseSync(databasePath);
-      try {
-        seedNativeVersionZeroState(native, hasExistingLeaseTables);
-      } finally {
-        native.close();
-      }
-
+      seedDatabase((db) => seedNativeVersionZeroState(db, hasExistingLeaseTables));
       const lease = await acquireLease({ owner: "native-bootstrap" });
       try {
-        const initialized = new DatabaseSync(databasePath, { readOnly: true });
-        try {
-          expect(readRow(initialized, "PRAGMA user_version")).toEqual({
-            user_version: OPENCLAW_STATE_SCHEMA_VERSION,
-          });
-          expect(
-            readRow(
-              initialized,
-              "SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'",
-            ),
-          ).toEqual({ schema_version: OPENCLAW_STATE_SCHEMA_VERSION });
-          expect(
-            readRow(
-              initialized,
-              "SELECT device_id FROM device_identities WHERE identity_key = 'node'",
-            ),
-          ).toEqual({ device_id: "native-device" });
-          expect(
-            readRow(
-              initialized,
-              "SELECT config_key FROM exec_approvals_config WHERE config_key = 'current'",
-            ),
-          ).toEqual({ config_key: "current" });
-        } finally {
-          initialized.close();
-        }
+        expect({
+          version: readRow("PRAGMA user_version"),
+          meta: readRow("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'"),
+          device: readRow("SELECT device_id FROM device_identities WHERE identity_key = 'node'"),
+          approval: readRow(
+            "SELECT config_key FROM exec_approvals_config WHERE config_key = 'current'",
+          ),
+        }).toEqual({
+          version: { user_version: OPENCLAW_STATE_SCHEMA_VERSION },
+          meta: { schema_version: OPENCLAW_STATE_SCHEMA_VERSION },
+          device: { device_id: "native-device" },
+          approval: { config_key: "current" },
+        });
       } finally {
         lease.release();
       }
@@ -186,27 +166,14 @@ describe("startup migration lease", () => {
         exec.mockRestore();
       }
 
-      const verify = new DatabaseSync(databasePath, { readOnly: true });
-      try {
-        expect(
-          readRow(
-            verify,
-            `SELECT COUNT(*) AS count
-             FROM state_leases
-             WHERE scope = 'startup-migrations' AND lease_key = 'global'`,
-          ),
-        ).toEqual({ count: 0 });
-        expect(
-          readRow(
-            verify,
-            `SELECT COUNT(*) AS count
-             FROM schema_meta
-             WHERE meta_key IN ('state-migrations', 'startup-migrations')`,
-          ),
-        ).toEqual({ count: 0 });
-      } finally {
-        verify.close();
-      }
+      expect({
+        leases: readRow(
+          "SELECT COUNT(*) AS count FROM state_leases WHERE scope = 'startup-migrations' AND lease_key = 'global'",
+        ),
+        checkpoints: readRow(
+          "SELECT COUNT(*) AS count FROM schema_meta WHERE meta_key IN ('state-migrations', 'startup-migrations')",
+        ),
+      }).toEqual({ leases: { count: 0 }, checkpoints: { count: 0 } });
     },
   );
 
@@ -220,8 +187,7 @@ describe("startup migration lease", () => {
       if (otherHost) {
         overwriteStartupMigrationLeaseOwner(env, { host: "previous-pod" });
       }
-      const acquired = await acquireStartupMigrationLeaseWithWait({
-        env,
+      const acquired = await acquireLease({
         owner: "second",
         timeoutMs: 1000,
         pollIntervalMs: 250,
@@ -252,8 +218,7 @@ describe("startup migration lease", () => {
       }
 
       await expect(
-        acquireStartupMigrationLeaseWithWait({
-          env,
+        acquireLease({
           owner: "second",
           timeoutMs: 500,
           pollIntervalMs: 250,
@@ -278,8 +243,7 @@ describe("startup migration lease", () => {
     overwriteStartupMigrationLeaseOwner(env, { host: "previous-pod" });
     let nowMs = 1000 + STARTUP_MIGRATION_LEASE_TTL_MS - 1;
     let elapsedMs = 0;
-    const acquired = await acquireStartupMigrationLeaseWithWait({
-      env,
+    const acquired = await acquireLease({
       owner: "replacement",
       timeoutMs: 500,
       pollIntervalMs: 250,
@@ -303,10 +267,10 @@ describe("startup migration lease", () => {
 
     expect(hasActiveStartupMigrationLease({ env, nowMs: 1001 })).toBe(false);
 
-    const replacement = await acquireStartupMigrationLeaseWithWait({
-      env,
+    const replacement = await acquireLease({
       owner: "replacement",
       now: () => 1001,
+      timeoutMs: STARTUP_MIGRATION_LEASE_TTL_MS,
     });
     stale.release();
     expect(hasActiveStartupMigrationLease({ env, nowMs: 1002 })).toBe(true);
@@ -406,9 +370,8 @@ describe("startup migration lease", () => {
   });
 
   it("acquires a lease without requiring the full state schema to be canonical", async () => {
-    mkdirSync(path.dirname(databasePath), { recursive: true });
-    const db = new DatabaseSync(databasePath);
-    db.exec(`
+    seedDatabase((db) =>
+      db.exec(`
       CREATE TABLE agent_databases (
         agent_id TEXT NOT NULL PRIMARY KEY,
         path TEXT NOT NULL,
@@ -416,32 +379,24 @@ describe("startup migration lease", () => {
         last_seen_at INTEGER NOT NULL,
         size_bytes INTEGER
       );
-    `);
-    db.close();
+    `),
+    );
 
     const lease = await acquireLease({ now: () => 1000, owner: "first" });
-    const leased = new DatabaseSync(databasePath, { readOnly: true });
-    expect(readRow(leased, "PRAGMA user_version")).toEqual({ user_version: 0 });
-    leased.close();
+    expect(readRow("PRAGMA user_version")).toEqual({ user_version: 0 });
     lease.release();
   });
 
   it("refuses future-version state databases before creating lease tables", async () => {
-    mkdirSync(path.dirname(databasePath), { recursive: true });
-    const db = new DatabaseSync(databasePath);
-    db.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION + 1};`);
-    db.close();
+    seedDatabase((db) => db.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION + 1};`));
 
     await expect(acquireLease({ now: () => 1000, owner: "first" })).rejects.toThrow(
       `newer schema version ${OPENCLAW_STATE_SCHEMA_VERSION + 1}`,
     );
 
-    const verify = new DatabaseSync(databasePath, { readOnly: true });
     const row = readRow(
-      verify,
       "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'state_leases'",
     ) as { ok?: unknown } | undefined;
-    verify.close();
     expect(row).toBeUndefined();
   });
 });

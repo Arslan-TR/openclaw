@@ -33,11 +33,26 @@ beforeEach(() => {
     path.join(handoffRoot, "managed-update-handoffs.sqlite"),
   );
 });
-function parameters() {
-  return { env, timeoutMs: 0, sleep: async () => {} };
+function acquire(options: Parameters<typeof acquireStartupMigrationLeaseWithWait>[0] = {}) {
+  return acquireStartupMigrationLeaseWithWait({
+    env,
+    timeoutMs: 0,
+    sleep: async () => {},
+    ...options,
+  });
+}
+function seed(sql: string) {
+  const pathname = resolveOpenClawStateSqlitePath(env);
+  mkdirSync(path.dirname(pathname), { recursive: true });
+  using db = new DatabaseSync(pathname);
+  db.exec(sql);
+}
+function query(sql: string, ...params: import("node:sqlite").SQLInputValue[]) {
+  using db = new DatabaseSync(resolveOpenClawStateSqlitePath(env), { readOnly: true });
+  return db.prepare(sql).all(...params);
 }
 async function initializeLeaseDatabase() {
-  const lease = await acquireStartupMigrationLeaseWithWait(parameters());
+  const lease = await acquire();
   lease.release();
   closeOpenClawStateDatabaseForTest();
   const pathname = resolveOpenClawStateSqlitePath(env);
@@ -85,8 +100,7 @@ describe("startup lease integrity and admission", () => {
         });
       let lease: StartupMigrationLease | undefined;
       try {
-        const operation = acquireStartupMigrationLeaseWithWait({
-          ...parameters(),
+        const operation = acquire({
           timeoutMs: 1000,
           now: () => nowMs,
         });
@@ -109,9 +123,7 @@ describe("startup lease integrity and admission", () => {
         expect(committed).toBe(true);
         expect(checker).toHaveBeenCalledTimes(2);
         if (!corrupt) {
-          await expect(acquireStartupMigrationLeaseWithWait(parameters())).rejects.toThrow(
-            "already running",
-          );
+          await expect(acquire()).rejects.toThrow("already running");
         }
       } finally {
         checker.mockRestore();
@@ -151,8 +163,7 @@ describe("startup lease integrity and admission", () => {
       });
       let lease: StartupMigrationLease | undefined;
       try {
-        const operation = acquireStartupMigrationLeaseWithWait({
-          ...parameters(),
+        const operation = acquire({
           sleep,
           monotonicNow: () => clock,
           timeoutMs: exhausted ? 0 : 10,
@@ -168,9 +179,7 @@ describe("startup lease integrity and admission", () => {
           expect(lease).toBeDefined();
           expect(sleep).toHaveBeenCalledTimes(1);
           expect(checker).toHaveBeenCalledTimes(2);
-          await expect(acquireStartupMigrationLeaseWithWait(parameters())).rejects.toThrow(
-            "already running",
-          );
+          await expect(acquire()).rejects.toThrow("already running");
         }
       } finally {
         checker.mockRestore();
@@ -185,17 +194,11 @@ describe("startup lease integrity and admission", () => {
 
   it("rechecks schema repair and rolls back damage", async () => {
     await initializeLeaseDatabase();
-    const pathname = resolveOpenClawStateSqlitePath(env);
-    const fixture = new DatabaseSync(pathname);
-    try {
-      fixture.exec(`
+    seed(`
         PRAGMA journal_mode = WAL;
         ALTER TABLE schema_meta DROP COLUMN app_version;
         CREATE TABLE repair_fixture (value INTEGER CHECK(value > 0));
       `);
-    } finally {
-      fixture.close();
-    }
     const ensureColumn = schemaHelpers.ensureColumn;
     const repair = vi
       .spyOn(schemaHelpers, "ensureColumn")
@@ -210,27 +213,17 @@ describe("startup lease integrity and admission", () => {
         return changed;
       });
     try {
-      await expect(
-        acquireStartupMigrationLeaseWithWait({ ...parameters(), timeoutMs: 1000 }),
-      ).rejects.toThrow("integrity_check failed");
+      await expect(acquire({ timeoutMs: 1000 })).rejects.toThrow("integrity_check failed");
     } finally {
       repair.mockRestore();
     }
-    const verify = new DatabaseSync(pathname, { readOnly: true });
-    try {
-      expect(
-        verify
-          .prepare("PRAGMA table_info(schema_meta)")
-          .all()
-          .map((row) => row.name),
-      ).not.toContain("app_version");
-      expect(verify.prepare("SELECT * FROM repair_fixture").all()).toEqual([]);
-      expect(
-        verify.prepare("SELECT owner FROM state_leases WHERE scope = 'startup-migrations'").all(),
-      ).toEqual([]);
-    } finally {
-      verify.close();
-    }
+    expect(query("PRAGMA table_info(schema_meta)").map((row) => row.name)).not.toContain(
+      "app_version",
+    );
+    expect({
+      repairRows: query("SELECT * FROM repair_fixture"),
+      leases: query("SELECT owner FROM state_leases WHERE scope = 'startup-migrations'"),
+    }).toEqual({ repairRows: [], leases: [] });
   });
 
   it("rolls back a lease claim when its verified transaction cannot commit", async () => {
@@ -250,46 +243,27 @@ describe("startup lease integrity and admission", () => {
         return verified;
       });
     try {
-      await expect(acquireStartupMigrationLeaseWithWait(parameters())).rejects.toThrow(
-        "synthetic inspection commit failure",
-      );
+      await expect(acquire()).rejects.toThrow("synthetic inspection commit failure");
     } finally {
       spy.mockRestore();
     }
-    const next = await acquireStartupMigrationLeaseWithWait({
-      ...parameters(),
+    const next = await acquire({
       owner: "after-rollback",
     });
     next.release();
   });
 
   it("refuses corruption before schema bootstrap or lease writes", async () => {
-    const pathname = resolveOpenClawStateSqlitePath(env);
-    mkdirSync(path.dirname(pathname), { recursive: true });
-    const corrupt = new DatabaseSync(pathname);
-    try {
-      corrupt.exec(`
+    seed(`
       PRAGMA foreign_keys = OFF;
       CREATE TABLE parent (id INTEGER PRIMARY KEY);
       CREATE TABLE child (parent_id INTEGER REFERENCES parent(id));
       INSERT INTO child VALUES (1);
     `);
-    } finally {
-      corrupt.close();
-    }
-    await expect(acquireStartupMigrationLeaseWithWait(parameters())).rejects.toThrow(
-      "foreign_key_check failed",
-    );
-    const verify = new DatabaseSync(pathname, { readOnly: true });
-    try {
-      expect(
-        verify
-          .prepare("SELECT name FROM sqlite_schema WHERE name IN ('schema_meta', 'state_leases')")
-          .all(),
-      ).toEqual([]);
-      expect(verify.prepare("SELECT parent_id FROM child").all()).toEqual([{ parent_id: 1 }]);
-    } finally {
-      verify.close();
-    }
+    await expect(acquire()).rejects.toThrow("foreign_key_check failed");
+    expect({
+      tables: query("SELECT name FROM sqlite_schema WHERE name IN ('schema_meta', 'state_leases')"),
+      children: query("SELECT parent_id FROM child"),
+    }).toEqual({ tables: [], children: [{ parent_id: 1 }] });
   });
 });

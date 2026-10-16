@@ -2,6 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type { SQLInputValue } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -33,9 +34,10 @@ import {
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { requireNativeSqliteDatabase } from "../test-utils/native-sqlite.js";
-import { openNodeSqliteDatabase, requireNodeSqlite } from "./node-sqlite.js";
+import { openNodeSqliteDatabase } from "./node-sqlite.js";
+import type { EngineConnection } from "./sql-connection.js";
 import { TRANSCRIPT_DIRECTIVE_MIGRATION_BATCH_SIZE } from "./state-migrations.transcript-directives-archives.js";
-import { migrateHistoricalTranscriptDirectives } from "./state-migrations.transcript-directives.js";
+import { migrateHistoricalTranscriptDirectives as migrate } from "./state-migrations.transcript-directives.js";
 
 const tempDirs: string[] = [];
 
@@ -57,22 +59,6 @@ function messageEvent(params: {
       role: params.role,
       content: params.content,
       timestamp: params.timestamp,
-      ...(params.role === "assistant"
-        ? {
-            api: "messages",
-            provider: "anthropic",
-            model: "sonnet-4.6",
-            usage: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
-            stopReason: "stop",
-          }
-        : {}),
     },
   };
 }
@@ -87,7 +73,7 @@ function createFixture() {
   return { stateDir, env, opened, databasePath: opened.path };
 }
 function insertArchive(
-  db: import("./sql-connection.js").EngineConnection,
+  db: EngineConnection,
   sessionId: string,
   generation: string,
   bytes: Buffer,
@@ -132,31 +118,23 @@ function insertSession(
 ): void {
   const sessionKey = `agent:main:${params.sessionId}`;
   database
-    .prepare(
-      `INSERT INTO session_nodes(session_key,current_session_id,entry_json,updated_at)
-       VALUES(?,?,?,?)`,
-    )
+    .prepare(`INSERT INTO session_nodes(session_key,current_session_id,entry_json,updated_at)
+       VALUES(?,?,?,?)`)
     .run(sessionKey, params.sessionId, "{}", 1);
   database
-    .prepare(
-      `INSERT INTO session_windows(session_id,session_key,created_at,updated_at,transcript_updated_at)
-       VALUES(?,?,?,?,?)`,
-    )
+    .prepare(`INSERT INTO session_windows(session_id,session_key,created_at,updated_at,transcript_updated_at)
+       VALUES(?,?,?,?,?)`)
     .run(params.sessionId, sessionKey, 1, 1, 1);
   database
-    .prepare(
-      `INSERT INTO transcript_rewrite_watermarks(session_id,generation,updated_at)
-       VALUES(?,?,?)`,
-    )
+    .prepare(`INSERT INTO transcript_rewrite_watermarks(session_id,generation,updated_at)
+       VALUES(?,?,?)`)
     .run(params.sessionId, params.generation, 1);
   for (const [seq, event] of params.events.entries()) {
     const eventJson = JSON.stringify(event);
     if (params.legacy) {
       database
-        .prepare(
-          `INSERT INTO transcript_events(session_id,seq,event_json,created_at)
-         VALUES(?,?,?,?)`,
-        )
+        .prepare(`INSERT INTO transcript_events(session_id,seq,event_json,created_at)
+         VALUES(?,?,?,?)`)
         .run(params.sessionId, seq, eventJson, Number(event.timestamp ?? 1));
     } else {
       database
@@ -196,64 +174,58 @@ function openLegacyAgentDatabase(stateDir: string, agentId = "main") {
   return { db: database, path: databasePath };
 }
 
+function readRows(databasePath: string, sql: string, ...params: SQLInputValue[]) {
+  using db = openNodeSqliteDatabase(databasePath, { readOnly: true });
+  return db.prepare(sql).all(...params);
+}
+const readRow = (...args: Parameters<typeof readRows>) => readRows(...args)[0];
 function readEventJson(databasePath: string, sessionId: string, seq: number): string {
-  const { DatabaseSync } = requireNodeSqlite();
-  const database = new DatabaseSync(databasePath, { readOnly: true });
-  try {
-    const row = database
-      .prepare(
-        `SELECT ${sqliteTranscriptPayloadColumns(database)} FROM transcript_events WHERE session_id = ? AND seq = ?`,
-      )
-      .get(sessionId, seq);
-    if (!row) {
-      throw new Error(`Missing transcript fixture ${sessionId}:${seq}`);
-    }
-    return readSqliteTranscriptPayload(row);
-  } finally {
-    database.close();
+  using database = openNodeSqliteDatabase(databasePath, { readOnly: true });
+  const row = database
+    .prepare(
+      `SELECT ${sqliteTranscriptPayloadColumns(database)} FROM transcript_events WHERE session_id = ? AND seq = ?`,
+    )
+    .get(sessionId, seq);
+  if (!row) {
+    throw new Error(`Missing transcript fixture ${sessionId}:${seq}`);
   }
+  return readSqliteTranscriptPayload(row);
 }
-
-function readGeneration(databasePath: string, sessionId: string): string {
-  const { DatabaseSync } = requireNodeSqlite();
-  const database = new DatabaseSync(databasePath, { readOnly: true });
-  try {
-    const row = database
-      .prepare("SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?")
-      .get(sessionId) as { generation: string };
-    return row.generation;
-  } finally {
-    database.close();
-  }
+function readGeneration(databasePath: string, sessionId: string) {
+  return readRow(
+    databasePath,
+    "SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?",
+    sessionId,
+  )!.generation;
 }
-
 function readMigrationCursor(databasePath: string): unknown {
-  const { DatabaseSync } = requireNodeSqlite();
-  const database = new DatabaseSync(databasePath, { readOnly: true });
-  try {
-    const row = database
-      .prepare(
-        "SELECT app_version FROM schema_meta WHERE meta_key = 'historical-transcript-directives-v1'",
-      )
-      .get() as { app_version: string } | undefined;
-    return row ? JSON.parse(row.app_version) : undefined;
-  } finally {
-    database.close();
-  }
+  const row = readRow(
+    databasePath,
+    "SELECT app_version FROM schema_meta WHERE meta_key = 'historical-transcript-directives-v1'",
+  ) as { app_version: string } | undefined;
+  return row ? JSON.parse(row.app_version) : undefined;
 }
-
-function hasTranscriptArchivesTable(databasePath: string): boolean {
-  const { DatabaseSync } = requireNodeSqlite();
-  const database = new DatabaseSync(databasePath, { readOnly: true });
-  try {
-    return Boolean(
-      database
-        .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?")
-        .get("session_transcript_archives"),
-    );
-  } finally {
-    database.close();
-  }
+function hasTranscriptArchivesTable(databasePath: string) {
+  return Boolean(
+    readRow(
+      databasePath,
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+      "session_transcript_archives",
+    ),
+  );
+}
+function seedArchiveCursor(db: EngineConnection) {
+  db.prepare(`INSERT INTO schema_meta(meta_key,role,schema_version,agent_id,app_version,created_at,updated_at)
+    VALUES(?, 'agent', 1, 'main', ?, 1, 1)`).run(
+    "historical-transcript-directives-v1",
+    JSON.stringify({ generation: "", phase: "archives", sessionId: "" }),
+  );
+}
+function bindCompetingWriter(stateDir: string, env: NodeJS.ProcessEnv) {
+  // Bind before entering maintenance so the contender does not inherit its authority.
+  const claim = AsyncResource.bind(claimOpenClawAgentDatabaseLease);
+  return () =>
+    claim({ agentId: "competitor", path: path.join(stateDir, "competitor.sqlite"), env });
 }
 
 function parseArchive(content: string): FixtureEvent[] {
@@ -312,21 +284,17 @@ describe("historical transcript directive migration", () => {
           event.fixturePadding = "compression fixture ".repeat(256);
         }
       }
-      insertSession(requireNativeSqliteDatabase(opened.db), {
-        events: [tagged, user, tool],
-        generation: "tagged-before",
-        sessionId: "tagged-session",
-      });
-      insertSession(requireNativeSqliteDatabase(opened.db), {
-        events: [code],
-        generation: "code-before",
-        sessionId: "code-session",
-      });
-      insertSession(requireNativeSqliteDatabase(opened.db), {
-        events: [reaction],
-        generation: "reaction-before",
-        sessionId: "reaction-session",
-      });
+      for (const [name, events] of [
+        ["tagged", [tagged, user, tool]],
+        ["code", [code]],
+        ["reaction", [reaction]],
+      ] as const) {
+        insertSession(requireNativeSqliteDatabase(opened.db), {
+          events: [...events],
+          generation: `${name}-before`,
+          sessionId: `${name}-session`,
+        });
+      }
       if (storage === "zstd") {
         const update = opened.db.prepare(
           "UPDATE transcript_events SET event_json = NULL, event_zstd = ?, event_utf8_bytes = ?, navigation_json = ? WHERE session_id = ? AND seq = ?",
@@ -394,7 +362,7 @@ describe("historical transcript directive migration", () => {
       const archivedUserJson = JSON.stringify(archivedUser);
       closeOpenClawAgentDatabasesForTest();
 
-      const result = await migrateHistoricalTranscriptDirectives({ env });
+      const result = await migrate({ env });
       expect(result.warnings).toEqual([]);
       expect(result.changes).toHaveLength(2);
       const recoveryDirectories = () =>
@@ -406,14 +374,9 @@ describe("historical transcript directive migration", () => {
       const backupPath = path.join(path.dirname(databasePath), backups[0]!, "database.sqlite");
       expect(readEventJson(backupPath, "tagged-session", 0)).toBe(JSON.stringify(tagged));
       expect(readEventJson(backupPath, "reaction-session", 0)).toBe(JSON.stringify(reaction));
-      const backup = openNodeSqliteDatabase(backupPath, { readOnly: true });
-      try {
-        expect(
-          backup.prepare("SELECT archive_blob FROM session_transcript_archives").get(),
-        ).toEqual({ archive_blob: new Uint8Array(archiveBytes) });
-      } finally {
-        backup.close();
-      }
+      expect(readRow(backupPath, "SELECT archive_blob FROM session_transcript_archives")).toEqual({
+        archive_blob: new Uint8Array(archiveBytes),
+      });
 
       const migratedTagged = JSON.parse(readEventJson(databasePath, "tagged-session", 0)) as {
         message: Record<string, unknown>;
@@ -425,9 +388,11 @@ describe("historical transcript directive migration", () => {
           replyToId: "message-7",
         },
       });
-      expect(readEventJson(databasePath, "tagged-session", 1)).toBe(userEventJson);
-      expect(readEventJson(databasePath, "tagged-session", 2)).toBe(toolEventJson);
-      expect(readEventJson(databasePath, "code-session", 0)).toBe(codeEventJson);
+      expect([
+        readEventJson(databasePath, "tagged-session", 1),
+        readEventJson(databasePath, "tagged-session", 2),
+        readEventJson(databasePath, "code-session", 0),
+      ]).toEqual([userEventJson, toolEventJson, codeEventJson]);
       const migratedReaction = JSON.parse(readEventJson(databasePath, "reaction-session", 0)) as {
         message: Record<string, unknown>;
       };
@@ -440,25 +405,18 @@ describe("historical transcript directive migration", () => {
       expect(readGeneration(databasePath, "reaction-session")).not.toBe("reaction-before");
       expect(readGeneration(databasePath, "code-session")).toBe("code-before");
 
-      const { DatabaseSync } = requireNodeSqlite();
-      const migratedDb = new DatabaseSync(databasePath, { readOnly: true });
-      let archivedRow: { archive_blob: Uint8Array; archive_sha256: string };
-      try {
-        expect(
-          migratedDb
-            .prepare(
-              "SELECT session_id FROM session_transcript_fts WHERE session_transcript_fts MATCH ?",
-            )
-            .all("Final"),
-        ).toContainEqual({ session_id: "tagged-session" });
-        archivedRow = migratedDb
-          .prepare(
-            "SELECT archive_blob,archive_sha256 FROM session_transcript_archives WHERE session_id = ?",
-          )
-          .get("archived-session") as typeof archivedRow;
-      } finally {
-        migratedDb.close();
-      }
+      expect(
+        readRows(
+          databasePath,
+          "SELECT session_id FROM session_transcript_fts WHERE session_transcript_fts MATCH ?",
+          "Final",
+        ),
+      ).toContainEqual({ session_id: "tagged-session" });
+      const archivedRow = readRow(
+        databasePath,
+        "SELECT archive_blob,archive_sha256 FROM session_transcript_archives WHERE session_id = ?",
+        "archived-session",
+      ) as { archive_blob: Uint8Array; archive_sha256: string };
       expect(createHash("sha256").update(archivedRow.archive_blob).digest("hex")).toBe(
         archivedRow.archive_sha256,
       );
@@ -479,7 +437,7 @@ describe("historical transcript directive migration", () => {
         reaction: readGeneration(databasePath, "reaction-session"),
       };
       const archiveBytesAfterFirstRun = fs.readFileSync(archivePath);
-      await expect(migrateHistoricalTranscriptDirectives({ env })).resolves.toEqual({
+      await expect(migrate({ env })).resolves.toEqual({
         changes: [],
         warnings: [],
       });
@@ -495,23 +453,10 @@ describe("historical transcript directive migration", () => {
   it("completes a pre-stuck archives cursor when the optional table is absent", async () => {
     const { env, opened, databasePath } = createFixture();
     opened.db.exec("DROP TABLE session_transcript_archives");
-    opened.db
-      .prepare(
-        `INSERT INTO schema_meta(meta_key,role,schema_version,agent_id,app_version,created_at,updated_at)
-         VALUES(?,?,?,?,?,?,?)`,
-      )
-      .run(
-        "historical-transcript-directives-v1",
-        "agent",
-        1,
-        "main",
-        JSON.stringify({ generation: "", phase: "archives", sessionId: "" }),
-        1,
-        1,
-      );
+    seedArchiveCursor(opened.db);
     closeOpenClawAgentDatabasesForTest();
 
-    await expect(migrateHistoricalTranscriptDirectives({ env })).resolves.toEqual({
+    await expect(migrate({ env })).resolves.toEqual({
       changes: [],
       warnings: [],
     });
@@ -527,8 +472,7 @@ describe("historical transcript directive migration", () => {
     `);
     closeOpenClawAgentDatabasesForTest();
 
-    // Capture the competing task before entering maintenance, without inheriting its authority.
-    const claimCompetingLease = AsyncResource.bind(claimOpenClawAgentDatabaseLease);
+    const claimCompetingLease = bindCompetingWriter(stateDir, env);
     let competingLeaseId: string | undefined;
     const agentDatabaseLease = await import("../state/openclaw-agent-db-lease.js");
     const originalAssert = agentDatabaseLease.assertAgentDatabaseMaintenanceAuthorityIfPresent;
@@ -536,42 +480,29 @@ describe("historical transcript directive migration", () => {
       .spyOn(agentDatabaseLease, "assertAgentDatabaseMaintenanceAuthorityIfPresent")
       .mockImplementation(() => {
         expireMaintenance(env);
-        competingLeaseId = claimCompetingLease({
-          agentId: "competitor",
-          path: path.join(stateDir, "competitor.sqlite"),
-          env,
-        });
+        competingLeaseId = claimCompetingLease();
         originalAssert();
       });
 
-    const result = await migrateHistoricalTranscriptDirectives({ env }).finally(() => {
-      authority.mockRestore();
-    });
+    const result = await migrate({ env }).finally(() => authority.mockRestore());
 
     expect(result.warnings.some((warning) => warning.includes("maintenance lease"))).toBe(true);
     expect(competingLeaseId).toBeDefined();
-    const rolledBack = openNodeSqliteDatabase(databasePath, { readOnly: true });
-    try {
-      expect(
-        rolledBack
-          .prepare(
-            "SELECT 1 FROM pragma_table_info('session_conversations') WHERE name = 'route_context_json'",
-          )
-          .get(),
-      ).toBeUndefined();
-      expect(rolledBack.prepare("PRAGMA user_version").get()).toEqual({
-        user_version: OPENCLAW_AGENT_SCHEMA_VERSION,
-      });
-      expect(
-        rolledBack
-          .prepare(
-            "SELECT name FROM sqlite_schema WHERE name = 'session_conversations_route_context_invalidate_after_update'",
-          )
-          .get(),
-      ).toBeUndefined();
-    } finally {
-      rolledBack.close();
-    }
+    expect(
+      readRow(
+        databasePath,
+        "SELECT 1 FROM pragma_table_info('session_conversations') WHERE name = 'route_context_json'",
+      ),
+    ).toBeUndefined();
+    expect(readRow(databasePath, "PRAGMA user_version")).toEqual({
+      user_version: OPENCLAW_AGENT_SCHEMA_VERSION,
+    });
+    expect(
+      readRow(
+        databasePath,
+        "SELECT name FROM sqlite_schema WHERE name = 'session_conversations_route_context_invalidate_after_update'",
+      ),
+    ).toBeUndefined();
     releaseOpenClawAgentDatabaseLease(competingLeaseId as string, { env });
   });
 
@@ -583,7 +514,7 @@ describe("historical transcript directive migration", () => {
       throw new Error("shared-state lease inspection failed");
     });
 
-    const result = await migrateHistoricalTranscriptDirectives({ env });
+    const result = await migrate({ env });
 
     expect(result.changes).toEqual([]);
     expect(result.warnings).toEqual([
@@ -591,16 +522,13 @@ describe("historical transcript directive migration", () => {
         `Skipped historical transcript directive migration preflight for ${databasePath}: Error: shared-state lease inspection failed`,
       ),
     ]);
-    const database = openNodeSqliteDatabase(databasePath, { readOnly: true });
-    try {
-      expect(
-        database
-          .prepare("SELECT 1 FROM schema_meta WHERE meta_key = ?")
-          .get("historical-transcript-directives-v1"),
-      ).toBeUndefined();
-    } finally {
-      database.close();
-    }
+    expect(
+      readRow(
+        databasePath,
+        "SELECT 1 FROM schema_meta WHERE meta_key = ?",
+        "historical-transcript-directives-v1",
+      ),
+    ).toBeUndefined();
   });
 
   it("leaves canonical archives and their active writer untouched", async () => {
@@ -617,7 +545,7 @@ describe("historical transcript directive migration", () => {
       null,
     );
 
-    await expect(migrateHistoricalTranscriptDirectives({ env })).resolves.toEqual({
+    await expect(migrate({ env })).resolves.toEqual({
       changes: [],
       warnings: [],
     });
@@ -640,7 +568,7 @@ describe("historical transcript directive migration", () => {
     fs.writeFileSync(unreadablePath, "not a sqlite database");
     opened.db.close();
 
-    const result = await migrateHistoricalTranscriptDirectives({
+    const result = await migrate({
       env,
       configuredAgentDatabaseTargets: [
         { agentId: "first", path: unreadablePath },
@@ -649,14 +577,9 @@ describe("historical transcript directive migration", () => {
     });
 
     expect(result.warnings.some((warning) => warning.includes("preflight"))).toBe(true);
-    const migrated = openNodeSqliteDatabase(databasePath, { readOnly: true });
-    try {
-      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(
-        OPENCLAW_AGENT_SCHEMA_VERSION,
-      );
-    } finally {
-      migrated.close();
-    }
+    expect(readRow(databasePath, "PRAGMA user_version")?.user_version).toBe(
+      OPENCLAW_AGENT_SCHEMA_VERSION,
+    );
   });
 
   it("prunes a stale writer lease before completing an empty database", async () => {
@@ -671,7 +594,7 @@ describe("historical transcript directive migration", () => {
       .db.prepare("UPDATE agent_database_leases SET owner_pid = ? WHERE lease_id = ?")
       .run(2_147_483_647, leaseId);
 
-    await expect(migrateHistoricalTranscriptDirectives({ env })).resolves.toEqual({
+    await expect(migrate({ env })).resolves.toEqual({
       changes: [],
       warnings: [],
     });
@@ -688,8 +611,7 @@ describe("historical transcript directive migration", () => {
     const originalEventJson = readEventJson(opened.path, "session-expired", 0);
     closeOpenClawAgentDatabasesForTest();
 
-    // Capture the competing task before entering maintenance, without inheriting its authority.
-    const claimCompetingLease = AsyncResource.bind(claimOpenClawAgentDatabaseLease);
+    const claimCompetingLease = bindCompetingWriter(stateDir, env);
     let competingLeaseId: string | undefined;
     const originalAssert = assertAgentDatabaseMaintenanceAuthority;
     const agentDatabaseLease = await import("../state/openclaw-agent-db-lease.js");
@@ -701,14 +623,10 @@ describe("historical transcript directive migration", () => {
           return;
         }
         expireMaintenance(env);
-        competingLeaseId = claimCompetingLease({
-          agentId: "competitor",
-          path: path.join(stateDir, "competitor.sqlite"),
-          env,
-        });
+        competingLeaseId = claimCompetingLease();
       });
 
-    const result = await migrateHistoricalTranscriptDirectives({ env }).finally(() => {
+    const result = await migrate({ env }).finally(() => {
       authority.mockRestore();
     });
 
@@ -720,16 +638,13 @@ describe("historical transcript directive migration", () => {
     ).toBe(true);
     expect(competingLeaseId).toBeDefined();
     expect(readEventJson(opened.path, "session-expired", 0)).toBe(originalEventJson);
-    const migrated = openNodeSqliteDatabase(opened.path, { readOnly: true });
-    try {
-      expect(
-        migrated
-          .prepare("SELECT 1 FROM schema_meta WHERE meta_key = ?")
-          .get("historical-transcript-directives-v1"),
-      ).toBeUndefined();
-    } finally {
-      migrated.close();
-    }
+    expect(
+      readRow(
+        opened.path,
+        "SELECT 1 FROM schema_meta WHERE meta_key = ?",
+        "historical-transcript-directives-v1",
+      ),
+    ).toBeUndefined();
     releaseOpenClawAgentDatabaseLease(competingLeaseId as string, { env });
   });
 
@@ -739,21 +654,7 @@ describe("historical transcript directive migration", () => {
     const archiveBytes = Buffer.from(`${JSON.stringify(archived)}\n`, "utf8");
     const archiveName = "expired.jsonl.deleted.2026-01-01T00-00-00.000Z.generation";
     insertArchive(opened.db, "archived-expired", "generation", archiveBytes, archiveName, 1, 1);
-    opened.db
-      .prepare(
-        `INSERT INTO schema_meta(
-          meta_key,schema_version,app_version,created_at,updated_at,role,agent_id
-        ) VALUES(?,?,?,?,?,?,?)`,
-      )
-      .run(
-        "historical-transcript-directives-v1",
-        1,
-        JSON.stringify({ generation: "", phase: "archives", sessionId: "" }),
-        1,
-        1,
-        "agent",
-        "main",
-      );
+    seedArchiveCursor(opened.db);
     const archiveDirectory = resolveSqliteTranscriptArchiveDirectory({
       agentId: "main",
       path: opened.path,
@@ -763,8 +664,7 @@ describe("historical transcript directive migration", () => {
     fs.writeFileSync(archivePath, archiveBytes);
     closeOpenClawAgentDatabasesForTest();
 
-    // Capture the competing task before entering maintenance, without inheriting its authority.
-    const claimCompetingLease = AsyncResource.bind(claimOpenClawAgentDatabaseLease);
+    const claimCompetingLease = bindCompetingWriter(stateDir, env);
     let competingLeaseId: string | undefined;
     const originalAssert = assertAgentDatabaseMaintenanceAuthority;
     const agentDatabaseLease = await import("../state/openclaw-agent-db-lease.js");
@@ -773,16 +673,12 @@ describe("historical transcript directive migration", () => {
       .mockImplementation(() => {
         if (!competingLeaseId && new Error().stack?.includes("beforeRename")) {
           expireMaintenance(env);
-          competingLeaseId = claimCompetingLease({
-            agentId: "competitor",
-            path: path.join(stateDir, "competitor.sqlite"),
-            env,
-          });
+          competingLeaseId = claimCompetingLease();
         }
         originalAssert();
       });
 
-    const result = await migrateHistoricalTranscriptDirectives({ env }).finally(() => {
+    const result = await migrate({ env }).finally(() => {
       authority.mockRestore();
     });
 
@@ -844,8 +740,7 @@ describe("historical transcript directive migration", () => {
     });
 
     let competingWriterError: unknown;
-    // Capture the competing task before entering maintenance, without inheriting its authority.
-    const claimCompetingLease = AsyncResource.bind(claimOpenClawAgentDatabaseLease);
+    const claimCompetingLease = bindCompetingWriter(stateDir, env);
     let competingLeaseId: string | undefined;
     let cursorAtCompetition: unknown;
     let competedAt = 0;
@@ -857,11 +752,7 @@ describe("historical transcript directive migration", () => {
           cursorAtCompetition = readMigrationCursor(opened.path);
           competedAt = Date.now();
           try {
-            competingLeaseId = claimCompetingLease({
-              agentId: "competitor",
-              path: path.join(stateDir, "competitor.sqlite"),
-              env,
-            });
+            competingLeaseId = claimCompetingLease();
           } catch (error) {
             competingWriterError = error;
           }
@@ -870,7 +761,7 @@ describe("historical transcript directive migration", () => {
       }),
     );
 
-    await expect(migrateHistoricalTranscriptDirectives({ env })).resolves.toMatchObject({
+    await expect(migrate({ env })).resolves.toMatchObject({
       warnings: [],
     });
 
@@ -885,14 +776,9 @@ describe("historical transcript directive migration", () => {
     expect(JSON.parse(readEventJson(opened.path, sessionIdAt(batchSize), 0))).toMatchObject({
       message: { content: [{ type: "text", text: "Migrating" }] },
     });
-    const migrated = openNodeSqliteDatabase(opened.path, { readOnly: true });
-    try {
-      expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(
-        OPENCLAW_AGENT_SCHEMA_VERSION,
-      );
-    } finally {
-      migrated.close();
-    }
+    expect(readRow(opened.path, "PRAGMA user_version")?.user_version).toBe(
+      OPENCLAW_AGENT_SCHEMA_VERSION,
+    );
     const leaseId = claimOpenClawAgentDatabaseLease({
       agentId: "competitor",
       path: path.join(stateDir, "competitor.sqlite"),
