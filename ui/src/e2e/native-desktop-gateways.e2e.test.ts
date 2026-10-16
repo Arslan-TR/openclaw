@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { Page } from "playwright";
 import { expect, it } from "vitest";
 import type { NativeGatewaysSnapshot } from "../app/native-gateways.runtime.ts";
+import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 import { serveCompanion } from "./native-desktop.test-support.ts";
-import { expectControl, nativeForm } from "./native-form.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "Native desktop Gateways E2E" });
 const companionFile = (file: string) =>
@@ -35,44 +36,6 @@ type GatewayRequest = {
   command: string;
   params: { message: { type: string; id?: string }; token: string };
 };
-const gatewayRequest = (token: string, message: GatewayRequest["params"]["message"]) => ({
-  command: "gateway_request",
-  params: { message, token },
-});
-const profileRequests = (page: Page) =>
-  page.evaluate(() => Reflect.get(window, "profileRequests") as Array<Record<string, unknown>>);
-const postGateway = (page: Page, message: GatewayRequest["params"]["message"]) =>
-  page.evaluate((request) => {
-    const { postMessage } = Reflect.get(window, "webkit").messageHandlers.openclawGateways;
-    return postMessage(request);
-  }, message);
-
-const waitNotice = (page: Page, hasText: string, role: "alert" | "status" = "status") =>
-  page.getByRole(role).filter({ hasText }).waitFor();
-const requestsOf = async (page: Page, action: string) =>
-  (await profileRequests(page)).filter((message) => message.action === action);
-const lastRequest = async (page: Page, action: string) => (await requestsOf(page, action)).at(-1);
-
-async function showNotice(page: Page, message: string) {
-  await page.evaluate((notice) => {
-    window.dispatchEvent(
-      new CustomEvent("openclaw:gateway-notice", { detail: { message: notice } }),
-    );
-  }, message);
-}
-
-async function updateProfiles(
-  page: Page,
-  updates: Array<{ profile: Record<string, unknown>; detail?: Record<string, string> }>,
-) {
-  await page.evaluate((changes) => {
-    const catalog = Reflect.get(window, "profileCatalog") as Array<Record<string, unknown>>;
-    for (const { profile, detail = {} } of changes) {
-      catalog[0] = { ...catalog[0], ...profile };
-      window.dispatchEvent(new CustomEvent("openclaw:gateway-profiles-changed", { detail }));
-    }
-  }, updates);
-}
 
 async function installAdapter(page: Page, config?: { origin?: string; base?: string }) {
   await page.addInitScript({
@@ -102,110 +65,10 @@ async function ready(page: Page, documentToken: string, currentId = "primary") {
   );
 }
 
-async function installProfiles(page: Page, options?: { id: string; eventDelivery: boolean }) {
-  await page.addInitScript((recovery) => {
-    const profiles: Array<Record<string, unknown>> = [
-      {
-        id: "studio",
-        name: "Studio",
-        hasToken: true,
-        hasPassword: false,
-        ...(recovery
-          ? { transport: "ssh", sshTarget: "operator@unreachable.example.test", remotePort: 18789 }
-          : { transport: "direct", url: "https://studio.example.test" }),
-      },
-    ];
-    const calls: Array<Record<string, unknown>> = [];
-    let failList = !recovery;
-    let publishSaveFailure = recovery?.eventDelivery;
-    Reflect.set(window, "profileRequests", calls);
-    if (recovery) {
-      Reflect.set(window, "replaceGatewayProfile", () => {
-        profiles[0] = {
-          ...profiles[0],
-          id: "external-studio",
-          name: "Other studio",
-          sshTarget: "operator@elsewhere.example.test",
-        };
-      });
-      Reflect.set(window, "__OPENCLAW_GATEWAY_RECOVERY__", {
-        id: recovery.id,
-        error: recovery.eventDelivery
-          ? ""
-          : "SSH connection failed. Check the target and try again.",
-      });
-    } else {
-      Reflect.set(window, "profileCatalog", profiles);
-    }
-    const invoke = async (command: string, { message }: { message: Record<string, unknown> }) => {
-      if (!recovery && command !== "gateway_profile_request") {
-        throw new Error(`Unexpected command: ${command}`);
-      }
-      calls.push(message);
-      if (message.action === "list") {
-        if (failList) {
-          failList = false;
-          throw new Error("Could not unlock saved Gateways. Try again.");
-        }
-        if (publishSaveFailure && profiles[0].id === "updated-studio") {
-          publishSaveFailure = false;
-          const detail = {
-            id: profiles[0].id,
-            error: "Updated SSH connection failed. Check the new target.",
-          };
-          Reflect.set(window, "__OPENCLAW_GATEWAY_RECOVERY__", detail);
-          window.dispatchEvent(new CustomEvent("openclaw:gateway-recovery", { detail }));
-        }
-        const result = { profiles: recovery ? [profiles[0]] : profiles, selectedId: "studio" };
-        return recovery ? result : structuredClone(result);
-      }
-      if (message.action === "save") {
-        if (recovery) {
-          if (message.id && message.id !== profiles[0].id) {
-            throw new Error("That saved Gateway no longer exists.");
-          }
-          profiles[0] = {
-            ...profiles[0],
-            id: recovery.eventDelivery ? "updated-studio" : profiles[0].id,
-            name: String(message.name),
-          };
-          return profiles[0];
-        }
-        const connection = message.connection as Record<string, unknown>;
-        const index = profiles.findIndex((entry) => entry.id === message.id);
-        const previous = profiles[index];
-        const savedCredentials =
-          previous &&
-          !connection.token &&
-          !connection.password &&
-          ["transport", "url", "sshTarget", "remotePort"].every(
-            (key) => previous[key] === connection[key],
-          )
-            ? previous
-            : undefined;
-        const profile = {
-          id: message.id ?? "new-profile",
-          name: message.name,
-          transport: connection.transport,
-          url: connection.url,
-          sshTarget: connection.sshTarget,
-          remotePort: connection.remotePort,
-          hasToken: savedCredentials?.hasToken ?? Boolean(connection.token),
-          hasPassword: savedCredentials?.hasPassword ?? Boolean(connection.password),
-        };
-        profiles[index < 0 ? profiles.length : index] = profile;
-        return profile;
-      }
-      if (!recovery && message.action === "remove") {
-        profiles.splice(
-          profiles.findIndex((entry) => entry.id === message.id),
-          1,
-        );
-      }
-      return null;
-    };
-    Reflect.set(window, "__TAURI__", { core: { invoke } });
-  }, options);
+async function capture(page: Page, directory: string | undefined, name: string) {
+  if (directory) {
+    await page.screenshot({ path: path.join(directory, name), animations: "disabled" });
+  }
 }
 
 suite.define(() => {
@@ -213,7 +76,6 @@ suite.define(() => {
     "keeps one dismissible native Gateway notice on %s without modal alerts",
     async (file) => {
       await suite.withPage({}, async ({ page }) => {
-        const { button } = nativeForm(page);
         const dialogs: string[] = [];
         page.on("dialog", async (dialog) => {
           dialogs.push(dialog.message());
@@ -251,7 +113,12 @@ suite.define(() => {
           });
         });
         await page.goto(`${suite.server.baseUrl}companion/${file}`);
-        const show = (message: string) => showNotice(page, message);
+        const show = (message: string) =>
+          page.evaluate((noticeMessage) => {
+            window.dispatchEvent(
+              new CustomEvent("openclaw:gateway-notice", { detail: { message: noticeMessage } }),
+            );
+          }, message);
         await show("Credential store is locked.");
         const notice = page.getByRole("alert").filter({ hasText: "Credential store is locked." });
         await notice.waitFor();
@@ -270,7 +137,9 @@ suite.define(() => {
               new CustomEvent("openclaw:gateway-profiles-changed", { detail: {} }),
             );
           });
-          await expect.poll(() => button("Add Gateway").isDisabled()).toBe(true);
+          await expect
+            .poll(() => page.getByRole("button", { name: "Add Gateway", exact: true }).isDisabled())
+            .toBe(true);
         }
         await page.getByRole("button", { name: "Dismiss Gateway notice" }).click();
         expect(await page.getByRole("alert").count()).toBe(0);
@@ -289,6 +158,10 @@ suite.define(() => {
 
   it("uses the shared Gateway menu, queues until native readiness, and replaces the document token", async () => {
     await suite.withPage({ viewport: { width: 1280, height: 900 } }, async ({ page }) => {
+      const parent = process.env.OPENCLAW_UI_RAIL_PROOF_DIR?.trim();
+      const proof = parent
+        ? createControlUiE2eArtifactDir("desktop-gateway-switch", parent)
+        : undefined;
       await installMockGateway(page);
       await page.goto(suite.server.baseUrl);
       const openMenu = async () => {
@@ -297,6 +170,7 @@ suite.define(() => {
       };
       await openMenu();
       expect(await page.getByRole("menuitemradio", { name: /Studio/ }).count()).toBe(0);
+      await capture(page, proof, "gateway-menu-before.png");
       const requests = await installAdapter(page);
       await page.addInitScript({
         content: `${companionFile("gateway-notice.js")}
@@ -305,16 +179,20 @@ suite.define(() => {
           }));`,
       });
       await page.reload();
-      await waitNotice(page, "unavailable during startup", "alert");
+      await page.getByRole("alert").filter({ hasText: "unavailable during startup" }).waitFor();
       await openMenu();
       const studio = page.getByRole("menuitemradio", { name: /Studio/ });
       await studio.waitFor();
+      await capture(page, proof, "gateway-menu-after.png");
       await studio.click();
       expect(await requests()).toEqual([]);
       await ready(page, "first-document");
-      await expect
-        .poll(requests)
-        .toEqual([gatewayRequest("first-document", { type: "select", id: "profile:studio" })]);
+      await expect.poll(requests).toEqual([
+        {
+          command: "gateway_request",
+          params: { message: { type: "select", id: "profile:studio" }, token: "first-document" },
+        },
+      ]);
       await ready(page, "next-document", "profile:studio");
       await openMenu();
       await expect.poll(() => studio.getAttribute("aria-checked")).toBe("true");
@@ -325,15 +203,37 @@ suite.define(() => {
       await page.locator('[data-value="command:gateway-set-primary"]').click();
       await openMenu();
       await page.locator('[data-value="command:gateway-settings"]').click();
-      await waitNotice(page, "Could not open Gateway settings", "alert");
+      await page
+        .getByRole("alert")
+        .filter({ hasText: "Could not open Gateway settings" })
+        .waitFor();
       const notice = await page.getByRole("alert").elementHandle();
-      await showNotice(page, "Could not unlock saved Gateway credentials.");
+      await page.evaluate(() =>
+        window.dispatchEvent(
+          new CustomEvent("openclaw:gateway-notice", {
+            detail: { message: "Could not unlock saved Gateway credentials." },
+          }),
+        ),
+      );
       expect(await notice?.textContent()).toContain("Could not unlock saved Gateway credentials.");
       expect(await page.getByRole("alert").count()).toBe(1);
+      await capture(page, proof, "gateway-credential-notice.png");
       expect((await requests()).slice(1)).toEqual([
-        gatewayRequest("next-document", { type: "open-window", id: "primary" }),
-        gatewayRequest("next-document", { type: "set-primary", id: "profile:studio" }),
-        gatewayRequest("next-document", { type: "open-settings" }),
+        {
+          command: "gateway_request",
+          params: { message: { type: "open-window", id: "primary" }, token: "next-document" },
+        },
+        {
+          command: "gateway_request",
+          params: {
+            message: { type: "set-primary", id: "profile:studio" },
+            token: "next-document",
+          },
+        },
+        {
+          command: "gateway_request",
+          params: { message: { type: "open-settings" }, token: "next-document" },
+        },
       ]);
       await openMenu();
       await page.getByRole("menuitemradio", { name: /Local Gateway/ }).click();
@@ -354,9 +254,21 @@ suite.define(() => {
             ? "Could not remember the selected Gateway. Unlock the credential store."
             : "Could not open Gateway settings. Try again.";
         if (source === "native") {
-          await showNotice(page, message);
+          await page.evaluate(
+            (noticeMessage) =>
+              window.dispatchEvent(
+                new CustomEvent("openclaw:gateway-notice", {
+                  detail: { message: noticeMessage },
+                }),
+              ),
+            message,
+          );
         } else {
-          await postGateway(page, { type: "open-settings" });
+          await page.evaluate(() => {
+            const { postMessage: postGatewayMessage } = Reflect.get(window, "webkit")
+              .messageHandlers.openclawGateways;
+            return postGatewayMessage({ type: "open-settings" });
+          });
         }
         const warning = page.getByRole("alert").filter({ hasText: message });
         await warning.waitFor();
@@ -365,7 +277,11 @@ suite.define(() => {
           await Reflect.get(window, "pendingGatewayRequest");
         });
         expect(await warning.isVisible()).toBe(true);
-        await postGateway(page, { type: "select", id: "primary" });
+        await page.evaluate(() => {
+          const { postMessage: postGatewayMessage } = Reflect.get(window, "webkit").messageHandlers
+            .openclawGateways;
+          return postGatewayMessage({ type: "select", id: "primary" });
+        });
         expect(await page.getByRole("alert").count()).toBe(0);
       }
     });
@@ -413,9 +329,8 @@ suite.define(() => {
     "keeps the editor usable at $width × $height and preserves a failed-save draft",
     async (viewport) => {
       await suite.withPage({ viewport }, async ({ page }) => {
-        const { button, field, heading, text, expectValues } = nativeForm(page);
-        const token = field("Gateway token (optional)");
-        const password = field("Gateway password (optional)");
+        const token = page.getByLabel("Gateway token (optional)", { exact: true });
+        const password = page.getByLabel("Gateway password (optional)", { exact: true });
         await serveCompanion(page);
         await page.addInitScript(() => {
           Object.assign(window, {
@@ -434,20 +349,28 @@ suite.define(() => {
           });
         });
         await page.goto(`${suite.server.baseUrl}companion/gateways.html`);
-        await heading("Manage Gateways").waitFor();
-        await button("Add Gateway").click();
-        await heading("Add Gateway").waitFor();
-        const name = field("Name");
+        await page.getByRole("heading", { name: "Manage Gateways", exact: true }).waitFor();
+        await page.getByRole("button", { name: "Add Gateway", exact: true }).click();
+        await page.getByRole("heading", { name: "Add Gateway", exact: true }).waitFor();
+        const name = page.getByLabel("Name", { exact: true });
         expect(await name.evaluate((element) => element === document.activeElement)).toBe(true);
-        expect(await button("Add Gateway").isVisible()).toBe(false);
-        expect(await button("Back to Gateways").isVisible()).toBe(true);
-        expect(await button("Cancel").count()).toBe(0);
-        expect(await field("Authentication").isVisible()).toBe(true);
+        expect(
+          await page.getByRole("button", { name: "Add Gateway", exact: true }).isVisible(),
+        ).toBe(false);
+        expect(
+          await page.getByRole("button", { name: "Back to Gateways", exact: true }).isVisible(),
+        ).toBe(true);
+        expect(await page.getByRole("button", { name: "Cancel", exact: true }).count()).toBe(0);
+        expect(await page.getByLabel("Authentication", { exact: true }).isVisible()).toBe(true);
         expect(await token.isVisible()).toBe(true);
-        expect(await field("TLS fingerprint (optional)").isVisible()).toBe(false);
+        expect(
+          await page.getByLabel("TLS fingerprint (optional)", { exact: true }).isVisible(),
+        ).toBe(false);
         await name.fill("Workshop");
-        await field("Gateway URL").fill("https://workshop.example.test");
-        await button("Save Gateway").scrollIntoViewIfNeeded();
+        await page.getByLabel("Gateway URL", { exact: true }).fill("https://workshop.example.test");
+        await page
+          .getByRole("button", { name: "Save Gateway", exact: true })
+          .scrollIntoViewIfNeeded();
         const card = await page.locator(".gateways-panel").boundingBox();
         expect(card).not.toBeNull();
         expect(Math.abs(card!.x - (viewport.width - card!.x - card!.width))).toBeLessThanOrEqual(2);
@@ -455,34 +378,50 @@ suite.define(() => {
           await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
         ).toBe(true);
 
-        await field("Connection type").selectOption("ssh");
-        await expectControl(field("Gateway URL"), { disabled: true, visible: false });
-        await field("SSH target").fill("operator@workshop.example.test");
-        expect(await field("TLS fingerprint (optional)").isVisible()).toBe(false);
-        await text("Advanced connection settings").click();
-        await field("TLS fingerprint (optional)").fill("fixture-fingerprint");
+        await page.getByLabel("Connection type", { exact: true }).selectOption("ssh");
+        expect(await page.getByLabel("Gateway URL", { exact: true }).isDisabled()).toBe(true);
+        expect(await page.getByLabel("Gateway URL", { exact: true }).isVisible()).toBe(false);
+        await page.getByLabel("SSH target", { exact: true }).fill("operator@workshop.example.test");
+        expect(
+          await page.getByLabel("TLS fingerprint (optional)", { exact: true }).isVisible(),
+        ).toBe(false);
+        await page.getByText("Advanced connection settings", { exact: true }).click();
+        await page
+          .getByLabel("TLS fingerprint (optional)", { exact: true })
+          .fill("fixture-fingerprint");
         await token.fill("draft-token");
-        await button("Save Gateway").click();
+        await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
         const error = page.getByRole("alert").filter({ hasText: "Could not save Gateway" });
         await error.waitFor();
-        expect(await heading("Add Gateway").isVisible()).toBe(true);
-        await expectValues({
-          Name: "Workshop",
-          "SSH target": "operator@workshop.example.test",
-          "TLS fingerprint (optional)": "fixture-fingerprint",
-        });
-        await expectControl(token, { value: "draft-token", enabled: true });
+        expect(
+          await page.getByRole("heading", { name: "Add Gateway", exact: true }).isVisible(),
+        ).toBe(true);
+        expect(await name.inputValue()).toBe("Workshop");
+        expect(await page.getByLabel("SSH target", { exact: true }).inputValue()).toBe(
+          "operator@workshop.example.test",
+        );
+        expect(
+          await page.getByLabel("TLS fingerprint (optional)", { exact: true }).inputValue(),
+        ).toBe("fixture-fingerprint");
+        expect(await token.inputValue()).toBe("draft-token");
+        expect(await token.isEnabled()).toBe(true);
         expect(await password.isDisabled()).toBe(true);
         expect(
           await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
         ).toBe(true);
-        await button("Back to Gateways").click();
+        await page.getByRole("button", { name: "Back to Gateways", exact: true }).click();
         expect(
-          await button("Add Gateway").evaluate((element) => element === document.activeElement),
+          await page
+            .getByRole("button", { name: "Add Gateway", exact: true })
+            .evaluate((element) => element === document.activeElement),
         ).toBe(true);
-        await button("Add Gateway").click();
-        await expectValues({ Name: "", "Connection type": "direct" });
-        await expectControl(token, { value: "", type: "password" });
+        await page.getByRole("button", { name: "Add Gateway", exact: true }).click();
+        expect(await name.inputValue()).toBe("");
+        expect(await page.getByLabel("Connection type", { exact: true }).inputValue()).toBe(
+          "direct",
+        );
+        expect(await token.inputValue()).toBe("");
+        expect(await token.getAttribute("type")).toBe("password");
         expect(await error.isVisible()).toBe(false);
       });
     },
@@ -490,28 +429,111 @@ suite.define(() => {
 
   it("manages profiles offline without displaying stored credentials and confirms removal", async () => {
     await suite.withPage({ viewport: { width: 980, height: 980 } }, async ({ page }) => {
-      const { button, field, heading, expectValues } = nativeForm(page);
-      const token = field("Gateway token (optional)");
-      const password = field("Gateway password (optional)");
+      const token = page.getByLabel("Gateway token (optional)", { exact: true });
+      const password = page.getByLabel("Gateway password (optional)", { exact: true });
+      const parent = process.env.OPENCLAW_UI_RAIL_PROOF_DIR?.trim();
+      const proof = parent
+        ? createControlUiE2eArtifactDir("desktop-gateway-manager", parent)
+        : undefined;
       await serveCompanion(page);
-      await installProfiles(page);
+      await page.addInitScript(() => {
+        const profiles: Array<Record<string, unknown>> = [
+          {
+            id: "studio",
+            name: "Studio",
+            transport: "direct",
+            url: "https://studio.example.test",
+            hasToken: true,
+            hasPassword: false,
+          },
+        ];
+        const calls: Array<Record<string, unknown>> = [];
+        let failList = true;
+        Object.assign(window, {
+          profileRequests: calls,
+          profileCatalog: profiles,
+          __TAURI__: {
+            core: {
+              invoke: async (
+                command: string,
+                { message }: { message: Record<string, unknown> },
+              ) => {
+                if (command !== "gateway_profile_request") {
+                  throw new Error(`Unexpected command: ${command}`);
+                }
+                calls.push(message);
+                if (message.action === "list") {
+                  if (failList) {
+                    failList = false;
+                    throw new Error("Could not unlock saved Gateways. Try again.");
+                  }
+                  return structuredClone({ profiles, selectedId: "studio" });
+                }
+                if (message.action === "save") {
+                  const connection = message.connection as Record<string, unknown>;
+                  const index = profiles.findIndex((entry) => entry.id === message.id);
+                  const previous = profiles[index];
+                  const savedCredentials =
+                    previous &&
+                    !connection.token &&
+                    !connection.password &&
+                    previous.transport === connection.transport &&
+                    previous.url === connection.url &&
+                    previous.sshTarget === connection.sshTarget &&
+                    previous.remotePort === connection.remotePort
+                      ? previous
+                      : undefined;
+                  const profile = {
+                    id: message.id ?? "new-profile",
+                    name: message.name,
+                    transport: connection.transport,
+                    url: connection.url,
+                    sshTarget: connection.sshTarget,
+                    remotePort: connection.remotePort,
+                    hasToken: savedCredentials?.hasToken ?? Boolean(connection.token),
+                    hasPassword: savedCredentials?.hasPassword ?? Boolean(connection.password),
+                  };
+                  if (index < 0) {
+                    profiles.push(profile);
+                  } else {
+                    profiles[index] = profile;
+                  }
+                  return profile;
+                }
+                if (message.action === "remove") {
+                  profiles.splice(
+                    profiles.findIndex((entry) => entry.id === message.id),
+                    1,
+                  );
+                }
+                return null;
+              },
+            },
+          },
+        });
+      });
       await page.goto(`${suite.server.baseUrl}companion/gateways.html`);
-      await waitNotice(page, "Could not unlock saved Gateways", "alert");
+      await page
+        .getByRole("alert")
+        .filter({ hasText: "Could not unlock saved Gateways" })
+        .waitFor();
       await page.getByRole("button", { name: "Try again" }).click();
-      await button("Edit Studio").click();
+      await page.getByRole("button", { name: "Edit Studio", exact: true }).click();
       expect(await page.getByRole("heading", { name: "Manage Gateways" }).isVisible()).toBe(false);
       expect(await page.getByRole("list", { name: "Saved Gateways" }).isVisible()).toBe(false);
-      expect(await field("Name").evaluate((element) => element === document.activeElement)).toBe(
-        true,
-      );
-      await expectValues({
-        Authentication: "token",
-        "Gateway token (optional)": "",
-        "Gateway password (optional)": "",
-      });
+      expect(
+        await page
+          .getByLabel("Name", { exact: true })
+          .evaluate((element) => element === document.activeElement),
+      ).toBe(true);
+      expect(await page.getByLabel("Authentication", { exact: true }).inputValue()).toBe("token");
+      expect(await token.inputValue()).toBe("");
+      expect(await password.inputValue()).toBe("");
       expect(await token.isVisible()).toBe(true);
-      await expectControl(password, { visible: false, disabled: true });
+      expect(await password.isVisible()).toBe(false);
+      expect(await password.isDisabled()).toBe(true);
       await page.getByText(/Saved credentials stay hidden/).waitFor();
+      await capture(page, proof, "edit-saved-gateway.png");
       await token.fill("unsaved-token");
       for (const colorScheme of ["dark", "light", "dark"] as const) {
         await page.emulateMedia({ colorScheme });
@@ -527,34 +549,45 @@ suite.define(() => {
               ? { background: "rgb(250, 249, 247)", field: "rgb(255, 255, 255)" }
               : { background: "rgb(14, 16, 21)", field: "rgb(22, 25, 32)" },
           );
-        expect(await field("Name").inputValue()).toBe("Studio");
-        await expectControl(token, { value: "unsaved-token", type: "password" });
+        expect(await page.getByLabel("Name", { exact: true }).inputValue()).toBe("Studio");
+        expect(await token.inputValue()).toBe("unsaved-token");
+        expect(await token.getAttribute("type")).toBe("password");
       }
-      await button("Show credential").click();
+      await page.getByRole("button", { name: "Show credential", exact: true }).click();
       expect(await token.getAttribute("type")).toBe("text");
-      await button("Back to Gateways").click();
+      await page.getByRole("button", { name: "Back to Gateways", exact: true }).click();
       expect(await page.locator("#gateway-editor").isVisible()).toBe(false);
       expect(
-        await button("Add Gateway").evaluate((element) => element === document.activeElement),
+        await page
+          .getByRole("button", { name: "Add Gateway", exact: true })
+          .evaluate((element) => element === document.activeElement),
       ).toBe(true);
-      await button("Edit Studio").click();
-      await expectControl(token, { value: "", type: "password" });
-      expect(await button("Show credential").isVisible()).toBe(true);
-      await field("Name").fill("  ");
-      await button("Save Gateway").click();
+      await page.getByRole("button", { name: "Edit Studio", exact: true }).click();
+      expect(await token.inputValue()).toBe("");
+      expect(await token.getAttribute("type")).toBe("password");
       expect(
-        await field("Name").evaluate((element: HTMLInputElement) => element.validity.valid),
+        await page.getByRole("button", { name: "Show credential", exact: true }).isVisible(),
+      ).toBe(true);
+      await page.getByLabel("Name", { exact: true }).fill("  ");
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      expect(
+        await page
+          .getByLabel("Name", { exact: true })
+          .evaluate((element: HTMLInputElement) => element.validity.valid),
       ).toBe(false);
-      await button("Back to Gateways").click();
-      await button("Edit Studio").click();
-      await button("Save Gateway").click();
-      await waitNotice(page, "Saved Studio", "status");
-      await button("Edit Studio").click();
-      await field("Name").fill("Home studio");
-      await button("Save Gateway").click();
-      await button("Open Home studio").click();
-      await waitNotice(page, "Opened Home studio", "status");
-      const requests = () => profileRequests(page);
+      await page.getByRole("button", { name: "Back to Gateways", exact: true }).click();
+      await page.getByRole("button", { name: "Edit Studio", exact: true }).click();
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("status").filter({ hasText: "Saved Studio" }).waitFor();
+      await page.getByRole("button", { name: "Edit Studio", exact: true }).click();
+      await page.getByLabel("Name", { exact: true }).fill("Home studio");
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("button", { name: "Open Home studio", exact: true }).click();
+      await page.getByRole("status").filter({ hasText: "Opened Home studio" }).waitFor();
+      const requests = () =>
+        page.evaluate(
+          () => Reflect.get(window, "profileRequests") as Array<Record<string, unknown>>,
+        );
       expect(
         (await requests()).find(
           (message) => message.action === "save" && message.name === "Home studio",
@@ -570,48 +603,51 @@ suite.define(() => {
           password: null,
         },
       });
-      await button("Edit Home studio").click();
+      await page.getByRole("button", { name: "Edit Home studio", exact: true }).click();
       await token.fill("fixture-token");
-      await button("Show credential").click();
-      await field("Authentication").selectOption("password");
-      await expectControl(token, { value: "", visible: false, disabled: true });
-      await expectControl(password, { visible: true, enabled: true, type: "password" });
-      await password.fill("fixture-password");
-      await button("Show credential").click();
-      expect(await password.getAttribute("type")).toBe("text");
-      await button("Hide credential").click();
+      await page.getByRole("button", { name: "Show credential", exact: true }).click();
+      await page.getByLabel("Authentication", { exact: true }).selectOption("password");
+      expect(await token.inputValue()).toBe("");
+      expect(await token.isVisible()).toBe(false);
+      expect(await token.isDisabled()).toBe(true);
+      expect(await password.isVisible()).toBe(true);
+      expect(await password.isEnabled()).toBe(true);
       expect(await password.getAttribute("type")).toBe("password");
-      await field("Authentication").selectOption("token");
+      await password.fill("fixture-password");
+      await page.getByRole("button", { name: "Show credential", exact: true }).click();
+      expect(await password.getAttribute("type")).toBe("text");
+      await page.getByRole("button", { name: "Hide credential", exact: true }).click();
+      expect(await password.getAttribute("type")).toBe("password");
+      await page.getByLabel("Authentication", { exact: true }).selectOption("token");
       expect(await password.inputValue()).toBe("");
       await token.fill("replacement-token");
-      await button("Save Gateway").click();
-      await waitNotice(page, "Saved Home studio", "status");
-      expect(await lastRequest(page, "save")).toMatchObject({
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("status").filter({ hasText: "Saved Home studio" }).waitFor();
+      expect((await requests()).findLast((message) => message.action === "save")).toMatchObject({
         id: "studio",
         connection: { token: "replacement-token", password: null },
       });
-      await button("Edit Home studio").click();
-      await expectValues({
-        "Gateway token (optional)": "",
-        "Gateway password (optional)": "",
-      });
+      await page.getByRole("button", { name: "Edit Home studio", exact: true }).click();
+      expect(await token.inputValue()).toBe("");
+      expect(await password.inputValue()).toBe("");
       expect(await token.getAttribute("type")).toBe("password");
-      await field("Authentication").selectOption("password");
-      await button("Save Gateway").click();
-      await waitNotice(page, "Saved Home studio", "status");
-      expect(await lastRequest(page, "save")).toMatchObject({
+      await page.getByLabel("Authentication", { exact: true }).selectOption("password");
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("status").filter({ hasText: "Saved Home studio" }).waitFor();
+      expect((await requests()).findLast((message) => message.action === "save")).toMatchObject({
         connection: { token: null, password: null },
       });
-      await button("Add Gateway").click();
-      await field("Name").fill("Workshop");
-      await field("Connection type").selectOption("ssh");
-      await field("SSH target").fill("operator@workshop.example.test");
-      await field("Gateway port").fill("19789");
-      await field("Authentication").selectOption("password");
+      await page.getByRole("button", { name: "Add Gateway", exact: true }).click();
+      await page.getByLabel("Name", { exact: true }).fill("Workshop");
+      await page.getByLabel("Connection type", { exact: true }).selectOption("ssh");
+      await page.getByLabel("SSH target", { exact: true }).fill("operator@workshop.example.test");
+      await page.getByLabel("Gateway port", { exact: true }).fill("19789");
+      await page.getByLabel("Authentication", { exact: true }).selectOption("password");
       await password.fill("fixture-password");
-      await button("Save Gateway").click();
-      await button("Edit Workshop").waitFor();
-      expect(await lastRequest(page, "save")).toEqual({
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("button", { name: "Edit Workshop", exact: true }).waitFor();
+      await capture(page, proof, "saved-gateways.png");
+      expect((await requests()).findLast((message) => message.action === "save")).toEqual({
         action: "save",
         name: "Workshop",
         connection: {
@@ -623,51 +659,84 @@ suite.define(() => {
           password: "fixture-password",
         },
       });
-      await button("Edit Workshop").click();
-      expect(await field("Authentication").inputValue()).toBe("password");
-      await expectControl(password, { visible: true, value: "" });
-      await button("Back to Gateways").click();
-      await button("Remove Workshop").click();
+      await page.getByRole("button", { name: "Edit Workshop", exact: true }).click();
+      expect(await page.getByLabel("Authentication", { exact: true }).inputValue()).toBe(
+        "password",
+      );
+      expect(await password.isVisible()).toBe(true);
+      expect(await password.inputValue()).toBe("");
+      await page.getByRole("button", { name: "Back to Gateways", exact: true }).click();
+      await page.getByRole("button", { name: "Remove Workshop", exact: true }).click();
       await page.getByRole("dialog").waitFor();
       await page.keyboard.press("Escape");
-      expect(await requestsOf(page, "remove")).toHaveLength(0);
-      await button("Remove Workshop").click();
-      await button("Remove Gateway").click();
-      await expect.poll(() => button("Edit Workshop").count()).toBe(0);
-      expect(await requestsOf(page, "remove")).toEqual([{ action: "remove", id: "new-profile" }]);
-      await updateProfiles(page, [{ profile: { name: "Renamed studio" } }]);
-      await button("Open Renamed studio").waitFor();
-      await button("Remove Renamed studio").click();
+      expect((await requests()).filter((message) => message.action === "remove")).toHaveLength(0);
+      await page.getByRole("button", { name: "Remove Workshop", exact: true }).click();
+      await page.getByRole("button", { name: "Remove Gateway", exact: true }).click();
+      await expect
+        .poll(() => page.getByRole("button", { name: "Edit Workshop", exact: true }).count())
+        .toBe(0);
+      expect((await requests()).filter((message) => message.action === "remove")).toEqual([
+        { action: "remove", id: "new-profile" },
+      ]);
+      await page.evaluate(() => {
+        const catalog = Reflect.get(window, "profileCatalog") as Array<Record<string, unknown>>;
+        catalog[0] = { ...catalog[0], name: "Renamed studio" };
+        window.dispatchEvent(new CustomEvent("openclaw:gateway-profiles-changed", { detail: {} }));
+      });
+      await page.getByRole("button", { name: "Open Renamed studio", exact: true }).waitFor();
+      await page.getByRole("button", { name: "Remove Renamed studio", exact: true }).click();
       await page.getByRole("dialog").waitFor();
-      await updateProfiles(page, [
-        {
-          profile: { id: "relocated-studio", name: "Relocated studio" },
-          detail: { previousId: "studio", id: "relocated-studio" },
-        },
-      ]);
-      await button("Open Relocated studio").click();
+      await page.evaluate(() => {
+        const catalog = Reflect.get(window, "profileCatalog") as Array<Record<string, unknown>>;
+        catalog[0] = { ...catalog[0], id: "relocated-studio", name: "Relocated studio" };
+        window.dispatchEvent(
+          new CustomEvent("openclaw:gateway-profiles-changed", {
+            detail: { previousId: "studio", id: "relocated-studio" },
+          }),
+        );
+      });
+      await page.getByRole("button", { name: "Open Relocated studio", exact: true }).click();
       expect(await page.getByRole("dialog").isVisible()).toBe(false);
-      expect(await requestsOf(page, "remove")).toHaveLength(1);
-      expect((await lastRequest(page, "open"))?.id).toBe("relocated-studio");
-      await button("Edit Relocated studio").click();
-      await field("Name").fill("My draft");
-      await updateProfiles(page, [
-        {
-          profile: { id: "intermediate-studio" },
-          detail: { previousId: "relocated-studio", id: "intermediate-studio" },
-        },
-        {
-          profile: { id: "moved-studio", name: "Moved studio", url: "https://moved.example.test" },
-          detail: { previousId: "intermediate-studio", id: "moved-studio" },
-        },
-      ]);
-      expect(await heading("Edit Gateway").isVisible()).toBe(true);
+      expect((await requests()).filter((message) => message.action === "remove")).toHaveLength(1);
+      expect((await requests()).findLast((message) => message.action === "open")?.id).toBe(
+        "relocated-studio",
+      );
+      await page.getByRole("button", { name: "Edit Relocated studio", exact: true }).click();
+      await page.getByLabel("Name", { exact: true }).fill("My draft");
+      await page.evaluate(() => {
+        const catalog = Reflect.get(window, "profileCatalog") as Array<Record<string, unknown>>;
+        catalog[0] = { ...catalog[0], id: "intermediate-studio" };
+        window.dispatchEvent(
+          new CustomEvent("openclaw:gateway-profiles-changed", {
+            detail: { previousId: "relocated-studio", id: "intermediate-studio" },
+          }),
+        );
+        catalog[0] = {
+          ...catalog[0],
+          id: "moved-studio",
+          name: "Moved studio",
+          url: "https://moved.example.test",
+        };
+        window.dispatchEvent(
+          new CustomEvent("openclaw:gateway-profiles-changed", {
+            detail: { previousId: "intermediate-studio", id: "moved-studio" },
+          }),
+        );
+      });
+      expect(
+        await page.getByRole("heading", { name: "Edit Gateway", exact: true }).isVisible(),
+      ).toBe(true);
       expect(await page.getByRole("list", { name: "Saved Gateways" }).isVisible()).toBe(false);
-      await expectValues({ Name: "My draft", "Gateway URL": "https://studio.example.test" });
-      await button("Save Gateway").click();
-      await waitNotice(page, "Saved My draft", "status");
-      expect((await lastRequest(page, "save"))?.id).toBe("moved-studio");
-      await button("Edit My draft").click();
+      expect(await page.getByLabel("Name", { exact: true }).inputValue()).toBe("My draft");
+      expect(await page.getByLabel("Gateway URL", { exact: true }).inputValue()).toBe(
+        "https://studio.example.test",
+      );
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("status").filter({ hasText: "Saved My draft" }).waitFor();
+      expect((await requests()).findLast((message) => message.action === "save")?.id).toBe(
+        "moved-studio",
+      );
+      await page.getByRole("button", { name: "Edit My draft", exact: true }).click();
       await token.fill("draft-token");
       await page.evaluate(() => {
         (Reflect.get(window, "profileCatalog") as Array<Record<string, unknown>>).splice(0);
@@ -677,17 +746,22 @@ suite.define(() => {
           }),
         );
       });
-      await waitNotice(page, "removed", "status");
-      await heading("Add Gateway").waitFor();
-      await expectValues({ Name: "My draft", "Gateway token (optional)": "draft-token" });
-      expect(await button("Open My draft").count()).toBe(0);
-      await button("Save Gateway").click();
-      await button("Open My draft").waitFor();
-      expect(await lastRequest(page, "save")).toMatchObject({
+      await page.getByRole("status").filter({ hasText: "removed" }).waitFor();
+      await page.getByRole("heading", { name: "Add Gateway", exact: true }).waitFor();
+      expect(await page.getByLabel("Name", { exact: true }).inputValue()).toBe("My draft");
+      expect(await token.inputValue()).toBe("draft-token");
+      expect(await page.getByRole("button", { name: "Open My draft", exact: true }).count()).toBe(
+        0,
+      );
+      await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+      await page.getByRole("button", { name: "Open My draft", exact: true }).waitFor();
+      expect((await requests()).findLast((message) => message.action === "save")).toMatchObject({
         name: "My draft",
         connection: { token: "draft-token" },
       });
-      expect((await lastRequest(page, "save"))?.id).toBeUndefined();
+      expect(
+        (await requests()).findLast((message) => message.action === "save")?.id,
+      ).toBeUndefined();
     });
   });
 
@@ -699,31 +773,104 @@ suite.define(() => {
     "offers $delivery recovery for failed SSH profile $recoveryId without replaying its error after save",
     async ({ recoveryId, delivery }) => {
       await suite.withPage({}, async ({ page }) => {
-        const { button, field, heading, expectValues } = nativeForm(page);
         await serveCompanion(page);
-        await installProfiles(page, { id: recoveryId, eventDelivery: delivery === "event" });
+        await page.addInitScript(
+          ({ id, eventDelivery }) => {
+            let profile = {
+              id: "studio",
+              name: "Studio",
+              transport: "ssh",
+              sshTarget: "operator@unreachable.example.test",
+              remotePort: 18789,
+              hasToken: true,
+              hasPassword: false,
+            };
+            const calls: Array<Record<string, unknown>> = [];
+            let publishSaveFailure = eventDelivery;
+            Object.assign(window, {
+              replaceGatewayProfile: () => {
+                profile = {
+                  ...profile,
+                  id: "external-studio",
+                  name: "Other studio",
+                  sshTarget: "operator@elsewhere.example.test",
+                };
+              },
+              __OPENCLAW_GATEWAY_RECOVERY__: {
+                id,
+                error: eventDelivery
+                  ? ""
+                  : "SSH connection failed. Check the target and try again.",
+              },
+              profileRequests: calls,
+              __TAURI__: {
+                core: {
+                  invoke: async (
+                    _command: string,
+                    { message }: { message: Record<string, unknown> },
+                  ) => {
+                    calls.push(message);
+                    if (message.action === "list") {
+                      if (publishSaveFailure && profile.id === "updated-studio") {
+                        publishSaveFailure = false;
+                        const detail = {
+                          id: profile.id,
+                          error: "Updated SSH connection failed. Check the new target.",
+                        };
+                        Reflect.set(window, "__OPENCLAW_GATEWAY_RECOVERY__", detail);
+                        window.dispatchEvent(
+                          new CustomEvent("openclaw:gateway-recovery", { detail }),
+                        );
+                      }
+                      return { profiles: [profile], selectedId: "studio" };
+                    }
+                    if (message.action === "save") {
+                      if (message.id && message.id !== profile.id) {
+                        throw new Error("That saved Gateway no longer exists.");
+                      }
+                      profile = {
+                        ...profile,
+                        id: eventDelivery ? "updated-studio" : profile.id,
+                        name: String(message.name),
+                      };
+                      return profile;
+                    }
+                    return null;
+                  },
+                },
+              },
+            });
+          },
+          { id: recoveryId, eventDelivery: delivery === "event" },
+        );
         await page.goto(`${suite.server.baseUrl}companion/gateways.html`);
         if (delivery !== "event") {
-          await waitNotice(page, "SSH connection failed", "alert");
+          await page.getByRole("alert").filter({ hasText: "SSH connection failed" }).waitFor();
         }
         if (recoveryId === "studio") {
-          await heading("Edit Gateway").waitFor();
-          expect(await field("SSH target").inputValue()).toBe("operator@unreachable.example.test");
+          await page.getByRole("heading", { name: "Edit Gateway", exact: true }).waitFor();
+          expect(await page.getByLabel("SSH target", { exact: true }).inputValue()).toBe(
+            "operator@unreachable.example.test",
+          );
         } else {
           expect(await page.locator("#gateway-editor").isVisible()).toBe(false);
-          await button("Open Studio").click({ trial: true });
-          await button("Add Gateway").click();
-          await field("Connection type").selectOption("ssh");
+          await page
+            .getByRole("button", { name: "Open Studio", exact: true })
+            .click({ trial: true });
+          await page.getByRole("button", { name: "Add Gateway", exact: true }).click();
+          await page.getByLabel("Connection type", { exact: true }).selectOption("ssh");
         }
-        await expectValues({
-          "Gateway token (optional)": "",
-          "Gateway password (optional)": "",
-        });
-        await field("Name").fill("Recovered studio");
-        await field("SSH target").fill("operator@studio.example.test");
+        expect(
+          await page.getByLabel("Gateway token (optional)", { exact: true }).inputValue(),
+        ).toBe("");
+        expect(
+          await page.getByLabel("Gateway password (optional)", { exact: true }).inputValue(),
+        ).toBe("");
+        await page.getByLabel("Name", { exact: true }).fill("Recovered studio");
+        await page.getByLabel("SSH target", { exact: true }).fill("operator@studio.example.test");
         if (delivery === "event") {
           expect(await page.locator("#gateway-error").getAttribute("hidden")).not.toBeNull();
-          await field("Gateway token (optional)").fill("unsaved-token");
+          await page.getByLabel("Gateway token (optional)", { exact: true }).fill("unsaved-token");
           await page.evaluate(() => {
             Reflect.get(window, "replaceGatewayProfile")();
             const detail = {
@@ -733,34 +880,51 @@ suite.define(() => {
             Reflect.set(window, "__OPENCLAW_GATEWAY_RECOVERY__", detail);
             window.dispatchEvent(new CustomEvent("openclaw:gateway-recovery", { detail }));
           });
-          await waitNotice(page, "SSH connection failed", "alert");
-          expect(await heading("Edit Gateway").isVisible()).toBe(true);
+          await page.getByRole("alert").filter({ hasText: "SSH connection failed" }).waitFor();
+          expect(
+            await page.getByRole("heading", { name: "Edit Gateway", exact: true }).isVisible(),
+          ).toBe(true);
           expect(await page.getByRole("list", { name: "Saved Gateways" }).isVisible()).toBe(false);
-          await expectValues({
-            Name: "Recovered studio",
-            "SSH target": "operator@studio.example.test",
-            "Gateway token (optional)": "unsaved-token",
-          });
-          await field("Gateway token (optional)").fill("");
+          expect(await page.getByLabel("Name", { exact: true }).inputValue()).toBe(
+            "Recovered studio",
+          );
+          expect(await page.getByLabel("SSH target", { exact: true }).inputValue()).toBe(
+            "operator@studio.example.test",
+          );
+          expect(
+            await page.getByLabel("Gateway token (optional)", { exact: true }).inputValue(),
+          ).toBe("unsaved-token");
+          await page.getByLabel("Gateway token (optional)", { exact: true }).fill("");
         }
-        await button("Save Gateway").click();
+        await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
         if (delivery === "event") {
-          await waitNotice(page, "Updated SSH connection failed", "alert");
-          await heading("Edit Gateway").waitFor();
-          expect(await field("Name").inputValue()).toBe("Recovered studio");
-          await field("Name").fill("Ready studio");
-          await button("Save Gateway").click();
-          await waitNotice(page, "Saved Ready studio", "status");
-          const lastSave = (await profileRequests(page)).findLast(
-            (message) => message.action === "save",
+          await page
+            .getByRole("alert")
+            .filter({ hasText: "Updated SSH connection failed" })
+            .waitFor();
+          await page.getByRole("heading", { name: "Edit Gateway", exact: true }).waitFor();
+          expect(await page.getByLabel("Name", { exact: true }).inputValue()).toBe(
+            "Recovered studio",
+          );
+          await page.getByLabel("Name", { exact: true }).fill("Ready studio");
+          await page.getByRole("button", { name: "Save Gateway", exact: true }).click();
+          await page.getByRole("status").filter({ hasText: "Saved Ready studio" }).waitFor();
+          const lastSave = await page.evaluate(() =>
+            (Reflect.get(window, "profileRequests") as Array<Record<string, unknown>>).findLast(
+              (message) => message.action === "save",
+            ),
           );
           expect(lastSave?.id).toBe("updated-studio");
         } else {
-          await waitNotice(page, "Saved Recovered studio", "status");
+          await page.getByRole("status").filter({ hasText: "Saved Recovered studio" }).waitFor();
         }
         expect(await page.getByRole("alert").isVisible()).toBe(false);
         expect(await page.locator("#gateway-editor").isVisible()).toBe(false);
-        const saved = (await profileRequests(page)).find((message) => message.action === "save");
+        const saved = await page.evaluate(() =>
+          (Reflect.get(window, "profileRequests") as Array<Record<string, unknown>>).find(
+            (message) => message.action === "save",
+          ),
+        );
         expect(saved).toEqual({
           action: "save",
           ...(recoveryId === "studio"

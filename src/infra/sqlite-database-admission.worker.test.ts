@@ -113,7 +113,7 @@ function taskPool(retainedTransport = false) {
       maxWorkers: 1,
       idleTimeoutMs: 0,
     },
-    { retainedTransport },
+    retainedTransport ? { retainedTransport: true } : undefined,
   );
   cleanups.push(() => pool.close());
   return pool;

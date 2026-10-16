@@ -233,11 +233,10 @@ describe("async login-shell PATH preparation", () => {
         windowsHide: true,
       }),
     );
-    expect(probe.exec.mock.calls[0]?.[2]?.env).toMatchObject({
-      HOME: os.homedir(),
-      ZDOTDIR: undefined,
-      BASH_ENV: undefined,
-    });
+    const options = probe.exec.mock.calls[0]?.[2];
+    expect(options?.env?.HOME).toBe(os.homedir());
+    expect(options?.env?.ZDOTDIR).toBeUndefined();
+    expect(options?.env?.BASH_ENV).toBeUndefined();
     // The first child's promise is still in flight until the next microtask.
     probe.finish(null);
     const second = shellEnv.prepareShellPathFromLoginShell({
@@ -290,13 +289,10 @@ describe("shell env fallback", () => {
   }
 
   function expectSanitizedStartupEnv(receivedEnv: NodeJS.ProcessEnv | undefined) {
-    expect(receivedEnv).toMatchObject({
-      BASH_ENV: undefined,
-      PS4: undefined,
-      ZDOTDIR: undefined,
-      SHELL: undefined,
-      HOME: os.homedir(),
-    });
+    expect(receivedEnv?.HOME).toBe(os.homedir());
+    for (const key of ["BASH_ENV", "PS4", "ZDOTDIR", "SHELL"]) {
+      expect(receivedEnv?.[key]).toBeUndefined();
+    }
   }
 
   function registerShells(shells: string[]) {
