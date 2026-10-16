@@ -733,16 +733,16 @@ suite.define(() => {
       await gateway.deferNext("connect");
       await gateway.closeLatest();
       await gateway.waitForRequest("connect", { after: connected });
-      const sidebar = page.locator("openclaw-app-sidebar");
+      const navigationSidebar = page.locator("openclaw-app-sidebar");
       for (const collapsed of [false, true]) {
         if (collapsed) {
           await page.locator('[data-navigation-view][aria-pressed="true"]').click();
         }
-        await sidebar.locator(".sidebar-shell").waitFor({
+        await navigationSidebar.locator(".sidebar-shell").waitFor({
           state: collapsed ? "hidden" : "visible",
         });
         // Web collapse keeps navigation in the rail; the native control cluster can be empty.
-        await sidebar.locator(".sidebar-rail").waitFor({ state: "visible" });
+        await navigationSidebar.locator(".sidebar-rail").waitFor({ state: "visible" });
         expect(await page.locator(".connection-action-block").count()).toBe(0);
         expect(await page.locator("#control-ui-main").getAttribute("inert")).toBeNull();
         expect(await page.locator("openclaw-router-outlet").getAttribute("inert")).toBeNull();
