@@ -3596,8 +3596,9 @@ button.gateway-status:focus-visible {
   color: var(--danger);
 }
 
-/* The connection chip follows the visible writing surface so it never covers a composer. */
-.shell :is(.chat-footer, .creation-composer, .new-session-page__composer) {
+/* The connection chip follows the visible writing surface or sticky save bar so it never
+   covers a composer or primary action. */
+.shell :is(.chat-footer, .creation-composer, .new-session-page__composer, .cron-editor-actions) {
   anchor-name: --shell-composer;
 }
 
