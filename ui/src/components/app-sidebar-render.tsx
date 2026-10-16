@@ -264,28 +264,22 @@ export function renderAppSidebarFooterBar(host: AppSidebarRenderHost): JSX.Eleme
   const buildSubtitle = () => formatSidebarBuildSubtitle(CONTROL_UI_BUILD_INFO);
   const gatewayPrimaryTag = () => (gateway()?.isPrimary ? t("nav.gateway.primaryTag") : null);
   const identityMenuLabel = () => t("profilePage.identity.menuButtonLabel", { name: selfLabel() });
-  const statusLabel = () =>
-    connectionStatus()
-      ? t(`connection.${connectionStatus()}`)
-      : host.connected
-        ? t("nav.gateway.connected")
-        : t("connection.offline");
+  const statusLabel = () => (connectionStatus() ? t(`connection.${connectionStatus()}`) : null);
   const identityDetail = () => {
     const status = statusLabel();
     const selectedGateway = gateway();
-    return [
-      status,
-      selectedGateway
+    return (
+      status ??
+      (selectedGateway
         ? `${selectedGateway.name}${gatewayPrimaryTag() ? `, ${gatewayPrimaryTag()}` : ""}`
-        : buildSubtitle(),
-    ]
-      .filter(Boolean)
-      .join(" — ");
+        : buildSubtitle())
+    );
   };
+  const announcement = () => statusLabel() ?? (host.connected ? t("nav.gateway.connected") : "");
   return (
     <div class="sidebar-footer-bar sidebar-footer-bar--one-action">
       <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {statusLabel()}
+        {announcement()}
       </span>
       <span class="sidebar-footer-actions">
         <openclaw-tooltip>
@@ -352,7 +346,7 @@ export function renderAppSidebarFooterBar(host: AppSidebarRenderHost): JSX.Eleme
         title={
           identityDetail() ? `${identityMenuLabel()}: ${identityDetail()}` : identityMenuLabel()
         }
-        data-connection-status={connectionStatus() ?? (host.connected ? "connected" : "offline")}
+        data-connection-status={connectionStatus() ?? (host.connected ? "connected" : undefined)}
         aria-label={
           identityDetail() ? `${identityMenuLabel()}: ${identityDetail()}` : identityMenuLabel()
         }

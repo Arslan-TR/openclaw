@@ -332,7 +332,10 @@ it("keeps the focused gateway retry button across shell and error updates", asyn
   retry.focus();
   expect(document.activeElement).toBe(retry);
 
-  snapshot.mockReturnValue({ ...disconnected, lastError: "Connection refused" });
+  snapshot.mockReturnValue({
+    ...disconnected,
+    lastError: "Connection refused?token=chip-secret",
+  });
   owner.invalidate();
   flush();
 
@@ -341,7 +344,7 @@ it("keeps the focused gateway retry button across shell and error updates", asyn
   const tooltip = view.container.querySelector<HTMLElementTagNameMap["openclaw-tooltip"]>(
     ".shell-connection-status openclaw-tooltip",
   );
-  expect(tooltip?.content).toBe("Connection refused");
+  expect(tooltip?.content).toBe("Connection refused?[redacted-credential]");
 
   let queuedCount = 2;
   owner.outboxStoreRuntime = {

@@ -3354,6 +3354,10 @@ openclaw-sidebar-attention {
   background: var(--warn);
 }
 
+.sidebar-identity-card:not([data-connection-status]) .sidebar-identity-card__status {
+  display: none;
+}
+
 .sidebar-identity-card[data-connection-status="connected"] .sidebar-identity-card__status {
   background: var(--ok);
 }
