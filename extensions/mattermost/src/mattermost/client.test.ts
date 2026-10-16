@@ -61,14 +61,18 @@ function errorResponse(body: BodyInit | null, status: number, statusText?: strin
   return new Response(body, { status, statusText, headers: jsonHeaders });
 }
 
+function streamResponse(source: UnderlyingSource<Uint8Array>, status = 200) {
+  return new Response(new ReadableStream(source), { status, headers: jsonHeaders });
+}
+
 function unreadableResponse(status = 200, message = "network error") {
-  return new Response(
-    new ReadableStream({
+  return streamResponse(
+    {
       pull() {
         throw new TypeError(message);
       },
-    }),
-    { status, headers: jsonHeaders },
+    },
+    status,
   );
 }
 
@@ -176,19 +180,6 @@ describe("Mattermost request boundary", () => {
     expect(() => createMattermostClient({ baseUrl: "", botToken })).toThrow("baseUrl is required");
   });
 
-  it("releases null-body errors without unbounded response readers", async () => {
-    const response = errorResponse(null, 503, "Service Unavailable");
-    const json = vi.spyOn(response, "json");
-    const text = vi.spyOn(response, "text");
-    const { client, release } = guardedClient(response);
-    await expect(client.request("/users/me")).rejects.toThrow(
-      "Mattermost API 503 Service Unavailable: unknown error",
-    );
-    expect(json).not.toHaveBeenCalled();
-    expect(text).not.toHaveBeenCalled();
-    expect(release).toHaveBeenCalledOnce();
-  });
-
   it("rejects raw, encoded, and URL-normalized traversal before fetch", async () => {
     const { client, fetchImpl } = customClient();
     for (const path of [
@@ -213,18 +204,15 @@ describe("Mattermost request boundary", () => {
     let pulled = 0;
     const chunk = new Uint8Array(2 * 1024 * 1024).fill(0x7b);
     const { client, release } = guardedClient(
-      new Response(
-        new ReadableStream<Uint8Array>({
-          pull(controller) {
-            pulled++;
-            controller.enqueue(chunk);
-          },
-          cancel() {
-            canceled = true;
-          },
-        }),
-        { headers: jsonHeaders },
-      ),
+      streamResponse({
+        pull(controller) {
+          pulled++;
+          controller.enqueue(chunk);
+        },
+        cancel() {
+          canceled = true;
+        },
+      }),
     );
     await expect(client.request("/users/me")).rejects.toThrow(
       "JSON response exceeds 16777216 bytes",
@@ -254,14 +242,11 @@ describe("Mattermost request boundary", () => {
 
   it("reports accepted deletion as done even when releasing its body fails", async () => {
     const { client, release } = guardedClient(
-      new Response(
-        new ReadableStream({
-          cancel() {
-            return Promise.reject(new Error("release failed"));
-          },
-        }),
-        { headers: jsonHeaders },
-      ),
+      streamResponse({
+        cancel() {
+          return Promise.reject(new Error("release failed"));
+        },
+      }),
     );
     release.mockRejectedValueOnce(new Error("release failed"));
     await expect(deleteMattermostPost(client, "post1")).resolves.toBeUndefined();
@@ -277,19 +262,32 @@ describe("Mattermost request boundary", () => {
 });
 
 describe("Mattermost credential diagnostics", () => {
-  it("decodes JSON escapes before redacting the request credential", async () => {
-    const response = errorResponse(
-      String.raw`{"message":"Bearer\u0020\u0061bcdefghijklmnopqrstuvwxyz"}`,
+  it.each([
+    [503, "Service Unavailable", null, "unknown error", guardedClient],
+    [
       401,
-    );
-    const json = vi.spyOn(response, "json");
-    const text = vi.spyOn(response, "text");
-    const { client, fetchImpl } = customClient(response);
-    await expect(client.request("/users/me")).rejects.toThrow("Mattermost API 401 : ***");
-    expect(requestHeaders(fetchImpl).get("Authorization")).toBe(`Bearer ${botToken}`);
-    expect(json).not.toHaveBeenCalled();
-    expect(text).not.toHaveBeenCalled();
-  });
+      "",
+      String.raw`{"message":"Bearer\u0020\u0061bcdefghijklmnopqrstuvwxyz"}`,
+      "***",
+      customClient,
+    ],
+  ] as const)(
+    "bounds HTTP %s diagnostics and redacts decoded credentials",
+    async (status, statusText, body, detail, createClient) => {
+      const response = errorResponse(body, status, statusText);
+      const readers = [vi.spyOn(response, "json"), vi.spyOn(response, "text")];
+      const fixture = createClient(response);
+      await expect(fixture.client.request("/users/me")).rejects.toThrow(
+        `Mattermost API ${status} ${statusText}: ${detail}`,
+      );
+      expect(readers.map((reader) => reader.mock.calls)).toEqual([[], []]);
+      if ("release" in fixture) {
+        expect(fixture.release).toHaveBeenCalledOnce();
+      } else {
+        expect(requestHeaders(fixture.fetchImpl).get("Authorization")).toBe(`Bearer ${botToken}`);
+      }
+    },
+  );
 
   it("redacts malformed JSON served with a JSON content type", async () => {
     const { client } = customClient(errorResponse(`upstream error: Bearer ${botToken}`, 502));
@@ -327,15 +325,13 @@ describe("Mattermost credential diagnostics", () => {
 });
 
 describe("Mattermost post receipts", () => {
-  it("preserves accepted visibility when a post receipt cannot be decoded", async () => {
-    const { client, fetchImpl } = customClient(new Response("{", { headers: jsonHeaders }));
+  it.each([
+    ["undecodable receipt", () => new Response("{", { headers: jsonHeaders })],
+    ["no-content identity", () => new Response(null, { status: 204 })],
+  ] as const)("preserves accepted visibility for %s", async (_name, response) => {
+    const { client, fetchImpl } = customClient(response());
     await expectAccepted(createMattermostPost(client, postParams));
     expect(fetchImpl).toHaveBeenCalledOnce();
-  });
-
-  it("preserves accepted visibility for a no-content post identity", async () => {
-    const { client } = customClient(new Response(null, { status: 204 }));
-    await expectAccepted(createMattermostPost(client, postParams));
   });
 
   it("sends post attachments and trims the provider identity", async () => {
@@ -403,21 +399,20 @@ describe("Mattermost post reads and edits", () => {
     },
   );
 
-  it("rejects invalid limits before provider access", async () => {
+  it.each([
+    ["invalid limits", [{ limit: 0 }, { limit: 1.5 }], "limit must be a positive integer"],
+    [
+      "conflicting cursors",
+      [{ before: "older", after: "newer" }],
+      "accepts either before or after, not both",
+    ],
+  ] as const)("rejects %s before provider access", async (_name, variants, message) => {
     const { client, fetchImpl } = customClient();
-    for (const limit of [0, 1.5]) {
-      await expect(fetchMattermostChannelPosts(client, "ch1", { limit })).rejects.toThrow(
-        "Mattermost read limit must be a positive integer",
+    for (const options of variants) {
+      await expect(fetchMattermostChannelPosts(client, "ch1", options)).rejects.toThrow(
+        `Mattermost read ${message}`,
       );
     }
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it("rejects mutually exclusive cursors before provider access", async () => {
-    const { client, fetchImpl } = customClient();
-    await expect(
-      fetchMattermostChannelPosts(client, "ch1", { before: "older", after: "newer" }),
-    ).rejects.toThrow("Mattermost read accepts either before or after, not both");
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
