@@ -522,10 +522,7 @@ export function createApplicationGateway(
           return;
         }
         canvasSurface.stop();
-        const admissionRejected = Boolean(
-          readConnectionAuthReason(error?.details) || error?.code === "PAIRING_REQUIRED",
-        );
-        if (admissionRejected) {
+        if (readConnectionAuthReason(error?.details) || error?.code === "PAIRING_REQUIRED") {
           nextClient.retireOfflineRecoveryScope?.();
           everConnected = false;
           credentials.retire(false);
@@ -543,10 +540,6 @@ export function createApplicationGateway(
           return;
         }
         const lastErrorCode = resolveGatewayErrorDetailCode(error) ?? error?.code ?? null;
-        const retainPresentation =
-          !admissionRejected &&
-          lastErrorCode !== ConnectErrorDetailCodes.PROTOCOL_MISMATCH &&
-          lastErrorCode !== ConnectErrorDetailCodes.CONTROL_UI_BUILD_MISMATCH;
         if (lastErrorCode === ConnectErrorDetailCodes.AUTH_BOOTSTRAP_TOKEN_INVALID) {
           connection = { ...connection, bootstrapToken: "", bootstrapProfile: undefined };
         }
@@ -561,6 +554,14 @@ export function createApplicationGateway(
           : undefined;
         // Display-only evidence; admission is still re-derived from the next hello.
         setUnavailableDeadline("suspensionPhase", suspensionPhase ? 0 : undefined);
+        // Transport loss and announced unavailability keep this client's presentation;
+        // any connect rejection (auth, pairing, protocol, build) fails closed.
+        const transientClose =
+          !error ||
+          restartPending ||
+          Boolean(suspensionPhase) ||
+          isRetryableGatewayStartupUnavailableError(error);
+        const retainPresentation = transientClose && !nextClient.offlineRecoveryRetired;
         const closeReason = formatUiExternalText(reason);
         setConnectionSnapshot({
           client: nextClient,
@@ -582,15 +583,7 @@ export function createApplicationGateway(
           // Retain only established profileless display identity through transport loss.
           // Rejected admission and unresolved/replaced identities must stay fail-closed.
           selfUser:
-            everConnected &&
-            (!error ||
-              restartPending ||
-              suspensionPhase ||
-              isRetryableGatewayStartupUnavailableError(error)) &&
-            !nextClient.offlineRecoveryRetired &&
-            snapshot.selfUser === null
-              ? null
-              : undefined,
+            everConnected && retainPresentation && snapshot.selfUser === null ? null : undefined,
           restartPending: restartPending || snapshot.restartPending === true,
           suspensionPhase,
           lastError: startupPending

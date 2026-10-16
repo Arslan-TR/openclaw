@@ -35,7 +35,7 @@ import {
   NAVIGATION_RAIL_WIDTH,
 } from "./navigation-surface.ts";
 import { readGatewayOperatorAccess } from "./operator-access.ts";
-import { isHomePanelAvailable } from "./panel-availability.ts";
+import { isCustodianPanelAvailable, isHomePanelAvailable } from "./panel-availability.ts";
 import { resolveProfileAppearancePrefs } from "./server-prefs-profile.ts";
 import { NAV_WIDTH_MAX, normalizeCatalogOpenTarget } from "./settings.ts";
 import type { ShellLayoutOwner } from "./shell-layout-owner.ts";
@@ -121,9 +121,7 @@ export function readShellView(host: ShellViewHost) {
     "operator.admin",
   );
   const homePanelAvailable = isHomePanelAvailable(context.gateway);
-  const custodianPanelAvailable =
-    // Scope-aware to match the store: admin-only, never advertisement alone.
-    canPresentGatewayMethod(gatewaySnapshot, "openclaw.chat", "operator.admin");
+  const custodianPanelAvailable = isCustodianPanelAvailable(context.gateway);
   const activeRoute = host.routeState.routeId ?? "chat";
   const sessionRoute = isSessionRouteId(activeRoute);
   const reloadRequired = gatewaySnapshot.phase === "reload-required";
