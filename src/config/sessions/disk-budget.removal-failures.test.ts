@@ -20,6 +20,12 @@ import { replaceSessionEntry } from "./session-accessor.js";
 import { projectSessionStoreForPersistence } from "./skill-prompt-blobs.js";
 import type { SessionEntry } from "./types.js";
 
+const archivedEntry = (sessionId: string, updatedAt: number): SessionEntry => ({
+  sessionId,
+  updatedAt,
+  archivedAt: updatedAt,
+  archiveReason: "active-session-cap",
+});
 function rejectRemoval(targetPath: string, code: "EPERM" | "EACCES") {
   const originalRm = nodeFs.promises.rm.bind(nodeFs.promises);
   return vi.spyOn(nodeFs.promises, "rm").mockImplementation(async (target, options) => {
@@ -104,6 +110,11 @@ describe("session artifact deletion failures", () => {
             });
             expect.soft(result.removedFiles).toBe(2);
             expect.soft(result.usage.totalBytes).toBe(102);
+            expect
+              .soft(
+                await pruneSessionTranscriptArchivesToHighWater({ storePath, highWaterBytes: 101 }),
+              )
+              .toMatchObject({ removedFiles: 0, usage: { totalBytes: 102 } });
           } else if (boundary === "unreferenced") {
             const result = await pruneUnreferencedSessionArtifacts({
               store: {},
@@ -111,6 +122,15 @@ describe("session artifact deletion failures", () => {
               olderThanMs: 60_000,
             });
             expect.soft(result).toMatchObject({ removedFiles: 2, freedBytes: 100 });
+            expect
+              .soft(
+                await pruneUnreferencedSessionArtifacts({
+                  store: {},
+                  storePath,
+                  olderThanMs: 60_000,
+                }),
+              )
+              .toMatchObject({ removedFiles: 0, freedBytes: 0 });
           } else {
             const result = await enforceSessionDiskBudget({
               store: {},
@@ -156,19 +176,11 @@ describe("session artifact deletion failures", () => {
         const retainedStore = {
           [activeKey]: { sessionId: "active", updatedAt: 1 },
           [preservedKey]: { sessionId: "preserved", updatedAt: 1 },
-          [laterKey]: {
-            sessionId: "later",
-            updatedAt: 3,
-            archivedAt: 3,
-            archiveReason: "active-session-cap",
-          },
+          [laterKey]: archivedEntry("later", 3),
         } satisfies Record<string, SessionEntry>;
         const store: Record<string, SessionEntry> = {
           [oldKey]: {
-            sessionId: "old",
-            updatedAt: 2,
-            archivedAt: 2,
-            archiveReason: "active-session-cap",
+            ...archivedEntry("old", 2),
             skillsSnapshot: {
               prompt: "",
               skills: [],
@@ -177,28 +189,20 @@ describe("session artifact deletion failures", () => {
           },
           ...retainedStore,
         };
-        const artifacts = [
-          {
-            kind: "promptBlob",
-            owner: oldKey,
-            file: path.join(dir, "skills-prompts", "sha256", "aa", `${hash}.txt`),
-            size: 600,
-          },
-          { kind: "transcript", owner: oldKey, file: path.join(dir, "old.jsonl"), size: 400 },
-          {
-            kind: "pointer",
-            owner: oldKey,
-            file: path.join(dir, "old.trajectory-path.json"),
-            size: 80,
-          },
-          {
-            kind: "trajectory",
-            owner: oldKey,
-            file: path.join(dir, "old.trajectory.jsonl"),
-            size: 120,
-          },
-          { kind: "later", owner: laterKey, file: path.join(dir, "later.jsonl"), size: 1000 },
-        ];
+        const artifacts = (
+          [
+            ["promptBlob", oldKey, "skills-prompts/sha256/aa/" + hash + ".txt", 600],
+            ["transcript", oldKey, "old.jsonl", 400],
+            ["pointer", oldKey, "old.trajectory-path.json", 80],
+            ["trajectory", oldKey, "old.trajectory.jsonl", 120],
+            ["later", laterKey, "later.jsonl", 1000],
+          ] satisfies [string, string, string, number][]
+        ).map(([kind, owner, name, size]) => ({
+          kind,
+          owner,
+          file: path.join(dir, name),
+          size,
+        }));
         for (const { file, size } of artifacts) {
           await fs.mkdir(path.dirname(file), { recursive: true });
           await fs.writeFile(file, Buffer.alloc(size, 1));
@@ -314,17 +318,11 @@ describe("session artifact deletion failures", () => {
       const prompt = "p".repeat(600);
       const store: Record<string, SessionEntry> = {
         [oldKey]: {
-          sessionId: "old",
-          updatedAt: 1,
-          archivedAt: 1,
-          archiveReason: "active-session-cap",
+          ...archivedEntry("old", 1),
           delivery: { kind: "none" },
         },
         [laterKey]: {
-          sessionId: "later",
-          updatedAt: 2,
-          archivedAt: 2,
-          archiveReason: "active-session-cap",
+          ...archivedEntry("later", 2),
           delivery: { kind: "none" },
           skillsSnapshot: { prompt, skills: [] },
         },

@@ -23,6 +23,40 @@ import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target
 import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
 
+type BudgetOptions = Omit<
+  Parameters<typeof enforceSessionDiskBudget>[0],
+  "store" | "storePath" | "maintenance" | "warnOnly"
+>;
+function enforceBudget(
+  storePath: string,
+  store: Record<string, SessionEntry>,
+  maxDiskBytes: number,
+  highWaterBytes: number,
+  options: BudgetOptions = {},
+) {
+  return enforceSessionDiskBudget({
+    storePath,
+    store,
+    maintenance: { maxDiskBytes, highWaterBytes },
+    warnOnly: false,
+    ...options,
+  });
+}
+const archivedEntry = (sessionId: string, updatedAt: number): SessionEntry => ({
+  sessionId,
+  updatedAt,
+  archivedAt: updatedAt,
+  archiveReason: "active-session-cap",
+});
+
+const makeEntry = (sessionId: string, updatedAt = Date.now()): SessionEntry => ({
+  sessionId,
+  updatedAt,
+});
+const promptBlob = (dir: string, hash: string) =>
+  path.join(dir, "skills-prompts", "sha256", hash.slice(0, 2), `${hash}.txt`);
+const writeStore = (storePath: string, store: Record<string, SessionEntry>) =>
+  fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
 async function expectPathExists(targetPath: string): Promise<void> {
   await fs.access(targetPath);
 }
@@ -118,30 +152,17 @@ describe("enforceSessionDiskBudget", () => {
         `old-session.jsonl.deleted.${formatSessionArchiveTimestamp(Date.now() - 24 * 60 * 60 * 1000)}`,
       );
       const store: Record<string, SessionEntry> = {
-        "agent:main:main": {
-          sessionId,
-          updatedAt: Date.now(),
-        },
+        "agent:main:main": makeEntry(sessionId),
       };
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.writeFile(transcriptPath, "k".repeat(80), "utf-8");
       await fs.writeFile(archivePath, "a".repeat(260), "utf-8");
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: {
-          maxDiskBytes: 300,
-          highWaterBytes: 220,
-        },
-        warnOnly: false,
-      });
+      const result = await enforceBudget(storePath, store, 300, 220);
 
       await expectPathExists(transcriptPath);
       await expectPathMissing(archivePath);
-      expectBudgetResult(result);
-      expect(result.removedFiles).toBe(1);
-      expect(result.removedEntries).toBe(0);
+      expect(result).toMatchObject({ removedFiles: 1, removedEntries: 0 });
     });
   });
 
@@ -159,9 +180,9 @@ describe("enforceSessionDiskBudget", () => {
         "sessions.json.222.1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d.tmp",
       );
       const store: Record<string, SessionEntry> = {
-        "agent:main:main": { sessionId, updatedAt: Date.now() },
+        "agent:main:main": makeEntry(sessionId),
       };
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.writeFile(transcriptPath, "k".repeat(80), "utf-8");
       await fs.writeFile(staleTemp, "s".repeat(300), "utf-8");
       await fs.writeFile(freshTemp, "f".repeat(300), "utf-8");
@@ -169,23 +190,14 @@ describe("enforceSessionDiskBudget", () => {
       const old = new Date(Date.now() - 30 * 60 * 1000);
       await fs.utimes(staleTemp, old, old);
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: {
-          maxDiskBytes: 750,
-          highWaterBytes: 600,
-        },
-        warnOnly: false,
-      });
+      const result = await enforceBudget(storePath, store, 750, 600);
 
       // Stale orphan reclaimed; fresh in-flight temp (a live atomic-write source)
       // and referenced transcript preserved even though still over the high-water mark.
       await expectPathMissing(staleTemp);
       await expectPathExists(freshTemp);
       await expectPathExists(transcriptPath);
-      expectBudgetResult(result);
-      expect(result.removedFiles).toBe(1);
+      expect(result).toMatchObject({ removedFiles: 1 });
     });
   });
 
@@ -207,12 +219,7 @@ describe("enforceSessionDiskBudget", () => {
       };
       const store = { [sessionKey]: entry };
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: { maxDiskBytes: 2_048, highWaterBytes: 1_024 },
-        warnOnly: false,
-      });
+      const result = await enforceBudget(storePath, store, 2_048, 1_024);
 
       expect(result).toMatchObject({ overBudget: false, removedEntries: 0 });
       expect(store[sessionKey]).toBe(entry);
@@ -239,7 +246,7 @@ describe("enforceSessionDiskBudget", () => {
           } satisfies SessionEntry,
         ]),
       );
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
 
       const inlineBytes = Buffer.byteLength(JSON.stringify(store, null, 2), "utf8");
       const result = await enforceSessionDiskBudget({
@@ -268,10 +275,7 @@ describe("enforceSessionDiskBudget", () => {
       const activePrompt = `<available_skills>\n${"active prompt\n".repeat(200)}</available_skills>`;
       const store: Record<string, SessionEntry> = {
         [oldKey]: {
-          sessionId: "old",
-          updatedAt: 1,
-          archivedAt: 1,
-          archiveReason: "active-session-cap",
+          ...archivedEntry("old", 1),
           skillsSnapshot: {
             prompt: oldPrompt,
             skills: [{ name: "old" }],
@@ -295,35 +299,16 @@ describe("enforceSessionDiskBudget", () => {
       if (!oldHash || !activeHash) {
         throw new Error("expected prompt refs");
       }
-      const oldBlob = path.join(
-        dir,
-        "skills-prompts",
-        "sha256",
-        oldHash.slice(0, 2),
-        `${oldHash}.txt`,
-      );
-      const activeBlob = path.join(
-        dir,
-        "skills-prompts",
-        "sha256",
-        activeHash.slice(0, 2),
-        `${activeHash}.txt`,
-      );
+      const oldBlob = promptBlob(dir, oldHash);
+      const activeBlob = promptBlob(dir, activeHash);
       await expectPathExists(oldBlob);
       await expectPathExists(activeBlob);
       const staleBlobTime = new Date(Date.now() - 10 * 60 * 1000);
       await fs.utimes(oldBlob, staleBlobTime, staleBlobTime);
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: {
-          maxDiskBytes: 1,
-          highWaterBytes: 1,
-        },
-        warnOnly: false,
+      const result = await enforceBudget(storePath, store, 1, 1, {
         commitEvictedIndex: async () => {
-          await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+          await writeStore(storePath, store);
         },
       });
 
@@ -339,27 +324,19 @@ describe("enforceSessionDiskBudget", () => {
     await withTestDir({ prefix: "openclaw-disk-budget-revalidate-prompt-blob-" }, async (dir) => {
       const storePath = path.join(dir, "sessions.json");
       const store: Record<string, SessionEntry> = {
-        "agent:main:active": { sessionId: "active", updatedAt: Date.now() },
+        "agent:main:active": makeEntry("active"),
       };
       const hash = "d".repeat(64);
       const blobDir = path.join(dir, "skills-prompts", "sha256", hash.slice(0, 2));
       const blobPath = path.join(blobDir, `${hash}.txt`);
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.mkdir(blobDir, { recursive: true });
       await fs.writeFile(blobPath, "stale prompt blob".repeat(200), "utf-8");
       const staleBlobTime = new Date(Date.now() - 10 * 60 * 1000);
       await fs.utimes(blobPath, staleBlobTime, staleBlobTime);
       const statSpy = refreshPathBeforeSecondStat(blobPath);
       try {
-        const result = await enforceSessionDiskBudget({
-          store,
-          storePath,
-          maintenance: {
-            maxDiskBytes: 1,
-            highWaterBytes: 1,
-          },
-          warnOnly: false,
-        });
+        const result = await enforceBudget(storePath, store, 1, 1);
 
         expectBudgetResult(result);
         expect(result.overBudget).toBe(true);
@@ -375,7 +352,7 @@ describe("enforceSessionDiskBudget", () => {
     await withTestDir({ prefix: "openclaw-disk-budget-prompt-temp-" }, async (dir) => {
       const storePath = path.join(dir, "sessions.json");
       const store: Record<string, SessionEntry> = {
-        "agent:main:main": { sessionId: "keep", updatedAt: Date.now() },
+        "agent:main:main": makeEntry("keep"),
       };
       const hash = "a".repeat(64);
       const tempDir = path.join(dir, "skills-prompts", "sha256", hash.slice(0, 2));
@@ -383,26 +360,16 @@ describe("enforceSessionDiskBudget", () => {
         tempDir,
         `${hash}.txt.123.11111111-1111-4111-8111-111111111111.tmp`,
       );
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.mkdir(tempDir, { recursive: true });
       await fs.writeFile(tempPath, "t".repeat(2000), "utf-8");
       const old = new Date(Date.now() - 30 * 60 * 1000);
       await fs.utimes(tempPath, old, old);
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: {
-          maxDiskBytes: 1000,
-          highWaterBytes: 500,
-        },
-        warnOnly: false,
-      });
+      const result = await enforceBudget(storePath, store, 1000, 500);
 
       await expectPathMissing(tempPath);
-      expectBudgetResult(result);
-      expect(result.removedFiles).toBe(1);
-      expect(result.removedEntries).toBe(0);
+      expect(result).toMatchObject({ removedFiles: 1, removedEntries: 0 });
     });
   });
 
@@ -442,81 +409,52 @@ describe("enforceSessionDiskBudget", () => {
           ],
         },
       };
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.writeFile(transcriptPath, "k".repeat(80), "utf-8");
       await fs.writeFile(checkpointPath, "c".repeat(5000), "utf-8");
       await fs.writeFile(referencedCheckpointPath, "r".repeat(260), "utf-8");
       await fs.utimes(referencedCheckpointPath, new Date(0), new Date(0));
       await fs.writeFile(referencedPostCompactionPath, "p".repeat(260), "utf-8");
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: {
-          maxDiskBytes: 4000,
-          highWaterBytes: 3000,
-        },
-        warnOnly: false,
-      });
+      const result = await enforceBudget(storePath, store, 4000, 3000);
 
       await expectPathExists(transcriptPath);
       await expectPathMissing(checkpointPath);
       await expectPathExists(referencedCheckpointPath);
       await expectPathExists(referencedPostCompactionPath);
-      expectBudgetResult(result);
-      expect(result.removedFiles).toBe(1);
-      expect(result.removedEntries).toBe(0);
+      expect(result).toMatchObject({ removedFiles: 1, removedEntries: 0 });
     });
   });
 
-  it.each([["keep.log", "keep.log.trajectory.jsonl", "keep.log.trajectory-path.json"]])(
-    "removes orphaned sidecars while preserving %s companions",
-    async (transcript, runtime, pointer) => {
-      await withTestDir({ prefix: "openclaw-disk-budget-" }, async (dir) => {
-        const storePath = path.join(dir, "sessions.json");
-        const sessionId = "keep";
-        const transcriptPath = path.join(dir, transcript);
-        const referencedRuntime = path.join(dir, runtime);
-        const referencedPointer = path.join(dir, pointer);
-        const orphanRuntime = path.join(dir, "old.trajectory.jsonl");
-        const orphanPointer = path.join(dir, "old.trajectory-path.json");
-        const store: Record<string, SessionEntry> = {
-          "agent:main:main": Object.assign(
-            {
-              sessionId,
-              updatedAt: Date.now(),
-            },
-            { sessionFile: transcriptPath },
-          ),
-        };
-        await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
-        await fs.writeFile(transcriptPath, "k".repeat(80), "utf-8");
-        await fs.writeFile(referencedRuntime, "r".repeat(80), "utf-8");
-        await fs.writeFile(referencedPointer, "p".repeat(80), "utf-8");
-        await fs.writeFile(orphanRuntime, "o".repeat(5000), "utf-8");
-        await fs.writeFile(orphanPointer, "q".repeat(5000), "utf-8");
+  it("removes orphaned sidecars while preserving custom transcript companions", async () => {
+    await withTestDir({ prefix: "openclaw-disk-budget-" }, async (dir) => {
+      const storePath = path.join(dir, "sessions.json");
+      const sessionId = "keep";
+      const transcriptPath = path.join(dir, "keep.log");
+      const referencedRuntime = path.join(dir, "keep.log.trajectory.jsonl");
+      const referencedPointer = path.join(dir, "keep.log.trajectory-path.json");
+      const orphanRuntime = path.join(dir, "old.trajectory.jsonl");
+      const orphanPointer = path.join(dir, "old.trajectory-path.json");
+      const store: Record<string, SessionEntry> = {
+        "agent:main:main": Object.assign(makeEntry(sessionId), { sessionFile: transcriptPath }),
+      };
+      await writeStore(storePath, store);
+      await fs.writeFile(transcriptPath, "k".repeat(80), "utf-8");
+      await fs.writeFile(referencedRuntime, "r".repeat(80), "utf-8");
+      await fs.writeFile(referencedPointer, "p".repeat(80), "utf-8");
+      await fs.writeFile(orphanRuntime, "o".repeat(5000), "utf-8");
+      await fs.writeFile(orphanPointer, "q".repeat(5000), "utf-8");
 
-        const result = await enforceSessionDiskBudget({
-          store,
-          storePath,
-          maintenance: {
-            maxDiskBytes: 7000,
-            highWaterBytes: 2000,
-          },
-          warnOnly: false,
-        });
+      const result = await enforceBudget(storePath, store, 7000, 2000);
 
-        await expectPathExists(transcriptPath);
-        await expectPathExists(referencedRuntime);
-        await expectPathExists(referencedPointer);
-        await expectPathMissing(orphanRuntime);
-        await expectPathMissing(orphanPointer);
-        expectBudgetResult(result);
-        expect(result.removedFiles).toBe(2);
-        expect(result.removedEntries).toBe(0);
-      });
-    },
-  );
+      await expectPathExists(transcriptPath);
+      await expectPathExists(referencedRuntime);
+      await expectPathExists(referencedPointer);
+      await expectPathMissing(orphanRuntime);
+      await expectPathMissing(orphanPointer);
+      expect(result).toMatchObject({ removedFiles: 2, removedEntries: 0 });
+    });
+  });
 
   it("retains the evicted transcript when the index commit fails", async () => {
     await withTestDir({ prefix: "openclaw-disk-budget-commit-fail-" }, async (dir) => {
@@ -525,24 +463,15 @@ describe("enforceSessionDiskBudget", () => {
       const activeKey = "agent:main:main";
       const oldTranscript = path.join(dir, "old.jsonl");
       const store: Record<string, SessionEntry> = {
-        [oldKey]: {
-          sessionId: "old",
-          updatedAt: 1,
-          archivedAt: 1,
-          archiveReason: "active-session-cap",
-        },
-        [activeKey]: { sessionId: "active", updatedAt: 2 },
+        [oldKey]: archivedEntry("old", 1),
+        [activeKey]: makeEntry("active", 2),
       };
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.writeFile(oldTranscript, "t".repeat(10 * 1024), "utf-8");
 
       const commitFailure = new Error("simulated store-write failure");
       await expect(
-        enforceSessionDiskBudget({
-          store,
-          storePath,
-          maintenance: { maxDiskBytes: 100, highWaterBytes: 100 },
-          warnOnly: false,
+        enforceBudget(storePath, store, 100, 100, {
           commitEvictedIndex: async () => {
             throw commitFailure;
           },
@@ -560,23 +489,13 @@ describe("enforceSessionDiskBudget", () => {
       const activeKey = "agent:main:main";
       const oldTranscript = path.join(dir, "old.jsonl");
       const store: Record<string, SessionEntry> = {
-        [oldKey]: {
-          sessionId: "old",
-          updatedAt: 1,
-          archivedAt: 1,
-          archiveReason: "active-session-cap",
-        },
-        [activeKey]: { sessionId: "active", updatedAt: 2 },
+        [oldKey]: archivedEntry("old", 1),
+        [activeKey]: makeEntry("active", 2),
       };
-      await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+      await writeStore(storePath, store);
       await fs.writeFile(oldTranscript, "t".repeat(10 * 1024), "utf-8");
 
-      const result = await enforceSessionDiskBudget({
-        store,
-        storePath,
-        maintenance: { maxDiskBytes: 100, highWaterBytes: 100 },
-        warnOnly: false,
-      });
+      const result = await enforceBudget(storePath, store, 100, 100);
 
       expectBudgetResult(result);
       expect(result.removedEntries).toBe(1);
@@ -593,12 +512,7 @@ describe("enforceSessionDiskBudget", () => {
       const store: Record<string, SessionEntry> = {};
       for (let index = 1; index <= 4; index += 1) {
         await fs.writeFile(path.join(dir, `worker-${index}.jsonl`), "x".repeat(64 * 1024));
-        store[`agent:main:subagent:worker-${index}`] = {
-          sessionId: `worker-${index}`,
-          updatedAt: index,
-          archivedAt: index,
-          archiveReason: "active-session-cap",
-        };
+        store[`agent:main:subagent:worker-${index}`] = archivedEntry(`worker-${index}`, index);
       }
       await saveSessionStore(storePath, store, { skipMaintenance: true });
 
@@ -615,7 +529,7 @@ describe("enforceSessionDiskBudget", () => {
         },
         warnOnly: false,
         commitEvictedIndex: async () => {
-          await fs.writeFile(storePath, JSON.stringify(store, null, 2), "utf-8");
+          await writeStore(storePath, store);
         },
       });
 
@@ -655,7 +569,7 @@ describe("pruneUnreferencedSessionArtifacts", () => {
       }
       const storePath = databasePath;
       const result = await pruneUnreferencedSessionArtifacts({
-        store: { "agent:main:main": { sessionId: "keep", updatedAt: Date.now() } },
+        store: { "agent:main:main": makeEntry("keep") },
         storePath,
         olderThanMs: 60_000,
       });
@@ -844,43 +758,3 @@ it("does not count an empty file removed by another cleanup before rm", async ()
     }
   });
 });
-
-it.each(["unreferenced", "archives"] as const)(
-  "%s cleanup does not count a rejected nonempty removal",
-  async (cleanup) => {
-    await withTestDir({ prefix: "openclaw-rejected-removal-" }, async (dir) => {
-      const storePath = path.join(dir, "sessions.json");
-      const name = cleanup === "archives" ? `old.jsonl.deleted.${ARCHIVE_STAMP}` : "orphan.jsonl";
-      const content = "x".repeat(64);
-      const artifact = await writeOldFile(dir, name, content);
-      await fs.writeFile(path.join(dir, "filler.bin"), Buffer.alloc(128));
-      const originalRm = nodeFs.promises.rm.bind(nodeFs.promises);
-      const rm = vi.spyOn(nodeFs.promises, "rm").mockImplementation(async (target, options) => {
-        if (target === artifact) {
-          throw new Error("injected removal failure");
-        }
-        return originalRm(target, options);
-      });
-      try {
-        if (cleanup === "archives") {
-          const result = await pruneSessionTranscriptArchivesToHighWater({
-            storePath,
-            highWaterBytes: 64,
-          });
-          expect(result.removedFiles).toBe(0);
-          expect(result.usage.totalBytes).toBe(192);
-        } else {
-          const result = await pruneUnreferencedSessionArtifacts({
-            store: {},
-            storePath,
-            olderThanMs: 1000,
-          });
-          expect(result).toMatchObject({ removedFiles: 0, freedBytes: 0 });
-        }
-        expect(await fs.readFile(artifact, "utf8")).toBe(content);
-      } finally {
-        rm.mockRestore();
-      }
-    });
-  },
-);
