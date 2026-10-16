@@ -108,52 +108,96 @@ function mount(
   };
 }
 
-it("retains shared identity drafts and status across a blip and retires them for another identity", async () => {
-  const request = vi.fn(async (method: string) =>
-    method === "users.github.status"
-      ? { personal: disconnected, system }
-      : {
-          agentId: "main",
-          selectedScope: "system",
-          selected: { scope: "system", configured: true, identity: system },
-          effective: system,
-        },
-  );
-  const config = { tools: { github: { gitAuthor: { name: "Configured author" } } } };
-  const harness = mount(["operator.admin"], "profile-a", request, config);
-  await waitForFast(() => expect(harness.element.textContent).toContain("@system-account"));
-  const button = (label: string) =>
-    [...harness.element.querySelectorAll<HTMLButtonElement>("button")].find(
-      (entry) => entry.textContent?.trim() === label,
-    )!;
-  button("Change System GitHub").click();
-  flush();
-  button("Use a PAT instead").click();
-  flush();
-  const input = () =>
-    harness.element.querySelector<HTMLInputElement>('input[aria-label="Author Name"]');
-  expect(input()).not.toBeNull();
-  input()!.value = "Draft author";
-  input()!.dispatchEvent(new Event("input", { bubbles: true }));
-  flush();
-  harness.context.runtimeConfig.state.configForm = null;
-  harness.emit({ phase: "reconnecting" });
-  flush();
-  expect(input()?.value).toBe("Draft author");
-  expect(harness.element.textContent).toContain("@system-account");
-  expect(input()?.disabled).toBe(true);
-  harness.emit({ phase: "connected", selfUser: undefined });
-  flush();
-  expect(input()?.value).toBe("Draft author");
-  expect(input()?.disabled).toBe(true);
-  harness.context.runtimeConfig.state.configForm = config;
-  harness.emit({ selfUser: { id: "profile-a" } });
-  await waitForFast(() => expect(input()?.disabled).toBe(false));
-  expect(input()?.value).toBe("Draft author");
-  harness.emit({ selfUser: { id: "profile-b" } });
-  flush();
-  expect(input()).toBeNull();
-});
+it.each([
+  { access: "unchanged", scopes: ["operator.admin"] },
+  { access: "admin revoked", scopes: ["operator.read"] },
+  { access: "read revoked", scopes: [] },
+])(
+  "reconciles retained GitHub work before reconnect identity resolves ($access)",
+  async ({ access, scopes }) => {
+    const sharedIdentity = { ...system, account: { login: "admin-only-account" } };
+    const request = vi.fn(async (method: string) =>
+      method === "users.github.status"
+        ? { personal: disconnected, system }
+        : {
+            agentId: "main",
+            selectedScope: "system",
+            selected: { scope: "system", configured: true, identity: sharedIdentity },
+            effective: sharedIdentity,
+          },
+    );
+    const config = { tools: { github: { gitAuthor: { name: "Configured author" } } } };
+    const harness = mount(["operator.admin"], "profile-a", request, config);
+    await waitForFast(() => expect(harness.element.textContent).toContain("@admin-only-account"));
+    const button = (label: string) =>
+      [...harness.element.querySelectorAll<HTMLButtonElement>("button")].find(
+        (entry) => entry.textContent?.trim() === label,
+      )!;
+    button("Change System GitHub").click();
+    flush();
+    button("Use a PAT instead").click();
+    flush();
+    const input = () =>
+      harness.element.querySelector<HTMLInputElement>('input[aria-label="Author Name"]');
+    const token = () => harness.element.querySelector<HTMLInputElement>(".settings-secret input");
+    expect(input()).not.toBeNull();
+    input()!.value = "Draft author";
+    input()!.dispatchEvent(new Event("input", { bubbles: true }));
+    token()!.value = "synthetic-pat-draft";
+    token()!.dispatchEvent(new Event("input", { bubbles: true }));
+    flush();
+    harness.context.runtimeConfig.state.configForm = null;
+    harness.emit({ phase: "reconnecting" });
+    flush();
+    expect(input()?.value).toBe("Draft author");
+    expect(token()?.value).toBe("synthetic-pat-draft");
+    expect(harness.element.textContent).toContain("@admin-only-account");
+    expect(input()?.disabled).toBe(true);
+    const reconnect = {
+      phase: "connected" as const,
+      selfUser: undefined,
+      hello: gatewayHelloForMethods([], scopes),
+    };
+    harness.emit(reconnect);
+    flush();
+    if (access === "unchanged") {
+      expect(input()?.value).toBe("Draft author");
+      expect(token()?.value).toBe("synthetic-pat-draft");
+      expect(input()?.disabled).toBe(true);
+    } else {
+      expect(harness.element.querySelector("[data-github-setup]")).toBeNull();
+      expect(harness.element.textContent).not.toContain("@admin-only-account");
+      if (access === "read revoked") {
+        expect(harness.element.textContent).not.toContain("@system-account");
+      }
+      const reads = request.mock.calls.length;
+      harness.emit(reconnect);
+      flush();
+      expect(harness.element.textContent).not.toContain("@admin-only-account");
+      expect(request.mock.calls).toHaveLength(reads);
+    }
+    harness.context.runtimeConfig.state.configForm = config;
+    harness.emit({ selfUser: { id: "profile-a" } });
+    flush();
+    if (access !== "unchanged") {
+      expect(harness.element.textContent).not.toContain("@admin-only-account");
+      expect(harness.element.querySelector("[data-github-setup]")).toBeNull();
+      harness.emit({ hello: gatewayHelloForMethods([], ["operator.admin"]) });
+      await waitForFast(() => expect(button("Change System GitHub")?.disabled).toBe(false));
+      button("Change System GitHub").click();
+      flush();
+      button("Use a PAT instead").click();
+      flush();
+      expect(input()?.value).toBe("Configured author");
+      expect(token()?.value).toBe("");
+    }
+    await waitForFast(() => expect(input()?.disabled).toBe(false));
+    expect(input()?.value).toBe(access === "unchanged" ? "Draft author" : "Configured author");
+    harness.emit({ selfUser: { id: "profile-b" } });
+    flush();
+    expect(input()).toBeNull();
+  },
+);
 
 it("follows Settings selection for effective agent GitHub without changing personal or system scope", async () => {
   const pending = createDeferredCore<ToolsGitHubStatusResult>();

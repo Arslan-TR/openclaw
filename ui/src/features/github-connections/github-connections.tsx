@@ -68,6 +68,7 @@ export function GitHubConnections() {
     const common = {
       client: snapshot.client,
       connected: snapshot.phase === "connected" && snapshot.selfUser !== undefined,
+      permissionsReady: snapshot.phase === "connected" && Boolean(snapshot.hello),
       clientRevision,
     };
     personal.sync({

@@ -106,6 +106,7 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
   function sync(params: {
     client: GatewayBrowserClient | null;
     connected: boolean;
+    permissionsReady: boolean;
     target: GitHubConnectionTarget | null;
     statusReadable: boolean;
     configurable: boolean;
@@ -123,12 +124,13 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     const scopeChanged = readScope() !== nextScope;
     const nextConfigurable = params.target?.kind === "shared" && params.configurable;
     const capabilityChanged =
-      statusReadable !== params.statusReadable ||
-      configurable !== nextConfigurable ||
-      authorizable !== params.authorizable;
+      params.permissionsReady &&
+      (statusReadable !== params.statusReadable ||
+        configurable !== nextConfigurable ||
+        authorizable !== params.authorizable);
     const contextChanged = transportChanged || ownerChanged || scopeChanged || capabilityChanged;
     const accessLost =
-      params.connected &&
+      capabilityChanged &&
       ((statusReadable && !params.statusReadable) ||
         (configurable && !nextConfigurable) ||
         (authorizable && !params.authorizable));
@@ -145,9 +147,12 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     client = params.client;
     connected = params.connected;
     clientRevision = params.clientRevision;
-    statusReadable = params.statusReadable;
-    configurable = nextConfigurable;
-    authorizable = params.authorizable;
+    // Hello permissions are authoritative even while the profile identity is unresolved.
+    if (params.permissionsReady) {
+      statusReadable = params.statusReadable;
+      configurable = nextConfigurable;
+      authorizable = params.authorizable;
+    }
     // An unavailable config is not evidence that the selected identity was removed.
     const nextTarget =
       params.target?.kind === "shared" &&

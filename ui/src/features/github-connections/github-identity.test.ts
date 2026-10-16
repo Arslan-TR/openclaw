@@ -163,6 +163,7 @@ function sync(
   controller.sync({
     client,
     connected: true,
+    permissionsReady: overrides.connected ?? true,
     target: {
       kind: "shared",
       agentId: overrides.agentId ?? "main",
@@ -500,7 +501,21 @@ describe("TestGitHubIdentity", () => {
         }
       }
       controller.setDraft("name", "Unsaved author");
-      sync(controller, client, {}, { connected: false, clientRevision: 2 });
+      const previousStatus = controller.read().status;
+      sync(
+        controller,
+        client,
+        {},
+        {
+          connected: false,
+          clientRevision: 2,
+          statusReadable: false,
+          configurable: false,
+          authorizable: false,
+        },
+      );
+      expect(controller.read().status).toBe(previousStatus);
+      expect(controller.read().draft.name).toBe("Unsaved author");
       sync(controller, client, {}, { clientRevision: 3 });
       await Promise.resolve();
       if (initialState !== "unused") {
