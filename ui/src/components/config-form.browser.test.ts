@@ -5,19 +5,7 @@ import {
   renderAnalyzedFormFixture,
   renderConfigFormFixture,
 } from "../test-helpers/config-form-fixtures.tsx";
-import type { ConfigFormProps } from "./config-form.shared.ts";
-import {
-  scalar,
-  anyOf,
-  oneOf,
-  analyzeProperties,
-  array,
-  byText,
-  edit,
-  expectElement,
-  object,
-  query,
-} from "./config-form.test-support.ts";
+import type { ConfigFormProps, JsonSchema } from "./config-form.shared.ts";
 import { analyzeConfigSchema } from "./config-form.ts";
 
 function renderConfigForm(
@@ -28,18 +16,30 @@ function renderConfigForm(
   return { showAdvanced: true, onShowAdvanced: () => {}, ...props };
 }
 
+function object(properties: Record<string, JsonSchema>): JsonSchema {
+  return { type: "object", properties };
+}
+
 const rootSchema = object({
   gateway: object({
     auth: object({
       token: { type: "string" },
     }),
   }),
-  allowFrom: array({ type: "string" }),
-  mode: scalar("string", { enum: ["off", "token"] }),
+  allowFrom: {
+    type: "array",
+    items: { type: "string" },
+  },
+  mode: {
+    type: "string",
+    enum: ["off", "token"],
+  },
   enabled: {
     type: "boolean",
   },
-  bind: anyOf({ const: "auto" }, { const: "lan" }, { const: "tailnet" }, { const: "loopback" }),
+  bind: {
+    anyOf: [{ const: "auto" }, { const: "lan" }, { const: "tailnet" }, { const: "loopback" }],
+  },
 });
 const rootAnalysis = analyzeConfigSchema(rootSchema);
 let container: HTMLDivElement;
@@ -51,15 +51,19 @@ beforeEach(() => {
   onPatch = vi.fn();
 });
 
-function renderForm(
-  analysis: ReturnType<typeof analyzeConfigSchema>,
-  props: Omit<Parameters<typeof renderAnalyzedFormFixture>[2], "onPatch">,
-) {
-  renderAnalyzedFormFixture(container, analysis, { ...props, onPatch });
+function expectElement<T extends Element>(element: T | null | undefined, label: string): T {
+  expect(element instanceof Element, label).toBe(true);
+  if (!(element instanceof Element)) {
+    throw new Error(`missing ${label}`);
+  }
+  return element;
 }
 
 function selectSegmented(control: HTMLElement) {
-  query<HTMLInputElement>(control, '.settings-segmented__input[type="radio"]').click();
+  expectElement(
+    control.querySelector<HTMLInputElement>('.settings-segmented__input[type="radio"]'),
+    "segmented radio input",
+  ).click();
 }
 
 afterEach(async () => {
@@ -100,10 +104,13 @@ describe("config form renderer", () => {
         );
       renderConfigFormFixture(container, props);
       const disclosure = expectElement(findDisclosure(), label);
-      const input = query<HTMLInputElement>(container, 'input[type="number"]');
+      const input = expectElement(
+        container.querySelector<HTMLInputElement>('input[type="number"]'),
+        "port field",
+      );
       expect(input.value).toBe("443");
       expect(disclosure.open).toBe(initiallyOpen);
-      query(disclosure, "summary").click();
+      expectElement(disclosure.querySelector("summary"), "object disclosure summary").click();
       expect(disclosure.open).toBe(!initiallyOpen);
 
       renderConfigFormFixture(container, {
@@ -150,9 +157,15 @@ describe("config form renderer", () => {
       });
       const analysis = field
         ? rootAnalysis
-        : analyzeProperties({
-            [key]: object({ enabled: { type: "boolean" } }, { description: "Schema description." }),
-          });
+        : analyzeConfigSchema(
+            object({
+              [key]: {
+                type: "object",
+                description: "Schema description.",
+                properties: { enabled: { type: "boolean" } },
+              },
+            }),
+          );
       const props = { value: {}, onPatch, uiHints: { [key]: { label, help } } };
       const heading = () =>
         field
@@ -194,11 +207,12 @@ describe("config form renderer", () => {
   it.each([false, true])(
     "renders section copy once, scoped to the subsection: %s",
     (subsection) => {
-      renderForm(rootAnalysis, {
+      renderAnalyzedFormFixture(container, rootAnalysis, {
         value: {},
         activeSection: "gateway",
         activeSubsection: subsection ? "auth" : undefined,
         uiHints: { gateway: { label: "Runtime gateway label", help: "Runtime gateway help" } },
+        onPatch,
       });
       expect(
         Array.from(
@@ -224,25 +238,31 @@ describe("config form renderer", () => {
   );
 
   it("conceals core-classified encryption, private-key, and local service env values", () => {
-    const analysis = analyzeProperties({
-      encryptKey: { type: "string" },
-      privateKey: { type: "string" },
-      localService: object({
-        env: object({ FOO: { type: "string" } }),
+    const analysis = analyzeConfigSchema(
+      object({
+        encryptKey: { type: "string" },
+        privateKey: { type: "string" },
+        localService: object({
+          env: object({ FOO: { type: "string" } }),
+        }),
       }),
-    });
+    );
 
-    renderForm(analysis, {
+    renderAnalyzedFormFixture(container, analysis, {
       value: {
         encryptKey: "encrypt-value",
         privateKey: "private-value",
         localService: { env: { FOO: "env-value" } },
       },
       revealSensitive: false,
+      onPatch,
     });
 
     for (const label of ["Encrypt Key", "Private Key", "FOO"]) {
-      const input = query<HTMLInputElement>(container, `input[aria-label='${label}']`);
+      const input = expectElement(
+        container.querySelector<HTMLInputElement>(`input[aria-label='${label}']`),
+        `${label} input`,
+      );
       expect(input.readOnly).toBe(true);
       expect(input.classList.contains("cfg-redacted")).toBe(true);
       expect(input.value).toBe("");
@@ -257,7 +277,7 @@ describe("config form renderer", () => {
     ["string or SecretRef", { type: ["string", "object"] }],
   ])("keeps a masked sensitive %s field editable across keystrokes", async (_name, tokenSchema) => {
     const { userEvent } = await import("vitest/browser");
-    const analysis = analyzeProperties({ token: tokenSchema });
+    const analysis = analyzeConfigSchema(object({ token: tokenSchema }));
     const revealed = new Set<string>();
     let value: Record<string, unknown> = {};
     const draw = () =>
@@ -280,7 +300,11 @@ describe("config form renderer", () => {
           },
         }),
       );
-    const token = () => query<HTMLInputElement>(container, "input[aria-label='Token']");
+    const token = () =>
+      expectElement(
+        container.querySelector<HTMLInputElement>("input[aria-label='Token']"),
+        "token",
+      );
 
     draw();
     await userEvent.click(token());
@@ -296,55 +320,85 @@ describe("config form renderer", () => {
 
   it("renders inputs and patches values", () => {
     const analysis = rootAnalysis;
-    renderForm(analysis, {
+    renderAnalyzedFormFixture(container, analysis, {
       uiHints: {
         "gateway.auth.token": { label: "Gateway Token", sensitive: true },
       },
       value: { allowFrom: ["+1"], bind: "auto" },
       revealSensitive: true,
+      onPatch,
     });
 
-    const tokenInput = query<HTMLInputElement>(
-      container,
-      '#config-section-gateway input.settings-input[type="text"]',
+    const tokenInput = expectElement(
+      container.querySelector<HTMLInputElement>(
+        '#config-section-gateway input.settings-input[type="text"]',
+      ),
+      "gateway token input",
     );
-    edit(tokenInput, "abc123");
+    tokenInput.value = "abc123";
+    tokenInput.dispatchEvent(new Event("input", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith(["gateway", "auth", "token"], "abc123");
 
-    const tokenButton = byText<HTMLElement>(container, ".settings-segmented__btn", "token");
+    const tokenButton = expectElement(
+      Array.from(container.querySelectorAll<HTMLElement>(".settings-segmented__btn")).find(
+        (btn) => btn.textContent?.trim() === "token",
+      ),
+      "token segmented button",
+    );
     selectSegmented(tokenButton);
     expect(onPatch).toHaveBeenCalledWith(["mode"], "token");
 
-    const checkbox = query<HTMLInputElement>(container, '.settings-toggle__input[role="switch"]');
+    const checkbox = expectElement(
+      container.querySelector<HTMLInputElement>('.settings-toggle__input[role="switch"]'),
+      "enabled switch",
+    );
     checkbox.click();
     expect(onPatch).toHaveBeenCalledWith(["enabled"], true);
 
-    const addButton = byText<HTMLButtonElement>(container, ".cfg-array button", "Add");
+    const addButton = expectElement(
+      Array.from(container.querySelectorAll<HTMLButtonElement>(".cfg-array button")).find(
+        (btn) => btn.textContent?.trim() === "Add",
+      ),
+      "array add button",
+    );
     addButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith(["allowFrom"], ["+1", ""]);
 
-    const removeButton = query(container, ".cfg-array button[aria-label='Remove item']");
+    const removeButton = expectElement(
+      container.querySelector(".cfg-array button[aria-label='Remove item']"),
+      "array remove button",
+    );
     removeButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith(["allowFrom"], []);
 
-    const tailnetButton = byText<HTMLElement>(container, ".settings-segmented__btn", "tailnet");
+    const tailnetButton = expectElement(
+      Array.from(container.querySelectorAll<HTMLElement>(".settings-segmented__btn")).find(
+        (btn) => btn.textContent?.trim() === "tailnet",
+      ),
+      "tailnet segmented button",
+    );
     selectSegmented(tailnetButton);
     expect(onPatch).toHaveBeenCalledWith(["bind"], "tailnet");
   });
 
   it("preserves raw phone values and focus as presentations change", () => {
-    const analysis = analyzeProperties({
-      fromNumber: { type: "string" },
-      target: { type: "string" },
-      accounts: {
-        type: "object",
-        additionalProperties: object({
-          allowFrom: array({ type: "string" }),
-        }),
-      },
-    });
+    const analysis = analyzeConfigSchema(
+      object({
+        fromNumber: { type: "string" },
+        target: { type: "string" },
+        accounts: {
+          type: "object",
+          additionalProperties: object({
+            allowFrom: {
+              type: "array",
+              items: { type: "string" },
+            },
+          }),
+        },
+      }),
+    );
     const draw = (fromNumber: string) =>
-      renderForm(analysis, {
+      renderAnalyzedFormFixture(container, analysis, {
         uiHints: {
           fromNumber: { presentation: "phone-number" },
           target: { presentation: "phone-number" },
@@ -355,6 +409,7 @@ describe("config form renderer", () => {
           target: "token-value",
           accounts: { work: { allowFrom: ["+81312345678"] } },
         },
+        onPatch,
       });
 
     draw("+4930123456");
@@ -386,7 +441,8 @@ describe("config form renderer", () => {
       phoneInputs.find((input) => input.value === "+4930123456"),
       "from number input",
     );
-    edit(fromNumberInput, " +4930123456 ");
+    fromNumberInput.value = " +4930123456 ";
+    fromNumberInput.dispatchEvent(new Event("input", { bubbles: true }));
     expect(onPatch).toHaveBeenLastCalledWith(["fromNumber"], " +4930123456 ");
     fromNumberInput.dispatchEvent(new Event("change", { bubbles: true }));
     expect(onPatch).toHaveBeenLastCalledWith(["fromNumber"], "+4930123456");
@@ -422,13 +478,17 @@ describe("config form renderer", () => {
             features: object({ beta: { type: "boolean", description: "Enable beta features" } }),
           }),
     );
-    renderForm(analysis, {
+    renderAnalyzedFormFixture(container, analysis, {
       uiHints: wildcard ? { "plugins.entries.*.enabled": { label: "Plugin Enabled" } } : {},
       value: wildcard
         ? { plugins: { entries: { "voice-call": { enabled: true } } } }
         : { features: { beta: false } },
+      onPatch,
     });
-    const checkbox = query<HTMLInputElement>(container, '.settings-toggle__input[role="switch"]');
+    const checkbox = expectElement(
+      container.querySelector<HTMLInputElement>('.settings-toggle__input[role="switch"]'),
+      "named toggle",
+    );
     const row = expectElement(checkbox.closest(".settings-row"), "toggle row");
     const label = wildcard ? "Plugin Enabled" : "Beta";
     expect(row.tagName).toBe("DIV");
@@ -450,21 +510,27 @@ describe("config form renderer", () => {
 
   it("keeps dropdown selects on their configured value after options render", () => {
     const schema = object({
-      provider: scalar("string", {
+      provider: {
+        type: "string",
         enum: ["anthropic", "codex", "gemini", "openai", "openrouter", "zai"],
-      }),
-      bind: anyOf(
-        { const: "auto" },
-        { const: "lan" },
-        { const: "tailnet" },
-        { const: "loopback" },
-        { const: "public" },
-        { const: "off" },
-      ),
+      },
+      bind: {
+        anyOf: [
+          { const: "auto" },
+          { const: "lan" },
+          { const: "tailnet" },
+          { const: "loopback" },
+          { const: "public" },
+          { const: "off" },
+        ],
+      },
     });
     const analysis = analyzeConfigSchema(schema);
 
-    renderForm(analysis, { value: { provider: "openai", bind: "tailnet" } });
+    renderAnalyzedFormFixture(container, analysis, {
+      value: { provider: "openai", bind: "tailnet" },
+      onPatch,
+    });
 
     const selects = container.querySelectorAll<HTMLSelectElement>("select.settings-select");
     expect(selects).toHaveLength(2);
@@ -475,9 +541,11 @@ describe("config form renderer", () => {
   });
 
   it("shows an unset default-on boolean as its placeholder instead of an off toggle", () => {
-    const analysis = analyzeProperties({
-      cron: object({ enabled: { type: "boolean" } }),
-    });
+    const analysis = analyzeConfigSchema(
+      object({
+        cron: object({ enabled: { type: "boolean" } }),
+      }),
+    );
     renderConfigFormFixture(
       container,
       renderConfigForm({
@@ -490,7 +558,10 @@ describe("config form renderer", () => {
     );
 
     expect(container.querySelector('.settings-toggle__input[role="switch"]')).toBeNull();
-    const select = query<HTMLSelectElement>(container, 'select[aria-label="Automations Enabled"]');
+    const select = expectElement(
+      container.querySelector<HTMLSelectElement>('select[aria-label="Automations Enabled"]'),
+      "automations enabled select",
+    );
     expect(select.selectedOptions[0]?.textContent?.trim()).toBe("Default: On");
     expect(onPatch).not.toHaveBeenCalled();
     select.value = "1";
@@ -508,37 +579,50 @@ describe("config form renderer", () => {
     { key: "slack", additionalProperties: { type: "string" }, value: { channelA: "ok" } },
     { key: "accounts", additionalProperties: true, value: { default: { enabled: true } } },
   ])("removes entries from the $key map", ({ key, additionalProperties, value }) => {
-    const analysis = analyzeProperties({ [key]: { type: "object", additionalProperties } });
-    expect(analysis.unsupportedPaths).toEqual([]);
-    renderForm(analysis, { value: { [key]: value } });
-    query(container, ".cfg-map button[aria-label='Remove entry']").dispatchEvent(
-      new MouseEvent("click", { bubbles: true }),
+    const analysis = analyzeConfigSchema(
+      object({ [key]: { type: "object", additionalProperties } }),
     );
+    expect(analysis.unsupportedPaths).toEqual([]);
+    renderAnalyzedFormFixture(container, analysis, { value: { [key]: value }, onPatch });
+    expectElement(
+      container.querySelector(".cfg-map button[aria-label='Remove entry']"),
+      "map remove button",
+    ).dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith([key], {});
   });
 
   it("filters by authored metadata tags without rendering field chips", () => {
     const analysis = rootAnalysis;
-    renderForm(analysis, {
+    renderAnalyzedFormFixture(container, analysis, {
       uiHints: {
         "gateway.auth.token": { tags: ["security", "advanced", "secret"] },
       },
       value: {},
+      onPatch,
     });
 
     expect(container.querySelector(".cfg-tag")).toBeNull();
 
-    renderForm(analysis, {
+    renderAnalyzedFormFixture(container, analysis, {
       uiHints: {
         "gateway.auth.token": { tags: ["security", "advanced"] },
       },
       value: {},
       searchQuery: "tag:advanced",
+      onPatch,
     });
 
-    const sectionTitle = query(container, ".settings-section__heading");
+    const sectionTitle = expectElement(
+      container.querySelector(".settings-section__heading"),
+      "tag-filtered section title",
+    );
     expect(sectionTitle.textContent?.trim()).toBe("Gateway");
-    const fieldLabel = byText<HTMLElement>(container, ".settings-row__title", "Token");
+    const fieldLabel = expectElement(
+      Array.from(container.querySelectorAll(".settings-row__title")).find(
+        (node) => node.textContent?.trim() === "Token",
+      ),
+      "tag-filtered field label",
+    );
     expect(fieldLabel.textContent?.trim()).toBe("Token");
     // Only the Auth subtree (matching the tag filter) renders rows.
     expect(
@@ -554,21 +638,35 @@ describe("config form renderer", () => {
         providers: {
           type: "object",
           additionalProperties: object({
-            apiKey: anyOf(
-              { type: "string" },
-              oneOf(
-                ...["env", "file"].map((source) =>
-                  object(
+            apiKey: {
+              anyOf: [
+                { type: "string" },
+                {
+                  oneOf: [
                     {
-                      source: { type: "string", const: source },
-                      provider: { type: "string" },
-                      id: { type: "string" },
+                      type: "object",
+                      properties: {
+                        source: { type: "string", const: "env" },
+                        provider: { type: "string" },
+                        id: { type: "string" },
+                      },
+                      required: ["source", "provider", "id"],
+                      additionalProperties: false,
                     },
-                    { required: ["source", "provider", "id"], additionalProperties: false },
-                  ),
-                ),
-              ),
-            ),
+                    {
+                      type: "object",
+                      properties: {
+                        source: { type: "string", const: "file" },
+                        provider: { type: "string" },
+                        id: { type: "string" },
+                      },
+                      required: ["source", "provider", "id"],
+                      additionalProperties: false,
+                    },
+                  ],
+                },
+              ],
+            },
           }),
         },
       }),
@@ -576,12 +674,13 @@ describe("config form renderer", () => {
     const analysis = analyzeConfigSchema(schema);
     expect(analysis.unsupportedPaths).toEqual([]);
 
-    renderForm(analysis, {
+    renderAnalyzedFormFixture(container, analysis, {
       uiHints: {
         "models.providers.*.apiKey": { sensitive: true },
       },
       value: { models: { providers: { openai: { apiKey: "old" } } } }, // pragma: allowlist secret
       revealSensitive: true,
+      onPatch,
     });
 
     const apiKeyInput = expectElement(
@@ -592,13 +691,14 @@ describe("config form renderer", () => {
       ).find((input) => input.value === "old"),
       "provider api key input",
     );
-    edit(apiKeyInput, "new-key");
+    apiKeyInput.value = "new-key";
+    apiKeyInput.dispatchEvent(new Event("input", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith(["models", "providers", "openai", "apiKey"], "new-key");
   });
 
   it.each([
     {
-      properties: { mixed: anyOf({ type: "string" }, object({})) },
+      properties: { mixed: { anyOf: [{ type: "string" }, object({})] } },
       unsupported: [],
     },
     {
@@ -612,27 +712,28 @@ describe("config form renderer", () => {
       unsupported: ["lastTouchedAt"],
     },
     {
-      properties: { note: anyOf({ type: "string", nullable: true }) },
+      properties: { note: { anyOf: [{ type: "string", nullable: true }] } },
       unsupported: [],
       nullable: true,
     },
     { properties: { note: { type: ["string", "null"] } }, unsupported: [] },
     {
       properties: {
-        channels: object(
-          {
+        channels: {
+          type: "object",
+          properties: {
             whatsapp: object({ enabled: { type: "boolean" } }),
           },
-          { additionalProperties: {} },
-        ),
+          additionalProperties: {},
+        },
       },
       unsupported: [],
     },
     {
       properties: {
-        lastTouchedAt: anyOf({ type: "string" }, { type: "number" }),
-        setupCommand: anyOf({ type: "string" }, array({ type: "string" })),
-        allowedDomains: array({ type: "string" }),
+        lastTouchedAt: { anyOf: [{ type: "string" }, { type: "number" }] },
+        setupCommand: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+        allowedDomains: { type: "array", items: { type: "string" } },
         displayWidth: { type: "string" },
       },
       unsupported: [],
@@ -646,13 +747,13 @@ describe("config form renderer", () => {
   ])(
     "analyzes public union shapes: $properties",
     ({ properties, unsupported, nullable, value }) => {
-      const analysis = analyzeProperties(properties);
+      const analysis = analyzeConfigSchema({ type: "object", properties });
       expect(analysis.unsupportedPaths).toEqual(unsupported);
       if (nullable) {
         expect(analysis.schema?.properties?.note?.nullable).toBe(true);
       }
       if (value) {
-        renderForm(analysis, { value });
+        renderAnalyzedFormFixture(container, analysis, { value, onPatch });
         expect(container.textContent).not.toContain("Unsupported schema node");
       }
     },
@@ -668,14 +769,20 @@ describe("config form renderer", () => {
     },
     {
       key: "groups",
-      items: array({ type: "string" }, { default: ["nested-default"] }),
+      items: { type: "array", default: ["nested-default"], items: { type: "string" } },
       defaults: [["root-default"]],
       value: [["first"], ["second"]],
       help: "Group sender ids.",
     },
   ])("renders $key metadata only on the array header", ({ key, items, defaults, value, help }) => {
-    const analysis = analyzeProperties({ [key]: array(items, { default: defaults }) });
-    renderForm(analysis, { uiHints: { [key]: { help } }, value: { [key]: value } });
+    const analysis = analyzeConfigSchema(
+      object({ [key]: { type: "array", items, default: defaults } }),
+    );
+    renderAnalyzedFormFixture(container, analysis, {
+      uiHints: { [key]: { help } },
+      value: { [key]: value },
+      onPatch,
+    });
     const descriptions = Array.from(container.querySelectorAll(".settings-row__desc"), (node) =>
       node.textContent?.trim(),
     );
@@ -687,24 +794,31 @@ describe("config form renderer", () => {
   });
 
   it.each([true, false])("renders section help only with a docs URL: %s", async (hasDocs) => {
-    renderForm(rootAnalysis, {
+    renderAnalyzedFormFixture(container, rootAnalysis, {
       uiHints: hasDocs
         ? { gateway: { docsUrl: "https://docs.openclaw.ai/gateway/configuration" } }
         : {},
       value: {},
       activeSection: "gateway",
+      onPatch,
     });
 
     if (!hasDocs) {
       expect(container.querySelector(".settings-section__help-button")).toBeNull();
       return;
     }
-    const button = query<HTMLButtonElement>(container, ".settings-section__help-button");
+    const button = expectElement(
+      container.querySelector<HTMLButtonElement>(".settings-section__help-button"),
+      "section help button",
+    );
     expect(button.getAttribute("aria-label")).toBe("Help for Gateway");
     expect(button.querySelector("svg")).not.toBeNull();
     const tooltip = expectElement(button.closest("openclaw-tooltip"), "section help tooltip");
     expect((tooltip as HTMLElement & { content: string }).content).toBe("Help for Gateway");
-    const link = query<HTMLAnchorElement>(container, ".settings-section__help-popover a");
+    const link = expectElement(
+      container.querySelector<HTMLAnchorElement>(".settings-section__help-popover a"),
+      "section guide link",
+    );
     expect(link.textContent?.trim()).toBe("Learn more");
     expect(link.classList.contains("learn-more-link")).toBe(true);
     const popover = expectElement(link.closest('[role="dialog"]'), "section help popover");

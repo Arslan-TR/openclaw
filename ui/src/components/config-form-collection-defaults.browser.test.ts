@@ -5,7 +5,14 @@ import {
   renderArrayFixture,
   renderObjectFixture,
 } from "../test-helpers/config-form-fixtures.tsx";
-import { array, byText, edit, object, query } from "./config-form.test-support.ts";
+
+function expectElement<T extends Element>(element: T | null | undefined, label: string): T {
+  expect(element instanceof Element, label).toBe(true);
+  if (!(element instanceof Element)) {
+    throw new Error(`missing ${label}`);
+  }
+  return element;
+}
 
 describe("config form collection defaults", () => {
   it("shows and clears optional JSON defaults without authoring the inherited value", () => {
@@ -16,42 +23,70 @@ describe("config form collection defaults", () => {
       default: { mode: "balanced" },
     };
 
-    const renderValue = (value: unknown) =>
-      renderJsonTextareaFixture(container, { schema, value, path: ["payload"], onPatch });
-    renderValue({ mode: "custom" });
+    renderJsonTextareaFixture(container, {
+      schema,
+      value: { mode: "custom" },
+      path: ["payload"],
+      onPatch,
+    });
 
     expect(container.textContent).toContain('Default: {"mode":"balanced"}');
-    const textarea = query<HTMLTextAreaElement>(container, "textarea");
+    const textarea = expectElement(
+      container.querySelector<HTMLTextAreaElement>("textarea"),
+      "explicit JSON",
+    );
     expect(textarea.value).toBe('{\n  "mode": "custom"\n}');
-    edit(textarea, "", "change");
+    textarea.value = "";
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith(["payload"], undefined);
 
     onPatch.mockClear();
-    renderValue(undefined);
+    renderJsonTextareaFixture(container, {
+      schema,
+      value: undefined,
+      path: ["payload"],
+      onPatch,
+    });
 
     expect(container.textContent).not.toContain("Using default:");
     expect(container.querySelector(".settings-row__desc")).toBeNull();
-    expect(query<HTMLTextAreaElement>(container, "textarea").value).toBe(
-      '{\n  "mode": "balanced"\n}',
-    );
+    expect(
+      expectElement(container.querySelector<HTMLTextAreaElement>("textarea"), "inherited JSON")
+        .value,
+    ).toBe('{\n  "mode": "balanced"\n}');
     expect(onPatch).not.toHaveBeenCalled();
   });
 
   it("shows optional array defaults and authors inherited items without dropping siblings", () => {
     const container = document.createElement("div");
     const onPatch = vi.fn(() => false);
-    const schema = array({ type: "string" as const }, { default: ["a", "b"] });
+    const schema = {
+      type: "array" as const,
+      items: { type: "string" as const },
+      default: ["a", "b"],
+    };
 
-    const renderValue = (value: unknown) =>
-      renderArrayFixture(container, { schema, value, path: ["values"], onPatch });
-    renderValue(["custom"]);
+    renderArrayFixture(container, {
+      schema,
+      value: ["custom"],
+      path: ["values"],
+      onPatch,
+    });
 
     expect(container.textContent).toContain('Default: ["a","b"]');
     expect(container.textContent).toContain("1 item");
-    expect(query<HTMLInputElement>(container, "input").value).toBe("custom");
+    expect(
+      expectElement(container.querySelector<HTMLInputElement>("input"), "explicit array item")
+        .value,
+    ).toBe("custom");
 
     onPatch.mockClear();
-    renderValue(undefined);
+    renderArrayFixture(container, {
+      schema,
+      value: undefined,
+      path: ["values"],
+      onPatch,
+    });
 
     expect(container.textContent).not.toContain("Using default:");
     expect(container.querySelector(".settings-row__desc")).toBeNull();
@@ -61,31 +96,35 @@ describe("config form collection defaults", () => {
     expect(inheritedInputs.map((input) => input.placeholder)).toEqual(["Default: a", "Default: b"]);
     expect(onPatch).not.toHaveBeenCalled();
 
-    edit(inheritedInputs[1]!, "custom", "input", true);
+    inheritedInputs[1]!.value = "custom";
+    inheritedInputs[1]!.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     expect(onPatch).toHaveBeenCalledWith(["values"], ["a", "custom"]);
   });
 
   it("authors a nested inherited array item without dropping sibling defaults", () => {
     const container = document.createElement("div");
     const onPatch = vi.fn();
-    const schema = array(
-      object({
-        name: { type: "string" as const, title: "Name" },
-        details: object(
-          {
-            label: { type: "string" as const, title: "Label" },
-            note: { type: "string" as const, title: "Note" },
+    const schema = {
+      type: "array" as const,
+      default: [
+        { name: "alpha", details: { label: "one", note: "keep-one" } },
+        { name: "beta", details: { label: "two", note: "keep-two" } },
+      ],
+      items: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string" as const, title: "Name" },
+          details: {
+            type: "object" as const,
+            title: "Details",
+            properties: {
+              label: { type: "string" as const, title: "Label" },
+              note: { type: "string" as const, title: "Note" },
+            },
           },
-          { title: "Details" },
-        ),
-      }),
-      {
-        default: [
-          { name: "alpha", details: { label: "one", note: "keep-one" } },
-          { name: "beta", details: { label: "two", note: "keep-two" } },
-        ],
+        },
       },
-    );
+    };
 
     renderArrayFixture(container, {
       schema,
@@ -98,7 +137,8 @@ describe("config form collection defaults", () => {
       container.querySelectorAll<HTMLInputElement>("input[aria-label='Label']"),
     );
     expect(labels).toHaveLength(2);
-    edit(labels[0]!, "changed");
+    labels[0]!.value = "changed";
+    labels[0]!.dispatchEvent(new Event("input", { bubbles: true }));
 
     expect(onPatch).toHaveBeenCalledExactlyOnceWith(
       ["entries"],
@@ -118,10 +158,12 @@ describe("config form collection defaults", () => {
     };
 
     renderObjectFixture(container, {
-      schema: object(
-        { apiKey: { type: "string" } },
-        { title: "Profile", default: { apiKey: "default-secret" } },
-      ),
+      schema: {
+        type: "object",
+        title: "Profile",
+        default: { apiKey: "default-secret" },
+        properties: { apiKey: { type: "string" } },
+      },
       value: { apiKey: "authored-secret" },
       path: ["settings", "profile"],
       hints,
@@ -132,7 +174,12 @@ describe("config form collection defaults", () => {
     expect(container.textContent).not.toContain("default-secret");
 
     renderArrayFixture(container, {
-      schema: array({ type: "string" }, { title: "Tokens", default: ["default-token"] }),
+      schema: {
+        type: "array",
+        title: "Tokens",
+        items: { type: "string" },
+        default: ["default-token"],
+      },
       value: ["authored-token"],
       path: ["settings", "tokens"],
       hints,
@@ -147,42 +194,84 @@ describe("config form collection defaults", () => {
     const container = document.createElement("div");
     const onPatch = vi.fn();
     const onRemove = vi.fn();
-    const schema = object({
-      profile: object(
-        {
-          enabled: { type: "boolean" as const, title: "Enabled" },
-          mode: { type: "string" as const, title: "Mode" },
+    const schema = {
+      type: "object" as const,
+      properties: {
+        profile: {
+          type: "object" as const,
+          title: "Profile",
+          default: { enabled: true, mode: "balanced" },
+          properties: {
+            enabled: { type: "boolean" as const, title: "Enabled" },
+            mode: { type: "string" as const, title: "Mode" },
+          },
         },
-        { title: "Profile", default: { enabled: true, mode: "balanced" } },
+        sibling: { type: "string" as const, title: "Sibling" },
+      },
+    };
+
+    renderObjectFixture(container, {
+      schema,
+      value: {
+        profile: { enabled: false, mode: "custom" },
+        sibling: "preserved",
+      },
+      path: ["settings"],
+      onPatch,
+      onRemove,
+    });
+
+    const profile = expectElement(
+      Array.from(container.querySelectorAll("details")).find((details) =>
+        details.textContent?.includes("Profile"),
       ),
-      sibling: { type: "string" as const, title: "Sibling" },
-    });
-
-    const renderValue = (value: unknown) =>
-      renderObjectFixture(container, { schema, value, path: ["settings"], onPatch, onRemove });
-    renderValue({
-      profile: { enabled: false, mode: "custom" },
-      sibling: "preserved",
-    });
-
-    const profile = byText<HTMLElement>(container, "details", "Profile", false);
+      "explicit profile object",
+    );
     expect(profile.textContent).not.toContain('{"enabled":true,"mode":"balanced"}');
     expect(onPatch).not.toHaveBeenCalled();
 
     onRemove.mockClear();
-    renderValue({ sibling: "preserved" });
+    renderObjectFixture(container, {
+      schema,
+      value: { sibling: "preserved" },
+      path: ["settings"],
+      onPatch,
+      onRemove,
+    });
 
-    const inheritedProfile = byText<HTMLElement>(container, "details", "Profile", false);
+    const inheritedProfile = expectElement(
+      Array.from(container.querySelectorAll("details")).find((details) =>
+        details.textContent?.includes("Profile"),
+      ),
+      "inherited profile object",
+    );
     expect(inheritedProfile.textContent).not.toContain('{"enabled":true,"mode":"balanced"}');
-    const enabledRow = byText<HTMLElement>(inheritedProfile, ".settings-row", "Enabled", false);
-    const modeRow = byText<HTMLElement>(inheritedProfile, ".settings-row", "Mode", false);
+    const enabledRow = expectElement(
+      Array.from(inheritedProfile.querySelectorAll(".settings-row")).find((row) =>
+        row.textContent?.includes("Enabled"),
+      ),
+      "inherited enabled row",
+    );
+    const modeRow = expectElement(
+      Array.from(inheritedProfile.querySelectorAll(".settings-row")).find((row) =>
+        row.textContent?.includes("Mode"),
+      ),
+      "inherited mode row",
+    );
     expect(enabledRow.textContent).not.toContain("Using default:");
     expect(modeRow.textContent).not.toContain("Using default:");
-    expect(query<HTMLInputElement>(modeRow, "input").placeholder).toBe("Default: balanced");
+    expect(
+      expectElement(modeRow.querySelector<HTMLInputElement>("input"), "inherited mode input")
+        .placeholder,
+    ).toBe("Default: balanced");
     expect(onRemove).not.toHaveBeenCalled();
 
-    const modeInput = query<HTMLInputElement>(modeRow, "input");
-    edit(modeInput, "custom", "input", true);
+    const modeInput = expectElement(
+      modeRow.querySelector<HTMLInputElement>("input"),
+      "inherited mode input",
+    );
+    modeInput.value = "custom";
+    modeInput.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     expect(onPatch).toHaveBeenCalledWith(["settings", "profile"], {
       enabled: true,
       mode: "custom",

@@ -2,7 +2,6 @@
 
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../../../test/helpers/promise.js";
 import { openEditor } from "../../../lib/editor-links.ts";
 import {
   clearNativeGatewayTestState,
@@ -10,51 +9,11 @@ import {
 } from "../../../test-helpers/native-gateways.ts";
 import "./chat-detail-panel.tsx";
 import { waitForSolid } from "../../../test-helpers/solid-settle.ts";
-import type { ChatDetailPanel as DetailPanel } from "./chat-detail-panel.tsx";
 import { setFileDraft } from "./chat-file-drafts.ts";
 import type { ChatHtmlPreviewElement } from "./chat-html-preview-element.tsx";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
 import { createChatSidebarContainer } from "./chat-sidebar.test-support.ts";
 import type { FileEditorViewHandle } from "./file-editor-view.ts";
-
-const file = (
-  path = "src/example.ts",
-  content = "const answer = 42;",
-): Extract<SidebarContent, { kind: "file" }> => ({
-  kind: "file",
-  path,
-  name: path.split("/").at(-1)!,
-  content,
-});
-const query = <T extends Element = HTMLElement>(panel: Element, selector: string) =>
-  panel.querySelector<T>(selector);
-const downloadButton = (panel: Element) =>
-  expectDefined(
-    query<HTMLButtonElement>(panel, ".chat-assistant-attachment-card__download"),
-    "Download button",
-  );
-const attachment = (
-  props: Partial<Extract<SidebarContent, { kind: "attachment" }>>,
-): SidebarContent => ({
-  kind: "attachment",
-  attachmentKind: "document",
-  title: "report.zip",
-  ...props,
-});
-async function settle(panel: DetailPanel) {
-  await Promise.resolve();
-  await Promise.resolve();
-  await panel.updateComplete;
-}
-function activate(link: Element | null, action: string) {
-  const options = { bubbles: true, cancelable: true };
-  const event =
-    action === "click"
-      ? new MouseEvent("click", { ...options, button: 0 })
-      : new KeyboardEvent("keydown", { ...options, key: "Enter" });
-  link?.dispatchEvent(event);
-  expect(event.defaultPrevented).toBe(true);
-}
 
 // mock-isolation: These sidebar contracts exclude CodeMirror's browser layout and language loading.
 vi.mock("./file-editor-view.ts", () => ({
@@ -77,16 +36,17 @@ vi.mock("./file-editor-view.ts", () => ({
   },
 }));
 
-async function mountPanel(
-  content: SidebarContent,
-  props: Partial<DetailPanel> = {},
-): Promise<DetailPanel> {
-  const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-  Object.assign(panel, { content }, props);
-  container.append(panel);
-  await panel.updateComplete;
-  return panel;
-}
+type DetailPanel = HTMLElement & {
+  content: unknown;
+  basePath?: string;
+  execNode: string | null;
+  updateComplete: Promise<unknown>;
+  onOpenWorkspaceFile?: (target: { path: string; line?: number | null }) => void;
+  onOpenSessionLink?: (target: { sessionKey: string; agentId: string }) => void;
+  onOpenImage?: (item: { src: string; title: string }) => void;
+  embedSandboxMode: "trusted";
+  canvasPluginSurfaceUrl: string;
+};
 
 let container: HTMLElement;
 beforeEach(() => {
@@ -98,15 +58,30 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it.each([
-  ["Windows path", "vscode", "C:\\src\\a.ts", 42, "vscode://file/C:/src/a.ts:42"],
-  ["URL chars", "windsurf", "/#a?.md", undefined, "windsurf://file/%23a%3F.md"],
-] as const)("opens the encoded custom URL for %s", (_name, editor, path, line, expected) => {
-  const open = vi.spyOn(window, "open").mockReturnValue(null);
-  openEditor(editor, path, line);
-  expect(open).toHaveBeenCalledWith(expected);
-  open.mockRestore();
+describe("openEditor", () => {
+  it.each([
+    [
+      "Windows path",
+      "vscode",
+      "C:\\workspace\\src\\foo.ts",
+      42,
+      "vscode://file/C:/workspace/src/foo.ts:42",
+    ],
+    [
+      "URL-significant characters",
+      "windsurf",
+      "/workspace/#notes?.md",
+      undefined,
+      "windsurf://file/workspace/%23notes%3F.md",
+    ],
+  ] as const)("opens the encoded custom URL for %s", (_name, editor, path, line, expected) => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    openEditor(editor, path, line);
+    expect(open).toHaveBeenCalledWith(expected);
+    open.mockRestore();
+  });
 });
+
 describe("file sidebar editor locality", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -116,12 +91,23 @@ describe("file sidebar editor locality", () => {
 
   it("removes editor controls when the native gateway switches to remote", async () => {
     setNativeGatewayTestState("local");
-    const panel = await mountPanel({ ...file(), root: "/workspace" });
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    panel.content = {
+      kind: "file",
+      path: "src/example.ts",
+      name: "example.ts",
+      root: "/workspace",
+      content: "const answer = 42;",
+    };
+    container.append(panel);
+    await panel.updateComplete;
     expect(panel.querySelector('[aria-label="Open in editor"]')).not.toBeNull();
     expect(panel.querySelectorAll(".sidebar-file-view__editor-item")).toHaveLength(4);
     expect(panel.querySelector(".sidebar-file-view__editor")).not.toBeNull();
+
     setNativeGatewayTestState("remote");
     await panel.updateComplete;
+
     expect(panel.querySelector('[aria-label="Open in editor"]')).toBeNull();
     expect(panel.querySelector(".sidebar-file-view__editor")).toBeNull();
   });
@@ -150,12 +136,14 @@ describe("markdown sidebar", () => {
       expect(rawButton).toBeDefined();
       rawButton!.click();
       await panel.updateComplete;
+
       expect(panel.querySelector(".sidebar-title")?.textContent?.trim()).toBe("Source");
       expect(panel.querySelector(".sidebar-markdown-shell__eyebrow")?.textContent?.trim()).toBe(
         "Source",
       );
       expect(panel.querySelector(".sidebar-markdown-shell__hint")).toBeNull();
       expect(panel.querySelector(".sidebar-markdown-shell__toolbar button")).toBeNull();
+
       const reader = panel.querySelector(".sidebar-markdown-reader");
       const copyButton = reader?.querySelector<HTMLButtonElement>(".code-block-copy");
       expect(copyButton).toBeInstanceOf(HTMLButtonElement);
@@ -164,10 +152,12 @@ describe("markdown sidebar", () => {
       copyButton!.click();
       await vi.waitFor(() => expect(copyButton!.getAttribute("aria-label")).toBe("Copied!"));
       expect(writeText).toHaveBeenCalledOnce();
+
       expect.soft(reader?.querySelectorAll("pre code")).toHaveLength(1);
       expect.soft(reader?.querySelector("pre code")?.textContent).toBe(`${source}\n`);
       expect.soft(reader?.querySelector("strong")).toBeNull();
       expect.soft(writeText).toHaveBeenCalledWith(source);
+
       panel.content = { kind: "markdown", content: "## Fresh preview" };
       await panel.updateComplete;
       expect(panel.querySelector(".sidebar-markdown-shell__eyebrow")?.textContent?.trim()).toBe(
@@ -188,103 +178,179 @@ describe("markdown sidebar", () => {
     }
   });
 
-  it.each([
-    { sessionKey: undefined, action: "click" },
-    { sessionKey: "agent:research:report", action: "click" },
-    { sessionKey: undefined, action: "Enter" },
-  ])(
-    "opens workspace files from markdown previews owned by $sessionKey with $action",
-    async ({ sessionKey, action }) => {
+  it.each([undefined, "agent:research:report"])(
+    "opens workspace files from markdown previews owned by %s",
+    async (sessionKey) => {
+      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
       const onOpenWorkspaceFile = vi.fn();
-      const panel = await mountPanel(
-        {
-          kind: "markdown",
-          content: "See `src/file.ts:362`",
-          fileLinkSessionKey: sessionKey,
-        },
-        { onOpenWorkspaceFile },
-      );
-      const link = panel.querySelector<HTMLAnchorElement>("a.markdown-file-link");
-      if (action === "Enter") {
-        link?.focus();
-        expect(document.activeElement).toBe(link);
-        activate(link, action);
-        expect(onOpenWorkspaceFile).toHaveBeenCalledOnce();
-      } else {
-        link?.click();
-      }
+      panel.content = {
+        kind: "markdown",
+        content: "See `ui/src/pages/chat/chat-view.ts:362`",
+        fileLinkSessionKey: sessionKey,
+      };
+      panel.onOpenWorkspaceFile = onOpenWorkspaceFile;
+      container.append(panel);
+      await panel.updateComplete;
+
+      panel.querySelector<HTMLAnchorElement>("a.markdown-file-link")?.click();
+
       expect(onOpenWorkspaceFile).toHaveBeenCalledWith({
-        path: "src/file.ts",
+        path: "ui/src/pages/chat/chat-view.ts",
         line: 362,
         ...(sessionKey ? { sessionKey } : {}),
       });
+      panel.remove();
     },
   );
 
+  it("opens focused markdown preview file links with Enter", async () => {
+    const key = "Enter";
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    const onOpenWorkspaceFile = vi.fn();
+    panel.content = { kind: "markdown", content: "See `ui/src/pages/chat/chat-view.ts:362`" };
+    panel.onOpenWorkspaceFile = onOpenWorkspaceFile;
+    container.append(panel);
+    await panel.updateComplete;
+
+    const link = panel.querySelector<HTMLAnchorElement>("a.markdown-file-link");
+    link?.focus();
+    expect(document.activeElement).toBe(link);
+    const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+    link?.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(onOpenWorkspaceFile).toHaveBeenCalledOnce();
+    expect(onOpenWorkspaceFile).toHaveBeenCalledWith({
+      path: "ui/src/pages/chat/chat-view.ts",
+      line: 362,
+    });
+    panel.remove();
+  });
+
   it("handles markdown preview session links with click", async () => {
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
     const onOpenSessionLink = vi.fn();
     const sessionKey = "agent:roboclaw:dashboard:2139bddb-3211-4641-b993-10f619f124e6";
-    const panel = await mountPanel(
-      { kind: "markdown", content: `Open \`${sessionKey}\`` },
-      { onOpenSessionLink },
-    );
+    panel.content = { kind: "markdown", content: `Open \`${sessionKey}\`` };
+    panel.onOpenSessionLink = onOpenSessionLink;
+    container.append(panel);
+    await panel.updateComplete;
+
     const link = panel.querySelector<HTMLAnchorElement>("a.markdown-session-link");
     link?.setAttribute("href", "/chat/roboclaw/2139bddb");
-    activate(link, "click");
+    const event = new MouseEvent("click", {
+      bubbles: true,
+      button: 0,
+      cancelable: true,
+    });
+    link?.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+
     expect(onOpenSessionLink).toHaveBeenCalledWith({ sessionKey, agentId: "roboclaw" });
+    panel.remove();
   });
 
   it.each(["click", "Enter"])(
     "SPA-routes markdown preview session hrefs with %s",
     async (action) => {
+      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
       const onOpenSessionLink = vi.fn();
       const literalUuid = "12345678-90ab-cdef-1234-567890abcdef";
       const href = `${window.location.origin}/control/dashboard/main/~key/${literalUuid}`;
-      const panel = await mountPanel(
-        { kind: "markdown", content: `[Open session](${href})` },
-        { basePath: "/control", onOpenSessionLink },
-      );
+      panel.basePath = "/control";
+      panel.content = { kind: "markdown", content: `[Open session](${href})` };
+      panel.onOpenSessionLink = onOpenSessionLink;
+      container.append(panel);
+      await panel.updateComplete;
+
       const link = panel.querySelector<HTMLAnchorElement>(`a[href^="${window.location.origin}"]`);
-      activate(link, action);
+      const event =
+        action === "click"
+          ? new MouseEvent("click", { bubbles: true, button: 0, cancelable: true })
+          : new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+      link?.dispatchEvent(event);
+
+      expect(event.defaultPrevented).toBe(true);
       expect(onOpenSessionLink).toHaveBeenCalledWith({
         namespace: "dashboard",
         pathname: `/control/dashboard/main/~key/${literalUuid}`,
       });
+      panel.remove();
     },
   );
 
-  it.each(["markdown", "image"] as const)(
-    "opens %s images only through its owner's lightbox or fallback",
-    async (kind) => {
-      const src = "data:image/png;base64,cG5n";
-      const title = kind === "markdown" ? "Preview" : "Artifact preview";
-      const content: SidebarContent =
-        kind === "markdown" ? { kind, content: `![${title}](${src})` } : { kind, title, src };
-      const selector =
-        kind === "markdown"
-          ? ".markdown-inline-image-button"
-          : ".chat-tool-card__preview-image-button";
-      const onOpenImage = vi.fn();
-      const panel = await mountPanel(content, { onOpenImage });
-      query<HTMLButtonElement>(panel, selector)?.click();
-      expect(onOpenImage).toHaveBeenCalledWith({ src, title });
-      panel.remove();
-      const fallbackPanel = await mountPanel(content);
-      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
-      if (kind === "markdown") {
-        expect(query(fallbackPanel, selector)).toBeNull();
-      } else {
-        query<HTMLButtonElement>(fallbackPanel, selector)?.click();
-        expect(openSpy).toHaveBeenCalledWith(src, "_blank", "noopener,noreferrer");
-      }
-      openSpy.mockRestore();
-    },
-  );
+  it("activates Markdown images only when a chat owner opts in", async () => {
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    const onOpenImage = vi.fn();
+    panel.content = { kind: "markdown", content: "![Preview](data:image/png;base64,cG5n)" };
+    panel.onOpenImage = onOpenImage;
+    container.append(panel);
+    await panel.updateComplete;
+
+    panel.querySelector<HTMLButtonElement>(".markdown-inline-image-button")?.click();
+    expect(onOpenImage).toHaveBeenCalledWith({
+      src: "data:image/png;base64,cG5n",
+      title: "Preview",
+    });
+    panel.remove();
+
+    const fallbackPanel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    fallbackPanel.content = {
+      kind: "markdown",
+      content: "![Preview](data:image/png;base64,cG5n)",
+    };
+    container.append(fallbackPanel);
+    await fallbackPanel.updateComplete;
+    expect(fallbackPanel.querySelector(".markdown-inline-image-button")).toBeNull();
+    fallbackPanel.remove();
+  });
+
+  it("opens image artifacts through the shared lightbox callback", async () => {
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    const onOpenImage = vi.fn();
+    panel.content = {
+      kind: "image",
+      title: "Artifact preview",
+      src: "data:image/png;base64,cG5n",
+    };
+    panel.onOpenImage = onOpenImage;
+    container.append(panel);
+    await panel.updateComplete;
+
+    panel.querySelector<HTMLButtonElement>(".chat-tool-card__preview-image-button")?.click();
+
+    expect(onOpenImage).toHaveBeenCalledWith({
+      src: "data:image/png;base64,cG5n",
+      title: "Artifact preview",
+    });
+    panel.remove();
+
+    const fallbackPanel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    fallbackPanel.content = {
+      kind: "image",
+      title: "Artifact preview",
+      src: "data:image/png;base64,cG5n",
+    };
+    container.append(fallbackPanel);
+    await fallbackPanel.updateComplete;
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    fallbackPanel
+      .querySelector<HTMLButtonElement>(".chat-tool-card__preview-image-button")
+      ?.click();
+    expect(openSpy).toHaveBeenCalledWith(
+      "data:image/png;base64,cG5n",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    openSpy.mockRestore();
+    fallbackPanel.remove();
+  });
 
   it("preserves authenticated transcoded video playback in Files", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
-    const panel = await mountPanel({
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    panel.content = {
       kind: "attachment",
       title: "clip.mov",
       src: "/api/chat/media/outgoing/session/artifact/full?mediaTicket=ticket",
@@ -294,28 +360,36 @@ describe("markdown sidebar", () => {
       authToken: "session-token",
       width: 9,
       height: 16,
-    });
+    };
+    container.append(panel);
+    await panel.updateComplete;
+
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     const [url, init] = fetchMock.mock.calls[0] ?? [];
     expect(url instanceof Request ? url.url : url?.toString()).toContain("playback=1");
     expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer session-token");
-    expect(panel.querySelector("openclaw-chat-video-player")).toMatchObject({
-      mediaWidth: 9,
-      mediaHeight: 16,
-    });
+    const player = panel.querySelector("openclaw-chat-video-player");
+    expect(player?.mediaWidth).toBe(9);
+    expect(player?.mediaHeight).toBe(16);
     expect(panel.querySelector(":scope > video")).toBeNull();
+    panel.remove();
   });
 
   it("plays normalized base64 audio from Files", async () => {
-    const panel = await mountPanel({
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    panel.content = {
       kind: "attachment",
       attachmentKind: "audio",
       title: "inline.wav",
       src: "data:audio/wav;base64,UklGRg==",
       mimeType: "audio/wav",
-    });
+    };
+    container.append(panel);
+    await panel.updateComplete;
+
     const player = panel.querySelector("openclaw-chat-audio-player");
     expect(player?.src).toBe("data:audio/wav;base64,UklGRg==");
+    panel.remove();
   });
 
   it.each([
@@ -327,26 +401,57 @@ describe("markdown sidebar", () => {
     async (title, src, mimeType) => {
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
-      const panel = await mountPanel(attachment({ title, src, mimeType }));
+      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+      panel.content = {
+        kind: "attachment",
+        attachmentKind: "document",
+        title,
+        src,
+        mimeType,
+      };
+      container.append(panel);
+      await panel.updateComplete;
+
       expect(panel.querySelector("iframe, table, audio, video")).toBeNull();
       expect(panel.querySelector(".chat-assistant-attachment-card--compact")).not.toBeNull();
-      const download = downloadButton(panel);
-      expect(download.getAttribute("href")).toBe(src);
-      expect(download).toMatchObject({ target: "_blank", rel: "noreferrer" });
-      expect(download.textContent).toContain("Download");
+      const download = panel.querySelector<HTMLAnchorElement>(
+        ".chat-assistant-attachment-card__download",
+      );
+      expect(download?.getAttribute("href")).toBe(src);
+      expect(download?.target).toBe("_blank");
+      expect(download?.rel).toBe("noreferrer");
+      expect(download?.textContent).toContain("Download");
       expect(fetchMock).not.toHaveBeenCalled();
+      panel.remove();
     },
   );
 
   it("shows a failed attachment download and lets the user retry", async () => {
-    const pending = createDeferred<Blob>();
-    const retry = createDeferred<Blob>();
-    const download = vi.fn(() => retry.promise).mockReturnValueOnce(pending.promise);
-    const panel = await mountPanel(attachment({ download }));
-    const button = downloadButton(panel);
+    let failDownload!: (reason: Error) => void;
+    const download = vi.fn(
+      () =>
+        new Promise<Blob>((_resolve, reject) => {
+          failDownload = reject;
+        }),
+    );
+    const panel = Object.assign(document.createElement("openclaw-chat-detail-panel"), {
+      content: {
+        kind: "attachment",
+        attachmentKind: "document",
+        title: "report.zip",
+        download,
+      } satisfies SidebarContent,
+    });
+    container.append(panel);
+    await panel.updateComplete;
+    const button = expectDefined(
+      panel.querySelector<HTMLButtonElement>(".chat-assistant-attachment-card__download"),
+      "Attachment download button",
+    );
+
     button.click();
     await vi.waitFor(() => expect(button.disabled).toBe(true));
-    pending.reject(new Error("Download interrupted"));
+    failDownload(new Error("Download interrupted"));
     await vi.waitFor(() => {
       expect(button.disabled).toBe(false);
       expect(panel.querySelector('[role="alert"]')?.textContent).toBe("Download interrupted");
@@ -357,19 +462,26 @@ describe("markdown sidebar", () => {
       expect(panel.querySelector('[role="alert"]')).toBeNull();
     });
     expect(download).toHaveBeenCalledTimes(2);
+    panel.remove();
   });
 
   it.each(["selection", "disconnection"])(
     "retires an attachment download on %s before late bytes arrive",
     async (change) => {
-      const pending = createDeferred<Blob>();
+      let finishDownload!: (blob: Blob) => void;
       let signal!: AbortSignal;
-      const content = attachment({
+      const panel = document.createElement("openclaw-chat-detail-panel");
+      panel.content = {
+        kind: "attachment",
+        attachmentKind: "document",
+        title: "report.zip",
         download: (requestSignal: AbortSignal) => {
           signal = requestSignal;
-          return pending.promise;
+          return new Promise<Blob>((resolve) => {
+            finishDownload = resolve;
+          });
         },
-      });
+      };
       const createObjectURL = vi.fn();
       vi.stubGlobal(
         "URL",
@@ -377,8 +489,9 @@ describe("markdown sidebar", () => {
           static override createObjectURL = createObjectURL;
         },
       );
-      const panel = await mountPanel(content);
-      downloadButton(panel).click();
+      container.append(panel);
+      await panel.updateComplete;
+      panel.querySelector<HTMLButtonElement>(".chat-assistant-attachment-card__download")!.click();
       if (change === "selection") {
         panel.content = { kind: "markdown", content: "Next" };
         await panel.updateComplete;
@@ -387,73 +500,98 @@ describe("markdown sidebar", () => {
         await Promise.resolve();
       }
       expect(signal.aborted).toBe(true);
-      pending.resolve(new Blob(["late content"]));
+      finishDownload(new Blob(["late content"]));
       await Promise.resolve();
       expect(createObjectURL).not.toHaveBeenCalled();
     },
   );
 
-  it("preserves image placeholders and ignores stale image events", async () => {
-    let pending = true;
-    let src = "/diagram.png";
-    const content = {
-      kind: "attachment",
-      attachmentKind: "image",
-      title: "diagram.png",
-      mimeType: "image/png",
-      width: 600,
-      height: 400,
-      resolveSource: () => (pending ? { status: "pending" } : { status: "ready", src }),
-    } satisfies SidebarContent;
-    const panel = await mountPanel(content);
-    await vi.waitFor(() => expect(panel.querySelector('[role="status"]')).not.toBeNull());
-    const presentation = panel.querySelector('[role="status"]');
-    const header = panel.querySelector(".chat-assistant-attachment-card__header");
-    pending = false;
-    panel.content = { ...content };
-    const image = await vi.waitFor(() =>
-      expectDefined(panel.querySelector(".sidebar-attachment-preview__image"), "Preview image"),
-    );
-    expect(panel.querySelector('[role="status"]')).toBe(presentation);
-    expect(panel.querySelector(".chat-assistant-attachment-card__header")).toBe(header);
-    image.dispatchEvent(new Event("error"));
-    expect(image.getAttribute("data-preview")).toBe("error");
-    src = "/next.png";
-    panel.content = { ...content };
-    const next = await vi.waitFor(() => {
-      const current = expectDefined(
-        panel.querySelector(".sidebar-attachment-preview__image"),
-        "Next preview image",
+  it.each(["error"] as const)(
+    "keeps the image placeholder through metadata until the image emits %s",
+    async (outcome) => {
+      let pending = true;
+      let src = "/diagram.png";
+      const content = {
+        kind: "attachment",
+        attachmentKind: "image",
+        title: "diagram.png",
+        mimeType: "image/png",
+        width: 600,
+        height: 400,
+        resolveSource: () => (pending ? { status: "pending" } : { status: "ready", src }),
+      } satisfies SidebarContent;
+      const panel = Object.assign(document.createElement("openclaw-chat-detail-panel"), {
+        content,
+      });
+      container.append(panel);
+      await vi.waitFor(() => expect(panel.querySelector('[role="status"]')).not.toBeNull());
+      const presentation = panel.querySelector('[role="status"]');
+      const header = panel.querySelector(".chat-assistant-attachment-card__header");
+      pending = false;
+      panel.content = { ...panel.content };
+      const image = await vi.waitFor(() =>
+        expectDefined(panel.querySelector(".sidebar-attachment-preview__image"), "Preview image"),
       );
-      expect(current).not.toBe(image);
-      return current;
-    });
-    image.dispatchEvent(new Event("load"));
-    expect(next.hasAttribute("data-preview")).toBe(false);
-    panel.remove();
-    next.dispatchEvent(new Event("load"));
-    container.append(panel);
-    expect(next.getAttribute("data-preview")).toBe("ready");
-  });
+      expect(panel.querySelector('[role="status"]')).toBe(presentation);
+      expect(panel.querySelector(".chat-assistant-attachment-card__header")).toBe(header);
+      image.dispatchEvent(new Event(outcome));
+      expect(image.getAttribute("data-preview")).toBe("error");
+      src = "/next.png";
+      panel.content = { ...panel.content };
+      const next = await vi.waitFor(() => {
+        const current = expectDefined(
+          panel.querySelector(".sidebar-attachment-preview__image"),
+          "Next preview image",
+        );
+        expect(current).not.toBe(image);
+        return current;
+      });
+      image.dispatchEvent(new Event("load"));
+      expect(next.hasAttribute("data-preview")).toBe(false);
+      panel.remove();
+      next.dispatchEvent(new Event("load"));
+      container.append(panel);
+      expect(next.getAttribute("data-preview")).toBe("ready");
+      panel.remove();
+    },
+  );
 
   it.each([
-    { title: "vector.svg", mimeType: "image/svg+xml", src: "https://x.test/a.svg" },
-    { title: "diagram", mimeType: undefined, src: "https://x.test/a.svg" },
+    { title: "vector.svg", mimeType: "image/svg+xml", src: "https://cdn.example/vector.svg" },
+    { title: "diagram", mimeType: undefined, src: "https://cdn.example/vector.svg" },
     {
       title: "vector.svg",
       mimeType: "application/octet-stream",
-      src: "https://x.test/opaque",
+      src: "https://cdn.example/download/opaque",
     },
   ])(
     "keeps external SVG attachments as Files cards with title $title and MIME $mimeType",
     async ({ title, mimeType, src }) => {
-      const panel = await mountPanel(attachment({ attachmentKind: "image", title, src, mimeType }));
+      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+      panel.content = {
+        kind: "attachment",
+        attachmentKind: "image",
+        title,
+        src,
+        mimeType,
+      };
+      container.append(panel);
+      await panel.updateComplete;
+
       expect(panel.querySelector(".sidebar-attachment-preview__image")).toBeNull();
-      expect(downloadButton(panel).getAttribute("href")).toBe(src);
+      expect(
+        panel
+          .querySelector<HTMLAnchorElement>(".chat-assistant-attachment-card__download")
+          ?.getAttribute("href"),
+      ).toBe(src);
+      panel.remove();
     },
   );
 
   it("keeps a canvas scripts ceiling under a trusted global sandbox", async () => {
+    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+    panel.embedSandboxMode = "trusted";
+    panel.canvasPluginSurfaceUrl = "https://canvas.example";
     const content = {
       kind: "canvas",
       docId: "preview-1",
@@ -461,31 +599,57 @@ describe("markdown sidebar", () => {
       entryUrl: "https://canvas.example/previews/preview-1",
       sandbox: "scripts",
     } satisfies SidebarContent;
-    const panel = await mountPanel(content, {
-      embedSandboxMode: "trusted",
-      canvasPluginSurfaceUrl: "https://canvas.example",
-    });
+    panel.content = content;
+    container.append(panel);
+    await panel.updateComplete;
+
     const frame = panel.querySelector("iframe");
     expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame?.getAttribute("sandbox")).not.toContain("allow-same-origin");
+
     panel.content = { ...content, title: "Renamed preview" };
     await panel.updateComplete;
     expect(panel.querySelector("iframe")).toBe(frame);
     expect(frame?.title).toBe("Renamed preview");
+
     panel.content = { ...content, sandbox: "strict" };
     await panel.updateComplete;
     expect(panel.querySelector("iframe")).not.toBe(frame);
     expect(panel.querySelector("iframe")?.getAttribute("sandbox")).toBe("");
+    panel.remove();
   });
 });
 
 describe("file sidebar clipboard feedback", () => {
   const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
 
-  const mountFilePanel = () => mountPanel(file());
+  type FilePanel = HTMLElement & {
+    content: unknown;
+    updateComplete: Promise<unknown>;
+  };
 
-  const findCopyButton = (panel: DetailPanel, label: string) =>
-    expectDefined(query<HTMLButtonElement>(panel, `button[aria-label="${label}"]`), label);
+  async function mountFilePanel(): Promise<FilePanel> {
+    const panel = document.createElement("openclaw-chat-detail-panel") as FilePanel;
+    panel.content = {
+      kind: "file",
+      path: "src/example.ts",
+      name: "example.ts",
+      content: "const answer = 42;",
+    };
+    container.append(panel);
+    await panel.updateComplete;
+    return panel;
+  }
+
+  function findCopyButton(panel: FilePanel, label: string): HTMLButtonElement {
+    const button = Array.from(panel.querySelectorAll<HTMLButtonElement>("button")).find(
+      (candidate) => candidate.getAttribute("aria-label") === label,
+    );
+    if (!button) {
+      throw new Error(`Missing sidebar button: ${label}`);
+    }
+    return button;
+  }
 
   function denyClipboard() {
     const writeText = vi.fn().mockRejectedValue(new DOMException("Clipboard access denied"));
@@ -530,15 +694,23 @@ describe("file sidebar clipboard feedback", () => {
   it("ignores an older successful path copy after a failed retry", async () => {
     const label = "Copy path";
     const { writeText } = denyClipboard();
-    const first = createDeferred<void>();
-    writeText.mockReturnValueOnce(first.promise);
+    let finishFirstCopy = () => {};
+    writeText.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishFirstCopy = resolve;
+      }),
+    );
     const panel = await mountFilePanel();
     const button = findCopyButton(panel, label);
+
     button.click();
     button.click();
     await vi.waitFor(() => expect(button.getAttribute("aria-label")).toBe("Copy failed"));
-    first.resolve();
-    await settle(panel);
+    finishFirstCopy();
+    await Promise.resolve();
+    await Promise.resolve();
+    await panel.updateComplete;
+
     expect(writeText).toHaveBeenCalledTimes(2);
     expect(button.getAttribute("aria-label")).toBe("Copy failed");
     expect(panel.querySelector('[role="alert"]')?.textContent).toContain("Copy failed");
@@ -550,17 +722,20 @@ describe("file sidebar clipboard feedback", () => {
     const pathButton = findCopyButton(panel, "Copy path");
     const contentsButton = findCopyButton(panel, "Copy file contents");
     const timers = captureFeedbackTimers();
+
     pathButton.click();
     contentsButton.click();
     await vi.waitFor(() => {
       expect(pathButton.getAttribute("aria-label")).toBe("Copy failed");
       expect(contentsButton.getAttribute("aria-label")).toBe("Copy failed");
     });
+
     timers.run(2_000);
     await panel.updateComplete;
     expect(pathButton.getAttribute("aria-label")).toBe("Copy path");
     expect(contentsButton.getAttribute("aria-label")).toBe("Copy failed");
     expect(panel.querySelector('[role="alert"]')?.textContent).toContain("Copy failed");
+
     timers.run(2_000, 1);
     await panel.updateComplete;
     expect(contentsButton.getAttribute("aria-label")).toBe("Copy file contents");
@@ -570,56 +745,90 @@ describe("file sidebar clipboard feedback", () => {
   it.each(["file selection", "disconnection"])(
     "ignores a delayed successful copy after %s changes its owner",
     async (change) => {
-      const pending = createDeferred<void>();
-      const writeText = vi.fn(() => pending.promise);
+      let finishCopy = () => {};
+      const writeText = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finishCopy = resolve;
+          }),
+      );
       vi.stubGlobal("navigator", { clipboard: { writeText } });
       const panel = await mountFilePanel();
       const button = findCopyButton(panel, "Copy file contents");
       const timers = captureFeedbackTimers();
+
       button.click();
       if (change === "file selection") {
-        panel.content = file("src/next.ts", "const next = true;");
+        panel.content = {
+          kind: "file",
+          path: "src/next.ts",
+          name: "next.ts",
+          content: "const next = true;",
+        };
         await panel.updateComplete;
       } else {
         panel.remove();
       }
-      pending.resolve();
-      await settle(panel);
+      finishCopy();
+      await Promise.resolve();
+      await Promise.resolve();
+      await panel.updateComplete;
+
       expect(timers.schedule.mock.calls.some(([, delay]) => delay === 1_500)).toBe(false);
       expect(button.getAttribute("aria-label")).toBe("Copy file contents");
       expect(panel.querySelector('[role="alert"]')).toBeNull();
     },
   );
 
-  it.each([false, true])(
-    "restores idle feedback on reconnection with a pending copy: %s",
-    async (pendingCopy) => {
-      const label = "Copy file contents";
-      const pending = createDeferred<void>();
-      const writeText = vi.fn(() => pending.promise);
-      vi.stubGlobal("navigator", { clipboard: { writeText } });
-      const panel = await mountFilePanel();
-      const button = findCopyButton(panel, label);
-      const timers = captureFeedbackTimers();
-      button.click();
-      if (!pendingCopy) {
-        pending.resolve();
-        await vi.waitFor(() => expect(button.getAttribute("aria-label")).toBe("Copied!"));
-        timers.schedule.mockClear();
-      }
-      panel.remove();
-      // Let the bridge retire the disconnected root before reconnecting this host.
-      await Promise.resolve();
-      container.append(panel);
-      await panel.updateComplete;
-      pending.resolve();
-      await settle(panel);
-      expect(findCopyButton(panel, label).getAttribute("aria-label")).toBe(label);
-      expect(findCopyButton(panel, label).classList.contains("copied")).toBe(false);
-      expect(timers.schedule.mock.calls.some(([, delay]) => delay === 1_500)).toBe(false);
-      expect(panel.querySelector('[role="alert"]')).toBeNull();
-    },
-  );
+  it("restores idle contents feedback when the same sidebar reconnects", async () => {
+    const label = "Copy file contents";
+    vi.stubGlobal("navigator", {
+      clipboard: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
+    const panel = await mountFilePanel();
+    const button = findCopyButton(panel, label);
+
+    button.click();
+    await vi.waitFor(() => expect(button.getAttribute("aria-label")).toBe("Copied!"));
+
+    panel.remove();
+    // Let the bridge retire the disconnected root before reconnecting this host.
+    await Promise.resolve();
+    container.append(panel);
+    await panel.updateComplete;
+
+    expect(findCopyButton(panel, label).classList.contains("copied")).toBe(false);
+    expect(panel.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("ignores an older contents copy after sidebar reconnection", async () => {
+    const label = "Copy file contents";
+    let finishCopy = () => {};
+    const writeText = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishCopy = resolve;
+        }),
+    );
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const panel = await mountFilePanel();
+    const button = findCopyButton(panel, label);
+    const timers = captureFeedbackTimers();
+
+    button.click();
+    panel.remove();
+    await Promise.resolve();
+    container.append(panel);
+    await panel.updateComplete;
+    finishCopy();
+    await Promise.resolve();
+    await Promise.resolve();
+    await panel.updateComplete;
+
+    expect(findCopyButton(panel, label).getAttribute("aria-label")).toBe(label);
+    expect(timers.schedule.mock.calls.some(([, delay]) => delay === 1_500)).toBe(false);
+    expect(panel.querySelector('[role="alert"]')).toBeNull();
+  });
 });
 
 describe("file sidebar HTML preview ownership", () => {

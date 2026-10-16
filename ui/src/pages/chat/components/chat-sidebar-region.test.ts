@@ -92,28 +92,6 @@ function root(region: Region): HTMLElement {
   return region.parentElement!;
 }
 
-function query<T extends Element = HTMLElement>(region: Region, selector: string) {
-  return root(region).querySelector<T>(selector);
-}
-
-async function updateRegion(region: Region, changes: Partial<Region>) {
-  Object.assign(region, changes);
-  await region.updateComplete;
-}
-
-function nativeClose(detail?: { browserScope: string }) {
-  const event = new CustomEvent("openclaw:native-close-focused-panel", {
-    cancelable: true,
-    detail,
-  });
-  window.dispatchEvent(event);
-  return event;
-}
-
-function pointAt(target: Element) {
-  target.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
-}
-
 afterEach(() => {
   for (const region of regions.splice(0)) {
     region.parentElement?.remove();
@@ -127,7 +105,9 @@ describe("chat sidebar region", () => {
       expanded: true,
       expandedSide: true,
     });
-    const tab = query<HTMLElement>(region, '.tabstrip-tab[data-tab-value="workspace"]')!;
+    const tab = root(region).querySelector<HTMLElement>(
+      '.tabstrip-tab[data-tab-value="workspace"]',
+    )!;
     tab.click();
     tab.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     tab.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
@@ -145,15 +125,18 @@ describe("chat sidebar region", () => {
     const dashboard = layout.columns[0]!.panels.find((panel) => panel.slot === "dashboard")!;
     const region = await createRegion(promoteSidebarPanel(layout, dashboard.id));
     const label = () =>
-      query(region, '.tabstrip-tab[data-tab-value="conversation"] .tabstrip-tab__label');
+      root(region).querySelector(
+        '.tabstrip-tab[data-tab-value="conversation"] .tabstrip-tab__label',
+      );
     expect(label()?.textContent).toBe("Chat");
 
-    await updateRegion(region, {
+    Object.assign(region, {
       conversationTab: {
         label: "Research assistant",
         avatar: { id: "research-assistant", textAvatar: "🦉" },
       },
     });
+    await region.updateComplete;
     expect(label()?.textContent).toBe("Research assistant");
     const icon = root(region).querySelector(
       '.tabstrip-tab[data-tab-value="conversation"] .identity-avatar--agent',
@@ -190,17 +173,18 @@ describe("chat sidebar region", () => {
     await region.updateComplete;
     expect(label()?.textContent).toBe("Chat");
     expect(
-      query(region, '.tabstrip-tab[data-tab-value="conversation"]')?.querySelector(
-        "openclaw-tooltip",
-      )?.content,
+      root(region)
+        .querySelector('.tabstrip-tab[data-tab-value="conversation"]')
+        ?.querySelector("openclaw-tooltip")?.content,
     ).toBe("Chat");
 
-    await updateRegion(region, {
+    Object.assign(region, {
       conversationTab: {
         label: "Planning assistant",
         avatar: { id: "planning-assistant", textAvatar: "🦊" },
       },
     });
+    await region.updateComplete;
     expect(label()?.textContent).toBe("Planning assistant");
     expect(
       root(region)
@@ -218,7 +202,8 @@ describe("chat sidebar region", () => {
       vi.useRealTimers();
     });
     const region = await createRegion();
-    await updateRegion(region, { narrow: true });
+    region.narrow = true;
+    await region.updateComplete;
     const shell = root(region);
     const primary = shell.querySelector<HTMLElement>(".sidebar-region__primary")!;
     const panel = shell.querySelector<HTMLElement>(".side-panel__panel")!;
@@ -239,7 +224,8 @@ describe("chat sidebar region", () => {
     commits.length = 0;
 
     for (let index = 0; index < 4; index++) {
-      await updateRegion(region, { layout: { ...region.layout } });
+      region.layout = { ...region.layout };
+      await region.updateComplete;
     }
     expect(measure).not.toHaveBeenCalled();
     expect(commits).toEqual([]);
@@ -250,12 +236,14 @@ describe("chat sidebar region", () => {
     // Swapping content can keep the total width while changing each transcript.
     mainWidth = 400;
     sideWidth = 800;
-    await updateRegion(region, { layout: { ...region.layout } });
+    region.layout = { ...region.layout };
+    await region.updateComplete;
     vi.advanceTimersToNextFrame();
     expect(commits).toEqual([false, true]);
 
     measure.mockClear();
-    await updateRegion(region, { layout: { ...region.layout } });
+    region.layout = { ...region.layout };
+    await region.updateComplete;
     shell.remove();
     vi.advanceTimersToNextFrame();
     expect(measure).not.toHaveBeenCalled();
@@ -277,30 +265,40 @@ describe("chat sidebar region", () => {
       region.layout = closeSlot(region.layout, slot);
     };
     await region.updateComplete;
-    query(region, "textarea")!.focus();
+    root(region).querySelector("textarea")!.focus();
 
-    const command = nativeClose();
+    const command = new CustomEvent("openclaw:native-close-focused-panel", { cancelable: true });
+    window.dispatchEvent(command);
     expect(command.defaultPrevented).toBe(true);
     await region.updateComplete;
     expect(region.layout.columns[0]?.panels.map((panel) => panel.slot)).toEqual(["workspace"]);
     expect(region.layout.open).toBe(true);
 
-    const nextCommand = nativeClose();
+    const nextCommand = new CustomEvent("openclaw:native-close-focused-panel", {
+      cancelable: true,
+    });
+    window.dispatchEvent(nextCommand);
     expect(nextCommand.defaultPrevented).toBe(true);
     expect(region.layout.open).toBe(false);
   });
 
   it("yields native Close after pointer focus moves from Side chat to main or outside", async () => {
     const region = await createRegion();
-    const side = query<HTMLElement>(region, '[data-panel-slot="detail"]')!;
-    pointAt(side);
-    const main = query<HTMLElement>(region, "[data-primary]")!;
-    pointAt(main);
-    const mainCommand = nativeClose();
+    const side = root(region).querySelector<HTMLElement>('[data-panel-slot="detail"]')!;
+    side.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    const main = root(region).querySelector<HTMLElement>("[data-primary]")!;
+    main.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    const mainCommand = new CustomEvent("openclaw:native-close-focused-panel", {
+      cancelable: true,
+    });
+    window.dispatchEvent(mainCommand);
     expect(mainCommand.defaultPrevented).toBe(false);
-    pointAt(side);
-    pointAt(document.body);
-    const outsideCommand = nativeClose();
+    side.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    document.body.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    const outsideCommand = new CustomEvent("openclaw:native-close-focused-panel", {
+      cancelable: true,
+    });
+    window.dispatchEvent(outsideCommand);
     expect(outsideCommand.defaultPrevented).toBe(false);
     expect(region.callbacks!.closeSlot).not.toHaveBeenCalled();
   });
@@ -311,14 +309,18 @@ describe("chat sidebar region", () => {
       "detail",
     );
     const region = await createRegion(layout);
-    const main = query<HTMLElement>(region, '[data-panel-slot="detail"]')!;
-    pointAt(main);
-    const mainCommand = nativeClose();
+    const main = root(region).querySelector<HTMLElement>('[data-panel-slot="detail"]')!;
+    main.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    const mainCommand = new CustomEvent("openclaw:native-close-focused-panel", {
+      cancelable: true,
+    });
+    window.dispatchEvent(mainCommand);
     expect(mainCommand.defaultPrevented).toBe(false);
-    const conversation = query<HTMLElement>(region, ".sidebar-region__primary")!;
+    const conversation = root(region).querySelector<HTMLElement>(".sidebar-region__primary")!;
     conversation.dataset.region = "side";
-    pointAt(conversation);
-    const command = nativeClose();
+    conversation.dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    const command = new CustomEvent("openclaw:native-close-focused-panel", { cancelable: true });
+    window.dispatchEvent(command);
     expect(command.defaultPrevented).toBe(true);
     expect(region.callbacks!.closeSlot).toHaveBeenCalledExactlyOnceWith("conversation");
   });
@@ -335,8 +337,14 @@ describe("chat sidebar region", () => {
       }),
     );
     await region.updateComplete;
-    pointAt(query(other, "[data-panel-slot]")!);
-    const command = nativeClose({ browserScope: "native-owner" });
+    root(other)
+      .querySelector("[data-panel-slot]")!
+      .dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
+    const command = new CustomEvent("openclaw:native-close-focused-panel", {
+      cancelable: true,
+      detail: { browserScope: "native-owner" },
+    });
+    window.dispatchEvent(command);
     expect(command.defaultPrevented).toBe(true);
     expect(region.callbacks!.closeSlot).toHaveBeenCalledExactlyOnceWith("browser");
     expect(other.callbacks!.closeSlot).not.toHaveBeenCalled();
@@ -346,7 +354,9 @@ describe("chat sidebar region", () => {
     "does not claim native Close from a %s retained panel",
     async (state) => {
       const region = await createRegion();
-      pointAt(query(region, "[data-panel-slot]")!);
+      root(region)
+        .querySelector("[data-panel-slot]")!
+        .dispatchEvent(new Event("pointerdown", { bubbles: true, composed: true }));
       if (state === "hidden") {
         root(region).hidden = true;
       }
@@ -356,7 +366,8 @@ describe("chat sidebar region", () => {
       if (state === "disconnected") {
         root(region).remove();
       }
-      const command = nativeClose();
+      const command = new CustomEvent("openclaw:native-close-focused-panel", { cancelable: true });
+      window.dispatchEvent(command);
       expect(command.defaultPrevented).toBe(false);
       expect(region.callbacks!.closeSlot).not.toHaveBeenCalled();
     },
@@ -470,28 +481,41 @@ describe("chat sidebar region", () => {
     };
     await refresh();
 
-    const unavailable = query(region, `[data-panel-slot="${slot}"] openclaw-panel-empty-state`);
+    const unavailable = root(region).querySelector(
+      `[data-panel-slot="${slot}"] openclaw-panel-empty-state`,
+    );
     expect(unavailable?.textContent).toContain("The plugin that owns this tab is not active");
     expect(region.panelDefinitions.find((definition) => definition.slot === slot)?.available).toBe(
       false,
     );
     expect(region.layout).toEqual(saved);
-    query<HTMLButtonElement>(region, 'button[aria-label="Close fixture/notes"]')?.click();
+    root(region)
+      .querySelector<HTMLButtonElement>('button[aria-label="Close fixture/notes"]')
+      ?.click();
     expect(region.callbacks?.closeSlot).toHaveBeenCalledWith(slot);
 
-    query<HTMLButtonElement>(region, '.tabstrip-tab[data-tab-value="workspace"]')?.click();
+    root(region)
+      .querySelector<HTMLButtonElement>('.tabstrip-tab[data-tab-value="workspace"]')
+      ?.click();
     expect(region.callbacks?.activatePanel).toHaveBeenCalledWith("workspace");
-    await updateRegion(region, { layout: activatePanel(region.layout, "workspace") });
-    expect(query(region, '[data-panel-slot="workspace"]')?.hasAttribute("hidden")).toBe(false);
-    expect(query(region, '[data-panel="workspace"]')?.textContent).toBe("Workspace panel");
+    region.layout = activatePanel(region.layout, "workspace");
+    await region.updateComplete;
+    expect(
+      root(region).querySelector('[data-panel-slot="workspace"]')?.hasAttribute("hidden"),
+    ).toBe(false);
+    expect(root(region).querySelector('[data-panel="workspace"]')?.textContent).toBe(
+      "Workspace panel",
+    );
 
     params.pluginPanels = [entry];
     await refresh();
     expect(region.panelDefinitions.find((definition) => definition.slot === slot)?.available).toBe(
       true,
     );
-    expect(query(region, `[data-panel-slot="${slot}"] openclaw-plugin-view`)).not.toBeNull();
-    expect(query(region, 'button[aria-label="Close Fixture notes"]')).not.toBeNull();
+    expect(
+      root(region).querySelector(`[data-panel-slot="${slot}"] openclaw-plugin-view`),
+    ).not.toBeNull();
+    expect(root(region).querySelector('button[aria-label="Close Fixture notes"]')).not.toBeNull();
     expect(region.layout.columns[0]?.panels).toEqual(saved.columns[0]?.panels);
   });
 
@@ -512,9 +536,9 @@ describe("chat sidebar region", () => {
         }),
       );
       await region.updateComplete;
-      query<HTMLButtonElement>(region, ".side-panel-type-menu__trigger")!.click();
+      root(region).querySelector<HTMLButtonElement>(".side-panel-type-menu__trigger")!.click();
       await waitForSolid(() =>
-        expect(query(region, '[role="menu"]')?.matches(":popover-open")).toBe(true),
+        expect(root(region).querySelector('[role="menu"]')?.matches(":popover-open")).toBe(true),
       );
       const menuItem = Array.from(
         root(region).querySelectorAll<HTMLButtonElement>(".side-panel-type-menu__item"),
@@ -533,7 +557,7 @@ describe("chat sidebar region", () => {
 
   it("opens into a type selector instead of restoring a previous tab", async () => {
     const region = await createRegion(setSidebarOpen({ columns: [], expanded: false }, true));
-    const selector = query(region, ".side-panel-empty--selector");
+    const selector = root(region).querySelector(".side-panel-empty--selector");
 
     expect(selector?.querySelector(".side-panel-empty__title")).toBeNull();
     expect(selector?.querySelector(".side-panel-empty__description")).toBeNull();
@@ -549,7 +573,7 @@ describe("chat sidebar region", () => {
       "Side chat Ctrl+Shift+S",
       "Dashboard Ctrl+Alt+Shift+G",
     ]);
-    query<HTMLButtonElement>(region, ".side-panel-empty__type")?.click();
+    root(region).querySelector<HTMLButtonElement>(".side-panel-empty__type")?.click();
     expect(region.callbacks?.openSlot).toHaveBeenCalledWith("detail");
 
     const dashboard = Array.from(
@@ -580,12 +604,12 @@ describe("chat sidebar region", () => {
     );
     await region.updateComplete;
 
-    expect(query(region, ".side-panel-type-menu__trigger")?.getAttribute("aria-expanded")).toBe(
-      "false",
-    );
-    query<HTMLButtonElement>(region, ".side-panel-type-menu__trigger")!.click();
+    expect(
+      root(region).querySelector(".side-panel-type-menu__trigger")?.getAttribute("aria-expanded"),
+    ).toBe("false");
+    root(region).querySelector<HTMLButtonElement>(".side-panel-type-menu__trigger")!.click();
     await waitForSolid(() =>
-      expect(query(region, '[role="menu"]')?.matches(":popover-open")).toBe(true),
+      expect(root(region).querySelector('[role="menu"]')?.matches(":popover-open")).toBe(true),
     );
     expect(
       Array.from(root(region).querySelectorAll(".side-panel-type-menu__item"), (item) =>
@@ -606,10 +630,12 @@ describe("chat sidebar region", () => {
     ).find((item) => Reflect.get(item, "value") === "browser");
     expect(browserMenuItem?.querySelector('path[d="M2 12h20"]')).not.toBeNull();
 
-    await updateRegion(region, { layout: openSlot({ columns: [] }, "browser") });
-    expect(query(region, '.tabstrip-tab__icon path[d="M2 12h20"]')).not.toBeNull();
+    region.layout = openSlot({ columns: [] }, "browser");
+    await region.updateComplete;
+    expect(root(region).querySelector('.tabstrip-tab__icon path[d="M2 12h20"]')).not.toBeNull();
 
-    await updateRegion(region, { layout: { columns: [], open: true } });
+    region.layout = { columns: [], open: true };
+    await region.updateComplete;
     const browserEmptyItem = Array.from(
       root(region).querySelectorAll<HTMLElement>(".side-panel-empty__type"),
     ).find(
@@ -620,13 +646,14 @@ describe("chat sidebar region", () => {
 
   it("keeps side tab dismissal separate from task toolbar actions", async () => {
     const region = await createRegion();
-    expect(query(region, '[data-region-header="side"] .rail-header__actions')).toBeNull();
-    query<HTMLButtonElement>(region, 'button[aria-label="Close Review"]')!.click();
+    expect(
+      root(region).querySelector('[data-region-header="side"] .rail-header__actions'),
+    ).toBeNull();
+    root(region).querySelector<HTMLButtonElement>('button[aria-label="Close Review"]')!.click();
     expect(region.callbacks?.closeSlot).toHaveBeenCalledWith("detail");
-    await updateRegion(region, {
-      layout: setSidebarExpanded(promoteSidebarPanel(region.layout, "detail"), true),
-    });
-    expect(query(region, '[data-region-header="main"]')).toBeNull();
+    region.layout = setSidebarExpanded(promoteSidebarPanel(region.layout, "detail"), true);
+    await region.updateComplete;
+    expect(root(region).querySelector('[data-region-header="main"]')).toBeNull();
     expect(
       Array.from(root(region).querySelectorAll(".tabstrip-tab__label"), (node) =>
         node.textContent?.trim(),
@@ -638,9 +665,11 @@ describe("chat sidebar region", () => {
     const region = await createRegion(
       setSidebarDock(openSlot({ columns: [] }, "detail"), "bottom"),
     );
-    const primary = query<HTMLElement>(region, ".sidebar-region__primary")!;
-    const panel = query<HTMLElement>(region, '[data-region="side"]:not([hidden])')!;
-    const divider = query<HTMLElement & { orientation: string }>(region, "resizable-divider")!;
+    const primary = root(region).querySelector<HTMLElement>(".sidebar-region__primary")!;
+    const panel = root(region).querySelector<HTMLElement>('[data-region="side"]:not([hidden])')!;
+    const divider = root(region).querySelector<HTMLElement & { orientation: string }>(
+      "resizable-divider",
+    )!;
     primary.getBoundingClientRect = () => ({ height: 440 }) as DOMRect;
     panel.getBoundingClientRect = () => ({ height: 360 }) as DOMRect;
     root(region).getBoundingClientRect = () => ({ height: 800 }) as DOMRect;
@@ -650,10 +679,13 @@ describe("chat sidebar region", () => {
       new CustomEvent("resize", { bubbles: true, detail: { splitRatio: 0.5 } }),
     );
     expect(region.callbacks?.resizePanel).toHaveBeenCalledWith(region.layout.columns[0]!.id, 400);
-    await updateRegion(region, { layout: setSidebarDock(region.layout, "left") });
+    region.layout = setSidebarDock(region.layout, "left");
+    await region.updateComplete;
     primary.getBoundingClientRect = () => ({ width: 800 }) as DOMRect;
     panel.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
-    const leftDivider = query<HTMLElement & { orientation: string }>(region, "resizable-divider")!;
+    const leftDivider = root(region).querySelector<HTMLElement & { orientation: string }>(
+      "resizable-divider",
+    )!;
     expect(leftDivider.orientation).toBe("vertical");
     leftDivider.dispatchEvent(
       new CustomEvent("resize", { bubbles: true, detail: { splitRatio: 0.25 } }),
@@ -670,12 +702,16 @@ describe("chat sidebar region", () => {
       "detail",
     );
     const region = await createRegion(setSidebarOpen(layout, false));
-    expect(query(region, '[data-panel-slot="terminal"]')?.hasAttribute("hidden")).toBe(true);
-    expect(query(region, '[data-panel="terminal"]')).not.toBeNull();
-    expect(query(region, '[data-panel-slot="detail"]')?.hasAttribute("hidden")).toBe(false);
-    expect(query(region, "resizable-divider")).toBeNull();
-    expect(query(region, '[data-region-header="main"]')).toBeNull();
-    expect(query(region, "[data-primary]")).not.toBeNull();
+    expect(root(region).querySelector('[data-panel-slot="terminal"]')?.hasAttribute("hidden")).toBe(
+      true,
+    );
+    expect(root(region).querySelector('[data-panel="terminal"]')).not.toBeNull();
+    expect(root(region).querySelector('[data-panel-slot="detail"]')?.hasAttribute("hidden")).toBe(
+      false,
+    );
+    expect(root(region).querySelector("resizable-divider")).toBeNull();
+    expect(root(region).querySelector('[data-region-header="main"]')).toBeNull();
+    expect(root(region).querySelector("[data-primary]")).not.toBeNull();
   });
 
   it("retains app input and terminal content while minimizing until their tabs close", async () => {
@@ -690,29 +726,37 @@ describe("chat sidebar region", () => {
         : definition,
     );
     await region.updateComplete;
-    expect(query(region, '[data-panel-slot="dashboard"]')).toBeNull();
-    await updateRegion(region, { layout: setSidebarOpen(region.layout, true) });
-    const input = query<HTMLInputElement>(region, "input")!;
+    expect(root(region).querySelector('[data-panel-slot="dashboard"]')).toBeNull();
+    region.layout = setSidebarOpen(region.layout, true);
+    await region.updateComplete;
+    const input = root(region).querySelector<HTMLInputElement>("input")!;
     input.value = "Unsaved note";
-    const terminal = query(region, '[data-panel="terminal"]')!;
+    const terminal = root(region).querySelector('[data-panel="terminal"]')!;
 
-    await updateRegion(region, { layout: setSidebarOpen(region.layout, false) });
-    const panel = query<HTMLElement>(region, '[data-panel-slot="dashboard"]')!;
+    region.layout = setSidebarOpen(region.layout, false);
+    await region.updateComplete;
+    const panel = root(region).querySelector<HTMLElement>('[data-panel-slot="dashboard"]')!;
     expect(panel.hidden).toBe(true);
-    expect(query(region, "resizable-divider")).toBeNull();
+    expect(root(region).querySelector("resizable-divider")).toBeNull();
     expect(input.isConnected).toBe(true);
     expect(terminal.isConnected).toBe(true);
-    expect(query<HTMLElement>(region, '[data-panel-slot="terminal"]')?.hidden).toBe(true);
+    expect(root(region).querySelector<HTMLElement>('[data-panel-slot="terminal"]')?.hidden).toBe(
+      true,
+    );
 
-    await updateRegion(region, { layout: setSidebarOpen(region.layout, true) });
-    expect(query(region, "input")).toBe(input);
+    region.layout = setSidebarOpen(region.layout, true);
+    await region.updateComplete;
+    expect(root(region).querySelector("input")).toBe(input);
     expect(input.value).toBe("Unsaved note");
     expect(panel.hidden).toBe(false);
-    expect(query(region, '[data-panel="terminal"]')).toBe(terminal);
+    expect(root(region).querySelector('[data-panel="terminal"]')).toBe(terminal);
 
-    await updateRegion(region, { layout: closeSlot(region.layout, "dashboard") });
+    region.layout = closeSlot(region.layout, "dashboard");
+    await region.updateComplete;
     expect(input.isConnected).toBe(false);
-    expect(query(region, '[data-panel="terminal"]')).toBe(terminal);
-    expect(query<HTMLElement>(region, '[data-panel-slot="terminal"]')?.hidden).toBe(false);
+    expect(root(region).querySelector('[data-panel="terminal"]')).toBe(terminal);
+    expect(root(region).querySelector<HTMLElement>('[data-panel-slot="terminal"]')?.hidden).toBe(
+      false,
+    );
   });
 });

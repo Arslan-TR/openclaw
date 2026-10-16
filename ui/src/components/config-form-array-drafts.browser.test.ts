@@ -1,4 +1,4 @@
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it } from "vitest";
 import { updateConfigFormValue } from "../lib/config/config-draft-model.ts";
 import { createInitialConfigState } from "../lib/config/config-state-model.ts";
 import {
@@ -7,7 +7,7 @@ import {
 } from "../test-helpers/config-form-fixtures.tsx";
 import { flush } from "../test-helpers/solid-settle.ts";
 import type { JsonSchema } from "./config-form.shared.ts";
-import { analyzeProperties, array, object } from "./config-form.test-support.ts";
+import { analyzeConfigSchema } from "./config-form.ts";
 import baseStyles from "../styles/base.css?inline";
 
 function mountForm(
@@ -15,7 +15,10 @@ function mountForm(
   values: Record<string, unknown>,
   accepts = () => true,
 ) {
-  const analysis = analyzeProperties({ settings: object(properties) });
+  const analysis = analyzeConfigSchema({
+    type: "object",
+    properties: { settings: { type: "object", properties } },
+  });
   const state = createInitialConfigState();
   state.configForm = { settings: values };
   const container = document.createElement("div");
@@ -39,11 +42,14 @@ function mountForm(
     });
   };
   renderValue();
-  onTestFinished(() => {
-    disposeConfigFormFixture(container);
-    container.remove();
-  });
-  return { state, container };
+  return {
+    state,
+    container,
+    close: () => {
+      disposeConfigFormFixture(container);
+      container.remove();
+    },
+  };
 }
 
 describe.runIf("__vitest_browser__" in globalThis)("config array row drafts", () => {
@@ -54,53 +60,62 @@ describe.runIf("__vitest_browser__" in globalThis)("config array row drafts", ()
       const objectRows = scenario !== "scalar removal";
       const initial = objectRows ? [{ name: "First" }, { name: "Second" }] : ["alpha", "beta"];
       const item = { type: "string", minLength: 2 };
-      const { state, container } = mountForm(
+      const { state, container, close } = mountForm(
         {
           enabled: { type: "boolean" },
-          values: array(objectRows ? object({ name: item }) : item),
+          values: {
+            type: "array",
+            items: objectRows ? { type: "object", properties: { name: item } } : item,
+          },
         },
         { enabled: false, values: initial },
       );
-      const inputs = () =>
-        Array.from(container.querySelectorAll<HTMLInputElement>(".cfg-array input.settings-input"));
-      const second = inputs()[1]!;
-      await page.elementLocator(second).fill("x");
-      expect(second.getAttribute("aria-invalid")).toBe("true");
-      const blurred = new Promise<void>((resolve) => {
-        second.addEventListener("blur", () => resolve(), { once: true });
-      });
-      const action = container.querySelector<HTMLElement>(
-        scenario === "unrelated edit"
-          ? '.settings-toggle__input[role="switch"]'
-          : "button[aria-label='Remove item']",
-      )!;
-      await page.elementLocator(action).click();
-      await blurred;
-      const values = scenario === "unrelated edit" ? initial : initial.slice(1);
-      await expect
-        .poll(() => state.configForm)
-        .toEqual({
-          settings: { enabled: scenario === "unrelated edit", values },
+      try {
+        const inputs = () =>
+          Array.from(
+            container.querySelectorAll<HTMLInputElement>(".cfg-array input.settings-input"),
+          );
+        const second = inputs()[1]!;
+        await page.elementLocator(second).fill("x");
+        expect(second.getAttribute("aria-invalid")).toBe("true");
+        const blurred = new Promise<void>((resolve) => {
+          second.addEventListener("blur", () => resolve(), { once: true });
         });
-      const surviving = inputs()[scenario === "unrelated edit" ? 1 : 0]!;
-      expect(surviving.value).toBe("x");
-      expect(surviving.getAttribute("aria-invalid")).toBe("true");
-      if (scenario !== "unrelated edit") {
+        const action = container.querySelector<HTMLElement>(
+          scenario === "unrelated edit"
+            ? '.settings-toggle__input[role="switch"]'
+            : "button[aria-label='Remove item']",
+        )!;
+        await page.elementLocator(action).click();
+        await blurred;
+        const values = scenario === "unrelated edit" ? initial : initial.slice(1);
         await expect
-          .poll(() => container.querySelector(".cfg-array")?.contains(document.activeElement))
-          .toBe(true);
+          .poll(() => state.configForm)
+          .toEqual({
+            settings: { enabled: scenario === "unrelated edit", values },
+          });
+        const surviving = inputs()[scenario === "unrelated edit" ? 1 : 0]!;
+        expect(surviving.value).toBe("x");
+        expect(surviving.getAttribute("aria-invalid")).toBe("true");
+        if (scenario !== "unrelated edit") {
+          await expect
+            .poll(() => container.querySelector(".cfg-array")?.contains(document.activeElement))
+            .toBe(true);
+        }
+        await page.elementLocator(surviving).fill("Repaired");
+        expect(surviving.getAttribute("aria-invalid")).toBe("false");
+        expect(state.configForm).toEqual({
+          settings: {
+            enabled: scenario === "unrelated edit",
+            values: [
+              ...(scenario === "unrelated edit" ? initial.slice(0, 1) : []),
+              objectRows ? { name: "Repaired" } : "Repaired",
+            ],
+          },
+        });
+      } finally {
+        close();
       }
-      await page.elementLocator(surviving).fill("Repaired");
-      expect(surviving.getAttribute("aria-invalid")).toBe("false");
-      expect(state.configForm).toEqual({
-        settings: {
-          enabled: scenario === "unrelated edit",
-          values: [
-            ...(scenario === "unrelated edit" ? initial.slice(0, 1) : []),
-            objectRows ? { name: "Repaired" } : "Repaired",
-          ],
-        },
-      });
     },
   );
 
@@ -111,48 +126,61 @@ describe.runIf("__vitest_browser__" in globalThis)("config array row drafts", ()
       const text = { type: "string", minLength: 2, pattern: "^[a-z]+$" };
       const child: JsonSchema =
         kind === "array"
-          ? array(text)
+          ? { type: "array", items: text }
           : kind === "map"
             ? { type: "object", additionalProperties: text }
-            : object({ first: text, second: text }, { required: ["first", "second"] });
+            : {
+                type: "object",
+                properties: { first: text, second: text },
+                required: ["first", "second"],
+              };
       const initial = ["First", "Second"].map((name) =>
         kind === "object" ? { name } : { name, child: kind === "array" ? [] : {} },
       );
-      const { state, container } = mountForm(
+      const { state, container, close } = mountForm(
         {
-          values: array(object({ name: { type: "string" }, child })),
+          values: {
+            type: "array",
+            items: { type: "object", properties: { name: { type: "string" }, child } },
+          },
         },
         { values: initial },
       );
-      const hostSelector =
-        kind === "object"
-          ? "openclaw-config-form-structured-draft"
-          : "openclaw-config-form-collection-draft";
-      const draft = Array.from(container.querySelectorAll<HTMLElement>(hostSelector)).at(-1)!;
-      flush();
-      const details = draft.querySelector("details") ?? draft.closest("details");
-      if (details && !details.open) {
-        await page.elementLocator(details.querySelector("summary")!).click();
-      }
-      if (kind !== "object") {
+      try {
+        const hostSelector =
+          kind === "object"
+            ? "openclaw-config-form-structured-draft"
+            : "openclaw-config-form-collection-draft";
+        const draft = Array.from(container.querySelectorAll<HTMLElement>(hostSelector)).at(-1)!;
+        flush();
+        const details = draft.querySelector("details") ?? draft.closest("details");
+        if (details && !details.open) {
+          await page.elementLocator(details.querySelector("summary")!).click();
+        }
+        if (kind !== "object") {
+          await page
+            .elementLocator(draft.closest(".cfg-block")!.querySelector("button[aria-controls]")!)
+            .click();
+        }
+        const inputSelector = kind === "object" ? "input" : "[data-collection-draft-value]";
+        await expect.poll(() => draft.querySelector(inputSelector)).not.toBeNull();
+        const draftText = kind === "object" ? "draft" : "x";
+        await page.elementLocator(draft.querySelector(inputSelector)!).fill(draftText);
         await page
-          .elementLocator(draft.closest(".cfg-block")!.querySelector("button[aria-controls]")!)
+          .elementLocator(container.querySelector("button[aria-label='Remove item']")!)
           .click();
+        await expect
+          .poll(() => state.configForm)
+          .toEqual({ settings: { values: initial.slice(1) } });
+        await expect
+          .poll(
+            () =>
+              container.querySelector<HTMLInputElement>(`${hostSelector} ${inputSelector}`)?.value,
+          )
+          .toBe(draftText);
+      } finally {
+        close();
       }
-      const inputSelector = kind === "object" ? "input" : "[data-collection-draft-value]";
-      await expect.poll(() => draft.querySelector(inputSelector)).not.toBeNull();
-      const draftText = kind === "object" ? "draft" : "x";
-      await page.elementLocator(draft.querySelector(inputSelector)!).fill(draftText);
-      await page
-        .elementLocator(container.querySelector("button[aria-label='Remove item']")!)
-        .click();
-      await expect.poll(() => state.configForm).toEqual({ settings: { values: initial.slice(1) } });
-      await expect
-        .poll(
-          () =>
-            container.querySelector<HTMLInputElement>(`${hostSelector} ${inputSelector}`)?.value,
-        )
-        .toBe(draftText);
     },
   );
 });
@@ -184,28 +212,32 @@ async function focusRemoveControl(container: HTMLElement, button: HTMLButtonElem
 describe.runIf("__vitest_browser__" in globalThis)("config collection removal focus", () => {
   it("moves keyboard focus to the next row, the previous row, then Add after list removals", async () => {
     const { userEvent } = await import("vitest/browser");
-    const { state, container } = mountForm(
-      { values: array({ type: "string" }) },
+    const { state, container, close } = mountForm(
+      { values: { type: "array", items: { type: "string" } } },
       { values: ["alpha", "beta", "gamma"] },
     );
-    const [alpha, beta, gamma] = removeControls(container, "Remove item");
-    await focusRemoveControl(container, beta);
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: ["alpha", "gamma"] } });
-    expect(document.activeElement).toBe(gamma);
+    try {
+      const [alpha, beta, gamma] = removeControls(container, "Remove item");
+      await focusRemoveControl(container, beta);
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: ["alpha", "gamma"] } });
+      expect(document.activeElement).toBe(gamma);
 
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: ["alpha"] } });
-    expect(document.activeElement).toBe(alpha);
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: ["alpha"] } });
+      expect(document.activeElement).toBe(alpha);
 
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: [] } });
-    expect(document.activeElement).toBe(addControl(container));
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: [] } });
+      expect(document.activeElement).toBe(addControl(container));
+    } finally {
+      close();
+    }
   });
 
   it("keeps keyboard focus on a surviving entry, then Add entry after map removals", async () => {
     const { userEvent } = await import("vitest/browser");
-    const { state, container } = mountForm(
+    const { state, container, close } = mountForm(
       { values: { type: "object", additionalProperties: { type: "string" } } },
       { values: { alpha: "a", beta: "b", gamma: "c" } },
     );
@@ -213,51 +245,65 @@ describe.runIf("__vitest_browser__" in globalThis)("config collection removal fo
       document.activeElement
         ?.closest(".settings-row")
         ?.querySelector<HTMLInputElement>("input[aria-label^='Key: ']")?.value;
-    await focusRemoveControl(container, removeControls(container, "Remove entry")[1]);
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: { alpha: "a", gamma: "c" } } });
-    expect(document.activeElement?.getAttribute("aria-label")).toBe("Remove entry");
-    expect(focusedKey()).toBe("gamma");
+    try {
+      await focusRemoveControl(container, removeControls(container, "Remove entry")[1]);
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: { alpha: "a", gamma: "c" } } });
+      expect(document.activeElement?.getAttribute("aria-label")).toBe("Remove entry");
+      expect(focusedKey()).toBe("gamma");
 
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: { alpha: "a" } } });
-    expect(document.activeElement?.getAttribute("aria-label")).toBe("Remove entry");
-    expect(focusedKey()).toBe("alpha");
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: { alpha: "a" } } });
+      expect(document.activeElement?.getAttribute("aria-label")).toBe("Remove entry");
+      expect(focusedKey()).toBe("alpha");
 
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: {} } });
-    expect(document.activeElement).toBe(addControl(container));
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: {} } });
+      expect(document.activeElement).toBe(addControl(container));
+    } finally {
+      close();
+    }
   });
 
   it("keeps focus on the outer list when a removed row contains a nested list", async () => {
     const { userEvent } = await import("vitest/browser");
-    const { state, container } = mountForm(
+    const { state, container, close } = mountForm(
       {
-        values: array(object({ tags: array({ type: "string" }) })),
+        values: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { tags: { type: "array", items: { type: "string" } } },
+          },
+        },
       },
       { values: [{ tags: ["x"] }, { tags: ["y"] }] },
     );
-    const outer = container.querySelector(".cfg-array");
-    if (!outer) {
-      throw new Error("missing outer list");
-    }
-    const outerControls = (selector: string) =>
-      Array.from(outer.querySelectorAll<HTMLButtonElement>(selector)).filter(
-        (button) => button.closest(".cfg-array") === outer,
-      );
-    const [first, second] = outerControls("button[aria-label='Remove item']");
-    await focusRemoveControl(container, second);
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: [{ tags: ["x"] }] } });
-    expect(document.activeElement).toBe(first);
+    try {
+      const outer = container.querySelector(".cfg-array");
+      if (!outer) {
+        throw new Error("missing outer list");
+      }
+      const outerControls = (selector: string) =>
+        Array.from(outer.querySelectorAll<HTMLButtonElement>(selector)).filter(
+          (button) => button.closest(".cfg-array") === outer,
+        );
+      const [first, second] = outerControls("button[aria-label='Remove item']");
+      await focusRemoveControl(container, second);
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: [{ tags: ["x"] }] } });
+      expect(document.activeElement).toBe(first);
 
-    await userEvent.keyboard("{Enter}");
-    expect(state.configForm).toEqual({ settings: { values: [] } });
-    expect(document.activeElement).toBe(outerControls("button[aria-controls]")[0]);
+      await userEvent.keyboard("{Enter}");
+      expect(state.configForm).toEqual({ settings: { values: [] } });
+      expect(document.activeElement).toBe(outerControls("button[aria-controls]")[0]);
+    } finally {
+      close();
+    }
   });
 
   it.each([
-    ["list", array({ type: "string" }), ["alpha", "beta"], "Remove item"],
+    ["list", { type: "array", items: { type: "string" } }, ["alpha", "beta"], "Remove item"],
     [
       "map",
       { type: "object", additionalProperties: { type: "string" } },
@@ -268,16 +314,20 @@ describe.runIf("__vitest_browser__" in globalThis)("config collection removal fo
     "keeps focus on the %s Remove control when its owner rejects the removal",
     async (_kind, schema, values, label) => {
       const { userEvent } = await import("vitest/browser");
-      const { state, container } = mountForm(
+      const { state, container, close } = mountForm(
         { values: schema as JsonSchema },
         { values },
         () => false,
       );
-      const remove = removeControls(container, label)[0];
-      await focusRemoveControl(container, remove);
-      await userEvent.keyboard("{Enter}");
-      expect(state.configForm).toEqual({ settings: { values } });
-      expect(document.activeElement).toBe(remove);
+      try {
+        const remove = removeControls(container, label)[0];
+        await focusRemoveControl(container, remove);
+        await userEvent.keyboard("{Enter}");
+        expect(state.configForm).toEqual({ settings: { values } });
+        expect(document.activeElement).toBe(remove);
+      } finally {
+        close();
+      }
     },
   );
 });

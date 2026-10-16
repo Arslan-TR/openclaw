@@ -3,7 +3,6 @@ import path from "node:path";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { expectObjectFields } from "../test-utils/mock-call-assertions.js";
 import { recordPluginCandidateInstallOwner } from "./candidate-install-owner.js";
 import type { PluginCandidate } from "./discovery.js";
 import { resolveInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
@@ -259,12 +258,12 @@ describe("installed plugin index", () => {
       installRecords: {},
     });
 
-    expectObjectFields(records[0], {
+    expect(records[0]).toMatchObject({
       pluginId: id,
       compat: [],
       startup: { sidecar: false },
-      installRecordHash: undefined,
     });
+    expect(records[0]?.installRecordHash).toBeUndefined();
   });
 
   it("changes manifestless Claude bundle hashes when derived metadata changes", () => {
