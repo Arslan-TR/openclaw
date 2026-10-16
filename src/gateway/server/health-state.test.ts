@@ -169,12 +169,16 @@ describe("refreshGatewayHealthSnapshot", () => {
     const version = healthState.getHealthVersion();
     const passive = await startRefresh(false);
     const probe = await startRefresh(true);
+    const duplicate = healthState.refreshGatewayHealthSnapshot({ probe: true });
 
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
     expectCollection(0, { audience: "public", probe: false, runtimeSnapshot: undefined });
     expectCollection(1, { audience: "public", probe: true, runtimeSnapshot: undefined });
     probe.finish();
-    await expect(probe.result).resolves.toBe(probe.summary);
+    await expect(Promise.all([probe.result, duplicate])).resolves.toEqual([
+      probe.summary,
+      probe.summary,
+    ]);
     expect(healthState.getHealthCache()).toBe(probe.summary);
     expect(healthState.getHealthVersion()).toBe(version + 1);
     expect(broadcast).toHaveBeenCalledTimes(1);
@@ -189,19 +193,11 @@ describe("refreshGatewayHealthSnapshot", () => {
       passive.summary,
     ]);
   });
-  it("coalesces concurrent explicit probe waiters", async () => {
-    const probe = await startRefresh(true);
-    const second = healthState.refreshGatewayHealthSnapshot({ probe: true });
-    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(1);
-    probe.finish();
-    await expect(Promise.all([probe.result, second])).resolves.toEqual([
-      probe.summary,
-      probe.summary,
-    ]);
-  });
-  it("retains a displaced passive refresh after a faster probe settles", async () => {
+  it("retains passive waiters and recovers a rejected probe lane", async () => {
     const passive = await startRefresh(false);
     const probe = await startRefresh(true);
+    const recovered = createHealthSummary();
+    collectGatewayHealthSnapshotMock.mockResolvedValueOnce(recovered);
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
     probe.reject(new Error("probe failed"));
     await expect(probe.result).rejects.toThrow("probe failed");
@@ -213,6 +209,12 @@ describe("refreshGatewayHealthSnapshot", () => {
       passive.summary,
       passive.summary,
     ]);
+    expect(healthState.getHealthCache()).toBe(passive.summary);
+    await expect(healthState.refreshGatewayHealthSnapshot({ probe: true })).resolves.toBe(
+      recovered,
+    );
+    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(3);
+    expect(healthState.getHealthCache()).toBe(recovered);
   });
   it.each([
     { includeSensitive: false, reset: false },
@@ -352,23 +354,5 @@ describe("refreshGatewayHealthSnapshot", () => {
     ]);
     await expect(adminPassive.result).resolves.toBe(adminPassive.summary);
     expect(healthState.getHealthCache()).toBe(publicProbe.summary);
-  });
-  it("recovers each strength lane after rejection without discarding an older success", async () => {
-    const passive = await startRefresh(false);
-    const probe = await startRefresh(true);
-    const recovered = createHealthSummary();
-    collectGatewayHealthSnapshotMock.mockResolvedValueOnce(recovered);
-    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
-    probe.reject(new Error("probe failed"));
-    await expect(probe.result).rejects.toThrow("probe failed");
-
-    passive.finish();
-    await expect(passive.result).resolves.toBe(passive.summary);
-    expect(healthState.getHealthCache()).toBe(passive.summary);
-    await expect(healthState.refreshGatewayHealthSnapshot({ probe: true })).resolves.toBe(
-      recovered,
-    );
-    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(3);
-    expect(healthState.getHealthCache()).toBe(recovered);
   });
 });
