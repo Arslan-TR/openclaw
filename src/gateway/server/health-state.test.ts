@@ -9,16 +9,14 @@ import {
 import type { HealthSummary } from "../health/types.js";
 import type { GatewayEventLoopHealth } from "./event-loop-health.js";
 
-/**
- * Health-state cache tests covering coalescing, sensitive probes, and broadcasts.
- */
 const {
   collectGatewayHealthSnapshotMock,
   getRuntimeConfigMock,
   getUpdateAvailableMock,
   getUpdateScheduleMock,
 } = vi.hoisted(() => ({
-  collectGatewayHealthSnapshotMock: vi.fn(),
+  collectGatewayHealthSnapshotMock:
+    vi.fn<typeof import("../health/collector.js").collectGatewayHealthSnapshot>(),
   getRuntimeConfigMock: vi.fn(),
   getUpdateAvailableMock: vi.fn(),
   getUpdateScheduleMock: vi.fn(),
@@ -44,16 +42,12 @@ vi.mock("../../infra/update-status-state.js", () => ({
   getUpdateSchedule: getUpdateScheduleMock,
 }));
 
+function expectCollection(index: number, expected: object) {
+  expect(healthSnapshotCallArg(index)).toMatchObject(expected);
+}
+
 function healthSnapshotCallArg(index = 0) {
-  return collectGatewayHealthSnapshotMock.mock.calls.at(index)?.at(0) as
-    | {
-        audience?: "public" | "admin";
-        eventLoop?: unknown;
-        probe?: boolean;
-        runtimeSnapshot?: unknown;
-        configReloadHotReloadStatus?: unknown;
-      }
-    | undefined;
+  return collectGatewayHealthSnapshotMock.mock.calls.at(index)?.[0];
 }
 
 // Vitest manual mocks cannot resolve concurrent imports from one module. Enter
@@ -90,11 +84,30 @@ function createHealthSummary(): HealthSummary {
   };
 }
 
+const updateAvailable = {
+  currentVersion: "2026.8.7",
+  latestVersion: "2026.8.8",
+  channel: "dev",
+  currentSha: "1111111111111111111111111111111111111111",
+  upstreamRef: "origin/main",
+  upstreamSha: "2222222222222222222222222222222222222222",
+  commitsBehind: 1,
+  commits: [{ sha: "2222222", subject: "Detailed commit subject" }],
+};
+const updateSchedule = { channel: "dev", autoEnabled: true, install: { kind: "git" as const } };
+
 const revisionProjector = {
   projectRawHash: (hash: string) => `raw-token:${hash}`,
   projectResolvedHash: (hash: string) => `resolved-token:${hash}`,
   hashResponseSessionBearer: () => "unused-test-scope",
 };
+
+let healthState: typeof import("./health-state.js");
+
+beforeEach(async () => {
+  vi.restoreAllMocks();
+  healthState = await loadHealthState();
+});
 
 async function loadHealthState() {
   vi.resetModules();
@@ -108,9 +121,17 @@ async function loadHealthState() {
   return await import("./health-state.js");
 }
 
+async function startRefresh(probe: boolean, includeSensitive = false) {
+  const pending = createPendingHealthSnapshot();
+  const summary = createHealthSummary();
+  collectGatewayHealthSnapshotMock.mockImplementationOnce(pending.collect);
+  const result = healthState.refreshGatewayHealthSnapshot({ probe, includeSensitive });
+  await pending.started;
+  return { ...pending, summary, result, finish: () => pending.resolve(summary) };
+}
+
 describe("buildGatewaySnapshot update metadata", () => {
   it("reads suspension synchronously without waiting for health collection", async () => {
-    const healthState = await loadHealthState();
     resetGatewayWorkAdmission();
     const read = () =>
       healthState.buildGatewaySnapshot({ client: null, revisionProjector }).suspension;
@@ -131,22 +152,8 @@ describe("buildGatewaySnapshot update metadata", () => {
   });
 
   it("omits the schedule and projects legacy availability without update detail access", async () => {
-    const healthState = await loadHealthState();
-    getUpdateAvailableMock.mockReturnValue({
-      currentVersion: "2026.8.7",
-      latestVersion: "2026.8.8",
-      channel: "dev",
-      currentSha: "1111111111111111111111111111111111111111",
-      upstreamRef: "origin/main",
-      upstreamSha: "2222222222222222222222222222222222222222",
-      commitsBehind: 1,
-      commits: [{ sha: "2222222", subject: "Detailed commit subject" }],
-    });
-    getUpdateScheduleMock.mockReturnValue({
-      channel: "dev",
-      autoEnabled: true,
-      install: { kind: "git" },
-    });
+    getUpdateAvailableMock.mockReturnValue(updateAvailable);
+    getUpdateScheduleMock.mockReturnValue(updateSchedule);
 
     const snapshot = healthState.buildGatewaySnapshot({
       client: null,
@@ -166,22 +173,6 @@ describe("buildGatewaySnapshot update metadata", () => {
   });
 
   it("includes the full update availability and schedule with update detail access", async () => {
-    const healthState = await loadHealthState();
-    const updateAvailable = {
-      currentVersion: "2026.8.7",
-      latestVersion: "2026.8.8",
-      channel: "dev",
-      currentSha: "1111111111111111111111111111111111111111",
-      upstreamRef: "origin/main",
-      upstreamSha: "2222222222222222222222222222222222222222",
-      commitsBehind: 1,
-      commits: [{ sha: "2222222", subject: "Detailed commit subject" }],
-    };
-    const updateSchedule = {
-      channel: "dev",
-      autoEnabled: true,
-      install: { kind: "git" as const },
-    };
     getUpdateAvailableMock.mockReturnValue(updateAvailable);
     getUpdateScheduleMock.mockReturnValue(updateSchedule);
 
@@ -197,98 +188,57 @@ describe("buildGatewaySnapshot update metadata", () => {
 });
 
 describe("refreshGatewayHealthSnapshot", () => {
-  beforeEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("does not let a post-connect passive refresh absorb an explicit probe", async () => {
-    const healthState = await loadHealthState();
-    const passiveDeferred = createPendingHealthSnapshot();
-    const probeDeferred = createPendingHealthSnapshot();
-    const passiveSummary = createHealthSummary();
-    const probeSummary = createHealthSummary();
     const broadcast = vi.fn();
-    collectGatewayHealthSnapshotMock
-      .mockImplementationOnce(passiveDeferred.collect)
-      .mockImplementationOnce(probeDeferred.collect);
     healthState.setBroadcastHealthUpdate(broadcast);
     const version = healthState.getHealthVersion();
-
-    const postConnectRefresh = healthState.refreshGatewayHealthSnapshot({ probe: false });
-    await passiveDeferred.started;
-    const explicitProbe = healthState.refreshGatewayHealthSnapshot({ probe: true });
-    await probeDeferred.started;
+    const passive = await startRefresh(false);
+    const probe = await startRefresh(true);
 
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
-    expect(healthSnapshotCallArg()).toMatchObject({
-      audience: "public",
-      probe: false,
-      runtimeSnapshot: undefined,
-    });
-    expect(healthSnapshotCallArg(1)).toMatchObject({
-      audience: "public",
-      probe: true,
-      runtimeSnapshot: undefined,
-    });
-
-    probeDeferred.resolve(probeSummary);
-    await expect(explicitProbe).resolves.toBe(probeSummary);
-    expect(healthState.getHealthCache()).toBe(probeSummary);
+    expectCollection(0, { audience: "public", probe: false, runtimeSnapshot: undefined });
+    expectCollection(1, { audience: "public", probe: true, runtimeSnapshot: undefined });
+    probe.finish();
+    await expect(probe.result).resolves.toBe(probe.summary);
+    expect(healthState.getHealthCache()).toBe(probe.summary);
     expect(healthState.getHealthVersion()).toBe(version + 1);
     expect(broadcast).toHaveBeenCalledTimes(1);
-    expect(broadcast).toHaveBeenLastCalledWith(probeSummary);
+    expect(broadcast).toHaveBeenLastCalledWith(probe.summary);
 
-    passiveDeferred.resolve(passiveSummary);
-    await expect(postConnectRefresh).resolves.toBe(passiveSummary);
-    expect(healthState.getHealthCache()).toBe(passiveSummary);
+    passive.finish();
+    await expect(passive.result).resolves.toBe(passive.summary);
+    expect(healthState.getHealthCache()).toBe(passive.summary);
     expect(healthState.getHealthVersion()).toBe(version + 2);
     expect(broadcast.mock.calls.map(([summary]) => summary)).toEqual([
-      probeSummary,
-      passiveSummary,
+      probe.summary,
+      passive.summary,
     ]);
   });
-
   it("coalesces concurrent explicit probe waiters", async () => {
-    const healthState = await loadHealthState();
-    const probeDeferred = createPendingHealthSnapshot();
-    const probeSummary = createHealthSummary();
-    collectGatewayHealthSnapshotMock.mockImplementationOnce(probeDeferred.collect);
-
-    const first = healthState.refreshGatewayHealthSnapshot({ probe: true });
+    const probe = await startRefresh(true);
     const second = healthState.refreshGatewayHealthSnapshot({ probe: true });
-
-    await probeDeferred.started;
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(1);
-    probeDeferred.resolve(probeSummary);
-    await expect(Promise.all([first, second])).resolves.toEqual([probeSummary, probeSummary]);
-  });
-
-  it("retains a displaced passive refresh after a faster probe settles", async () => {
-    const healthState = await loadHealthState();
-    const passiveDeferred = createPendingHealthSnapshot();
-    const probeDeferred = createPendingHealthSnapshot();
-    const passiveSummary = createHealthSummary();
-    collectGatewayHealthSnapshotMock
-      .mockImplementationOnce(passiveDeferred.collect)
-      .mockImplementationOnce(probeDeferred.collect);
-
-    const firstPassive = healthState.refreshGatewayHealthSnapshot({ probe: false });
-    await passiveDeferred.started;
-    const probe = healthState.refreshGatewayHealthSnapshot({ probe: true });
-    await probeDeferred.started;
-    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
-    probeDeferred.reject(new Error("probe failed"));
-    await expect(probe).rejects.toThrow("probe failed");
-
-    const secondPassive = healthState.refreshGatewayHealthSnapshot({ probe: false });
-    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
-    passiveDeferred.resolve(passiveSummary);
-    await expect(Promise.all([firstPassive, secondPassive])).resolves.toEqual([
-      passiveSummary,
-      passiveSummary,
+    probe.finish();
+    await expect(Promise.all([probe.result, second])).resolves.toEqual([
+      probe.summary,
+      probe.summary,
     ]);
   });
+  it("retains a displaced passive refresh after a faster probe settles", async () => {
+    const passive = await startRefresh(false);
+    const probe = await startRefresh(true);
+    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
+    probe.reject(new Error("probe failed"));
+    await expect(probe.result).rejects.toThrow("probe failed");
 
+    const second = healthState.refreshGatewayHealthSnapshot({ probe: false });
+    expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
+    passive.finish();
+    await expect(Promise.all([passive.result, second])).resolves.toEqual([
+      passive.summary,
+      passive.summary,
+    ]);
+  });
   it.each([
     { includeSensitive: false, reset: false },
     { includeSensitive: false, reset: true },
@@ -297,7 +247,6 @@ describe("refreshGatewayHealthSnapshot", () => {
   ])(
     "publishes current event-loop health after collection ($includeSensitive, $reset)",
     async ({ includeSensitive, reset }) => {
-      const healthState = await loadHealthState();
       const initial = {
         degraded: true,
         degradedSinceMs: 61_000,
@@ -345,8 +294,6 @@ describe("refreshGatewayHealthSnapshot", () => {
   );
 
   it("passes the config reloader hot-reload status only when the hook returns one", async () => {
-    const healthState = await loadHealthState();
-
     await healthState.refreshGatewayHealthSnapshot({
       probe: false,
       getConfigReloaderHotReloadStatus: () => "disabled",
@@ -364,7 +311,6 @@ describe("refreshGatewayHealthSnapshot", () => {
   });
 
   it("captures runtime snapshots for completed refreshes and guards snapshot failures", async () => {
-    const healthState = await loadHealthState();
     const runtimeSnapshot = {
       channels: { discord: { accountId: "default", connected: true } },
       channelAccounts: {},
@@ -382,22 +328,13 @@ describe("refreshGatewayHealthSnapshot", () => {
     });
 
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
-    expect(
-      collectGatewayHealthSnapshotMock.mock.calls
-        .map((_call, index) => healthSnapshotCallArg(index)?.probe)
-        .toSorted((a, b) => Number(a) - Number(b)),
-    ).toEqual([false, true]);
-    expect(
-      collectGatewayHealthSnapshotMock.mock.calls.map(
-        (_call, index) => healthSnapshotCallArg(index)?.audience,
-      ),
-    ).toEqual(["public", "public"]);
+    expectCollection(0, { audience: "public", probe: false });
+    expectCollection(1, { audience: "public", probe: true });
     expect(healthSnapshotCallArg()?.runtimeSnapshot).toBe(runtimeSnapshot);
     expect(healthSnapshotCallArg(1)?.runtimeSnapshot).toBeUndefined();
   });
 
   it("does not cache or broadcast sensitive health refreshes", async () => {
-    const healthState = await loadHealthState();
     const sensitiveSummary = createHealthSummary();
     const safeSummary = createHealthSummary();
     const broadcast = vi.fn();
@@ -421,80 +358,42 @@ describe("refreshGatewayHealthSnapshot", () => {
   });
 
   it("keeps strength-aware admin and public refresh lanes isolated", async () => {
-    const healthState = await loadHealthState();
-    const adminPassiveDeferred = createPendingHealthSnapshot();
-    const publicProbeDeferred = createPendingHealthSnapshot();
-    const adminProbeDeferred = createPendingHealthSnapshot();
-    const adminPassiveSummary = createHealthSummary();
-    const publicProbeSummary = createHealthSummary();
-    const adminProbeSummary = createHealthSummary();
-    collectGatewayHealthSnapshotMock
-      .mockImplementationOnce(adminPassiveDeferred.collect)
-      .mockImplementationOnce(publicProbeDeferred.collect)
-      .mockImplementationOnce(adminProbeDeferred.collect);
-
-    const adminPassive = healthState.refreshGatewayHealthSnapshot({
-      probe: false,
-      includeSensitive: true,
-    });
-    await adminPassiveDeferred.started;
-    const publicProbe = healthState.refreshGatewayHealthSnapshot({ probe: true });
-    await publicProbeDeferred.started;
+    const adminPassive = await startRefresh(false, true);
+    const publicProbe = await startRefresh(true);
     const publicPassive = healthState.refreshGatewayHealthSnapshot({ probe: false });
-    const adminProbe = healthState.refreshGatewayHealthSnapshot({
-      probe: true,
-      includeSensitive: true,
-    });
-    await adminProbeDeferred.started;
-
+    const adminProbe = await startRefresh(true, true);
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(3);
-    expect(healthSnapshotCallArg()?.audience).toBe("admin");
-    expect(healthSnapshotCallArg(1)?.audience).toBe("public");
-    expect(healthSnapshotCallArg(2)?.audience).toBe("admin");
-    expect(healthSnapshotCallArg()?.probe).toBe(false);
-    expect(healthSnapshotCallArg(1)?.probe).toBe(true);
-    expect(healthSnapshotCallArg(2)?.probe).toBe(true);
+    expectCollection(0, { audience: "admin", probe: false });
+    expectCollection(1, { audience: "public", probe: true });
+    expectCollection(2, { audience: "admin", probe: true });
 
-    adminProbeDeferred.resolve(adminProbeSummary);
-    publicProbeDeferred.resolve(publicProbeSummary);
-    adminPassiveDeferred.resolve(adminPassiveSummary);
-
-    await expect(adminProbe).resolves.toBe(adminProbeSummary);
-    await expect(Promise.all([publicProbe, publicPassive])).resolves.toEqual([
-      publicProbeSummary,
-      publicProbeSummary,
+    adminProbe.finish();
+    publicProbe.finish();
+    adminPassive.finish();
+    await expect(adminProbe.result).resolves.toBe(adminProbe.summary);
+    await expect(Promise.all([publicProbe.result, publicPassive])).resolves.toEqual([
+      publicProbe.summary,
+      publicProbe.summary,
     ]);
-    await expect(adminPassive).resolves.toBe(adminPassiveSummary);
-    expect(healthState.getHealthCache()).toBe(publicProbeSummary);
+    await expect(adminPassive.result).resolves.toBe(adminPassive.summary);
+    expect(healthState.getHealthCache()).toBe(publicProbe.summary);
   });
-
   it("recovers each strength lane after rejection without discarding an older success", async () => {
-    const healthState = await loadHealthState();
-    const passiveDeferred = createPendingHealthSnapshot();
-    const probeDeferred = createPendingHealthSnapshot();
-    const passiveSummary = createHealthSummary();
-    const recoveredProbeSummary = createHealthSummary();
-    collectGatewayHealthSnapshotMock
-      .mockImplementationOnce(passiveDeferred.collect)
-      .mockImplementationOnce(probeDeferred.collect)
-      .mockResolvedValueOnce(recoveredProbeSummary);
-
-    const passive = healthState.refreshGatewayHealthSnapshot({ probe: false });
-    await passiveDeferred.started;
-    const probe = healthState.refreshGatewayHealthSnapshot({ probe: true });
-    await probeDeferred.started;
+    const passive = await startRefresh(false);
+    const probe = await startRefresh(true);
+    const recovered = createHealthSummary();
+    collectGatewayHealthSnapshotMock.mockResolvedValueOnce(recovered);
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(2);
-    probeDeferred.reject(new Error("probe failed"));
-    await expect(probe).rejects.toThrow("probe failed");
+    probe.reject(new Error("probe failed"));
+    await expect(probe.result).rejects.toThrow("probe failed");
 
-    passiveDeferred.resolve(passiveSummary);
-    await expect(passive).resolves.toBe(passiveSummary);
-    expect(healthState.getHealthCache()).toBe(passiveSummary);
-
+    passive.finish();
+    await expect(passive.result).resolves.toBe(passive.summary);
+    expect(healthState.getHealthCache()).toBe(passive.summary);
     await expect(healthState.refreshGatewayHealthSnapshot({ probe: true })).resolves.toBe(
-      recoveredProbeSummary,
+      recovered,
     );
     expect(collectGatewayHealthSnapshotMock).toHaveBeenCalledTimes(3);
-    expect(healthState.getHealthCache()).toBe(recoveredProbeSummary);
+    expect(healthState.getHealthCache()).toBe(recovered);
   });
 });
