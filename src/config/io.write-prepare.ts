@@ -213,7 +213,7 @@ function setPathValue(
   createParents = false,
 ): unknown {
   if (path.length === 0) {
-    return structuredClone(nextValue);
+    return nextValue;
   }
   const head = expectDefined(path[0], "config path head");
   const tail = path.slice(1);
@@ -496,7 +496,7 @@ function projectRootAuthoredIncludeSibling(params: {
     params.baselinePresent &&
     isDeepStrictEqual(params.next, params.baseline)
   ) {
-    return { ok: true, present: true, value: structuredClone(params.authored) };
+    return { ok: true, present: true, value: params.authored };
   }
   if (!params.nextPresent) {
     return collectIncludeOwnedPaths(params.authored).length > 0
@@ -504,7 +504,7 @@ function projectRootAuthoredIncludeSibling(params: {
       : { ok: true, present: false };
   }
   if (!params.baselinePresent) {
-    return { ok: true, present: true, value: structuredClone(params.next) };
+    return { ok: true, present: true, value: params.next };
   }
   if (hasOwnValidIncludeDirective(params.authored)) {
     return { ok: false };
@@ -515,22 +515,22 @@ function projectRootAuthoredIncludeSibling(params: {
         ? isRootOwnedArray(params.authored, params.baseline, params.sourceBeforeMigrations)
         : collectIncludeOwnedPaths(params.authored).length === 0
     )
-      ? { ok: true, present: true, value: structuredClone(params.next) }
+      ? { ok: true, present: true, value: params.next }
       : { ok: false };
   }
   if (!isRecord(params.authored)) {
-    return { ok: true, present: true, value: structuredClone(params.next) };
+    return { ok: true, present: true, value: params.next };
   }
   if (!isRecord(params.next)) {
     return collectIncludeOwnedPaths(params.authored).length > 0
       ? { ok: false }
-      : { ok: true, present: true, value: structuredClone(params.next) };
+      : { ok: true, present: true, value: params.next };
   }
   if (!isRecord(params.baseline)) {
-    return { ok: true, present: true, value: structuredClone(params.next) };
+    return { ok: true, present: true, value: params.next };
   }
 
-  const value: Record<string, unknown> = structuredClone(params.authored);
+  const value: Record<string, unknown> = { ...params.authored };
   const keys = new Set([
     ...Object.keys(params.authored),
     ...Object.keys(params.baseline),
@@ -717,7 +717,7 @@ function mergeMissingExplicitValues(currentValue: unknown, explicitValue: unknow
       : !Object.hasOwn(next, key);
     const currentChild: unknown = missing ? undefined : Reflect.get(next, key);
     const childMerged = missing
-      ? structuredClone(childExplicitValue)
+      ? childExplicitValue
       : mergeMissingExplicitValues(currentChild, childExplicitValue);
     if (missing || !Object.is(childMerged, currentChild)) {
       Reflect.set(next, key, childMerged);
@@ -890,9 +890,6 @@ function shouldPersistCanonicalAgentRoster(params: {
   explicitSetPaths?: readonly (readonly string[])[];
   unsetPaths?: readonly (readonly string[])[];
 }): boolean {
-  if (!canCanonicalizeAgentRoster(params.nextConfig)) {
-    return false;
-  }
   if (
     params.persistCanonicalAgentRoster === true ||
     params.explicitSetPaths?.some(pathTouchesAgentRoster) ||
@@ -1027,7 +1024,7 @@ function projectAuthoredRosterValue(params: {
   }
   if (Array.isArray(params.next)) {
     if (explicitlySet && params.explicit.present && Array.isArray(params.explicit.value)) {
-      return structuredClone(params.explicit.value);
+      return params.explicit.value;
     }
     const runtime = Array.isArray(params.runtime.value) ? params.runtime.value : [];
     const source = Array.isArray(params.source.value) ? params.source.value : [];
@@ -1081,17 +1078,15 @@ function projectAuthoredRosterValue(params: {
     });
   }
   if (explicitlySet && params.explicit.present) {
-    return structuredClone(params.explicit.value);
+    return params.explicit.value;
   }
   const unchangedFromRuntime =
     params.runtime.present && isDeepStrictEqual(params.runtime.value, params.next);
   const unchangedFromSource =
     params.source.present && isDeepStrictEqual(params.source.value, params.next);
-  return structuredClone(
-    params.authored.present && (unchangedFromRuntime || unchangedFromSource)
-      ? params.authored.value
-      : params.next,
-  );
+  return params.authored.present && (unchangedFromRuntime || unchangedFromSource)
+    ? params.authored.value
+    : params.next;
 }
 
 function readLegacyAgentList(config: unknown): unknown[] | undefined {
@@ -1349,7 +1344,7 @@ function canonicalizeAgentRosterForExplicitWrite(params: {
                 isRecord(sourceEntries[priorId]) &&
                 isDeepStrictEqual(sourceEntries[priorId].default, nextEntry.default)));
           if (!preservesAuthoredReference) {
-            value.default = structuredClone(nextEntry.default);
+            value.default = nextEntry.default;
           }
         } else {
           delete value.default;
@@ -1484,7 +1479,7 @@ export function projectConfigWriteSource(params: ConfigWriteSourceProjectionPara
   const inputBasis = params.inputBasis ?? { kind: "runtime", config: params.runtimeConfig };
   // Source candidates own every value, including null; merge-patch null means deletion.
   if (inputBasis.kind === "source") {
-    return structuredClone(params.nextConfig);
+    return params.nextConfig;
   }
   const patch = createMergePatch(inputBasis.config, params.nextConfig);
   const projectedSource = normalizeTouchedAgentModelMapEntries({
@@ -1511,7 +1506,8 @@ export function resolvePersistCandidateForWrite(
 ): unknown {
   const inputBasis = params.inputBasis ?? { kind: "runtime", config: params.runtimeConfig };
   const rootAuthoredConfig = params.rootAuthoredConfig ?? params.sourceConfig;
-  const wantsCanonicalRoster = shouldPersistCanonicalAgentRoster(params);
+  const canCanonicalizeRoster = canCanonicalizeAgentRoster(params.nextConfig);
+  const wantsCanonicalRoster = canCanonicalizeRoster && shouldPersistCanonicalAgentRoster(params);
   const includeOwnsRoster =
     wantsCanonicalRoster &&
     configIncludeOwnsAgentRosterValues({
@@ -1599,8 +1595,7 @@ export function resolvePersistCandidateForWrite(
     // Includes were validated and restored above; ancestor merges retain their directives.
     preserveDescendantIncludes: persistCanonicalRoster,
   });
-  const preserveAuthoredRoster =
-    canCanonicalizeAgentRoster(params.nextConfig) || params.preserveLegacyAgentRoster === true;
+  const preserveAuthoredRoster = canCanonicalizeRoster || params.preserveLegacyAgentRoster === true;
   const withAuthoredRoster =
     wantsCanonicalRoster || !preserveAuthoredRoster
       ? persisted

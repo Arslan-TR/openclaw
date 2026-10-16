@@ -1,14 +1,12 @@
 import type { OpenClawAgentDatabaseOptions } from "../../state/openclaw-agent-db-contract.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
-import { cloneEnvWithPlatformSemantics } from "../config-env-vars.js";
-import { resolveStateDir } from "../state-dir.js";
 import type {
   SessionProviderReview,
   SessionProviderReviewComparison,
 } from "./provider-review.types.js";
 import type { SessionAccessScope } from "./session-accessor.sqlite-contract.js";
 import { runSessionEntryWorkerMutation } from "./session-accessor.sqlite-replacement-worker.js";
-import { resolveSqliteScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
+import { prepareSqliteStoreReadScope } from "./session-accessor.sqlite-scope.js";
 import { captureSessionStoreReadCandidates } from "./session-store-target-inventory.js";
 import { withSessionStoreTarget } from "./session-store-target-runtime.js";
 import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
@@ -29,12 +27,7 @@ async function withProviderReviewDatabase<T>(
   ) => Promise<T>,
 ): Promise<T> {
   assertCallerCurrent();
-  const env = cloneEnvWithPlatformSemantics(target.env ?? process.env);
-  env.OPENCLAW_STATE_DIR = resolveStateDir(env);
-  // Normalize the logical key without consulting a custom store's native registry.
-  const logical = resolveSqliteScope({ ...target, storePath: undefined, env });
-  const storePath =
-    logical.path ?? target.storePath ?? resolveOpenClawAgentSqlitePath(toDatabaseOptions(logical));
+  const { env, logical, storePath } = prepareSqliteStoreReadScope(target);
   const candidates = captureSessionStoreReadCandidates(storePath);
   return withSessionStoreTarget(
     { agentId: logical.agentId, storePath, env, candidates },
@@ -81,13 +74,13 @@ export async function compareSessionProviderReview(
 ): Promise<SessionEntry> {
   params.assertCurrent();
   const capturedTarget = { ...target };
-  const input: SessionProviderReviewComparison = structuredClone({
+  const input: SessionProviderReviewComparison = {
     sessionKey: target.sessionKey,
     sessionId: target.sessionId,
     lifecycleRevision: target.lifecycleRevision,
     expectedReview: params.expectedReview,
     nextReview: params.nextReview,
-  });
+  };
   return withProviderReviewDatabase(
     capturedTarget,
     params.assertCurrent,

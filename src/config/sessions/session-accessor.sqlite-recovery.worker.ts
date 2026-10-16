@@ -67,8 +67,8 @@ export function recoverRestartTombstoneInDatabase(
     return {
       result: {
         status: "existing",
-        sourceEntry: structuredClone(source),
-        successorEntry: structuredClone(linked),
+        sourceEntry: source,
+        successorEntry: linked,
         successorKey: recoveredSessionKey,
       },
     };
@@ -155,8 +155,8 @@ export function recoverRestartTombstoneInDatabase(
   ]);
   const result: RestartTombstoneRecoveryResult = {
     status: "created",
-    sourceEntry: structuredClone(nextSource),
-    successorEntry: structuredClone(params.successorEntry),
+    sourceEntry: nextSource,
+    successorEntry: params.successorEntry,
     successorKey: successorTarget.canonicalKey,
   };
   return {

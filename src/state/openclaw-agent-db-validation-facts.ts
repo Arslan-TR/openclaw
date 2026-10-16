@@ -60,7 +60,7 @@ export function createOpenClawAgentDatabaseValidationReceipt(
   canonicalReady: boolean,
 ): OpenClawAgentDatabaseValidation {
   const { identity, birthtime } = readOpenClawAgentDatabaseIdentity(database);
-  if (typeof identity !== "string" || birthtime === undefined) {
+  if (birthtime === undefined) {
     throw new Error("Only persistent agent databases retain integrity validation");
   }
   const validation = {

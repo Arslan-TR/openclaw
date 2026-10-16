@@ -37,17 +37,13 @@ export function projectSessionSharingEntry(entry: InternalSessionEntry) {
     updatedAt: entry.updatedAt,
     createdAt: entry.createdAt,
     initializationPending: entry.initializationPending,
-    providerReview: entry.providerReview ? structuredClone(entry.providerReview) : undefined,
-    mainRestartRecovery: entry.mainRestartRecovery
-      ? structuredClone(entry.mainRestartRecovery)
-      : undefined,
+    providerReview: entry.providerReview,
+    mainRestartRecovery: entry.mainRestartRecovery,
     modelSelectionLocked: entry.modelSelectionLocked,
     pluginOwnerId: entry.pluginOwnerId,
-    skillLibrarySelections: entry.skillLibrarySelections
-      ? structuredClone(entry.skillLibrarySelections)
-      : undefined,
+    skillLibrarySelections: entry.skillLibrarySelections,
     pendingProjectGitUrl: entry.pendingProjectGitUrl,
-    pendingWorktree: entry.pendingWorktree ? structuredClone(entry.pendingWorktree) : undefined,
+    pendingWorktree: entry.pendingWorktree,
     lifecycleRevision: entry.lifecycleRevision,
     lifecycleRunId: entry.lifecycleRunId,
     activeWriterRunId: entry.activeWriterRunId,
@@ -86,7 +82,7 @@ export function projectSessionSharingEntry(entry: InternalSessionEntry) {
     sessionRoot: entry.sessionRoot,
     spawnedCwd: entry.spawnedCwd,
     spawnedWorkspaceDir: entry.spawnedWorkspaceDir,
-    toolOverrides: entry.toolOverrides ? structuredClone(entry.toolOverrides) : undefined,
+    toolOverrides: entry.toolOverrides,
   };
 }
 

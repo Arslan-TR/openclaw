@@ -21,10 +21,8 @@ type UserProfileCatalogIdentityFacts = {
   github: StoredGitHubIdentity | undefined;
 };
 
-type UserProfileCatalogIdentityResult = { ok: true; facts: UserProfileCatalogIdentityFacts };
-
 export type UserProfileCatalogIdentityRead = {
-  profiles: Map<string, UserProfileCatalogIdentityResult>;
+  profiles: Map<string, UserProfileCatalogIdentityFacts>;
   accounts: Map<string, string>;
   owners: Map<string, string>;
 };
@@ -45,39 +43,27 @@ function readDisplays(
     : new Map();
 }
 
-function readIdentities(
-  db: EngineConnection,
-  ids?: readonly string[],
-): ReturnType<typeof selectStoredGitHubIdentities> {
-  return tableExists(db, "user_profile_identities")
-    ? selectStoredGitHubIdentities(db, ids)
-    : new Map();
-}
-
 function readProfiles(
   db: EngineConnection,
   ids: readonly string[],
   includeGitHub: boolean,
-): Map<string, UserProfileCatalogIdentityResult> {
+): Map<string, UserProfileCatalogIdentityFacts> {
   if (!ids.length) {
     return new Map();
   }
   const rows = readDisplays(db, ids);
   const canonicalIds = [...new Set(ids.map((id) => rows.get(id)?.id ?? id))];
-  const identities = includeGitHub ? readIdentities(db, canonicalIds) : undefined;
+  const identities = includeGitHub ? selectStoredGitHubIdentities(db, canonicalIds) : undefined;
   return new Map(
-    ids.map((id): [string, UserProfileCatalogIdentityResult] => {
+    ids.map((id): [string, UserProfileCatalogIdentityFacts] => {
       const row = rows.get(id);
       const profileId = row?.id ?? id;
       return [
         id,
         {
-          ok: true,
-          facts: {
-            profileId,
-            profile: row ? projectUserProfileDisplay(row) : undefined,
-            github: identities?.get(profileId)?.primary,
-          },
+          profileId,
+          profile: row ? projectUserProfileDisplay(row) : undefined,
+          github: identities?.get(profileId)?.primary,
         },
       ];
     }),
@@ -92,7 +78,7 @@ function readCatalogIdentity(db: EngineConnection, input: UserProfileCatalogIden
   }
   const byAccount = new Map<string, string>();
   const byLogin = new Map<string, string>();
-  for (const [profileId, identity] of readIdentities(db)) {
+  for (const [profileId, identity] of selectStoredGitHubIdentities(db)) {
     for (const account of identity.accounts) {
       const id = String(account.accountId);
       const login = account.login.toLowerCase();

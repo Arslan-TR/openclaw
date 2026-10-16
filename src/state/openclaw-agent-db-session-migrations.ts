@@ -12,7 +12,7 @@ import { buildConversationRef, normalizeConversationPeerId } from "../routing/co
 import { deriveSessionChatTypeFromKey } from "../sessions/session-chat-type-shared.js";
 import { migrateLegacySessionCreator } from "./creator-namespace-migration.js";
 import { STARTUP_ADDITIVE_AGENT_COLUMN_DEFINITIONS } from "./openclaw-agent-db-additive-columns.js";
-import { ensureColumn, tableExists } from "./openclaw-state-db-schema-helpers.js";
+import { ensureColumn, readTableColumns, tableExists } from "./openclaw-state-db-schema-helpers.js";
 
 export function assertSupportedAgentMigrationSchemas(
   db: DatabaseSync,
@@ -343,8 +343,7 @@ export function readSqliteTableColumns(db: DatabaseSync, tableName: string): Set
   if (!tableExists(db, tableName)) {
     return null;
   }
-  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
-  return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
+  return readTableColumns(db, tableName);
 }
 
 /** Installs same-version session projections on first updated-binary open. */

@@ -72,27 +72,6 @@ export class UserProfileOwnerError extends Error {
 
 const ensuredDatabases = new WeakSet<EngineConnection>();
 
-function rememberEnsuredSchema(database: EngineConnection, cache: WeakSet<EngineConnection>): void {
-  if (cache.has(database)) {
-    return;
-  }
-  const remember = () => {
-    cache.add(database);
-  };
-  // A nested ensure is valid in its transaction but must disappear with its savepoint.
-  if (
-    !stageSqliteTransactionState(database, {
-      stage: remember,
-      rollback: () => {
-        cache.delete(database);
-      },
-      commit: remember,
-    })
-  ) {
-    remember();
-  }
-}
-
 export function ensureUserProfilesSchema(
   options: UserProfileMutationOptions,
   database = openOpenClawStateDatabase(options),
@@ -148,8 +127,22 @@ export function ensureUserProfilesSchema(
     options,
     { operationLabel: "user-profiles.schema.ensure" },
   );
-  // A rolled-back ensure must retry rather than caching a missing table/column.
-  rememberEnsuredSchema(database.db, ensuredDatabases);
+  const connection = database.db;
+  const remember = () => {
+    ensuredDatabases.add(connection);
+  };
+  // A nested ensure is valid in its transaction but must disappear with its savepoint.
+  if (
+    !stageSqliteTransactionState(connection, {
+      stage: remember,
+      rollback: () => {
+        ensuredDatabases.delete(connection);
+      },
+      commit: remember,
+    })
+  ) {
+    remember();
+  }
 }
 
 export function ensureUserProfileRoleSchema(

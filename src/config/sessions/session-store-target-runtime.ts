@@ -80,14 +80,14 @@ function captureSelectionMemo<Value extends PreparedSelection>(
       }
       selections.delete(captured);
       selections.set(captured, cached);
-      return structuredClone(cached.value);
+      return cached.value;
     },
     install(value: Value): void {
       if (!captured) {
         return;
       }
       selections.delete(captured);
-      selections.set(captured, { registry, value: structuredClone(value) });
+      selections.set(captured, { registry, value });
       while (selections.size > MAX_SELECTIONS) {
         selections.delete(selections.keys().next().value!);
       }

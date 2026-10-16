@@ -283,23 +283,18 @@ export function commitSessionEntryReplacementsInDatabase(
     const canonical = transactionRows.get(replacement.sessionKey);
     const canonicalFacts = canonical && captureSessionEntrySnapshot(canonical);
     const previousWindow = windows.get(replacement.entry.sessionId);
-    const written = writeSessionEntry(
-      database,
-      replacement.sessionKey,
-      structuredClone(replacement.entry),
-      {
-        ...(input.consumePendingReset ? { consumePendingReset: true } : {}),
-        previousEntry: selectedBefore ?? null,
-        canonicalPreviousEntry: canonical?.entry ?? null,
-        canonicalPreviousRow: canonical?.row,
-        canonicalPreviousWindow:
-          previousWindow !== undefined
-            ? { sessionId: replacement.entry.sessionId, row: previousWindow }
-            : canonicalFacts?.window,
-        canonicalPreviousSideTables: canonicalFacts?.sideTables,
-        postimages: writtenPostimages,
-      },
-    );
+    const written = writeSessionEntry(database, replacement.sessionKey, replacement.entry, {
+      ...(input.consumePendingReset ? { consumePendingReset: true } : {}),
+      previousEntry: selectedBefore ?? null,
+      canonicalPreviousEntry: canonical?.entry ?? null,
+      canonicalPreviousRow: canonical?.row,
+      canonicalPreviousWindow:
+        previousWindow !== undefined
+          ? { sessionId: replacement.entry.sessionId, row: previousWindow }
+          : canonicalFacts?.window,
+      canonicalPreviousSideTables: canonicalFacts?.sideTables,
+      postimages: writtenPostimages,
+    });
     deleteLegacySessionEntryRows(
       database,
       [...(replacement.previousSessionKeys ?? [])],

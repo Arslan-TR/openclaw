@@ -191,7 +191,7 @@ export function deriveSessionLifecycleSnapshot(params: {
     return {};
   }
 
-  const existing = params.session ?? undefined;
+  const existing = params.session;
   const startedAt = resolveLifecycleTimestamp(
     params.event.data?.startedAt,
     existing?.startedAt,

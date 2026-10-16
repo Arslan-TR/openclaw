@@ -1,12 +1,17 @@
 // Session origin must drop the prior channel's identity when a dmScope:"main" session moves
 // across providers, so channel-keyed fields do not reference a now-inactive channel.
 import { describe, expect, it } from "vitest";
+import { finalizeInboundContextForSdk } from "../../auto-reply/reply/inbound-context.js";
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { buildChannelInboundEventContext } from "../../channels/inbound-event/context.js";
 import { sessionDeliveryOrigin } from "../../utils/delivery-context.read.js";
 import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
 import { projectLastRoutePatch } from "./metadata-projection.js";
-import { deriveSessionMetaPatch, prepareSessionMetaPatch } from "./metadata.js";
+import {
+  deriveSessionMetaPatch,
+  deriveSessionOrigin,
+  prepareSessionMetaPatch,
+} from "./metadata.js";
 import type { SessionEntry, SessionOrigin } from "./types.js";
 
 const sessionKey = "agent:user";
@@ -91,6 +96,23 @@ const telegramTurn = {
   To: "telegram:42",
   AccountId: "telegram-bot-1",
 } satisfies Partial<MsgContext>;
+
+it.each([
+  { name: "malformed", OriginatingChannel: 42, OriginatingTo: 42, to: "telegram:42" },
+  { name: "empty", OriginatingChannel: "", OriginatingTo: "", to: undefined },
+])(
+  "preserves origin fallback semantics for $name SDK overrides",
+  ({ to, OriginatingChannel, OriginatingTo }) => {
+    const ctx = finalizeInboundContextForSdk({
+      ...telegramTurn,
+      OriginatingChannel,
+      OriginatingTo,
+    });
+    const origin = deriveSessionOrigin(ctx);
+    expect(origin?.provider).toBe("telegram");
+    expect(origin?.to).toBe(to);
+  },
+);
 
 describe("session origin across a channel switch", () => {
   it.each([

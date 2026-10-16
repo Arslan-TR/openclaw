@@ -342,6 +342,16 @@ export function resolveSqliteScope(
   return { agentId, ...database, sessionKey: resolveSqliteSessionKey(scope.sessionKey, agentId) };
 }
 
+export function prepareSqliteStoreReadScope(scope: SqliteScopeInput & { sessionKey: string }) {
+  const env = cloneEnvWithPlatformSemantics(scope.env ?? process.env);
+  env.OPENCLAW_STATE_DIR = resolveStateDir(env);
+  // Normalize the logical key without consulting a custom store's native registry.
+  const logical = resolveSqliteScope({ ...scope, storePath: undefined, env });
+  const storePath =
+    logical.path ?? scope.storePath ?? resolveOpenClawAgentSqlitePath(toDatabaseOptions(logical));
+  return { env, logical, storePath };
+}
+
 export function resolveSqliteReadScope(
   scope: SqliteScopeInput,
   targetCache?: SessionSqliteTargetResolutionCache,

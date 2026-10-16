@@ -113,7 +113,6 @@ export function readTranscriptArchivePresenceInWorker(
     (database) => {
       const actual = readOpenClawAgentDatabaseIdentity(database);
       if (
-        typeof actual.identity !== "string" ||
         `file:${actual.identity}` !== request.expectedIdentity.key ||
         actual.birthtime !== request.expectedIdentity.birthtime
       ) {
@@ -145,7 +144,6 @@ export async function readTranscriptArchiveFinalInWorker(
     if (plan.expectedIdentity) {
       const actual = readOpenClawAgentDatabaseIdentity(database);
       if (
-        typeof actual.identity !== "string" ||
         `file:${actual.identity}` !== plan.expectedIdentity.key ||
         actual.birthtime !== plan.expectedIdentity.birthtime
       ) {
@@ -196,7 +194,7 @@ export async function readTranscriptArchiveFinalInWorker(
           hasTerminalResult = true;
           if (isVisibleAssistantResultEventForRun(event, plan.runId)) {
             result.event = event;
-          } else if (isRecord(event) && isSilentAssistantTranscriptMessage(event.message)) {
+          } else if (isSilentAssistantTranscriptMessage(event.message)) {
             const previousMessage = isRecord(result.event) ? result.event.message : undefined;
             if (
               !(isRecord(previousMessage) && previousMessage.display === true) &&

@@ -29,8 +29,7 @@ const log = createSubsystemLogger("sessions/recovery");
 export async function recoverSessionEntryFromRestartTombstone(
   params: RestartTombstoneRecoveryParams,
 ): Promise<RestartTombstoneRecoveryResult> {
-  const { commitGuard, storePath, ...values } = params;
-  const input = structuredClone(values);
+  const { commitGuard, storePath, ...input } = params;
   const scope = captureLifecycleDatabaseScope(
     await prepareSqliteScope({
       agentId: input.agentId,

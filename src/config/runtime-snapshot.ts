@@ -135,7 +135,6 @@ let runtimeConfigValueFact: RuntimeConfigValueFact | null = null;
 let runtimeSourceConfigValueFact: RuntimeConfigValueFact | null = null;
 let runtimeConfigAppliedHash: string | null = null;
 let runtimeConfigSnapshotRevision = 0;
-let runtimeConfigSnapshotGeneration = 0;
 let runtimeConfigPreparerGeneration = 0;
 let runtimeConfigSnapshotRefreshHandler: RuntimeConfigSnapshotRefreshHandler | null = null;
 type ManagedRuntimeConfigWritePreflight = (
@@ -239,7 +238,6 @@ function publishRuntimeConfigSnapshot(
     previousEditedInPlace: previousEditedInPlace || previousSourceEditedInPlace,
   });
   prepareRuntimePluginsConfig(config);
-  runtimeConfigSnapshotGeneration += 1;
   clearExecutablePathCache();
   runtimeConfigSnapshot = config;
   runtimeConfigCapturedSnapshot = null;
@@ -278,7 +276,7 @@ export function registerRuntimeConfigSnapshotPreparer(
   };
 }
 
-/** Prepare off the publication path; a superseded candidate must be discarded by its owner. */
+/** Stage contributions, then check candidate facts, environment, and caller authority at commit. */
 async function prepareRuntimeConfigSnapshot(
   inputConfig: OpenClawConfig,
   context: RuntimeConfigSnapshotPreparationContext = {},
@@ -290,7 +288,6 @@ async function prepareRuntimeConfigSnapshot(
     : inputConfig;
   const factSource = getConfigResolutionFacts(config) !== null ? config : (sourceConfig ?? config);
   copyConfigResolutionFacts(factSource, config);
-  const generation = runtimeConfigSnapshotGeneration;
   const preparerGeneration = runtimeConfigPreparerGeneration;
   const fingerprint = hashRuntimeConfigPreparation(config);
   const envFingerprint = context.env ? sha256Base64Url(stableConfigStringify(context.env)) : null;
@@ -309,7 +306,6 @@ async function prepareRuntimeConfigSnapshot(
   const isCurrent = () => {
     assertCurrent?.();
     return (
-      runtimeConfigSnapshotGeneration === generation &&
       runtimeConfigPreparerGeneration === preparerGeneration &&
       hashRuntimeConfigPreparation(config) === fingerprint &&
       (context.env ? sha256Base64Url(stableConfigStringify(context.env)) : null) === envFingerprint
@@ -323,7 +319,7 @@ async function prepareRuntimeConfigSnapshot(
     consumed = true;
     for (const contribute of contributions) {
       contribute();
-      // Contributions may reenter config publication or revoke the admitting owner.
+      // Contributions may change prepared facts or revoke the admitting owner.
       if (!isCurrent()) {
         return false;
       }
@@ -370,7 +366,6 @@ export function setRuntimeConfigSourceSnapshotIfCurrent(params: {
 }
 
 export function resetConfigRuntimeState(options: { preserveConfigEnv?: boolean } = {}): void {
-  runtimeConfigSnapshotGeneration += 1;
   clearExecutablePathCache();
   prepareRuntimePluginsConfig(null);
   runtimeConfigSnapshot = null;
@@ -586,13 +581,7 @@ export async function loadPinnedRuntimeConfigAsync(
   if (runtimeConfigSnapshot) {
     return result(runtimeConfigSnapshot);
   }
-  const generation = runtimeConfigSnapshotGeneration;
-  const assertCurrent = () => {
-    options.assertCurrent?.();
-    if (runtimeConfigSnapshotGeneration !== generation) {
-      throw new Error("Runtime config load was superseded before publication");
-    }
-  };
+  const assertCurrent = () => options.assertCurrent?.();
   try {
     const { config, runtimeEnv } = await loadFresh(assertCurrent);
     options.assertCurrent?.();
@@ -675,7 +664,6 @@ export async function finalizeRuntimeSnapshotWrite(
     notifyCommittedWrite();
     return;
   }
-  const generation = runtimeConfigSnapshotGeneration;
   const refreshHandler = getRuntimeConfigSnapshotRefreshHandler();
   if (refreshHandler) {
     let refreshed: boolean;
@@ -704,12 +692,7 @@ export async function finalizeRuntimeSnapshotWrite(
     }
   }
 
-  const assertCurrent = () => {
-    params.assertCurrent?.();
-    if (runtimeConfigSnapshotGeneration !== generation) {
-      throw new Error("Runtime config reload was superseded before publication");
-    }
-  };
+  const assertCurrent = () => params.assertCurrent?.();
   const { config, runtimeEnv } =
     typeof params.freshConfig === "function"
       ? await params.freshConfig(assertCurrent)

@@ -25,7 +25,10 @@ export function isVisibleTranscriptRecord(value: unknown): value is Record<strin
   );
 }
 
-export function isAssistantResultEventForRun(event: unknown, runId: string): boolean {
+export function isAssistantResultEventForRun(
+  event: unknown,
+  runId: string,
+): event is Record<string, unknown> & { message: Record<string, unknown> } {
   if (
     !isRecord(event) ||
     !isRecord(event.message) ||
@@ -45,7 +48,7 @@ export function isAssistantResultEventForRun(event: unknown, runId: string): boo
 }
 
 export function isVisibleAssistantResultEventForRun(event: unknown, runId: string): boolean {
-  if (!isAssistantResultEventForRun(event, runId) || !isRecord(event)) {
+  if (!isAssistantResultEventForRun(event, runId)) {
     return false;
   }
   const text = extractStoredAssistantText(event.message);
@@ -58,13 +61,10 @@ export function createVisibleAssistantResultEventMatcher(
 ): (event: unknown) => boolean {
   let silentFinalSeen = false;
   return (event) => {
-    if (!isAssistantResultEventForRun(event, runId) || !isRecord(event)) {
+    if (!isAssistantResultEventForRun(event, runId)) {
       return false;
     }
-    if (
-      (isRecord(event.message) && event.message.display === true) ||
-      readTerminalSourceReplyDeliveryMirror(event.message)
-    ) {
+    if (event.message.display === true || readTerminalSourceReplyDeliveryMirror(event.message)) {
       return isVisibleAssistantResultEventForRun(event, runId);
     }
     if (silentFinalSeen) {

@@ -47,6 +47,10 @@ type DiskBudgetOwner = {
   pool: Pick<import("../src/infra/worker-task-pool.js").WorkerTaskPool<string, unknown>, "close">;
 };
 type AgentOwner = AgentLifecycleModule["agentDatabaseLifecycle"];
+type AgentResources = {
+  owned: Set<{ closeOperation?: Promise<void> | null }>;
+  selections: Map<unknown, Promise<void>>;
+};
 const agentClosers = new WeakMap<AgentOwner, () => Promise<void>>();
 
 type SingletonReset = {
@@ -163,18 +167,22 @@ export async function drainSqliteTestAgentOwner(
   const globalStore = globalThis as Record<PropertyKey, unknown>;
   const owner = globalStore[agentKey] as AgentLifecycleModule["agentDatabaseLifecycle"] | undefined;
   const resources = globalStore[Symbol.for("openclaw.agentDatabaseAsyncResources")] as
-    | { active: Set<unknown>; closing: Map<unknown, unknown>; selections: Set<unknown> }
+    | AgentResources
     | undefined;
-  const custody = () => ({
-    databases: owner?.databases.size ?? 0,
-    leases: owner?.leases.size ?? 0,
-    pending: owner?.pending.size ?? 0,
-    activePending: owner?.activePending.size ?? 0,
-    retainedCloses: owner?.retainedCloses.size ?? 0,
-    resources: resources?.active.size ?? 0,
-    closing: resources?.closing.size ?? 0,
-    selections: resources?.selections.size ?? 0,
-  });
+  const custody = () => {
+    const owned = [...(resources?.owned ?? [])];
+    const closing = owned.filter((resource) => resource.closeOperation !== undefined).length;
+    return {
+      databases: owner?.databases.size ?? 0,
+      leases: owner?.leases.size ?? 0,
+      pending: owner?.pending.size ?? 0,
+      activePending: owner?.activePending.size ?? 0,
+      retainedCloses: owner?.retainedCloses.size ?? 0,
+      resources: owned.length - closing,
+      closing,
+      selections: resources?.selections.size ?? 0,
+    };
+  };
   const hasCustody = () => Object.values(custody()).some((count) => count > 0);
   if (!hasCustody()) {
     return;
@@ -204,21 +212,17 @@ export async function drainSqliteTestAgentOwner(
 export async function settleSqliteTestAgentCloses(): Promise<void> {
   const resources = (globalThis as Record<PropertyKey, unknown>)[
     Symbol.for("openclaw.agentDatabaseAsyncResources")
-  ] as
-    | {
-        closing: Map<unknown, Promise<void> | undefined>;
-        selections: Map<unknown, Promise<void>>;
-      }
-    | undefined;
+  ] as AgentResources | undefined;
   if (!resources) {
     return;
   }
   const joined = new Set<Promise<void>>();
   // A settled close can start dependent retirement; wait until nothing new is pending.
   while (true) {
-    const pending = [...resources.closing.values(), ...resources.selections.values()].filter(
-      (operation): operation is Promise<void> => operation !== undefined && !joined.has(operation),
-    );
+    const pending = [
+      ...[...resources.owned].flatMap((resource) => resource.closeOperation ?? []),
+      ...resources.selections.values(),
+    ].filter((operation) => !joined.has(operation));
     if (pending.length === 0) {
       return;
     }

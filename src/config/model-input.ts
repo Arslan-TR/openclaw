@@ -46,7 +46,7 @@ export function resolveSelectedModelFallbacksOverride(
   if (!Object.hasOwn(raw, "fallbacks")) {
     return Object.hasOwn(raw, "primary") && resolvePrimaryStringValue(raw) ? [] : undefined;
   }
-  return Array.isArray(raw.fallbacks) ? raw.fallbacks : undefined;
+  return raw.fallbacks;
 }
 
 /** Returns a positive finite tool timeout rounded down to whole milliseconds. */

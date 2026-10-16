@@ -293,12 +293,7 @@ export async function readCurrentConfigForPolicyCheckAsync(params: {
   configPath: string;
   env: NodeJS.ProcessEnv;
 }): Promise<OpenClawConfig> {
-  const configPath = params.configPath;
-  const env = cloneEnvWithPlatformSemantics(params.env);
-  return await createCurrentConfigReader({
-    configPath,
-    env,
-  }).loadConfigAsync({ skipSuspiciousRecovery: true });
+  return await createCurrentConfigReader(params).loadConfigAsync({ skipSuspiciousRecovery: true });
 }
 
 export async function readBestEffortConfig(options?: {

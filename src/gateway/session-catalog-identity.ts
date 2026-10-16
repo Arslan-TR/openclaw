@@ -45,8 +45,7 @@ async function prepareIdentityFacts(input: UserProfileCatalogIdentityInput) {
     // Attribution is a display snapshot; profile edits apply to the next page.
     assertCurrent: context.admission.assertCurrent,
     readProfile(id: string) {
-      const profile = result.profiles.get(id);
-      return profile?.facts ?? { profileId: id, profile: undefined, github: undefined };
+      return result.profiles.get(id) ?? { profileId: id, profile: undefined, github: undefined };
     },
   };
 }

@@ -36,18 +36,16 @@ it("invalidates retained cohorts after worker commits and rollback without fresh
     );
     try {
       expect(read().profiles.get(profile.id)).toMatchObject({
-        ok: true,
-        facts: { profile: { displayName: "Original" } },
+        profile: { displayName: "Original" },
       });
       expect(read().profiles.get("missing")).toMatchObject({
-        ok: true,
-        facts: { profileId: "missing", profile: undefined },
+        profileId: "missing",
+        profile: undefined,
       });
       expect(counter.counts).toEqual({ profiles: 1, identities: 1, freshness: 0 });
       await setCanonicalUserProfileDisplayName(profile.id, "Worker update");
       expect(read().profiles.get(profile.id)).toMatchObject({
-        ok: true,
-        facts: { profile: { displayName: "Worker update" } },
+        profile: { displayName: "Worker update" },
       });
       expect(counter.counts).toEqual({ profiles: 2, identities: 2, freshness: 0 });
       database.db.exec("BEGIN");
@@ -56,15 +54,13 @@ it("invalidates retained cohorts after worker commits and rollback without fresh
           .prepare("UPDATE user_profiles SET display_name = ? WHERE id = ?")
           .run("Pending", profile.id);
         expect(read().profiles.get(profile.id)).toMatchObject({
-          ok: true,
-          facts: { profile: { displayName: "Pending" } },
+          profile: { displayName: "Pending" },
         });
       } finally {
         database.db.exec("ROLLBACK");
       }
       expect(read().profiles.get(profile.id)).toMatchObject({
-        ok: true,
-        facts: { profile: { displayName: "Worker update" } },
+        profile: { displayName: "Worker update" },
       });
     } finally {
       counter.restore();

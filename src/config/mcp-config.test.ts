@@ -1,11 +1,15 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { withTempHome } from "openclaw/plugin-sdk/test-env";
-import { describe, expect, it, vi } from "vitest";
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { listConfiguredMcpServers, mcpConfigInternal } from "./mcp-config.js";
 import { REDACTED_SENTINEL } from "./redact-snapshot.js";
 
 const { set: setConfiguredMcpServer, unset: unsetConfiguredMcpServer } = mcpConfigInternal;
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const configPaths = new AsyncLocalStorage<string>();
 
 function stdio(command: string, arg: string) {
   return { command, args: [arg] };
@@ -16,11 +20,9 @@ function validationOk(raw: unknown) {
 }
 
 const mockReadSourceConfigSnapshot = vi.hoisted(() => async () => {
-  const fsValue = await import("node:fs/promises");
-  const pathValue = await import("node:path");
-  const configPath = pathValue.join(process.env.OPENCLAW_STATE_DIR ?? "", "openclaw.json");
+  const configPath = expectDefined(configPaths.getStore(), "MCP fixture config path");
   try {
-    const raw = await fsValue.readFile(configPath, "utf-8");
+    const raw = await fs.readFile(configPath, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       valid: true,
@@ -40,10 +42,8 @@ const mockReadSourceConfigSnapshot = vi.hoisted(() => async () => {
 const mockReplaceConfigFile = vi.hoisted(
   () =>
     async ({ sourceConfig }: { sourceConfig: unknown }) => {
-      const fsLocal = await import("node:fs/promises");
-      const pathLocal = await import("node:path");
-      const configPath = pathLocal.join(process.env.OPENCLAW_STATE_DIR ?? "", "openclaw.json");
-      await fsLocal.writeFile(configPath, JSON.stringify(sourceConfig, null, 2), "utf-8");
+      const configPath = expectDefined(configPaths.getStore(), "MCP fixture config path");
+      await fs.writeFile(configPath, JSON.stringify(sourceConfig, null, 2), "utf-8");
       return { nextConfig: sourceConfig };
     },
 );
@@ -69,23 +69,9 @@ async function withMcpConfigHome<T>(
   config: unknown,
   fn: (params: { configPath: string }) => Promise<T>,
 ) {
-  return await withTempHome(
-    async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
-      return await fn({ configPath });
-    },
-    {
-      prefix: "openclaw-mcp-config-",
-      skipSessionCleanup: true,
-      env: {
-        OPENCLAW_CONFIG_PATH: undefined,
-        OPENCLAW_BUNDLED_PLUGINS_DIR: undefined,
-        OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined,
-      },
-    },
-  );
+  const configPath = path.join(tempDirs.make("openclaw-mcp-config-"), "openclaw.json");
+  await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
+  return configPaths.run(configPath, () => fn({ configPath }));
 }
 
 async function readMcpServers() {
