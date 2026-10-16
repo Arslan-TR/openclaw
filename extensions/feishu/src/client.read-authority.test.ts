@@ -124,6 +124,10 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     token = `tat_${accountId}`;
 
     server = createServer((request, response) => {
+      const reply = (body: unknown, status = 200) => {
+        response.writeHead(status, { "content-type": "application/json" });
+        response.end(JSON.stringify(body));
+      };
       void (async () => {
         const rawBody = await text(request);
         const body = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : undefined;
@@ -137,30 +141,24 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
         if (await handleRequest(record, response)) {
           return;
         }
-        response.setHeader("content-type", "application/json");
         if (record.path === AUTH_PATH) {
           if (
             record.method !== "POST" ||
             body?.app_id !== credentials.appId ||
             body?.app_secret !== credentials.appSecret
           ) {
-            response.writeHead(401);
-            response.end(JSON.stringify({ code: 99991663, msg: "invalid loopback application" }));
+            reply({ code: 99991663, msg: "invalid loopback application" }, 401);
             return;
           }
-          response.end(JSON.stringify({ code: 0, tenant_access_token: token, expire: 7200 }));
+          reply({ code: 0, tenant_access_token: token, expire: 7200 });
           return;
         }
         if (record.headers.authorization !== `Bearer ${token}`) {
-          response.writeHead(401);
-          response.end(JSON.stringify({ code: 99991663, msg: "missing loopback authentication" }));
+          reply({ code: 99991663, msg: "missing loopback authentication" }, 401);
           return;
         }
-        response.end(JSON.stringify({ code: 0, data: { message_id: "om_result", items: [] } }));
-      })().catch((error: unknown) => {
-        response.writeHead(500, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: String(error) }));
-      });
+        reply({ code: 0, data: { message_id: "om_result", items: [] } });
+      })().catch((error: unknown) => reply({ error: String(error) }, 500));
     });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -189,13 +187,9 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
   });
 
   afterEach(async () => {
-    for (const release of releases) {
-      release();
-    }
+    releases.forEach((release) => release());
     await Promise.allSettled(pendingRequests);
-    for (const interceptor of interceptors) {
-      http.interceptors.request.eject(interceptor);
-    }
+    interceptors.forEach((interceptor) => http.interceptors.request.eject(interceptor));
     http.defaults.transformRequest = defaultTransforms;
     http.defaults.beforeRedirect = defaultBeforeRedirect;
     resetFeishuProxyAgentForTest();
@@ -295,18 +289,15 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
       fresh.run(() => read("om_fresh", createFeishuClient(credentials))),
     ).resolves.toMatchObject({ code: 0 });
     fresh.close();
-    await expect(
-      track(
-        client.im.message.create({
-          params: { receive_id_type: "chat_id" },
-          data: {
-            receive_id: "oc_loopback",
-            msg_type: "text",
-            content: JSON.stringify({ text: "ordinary write" }),
-          },
-        }),
-      ),
-    ).resolves.toMatchObject({ code: 0 });
+    const writing = client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: "oc_loopback",
+        msg_type: "text",
+        content: JSON.stringify({ text: "ordinary write" }),
+      },
+    });
+    await expect(track(writing)).resolves.toMatchObject({ code: 0 });
     expect(methods()).toEqual([
       `POST ${AUTH_PATH}`,
       `GET ${MESSAGE_PATH}/om_fresh`,
@@ -325,9 +316,9 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     });
     // Keep Node's default console formatting, including its normal inspection depth.
     const capturedConsole = new Console({ stdout: output, stderr: output });
-    const log = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
-      capturedConsole.log(...args);
-    });
+    const log = vi
+      .spyOn(console, "log")
+      .mockImplementation(capturedConsole.log.bind(capturedConsole));
     try {
       http.defaults.beforeRedirect = () => scope.close();
       redirect(AUTH_PATH, `${AUTH_PATH}/redirected`);

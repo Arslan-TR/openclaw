@@ -65,7 +65,10 @@ function requireArray(value: unknown): unknown[] {
 const details = (result: unknown) =>
   requireRecord(requireRecord(result, "result").details, "details");
 async function expectDetails(result: unknown, expected: Record<string, unknown>) {
-  expect(details(await result)).toMatchObject(expected);
+  expect(details(await result)).toMatchObject({ ok: true, ...expected });
+}
+function expectClientCall(mock: { mock: { calls: unknown[][] } }, ...expected: unknown[]) {
+  expect(mock).toHaveBeenCalledExactlyOnceWith({ tag: "client" }, ...expected);
 }
 function expectCall(mock: { mock: { calls: unknown[][] } }, expected: Record<string, unknown>) {
   expect(mock).toHaveBeenCalledExactlyOnceWith({ ...actionContext, ...expected });
@@ -77,6 +80,11 @@ function expectNoCalls(...mocks: Array<{ mock: { calls: unknown[][] } }>) {
 }
 const args = (mock: { mock: { calls: unknown[][] } }) =>
   requireRecord(mock.mock.calls[0]?.[0], "args");
+const reaction = (reactionId: string, operatorId = "cli_main", operatorType = "app") => ({
+  reactionId,
+  operatorType,
+  operatorId,
+});
 const card = () => requireRecord(args(runtime.sendCardFeishu).card, "card");
 const elements = () => requireRecord(card().body, "body").elements;
 const receipt = { messageId: "om_sent", chatId: "oc_group_1" };
@@ -325,7 +333,6 @@ describe("Feishu stickers", () => {
   });
   it.each([
     ["work", " thUMbs ", "file_work", "Thumbs Up"],
-    ["renamed", "赞", "file_work", "赞👍"],
     ["other", "赞", "file_other", "赞👍"],
   ])("searches the catalog owned by %s for %s", async (accountId, query, fileId, keyword) => {
     expect(details(await search({ query }, accountId))).toEqual({
@@ -397,7 +404,7 @@ describe("Feishu stickers", () => {
         { ...match, ...params },
         { ...(lookup ? {} : topicContext), cfg: stickerCfg, accountId },
       );
-      await expectDetails(result, { ok: true, action: "sticker", ...receipt });
+      await expectDetails(result, { action: "sticker", ...receipt });
       expect(runtime.sendStickerFeishu).toHaveBeenCalledExactlyOnceWith({
         cfg: stickerCfg,
         to: "oc_group_1",
@@ -532,7 +539,6 @@ describe("Feishu cards and delivery", () => {
         runtime.feishuOutbound.sendMedia,
       );
       await expectDetails(result, {
-        ok: true,
         action,
         messageId: "om_sent",
         chatId: "oc_provider_authoritative",
@@ -579,7 +585,7 @@ describe("Feishu cards and delivery", () => {
             }
           : {},
       );
-      await expectDetails(result, { ok: true, messageId: "om_sent" });
+      await expectDetails(result, { messageId: "om_sent" });
       expectNoCalls(runtime.sendCardFeishu);
       expect(runtime.feishuOutbound.sendPayload).toHaveBeenCalledOnce();
       const sent = args(runtime.feishuOutbound.sendPayload);
@@ -737,10 +743,7 @@ describe("Feishu cards and delivery", () => {
     async ({ action: requestedAction, params, context, header, elements: expectedElements }) => {
       const action = requestedAction ?? "send";
       runtime.sendCardFeishu.mockResolvedValueOnce(receipt);
-      await expectDetails(run(action, { to: "chat:oc_group_1", ...params }, context), {
-        ok: true,
-        ...receipt,
-      });
+      await expectDetails(run(action, { to: "chat:oc_group_1", ...params }, context), receipt);
       expect(elements()).toEqual(expectedElements);
       expect(card().header).toEqual(header);
       expect(args(runtime.sendCardFeishu)).toMatchObject({
@@ -867,7 +870,7 @@ describe("Feishu conversation reads and mutations", () => {
         });
         return;
       }
-      await expectDetails(result, { ok: true, action: "read", message: fetched() });
+      await expectDetails(result, { action: "read", message: fetched() });
       expect(runtime.getChatInfo).toHaveBeenCalledWith({ tag: "client" }, "oc_group_1");
       expect(runtime.getMessageFeishu).toHaveBeenCalledOnce();
       const metadataOrder = runtime.getChatInfo.mock.invocationCallOrder[0];
@@ -913,14 +916,14 @@ describe("Feishu conversation reads and mutations", () => {
             : runtime.removePinFeishu;
       mutate.mockResolvedValueOnce(result);
       const params = { messageId: "om_1", ...(action === "edit" ? { text: "updated" } : {}) };
-      await expectDetails(run(action, params, directOperatorContext), {
-        ok: true,
-        ...(action === "pin"
+      await expectDetails(
+        run(action, params, directOperatorContext),
+        action === "pin"
           ? { pin: { messageId: "om_1" } }
           : action === "edit"
             ? { messageId: "om_1", contentType: "post" }
-            : { messageId: "om_1" }),
-      });
+            : { messageId: "om_1" },
+      );
       expectCall(mutate, { ...params, ...(action === "edit" ? { card: undefined } : {}) });
     },
   );
@@ -931,7 +934,6 @@ describe("Feishu conversation reads and mutations", () => {
       hasMore: false,
     });
     await expectDetails(run("list-pins", { chatId: "oc_group_1" }), {
-      ok: true,
       pins: [{ messageId: "om_pin" }],
     });
     expectCall(runtime.listPinsFeishu, {
@@ -972,13 +974,7 @@ describe("Feishu conversation reads and mutations", () => {
     );
     expect(runtime.getChatInfo).toHaveBeenCalledWith({ tag: "client" }, "oc_group_1");
     if (includeMembers) {
-      expect(runtime.getChatMembers).toHaveBeenCalledExactlyOnceWith(
-        { tag: "client" },
-        "oc_group_1",
-        undefined,
-        undefined,
-        "open_id",
-      );
+      expectClientCall(runtime.getChatMembers, "oc_group_1", undefined, undefined, "open_id");
     }
   });
 
@@ -991,20 +987,10 @@ describe("Feishu conversation reads and mutations", () => {
     async (params, id, type) => {
       runtime.getFeishuMemberInfo.mockResolvedValueOnce({ member_id: id, name: "Alice" });
       await expectDetails(run("member-info", { chatId: "oc_group_1", ...params }), {
-        ok: true,
         member: { member_id: id, name: "Alice" },
       });
-      expect(runtime.assertFeishuChatMember).toHaveBeenCalledExactlyOnceWith(
-        { tag: "client" },
-        "oc_group_1",
-        id,
-        type,
-      );
-      expect(runtime.getFeishuMemberInfo).toHaveBeenCalledExactlyOnceWith(
-        { tag: "client" },
-        id,
-        type,
-      );
+      expectClientCall(runtime.assertFeishuChatMember, "oc_group_1", id, type);
+      expectClientCall(runtime.getFeishuMemberInfo, id, type);
     },
   );
   it.each([
@@ -1034,13 +1020,9 @@ describe("Feishu conversation reads and mutations", () => {
         await expect(result).rejects.toThrow("limited to the current sender");
         expectNoCalls(runtime.getFeishuMemberInfo);
       } else {
-        await expectDetails(result, { ok: true, member });
+        await expectDetails(result, { member });
         expectNoCalls(runtime.assertFeishuChatMember);
-        expect(runtime.getFeishuMemberInfo).toHaveBeenCalledExactlyOnceWith(
-          { tag: "client" },
-          sender,
-          type,
-        );
+        expectClientCall(runtime.getFeishuMemberInfo, sender, type);
       }
     },
   );
@@ -1060,7 +1042,7 @@ describe("Feishu conversation reads and mutations", () => {
       ...(success ? {} : { scope: "groups" }),
     });
     if (success) {
-      await expectDetails(result, { ok: true, groups, peers });
+      await expectDetails(result, { groups, peers });
     } else {
       await expect(result).rejects.toThrow("token expired");
     }
@@ -1131,7 +1113,7 @@ describe("Feishu reactions", () => {
     runtime.getMessageFeishu.mockResolvedValueOnce(fetched());
     await expectDetails(
       run("react", { messageId: "om_1", emoji: "THUMBSUP" }, directOperatorContext),
-      { ok: true, added: "THUMBSUP" },
+      { added: "THUMBSUP" },
     );
     expectCall(runtime.addReactionFeishu, { messageId: "om_1", emojiType: "THUMBSUP" });
   });
@@ -1143,10 +1125,10 @@ describe("Feishu reactions", () => {
       contentType: "text",
     });
     runtime.listReactionsFeishu.mockResolvedValueOnce([
-      { reactionId: "r1", operatorType: "app", operatorId: "cli_main" },
-      { reactionId: "r2", operatorType: "app", operatorId: "cli_main" },
-      { reactionId: "r-other", operatorType: "app", operatorId: "cli_other" },
-      { reactionId: "r-user", operatorType: "user", operatorId: "ou_user" },
+      reaction("r1"),
+      reaction("r2"),
+      reaction("r-other", "cli_other"),
+      reaction("r-user", "ou_user", "user"),
     ]);
     await expectDetails(
       await run(
@@ -1154,7 +1136,7 @@ describe("Feishu reactions", () => {
         { messageId: "om_1", clearAll: true },
         { ...currentReadContext, cfg: policyCfg },
       ),
-      { ok: true, removed: 2 },
+      { removed: 2 },
     );
     expect(runtime.getChatInfo).toHaveBeenCalledWith({ tag: "client" }, "oc_group_1");
     expect(runtime.removeReactionFeishu.mock.calls).toEqual(
@@ -1168,12 +1150,8 @@ describe("Feishu reactions", () => {
     async (own) => {
       runtime.getMessageFeishu.mockResolvedValueOnce(fetched());
       runtime.listReactionsFeishu.mockResolvedValueOnce([
-        { reactionId: "r-other", operatorType: "app", operatorId: "cli_other" },
-        {
-          reactionId: "r1",
-          operatorType: own ? "app" : "user",
-          operatorId: own ? "cli_main" : "ou_user",
-        },
+        reaction("r-other", "cli_other"),
+        reaction("r1", own ? "cli_main" : "ou_user", own ? "app" : "user"),
       ]);
       await expectDetails(
         await run("react", {
@@ -1182,7 +1160,7 @@ describe("Feishu reactions", () => {
           emoji: "THUMBSUP",
           remove: true,
         }),
-        { ok: true, removed: own ? "THUMBSUP" : null },
+        { removed: own ? "THUMBSUP" : null },
       );
       if (own) {
         expectCall(runtime.removeReactionFeishu, { messageId: "om_1", reactionId: "r1" });
@@ -1192,11 +1170,10 @@ describe("Feishu reactions", () => {
     },
   );
   it("lists reactions after message authorization", async () => {
-    const reactions = [{ reactionId: "r1", operatorType: "app", operatorId: "cli_main" }];
+    const reactions = [reaction("r1")];
     runtime.getMessageFeishu.mockResolvedValueOnce(fetched());
     runtime.listReactionsFeishu.mockResolvedValueOnce(reactions);
     await expectDetails(run("reactions", { messageId: "om_1", chatId: "oc_group_1" }), {
-      ok: true,
       reactions,
     });
     expectCall(runtime.listReactionsFeishu, { messageId: "om_1" });

@@ -26,12 +26,8 @@ it("quotes and bounds untrusted mention names in agent context", () => {
 
 it.each([
   ["image", "not-json", ""],
-  [
-    "sticker",
-    JSON.stringify({ file_key: 'sticker_"<&' }),
-    '<sticker key="sticker_&quot;&lt;&amp;"/>',
-  ],
-  ["sticker", JSON.stringify({ file_key: "../sticker" }), "[Sticker]"],
+  ["sticker", '{"file_key":"sticker_\\"<&"}', '<sticker key="sticker_&quot;&lt;&amp;"/>'],
+  ["sticker", '{"file_key":"../sticker"}', "[Sticker]"],
 ])("renders safe %s content: %s", (type, content, expected) => {
   expect(parseMessageContent(content, type)).toBe(expected);
 });
@@ -83,6 +79,9 @@ function parseEvent(input: Partial<EventInput>, botId = bot) {
 function post(content: unknown[][], botId = bot) {
   return parseEvent({ messageType: "post", content: JSON.stringify({ content }) }, botId);
 }
+function textEvent(text: string, mentions: Mention[], chatType: EventInput["chatType"] = "group") {
+  return { text, chatType, message: { mentions } };
+}
 
 it.each(["p2p", "group"] as const)(
   "preserves mention identities and literal names in %s",
@@ -94,11 +93,9 @@ it.each(["p2p", "group"] as const)(
       mention("@_all", "all", "all"),
     ];
     const before = structuredClone(mentions);
-    const ctx = parseEvent({
-      text: "@_user_1 /model @_user_10 @_user_11thanks @_all",
-      message: { mentions },
-      chatType,
-    });
+    const ctx = parseEvent(
+      textEvent("@_user_1 /model @_user_10 @_user_11thanks @_all", mentions, chatType),
+    );
     expect(ctx).toMatchObject({
       content:
         '/model <at user_id="ou_alice">Alice @_user_1</at> <at user_id="ou_bob">$& &lt;Bob&gt;</at>thanks <at user_id="all">all</at>',
@@ -115,27 +112,19 @@ it.each(["p2p", "group"] as const)(
 it.each([
   [
     "missing open ID",
-    {
-      text: "@_user hi",
-      chatType: "p2p",
-      message: { mentions: [{ key: "@_user", name: "Alice", id: { user_id: "uid_alice" } }] },
-    },
+    textEvent("@_user hi", [{ key: "@_user", name: "Alice", id: { user_id: "uid_alice" } }], "p2p"),
     { content: "@Alice hi" },
     bot,
   ],
   [
     "unknown bot",
-    {
-      text: "@_alice hi",
-      chatType: "p2p",
-      message: { mentions: [mention("@_alice", "Alice", "ou_alice")] },
-    },
+    textEvent("@_alice hi", [mention("@_alice", "Alice", "ou_alice")], "p2p"),
     { mentionedBot: false, mentionTargets: undefined },
     "  ",
   ],
   [
     "broadcast metadata",
-    { text: "@_all", message: { mentions: [mention("@_all", "all", "all")] } },
+    textEvent("@_all", [mention("@_all", "all", "all")]),
     { mentionedBot: false },
     "all",
   ],
