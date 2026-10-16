@@ -1,4 +1,5 @@
 import { getEnvironmentData } from "node:worker_threads";
+import { getDatabaseEngineSelection } from "../infra/database-engine/context.js";
 import type { PostgresSchemaFragment } from "../infra/database-engine/contract.js";
 import { openEngineStore } from "../infra/database-engine/open.js";
 import {
@@ -36,6 +37,10 @@ const recovery =
   "Use the matching OpenClaw version or restore the matching PostgreSQL schema and anchor.";
 
 export function stateEngineInput() {
+  const selected = getDatabaseEngineSelection()?.input;
+  if (selected) {
+    return selected;
+  }
   const connection: unknown =
     process.env.NODE_ENV === "test"
       ? getEnvironmentData("openclaw.test.state.connection")
@@ -103,11 +108,12 @@ export function admitStatePostgres(db: PostgresSqlConnection, fresh: boolean): v
       "SELECT value_json FROM config_machine_state WHERE state_key = 'state.schema.contentVersion'",
     )
     .get();
+  // SQLite may publish the current header without a redundant content-version row.
   if (
     meta?.schema_version !== OPENCLAW_STATE_SCHEMA_VERSION ||
     meta.role !== "global" ||
     meta.agent_id !== null ||
-    content?.value_json !== String(OPENCLAW_STATE_SCHEMA_VERSION)
+    (content !== undefined && content.value_json !== String(OPENCLAW_STATE_SCHEMA_VERSION))
   ) {
     throw new Error(`PostgreSQL state metadata mismatch. ${recovery}`);
   }

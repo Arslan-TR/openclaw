@@ -22,6 +22,7 @@ import {
   resolveRuntimeWorkerUrl,
 } from "../../infra/runtime-worker-url.js";
 import { resolveSqliteDatabaseFilePath } from "../../infra/sqlite-database-admission.js";
+import { migrateDaemonRuntimePins } from "../../infra/state-migrations.daemon-runtime-pins.js";
 import * as temporaryState from "../../infra/tmp-openclaw-dir.js";
 import { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
 import {
@@ -131,6 +132,7 @@ afterEach(async () => {
 it.each([
   { agentId: "main", changed: "none", blocked: undefined },
   { agentId: "verification", changed: "none", blocked: undefined },
+  { agentId: "main", changed: "local", blocked: undefined },
   { agentId: "main", changed: "shared", blocked: "state-migrated-no-rollback" },
   { agentId: "main", changed: "agent", blocked: "state-migrated-no-rollback" },
   { agentId: "main", changed: "incomplete", blocked: "state-migrated-no-rollback" },
@@ -143,6 +145,9 @@ it.each([
     const env = { OPENCLAW_STATE_DIR: stateDir };
     const shared = openOpenClawStateDatabase({ env });
     const schemaVersions = await readUpdateStateSchemaVersions({ stateDir, config: {}, env });
+    if (changed === "local") {
+      expect((await migrateDaemonRuntimePins(env)).warnings).toEqual([]);
+    }
     const agentPath = path.join(stateDir, "agents", agentId, "agent", "openclaw-agent.sqlite");
     expect(
       schemaVersions.find((entry) => entry.path === agentPath)?.userVersion ?? null,
@@ -244,6 +249,9 @@ it.each([
         }),
       ),
     ).resolves.toBe(blocked);
+    if (changed === "local") {
+      expect(result.status).toBe("ok");
+    }
     if (changed === "incomplete" || changed === "pending") {
       expect(result).toMatchObject({
         status: "error",
@@ -422,6 +430,9 @@ it.each([
         }
       `,
       );
+    }
+    if (original) {
+      expect((await migrateDaemonRuntimePins(env)).warnings).toEqual([]);
     }
     const created = createUpdateRun({ trigger: foreground ? "api" : "cli" }, { env });
     const parentDriver = parentOwns
