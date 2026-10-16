@@ -1,9 +1,9 @@
 // OpenClaw source performance isolation executes the workflow's real shared-shell path.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { parse } from "yaml";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
@@ -31,38 +31,36 @@ function readWorkflow(): Workflow {
   return parse(readFileSync(WORKFLOW, "utf8")) as Workflow;
 }
 
-function findStep(name: string, job: string): WorkflowStep {
-  const step = readWorkflow().jobs?.[job]?.steps?.find((candidate) => candidate.name === name);
-  expect(step).toBeDefined();
-  return step as WorkflowStep;
-}
+it("isolates the source performance gateway from network and scheduled work", () => {
+  const workflow = readWorkflow();
+  const job = workflow.jobs?.source_performance;
+  const targetStepName = "Run OpenClaw source performance probes";
+  const jobSteps = job?.steps ?? [];
+  const step = expectDefined(
+    jobSteps.find((candidate) => candidate.name === targetStepName),
+    targetStepName,
+  );
+  const targetStepIndex = jobSteps.findIndex((candidate) => candidate.name === targetStepName);
+  const run = step.run ?? "";
+  const sliceStartMarker = 'gateway_home="$(mktemp -d)"';
+  const sliceEndMarker = "cleanup_gateway\ntrap - EXIT";
+  const sliceStart = run.indexOf(sliceStartMarker);
+  const sliceEndMarkerIndex = run.indexOf(sliceEndMarker, sliceStart);
+  const workflowSlice = run.slice(sliceStart, sliceEndMarkerIndex + sliceEndMarker.length);
+  const cronEnv = "OPENCLAW_SKIP_CRON";
+  expect(sliceStart).toBeGreaterThanOrEqual(0);
+  expect(run.lastIndexOf(sliceStartMarker)).toBe(sliceStart);
+  expect(sliceEndMarkerIndex).toBeGreaterThan(sliceStart);
+  expect(run.lastIndexOf(sliceEndMarker)).toBe(sliceEndMarkerIndex);
 
-describe("OpenClaw source performance isolation", () => {
-  it("isolates the source performance gateway from network and scheduled work", () => {
-    const workflow = readWorkflow();
-    const job = workflow.jobs?.source_performance;
-    const targetStepName = "Run OpenClaw source performance probes";
-    const step = findStep(targetStepName, "source_performance");
-    const jobSteps = job?.steps ?? [];
-    const targetStepIndex = jobSteps.findIndex((candidate) => candidate.name === targetStepName);
-    const run = step.run ?? "";
-    const sliceStartMarker = 'gateway_home="$(mktemp -d)"';
-    const sliceEndMarker = "cleanup_gateway\ntrap - EXIT";
-    const sliceStart = run.indexOf(sliceStartMarker);
-    const sliceEndMarkerIndex = run.indexOf(sliceEndMarker, sliceStart);
-    const workflowSlice = run.slice(sliceStart, sliceEndMarkerIndex + sliceEndMarker.length);
-    const cronEnv = "OPENCLAW_SKIP_CRON";
-    expect(sliceStart).toBeGreaterThanOrEqual(0);
-    expect(run.lastIndexOf(sliceStartMarker)).toBe(sliceStart);
-    expect(sliceEndMarkerIndex).toBeGreaterThan(sliceStart);
-    expect(run.lastIndexOf(sliceEndMarker)).toBe(sliceEndMarkerIndex);
-
-    const fixtureRoot = tempDirs.make("openclaw-performance-isolation-");
-    const binDir = join(fixtureRoot, "bin");
-    mkdirSync(binDir);
-    writeFileSync(
-      join(binDir, "node"),
-      `#!/bin/sh
+  const fixtureRoot = tempDirs.make("openclaw-performance-isolation-");
+  const binDir = join(fixtureRoot, "bin");
+  mkdirSync(binDir);
+  const writeCommand = (name: string, source: string) =>
+    writeFileSync(join(binDir, name), source, { mode: 0o755 });
+  writeCommand(
+    "node",
+    `#!/bin/sh
 set -eu
 record_env() {
   {
@@ -122,20 +120,20 @@ printf ' %s' "$@" >&2
 printf '\\n' >&2
 exit 64
 `,
-    );
-    writeFileSync(
-      join(binDir, "cp"),
-      `#!/bin/sh
+  );
+  writeCommand(
+    "cp",
+    `#!/bin/sh
 set -eu
 [ "$#" -eq 2 ] || exit 64
 [ ! -e "$CAPTURE_DIR/readiness-copy.config" ] || exit 64
 /bin/cp "$1" "$CAPTURE_DIR/readiness-copy.config"
 /bin/cp "$1" "$2"
 `,
-    );
-    writeFileSync(
-      join(binDir, "curl"),
-      `#!/bin/sh
+  );
+  writeCommand(
+    "curl",
+    `#!/bin/sh
 set -eu
 [ -s "$CAPTURE_DIR/gateway.port" ] || exit 1
 port="$(cat "$CAPTURE_DIR/gateway.port")"
@@ -148,10 +146,10 @@ done
 [ -f "$CAPTURE_DIR/gateway.ready" ] || exit 1
 printf 'http-health\\n' >> "$EVENTS_FILE"
 `,
-    );
-    writeFileSync(
-      join(binDir, "rg"),
-      `#!/bin/sh
+  );
+  writeCommand(
+    "rg",
+    `#!/bin/sh
 set -eu
 [ "$#" -eq 3 ] && [ "$1" = '-q' ] && [ "$2" = 'catalogRefresh:' ] && [ "$3" = 'src/config/zod-schema.core.ts' ] || {
   printf 'unexpected rg argv\\n' >&2
@@ -160,201 +158,179 @@ set -eu
 printf 'catalog-probe\\n' >> "$EVENTS_FILE"
 exit "$RG_STATUS"
 `,
-    );
-    chmodSync(join(binDir, "rg"), 0o755);
-    chmodSync(join(binDir, "curl"), 0o755);
-    chmodSync(join(binDir, "cp"), 0o755);
-    chmodSync(join(binDir, "node"), 0o755);
+  );
 
-    for (const [branch, rgStatus, expectsCatalogRefresh] of [
-      ["unsupported", "1", false],
-      ["supported", "0", true],
-    ] as const) {
-      const branchDir = join(fixtureRoot, branch);
-      const captureDir = join(branchDir, "capture");
-      const sourcePerfDir = join(branchDir, "source");
-      const eventsFile = join(branchDir, "events.txt");
-      mkdirSync(captureDir, { recursive: true });
-      mkdirSync(sourcePerfDir);
-      const isolatedEnv = { ...process.env };
-      for (const name of [
-        "OPENCLAW_SKIP_CRON",
-        "OPENCLAW_SKIP_CHANNELS",
-        "OPENCLAW_GATEWAY_TOKEN",
-        "BASH_ENV",
-        "ENV",
-        "BASHOPTS",
-        "SHELLOPTS",
-        "CDPATH",
-        "GLOBIGNORE",
-        "PROMPT_COMMAND",
-        "ZDOTDIR",
-      ]) {
-        delete isolatedEnv[name];
-      }
-      Object.assign(isolatedEnv, {
-        PATH: `${binDir}:/usr/bin:/bin`,
-        HOME: branchDir,
-        TMPDIR: branchDir,
-        CAPTURE_DIR: captureDir,
-        EVENTS_FILE: eventsFile,
-        GITHUB_WORKSPACE: "/fixture/workspace",
-        PERFORMANCE_HELPER_DIR: "/fixture/helpers",
-        REAL_NODE: process.execPath,
-        RG_STATUS: rgStatus,
-        SOURCE_PERF_DIR: sourcePerfDir,
-        source_runs: "2",
-      });
-      const result = spawnSync(
-        "bash",
-        ["--noprofile", "--norc", "-c", `set -euo pipefail\n${workflowSlice}`],
-        {
-          cwd: fixtureRoot,
-          encoding: "utf8",
-          env: isolatedEnv,
-          timeout: 12_000,
-        },
-      );
-      expect(result.error, result.stderr).toBeUndefined();
-      expect(result.status, result.stderr).toBe(0);
-
-      expect(readFileSync(eventsFile, "utf8").trim().split("\n")).toEqual([
-        "catalog-probe",
-        "gateway-run",
-        "http-health",
-        "gateway-health",
-        "benchmark",
-      ]);
-      const gatewayConfig = readFileSync(join(captureDir, "gateway.config"), "utf8");
-      const gatewayPort = readFileSync(join(captureDir, "gateway.port"), "utf8").trim();
-      expect(gatewayPort).toMatch(/^[1-9][0-9]*$/);
-      for (const name of ["readiness-copy", "health", "benchmark"]) {
-        expect(readFileSync(join(captureDir, `${name}.config`), "utf8")).toBe(gatewayConfig);
-      }
-      parse(gatewayConfig, { uniqueKeys: true });
-      const parsedConfig = JSON.parse(gatewayConfig) as {
-        gateway?: { auth?: Record<string, unknown> };
-        models?: { catalogRefresh?: { enabled?: boolean } };
-      };
-      expect(parsedConfig).toMatchObject({
-        agents: { defaults: { heartbeat: { every: "0m" } } },
-        browser: { enabled: false },
-        update: { checkOnStart: false },
-        gateway: {
-          mode: "local",
-          port: Number(gatewayPort),
-          bind: "loopback",
-          auth: { mode: "token" },
-          controlUi: { enabled: false },
-          tailscale: { mode: "off" },
-        },
-        plugins: { enabled: true, entries: { browser: { enabled: false } } },
-      });
-      expect(JSON.stringify(parsedConfig)).not.toContain('"dreaming":');
-      expect(parsedConfig.gateway?.auth).toEqual({ mode: "token" });
-      if (expectsCatalogRefresh) {
-        expect(parsedConfig.models?.catalogRefresh?.enabled).toBe(false);
-      } else {
-        expect(parsedConfig.models?.catalogRefresh).toBeUndefined();
-      }
-
-      const readCapturedEnv = (name: string) =>
-        Object.fromEntries(
-          readFileSync(join(captureDir, `${name}.env`), "utf8")
-            .trim()
-            .split("\n")
-            .map((line) => {
-              const separator = line.indexOf("=");
-              return [line.slice(0, separator), line.slice(separator + 1)];
-            }),
-        ) as Record<string, string>;
-      const gatewayEnv = readCapturedEnv("gateway");
-      const healthEnv = readCapturedEnv("health");
-      const benchmarkEnv = readCapturedEnv("benchmark");
-      const gatewayHome = expectDefined(gatewayEnv.OPENCLAW_HOME, "gateway home capture");
-      const gatewayState = expectDefined(gatewayEnv.OPENCLAW_STATE_DIR, "gateway state capture");
-      const gatewayConfigPath = expectDefined(
-        gatewayEnv.OPENCLAW_CONFIG_PATH,
-        "gateway config capture",
-      );
-      const healthHome = expectDefined(healthEnv.OPENCLAW_HOME, "readiness home capture");
-      const healthState = expectDefined(healthEnv.OPENCLAW_STATE_DIR, "readiness state capture");
-      const healthConfigPath = expectDefined(
-        healthEnv.OPENCLAW_CONFIG_PATH,
-        "readiness config capture",
-      );
-      expect(gatewayEnv.OPENCLAW_SKIP_CRON).toBe("1");
-      expect(gatewayEnv.OPENCLAW_SKIP_CHANNELS).toBe("1");
-      expect(benchmarkEnv.OPENCLAW_SKIP_CRON).toBe("<unset>");
-      expect(benchmarkEnv.OPENCLAW_SKIP_CHANNELS).toBe("<unset>");
-      expect(healthEnv.OPENCLAW_SKIP_CRON).toBe("<unset>");
-      expect(healthEnv.OPENCLAW_SKIP_CHANNELS).toBe("<unset>");
-      expect(benchmarkEnv.OPENCLAW_HOME).toBe(gatewayHome);
-      expect(benchmarkEnv.OPENCLAW_STATE_DIR).toBe(gatewayState);
-      expect(benchmarkEnv.OPENCLAW_CONFIG_PATH).toBe(gatewayConfigPath);
-      expect(benchmarkEnv.OPENCLAW_GATEWAY_PORT).toBe(gatewayPort);
-      expect(gatewayEnv.OPENCLAW_GATEWAY_PORT).toBe(gatewayPort);
-      expect(gatewayEnv.OPENCLAW_GATEWAY_TOKEN).toMatch(/^[0-9a-f]{64}$/u);
-      expect(healthEnv.OPENCLAW_GATEWAY_TOKEN).toBe(gatewayEnv.OPENCLAW_GATEWAY_TOKEN);
-      expect(benchmarkEnv.OPENCLAW_GATEWAY_TOKEN).toBe(gatewayEnv.OPENCLAW_GATEWAY_TOKEN);
-      expect(healthHome).not.toBe(gatewayHome);
-      expect(healthState).not.toBe(gatewayState);
-      expect(healthConfigPath).not.toBe(gatewayConfigPath);
-      expect(gatewayState).toBe(join(gatewayHome, ".openclaw"));
-      expect(gatewayConfigPath).toBe(join(gatewayState, "openclaw.json"));
-      expect(healthState).toBe(join(healthHome, ".openclaw"));
-      expect(healthConfigPath).toBe(join(healthState, "openclaw.json"));
-
-      expect(readFileSync(join(captureDir, "gateway.argv"), "utf8").trim().split("\n")).toEqual([
-        "dist/entry.js",
-        "gateway",
-        "run",
-        "--bind",
-        "loopback",
-        "--port",
-        gatewayPort,
-        "--auth",
-        "token",
-        "--allow-unconfigured",
-        "--force",
-      ]);
-      expect(readFileSync(join(captureDir, "health.argv"), "utf8")).toContain(
-        `dist/entry.js\ngateway\nhealth\n--port\n${gatewayPort}\n`,
-      );
-      expect(readFileSync(join(captureDir, "benchmark.argv"), "utf8")).toContain(
-        "--import\ntsx\n/fixture/helpers/scripts/bench-cli-startup.ts\n",
-      );
-      expect(readFileSync(join(captureDir, "gateway.terminated"), "utf8")).toBe("terminated\n");
-      expect(existsSync(gatewayHome)).toBe(false);
-      expect(existsSync(healthHome)).toBe(false);
+  for (const [branch, rgStatus, expectsCatalogRefresh] of [
+    ["unsupported", "1", false],
+    ["supported", "0", true],
+  ] as const) {
+    const branchDir = join(fixtureRoot, branch);
+    const captureDir = join(branchDir, "capture");
+    const sourcePerfDir = join(branchDir, "source");
+    const eventsFile = join(branchDir, "events.txt");
+    const readCapture = (file: string) => readFileSync(join(captureDir, file), "utf8");
+    mkdirSync(captureDir, { recursive: true });
+    mkdirSync(sourcePerfDir);
+    const isolatedEnv = { ...process.env };
+    for (const name of [
+      "OPENCLAW_SKIP_CRON",
+      "OPENCLAW_SKIP_CHANNELS",
+      "OPENCLAW_GATEWAY_TOKEN",
+      "BASH_ENV",
+      "ENV",
+      "BASHOPTS",
+      "SHELLOPTS",
+      "CDPATH",
+      "GLOBIGNORE",
+      "PROMPT_COMMAND",
+      "ZDOTDIR",
+    ]) {
+      delete isolatedEnv[name];
     }
-
-    expect(targetStepIndex).toBeGreaterThanOrEqual(0);
-    const precedingStepScopes = jobSteps.slice(0, targetStepIndex).flatMap((candidate, index) => {
-      const stepLabel = `preceding step ${index + 1} (${candidate.name ?? "unnamed"})`;
-      return [
-        [`${stepLabel} run`, candidate.run ?? ""],
-        [`${stepLabel} env`, JSON.stringify(candidate.env ?? {})],
-        [`${stepLabel} with`, JSON.stringify(candidate.with ?? {})],
-      ] as const;
+    Object.assign(isolatedEnv, {
+      PATH: `${binDir}:/usr/bin:/bin`,
+      HOME: branchDir,
+      TMPDIR: branchDir,
+      CAPTURE_DIR: captureDir,
+      EVENTS_FILE: eventsFile,
+      GITHUB_WORKSPACE: "/fixture/workspace",
+      PERFORMANCE_HELPER_DIR: "/fixture/helpers",
+      REAL_NODE: process.execPath,
+      RG_STATUS: rgStatus,
+      SOURCE_PERF_DIR: sourcePerfDir,
+      source_runs: "2",
     });
+    const result = spawnSync(
+      "bash",
+      ["--noprofile", "--norc", "-c", `set -euo pipefail\n${workflowSlice}`],
+      {
+        cwd: fixtureRoot,
+        encoding: "utf8",
+        env: isolatedEnv,
+        timeout: 12_000,
+      },
+    );
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
 
-    const inheritedCronScopes = [
-      ["workflow env", JSON.stringify(workflow.env ?? {})],
-      ["job env", JSON.stringify(job?.env ?? {})],
-      ["current step env", JSON.stringify(step.env ?? {})],
-      ["current step before harness", run.slice(0, sliceStart)],
-      ...precedingStepScopes,
-      [
-        "current step GITHUB_ENV writes",
-        run
-          .split("\n")
-          .filter((line) => line.includes("GITHUB_ENV"))
-          .join("\n"),
-      ],
-    ] as const;
-    for (const [scope, text] of inheritedCronScopes) {
-      expect(text, scope).not.toContain(cronEnv);
+    expect(readFileSync(eventsFile, "utf8").trim().split("\n")).toEqual([
+      "catalog-probe",
+      "gateway-run",
+      "http-health",
+      "gateway-health",
+      "benchmark",
+    ]);
+    const gatewayConfig = readCapture("gateway.config");
+    const gatewayPort = readCapture("gateway.port").trim();
+    expect(gatewayPort).toMatch(/^[1-9][0-9]*$/);
+    for (const name of ["readiness-copy", "health", "benchmark"]) {
+      expect(readCapture(`${name}.config`)).toBe(gatewayConfig);
     }
-  });
+    parse(gatewayConfig, { uniqueKeys: true });
+    const parsedConfig = JSON.parse(gatewayConfig) as {
+      gateway?: { auth?: Record<string, unknown> };
+      models?: { catalogRefresh?: { enabled?: boolean } };
+    };
+    expect(parsedConfig).toMatchObject({
+      agents: { defaults: { heartbeat: { every: "0m" } } },
+      browser: { enabled: false },
+      update: { checkOnStart: false },
+      gateway: {
+        mode: "local",
+        port: Number(gatewayPort),
+        bind: "loopback",
+        auth: { mode: "token" },
+        controlUi: { enabled: false },
+        tailscale: { mode: "off" },
+      },
+      plugins: { enabled: true, entries: { browser: { enabled: false } } },
+    });
+    expect(JSON.stringify(parsedConfig)).not.toContain('"dreaming":');
+    expect(parsedConfig.gateway?.auth).toEqual({ mode: "token" });
+    if (expectsCatalogRefresh) {
+      expect(parsedConfig.models?.catalogRefresh?.enabled).toBe(false);
+    } else {
+      expect(parsedConfig.models?.catalogRefresh).toBeUndefined();
+    }
+
+    const readCapturedEnv = (name: string) =>
+      Object.fromEntries(
+        readCapture(`${name}.env`)
+          .trim()
+          .split("\n")
+          .map((line) => {
+            const separator = line.indexOf("=");
+            return [line.slice(0, separator), line.slice(separator + 1)];
+          }),
+      ) as Record<string, string>;
+    const gatewayEnv = readCapturedEnv("gateway");
+    const healthEnv = readCapturedEnv("health");
+    const benchmarkEnv = readCapturedEnv("benchmark");
+    const paths = (env: Record<string, string>) => {
+      const home = expectDefined(env.OPENCLAW_HOME, "home capture");
+      const state = expectDefined(env.OPENCLAW_STATE_DIR, "state capture");
+      const config = expectDefined(env.OPENCLAW_CONFIG_PATH, "config capture");
+      expect({ state, config }).toEqual({
+        state: join(home, ".openclaw"),
+        config: join(state, "openclaw.json"),
+      });
+      return { home, state, config };
+    };
+    const gatewayPaths = paths(gatewayEnv);
+    const healthPaths = paths(healthEnv);
+    expect(gatewayEnv).toMatchObject({
+      OPENCLAW_SKIP_CRON: "1",
+      OPENCLAW_SKIP_CHANNELS: "1",
+      OPENCLAW_GATEWAY_PORT: gatewayPort,
+    });
+    const inherited = {
+      OPENCLAW_SKIP_CRON: "<unset>",
+      OPENCLAW_SKIP_CHANNELS: "<unset>",
+      OPENCLAW_GATEWAY_TOKEN: gatewayEnv.OPENCLAW_GATEWAY_TOKEN,
+    };
+    expect(healthEnv).toMatchObject(inherited);
+    expect(benchmarkEnv).toEqual({ ...gatewayEnv, ...inherited });
+    expect(gatewayEnv.OPENCLAW_GATEWAY_TOKEN).toMatch(/^[0-9a-f]{64}$/u);
+    for (const key of ["home", "state", "config"] as const) {
+      expect(healthPaths[key]).not.toBe(gatewayPaths[key]);
+    }
+
+    expect(readCapture("gateway.argv").trim().split("\n")).toEqual(
+      `dist/entry.js gateway run --bind loopback --port ${gatewayPort} --auth token --allow-unconfigured --force`.split(
+        " ",
+      ),
+    );
+    expect(readCapture("health.argv")).toContain(
+      `dist/entry.js\ngateway\nhealth\n--port\n${gatewayPort}\n`,
+    );
+    expect(readCapture("benchmark.argv")).toContain(
+      "--import\ntsx\n/fixture/helpers/scripts/bench-cli-startup.ts\n",
+    );
+    expect(readCapture("gateway.terminated")).toBe("terminated\n");
+    expect([gatewayPaths.home, healthPaths.home].map(existsSync)).toEqual([false, false]);
+  }
+
+  expect(targetStepIndex).toBeGreaterThanOrEqual(0);
+  const inheritedCronScopes = [
+    ["workflow env", workflow.env],
+    ["job env", job?.env],
+    ["current step env", step.env],
+    ["current step before harness", run.slice(0, sliceStart)],
+    ...jobSteps
+      .slice(0, targetStepIndex)
+      .map(
+        (candidate, index) =>
+          [`preceding step ${index + 1} (${candidate.name ?? "unnamed"})`, candidate] as const,
+      ),
+    [
+      "current step GITHUB_ENV writes",
+      run
+        .split("\n")
+        .filter((line) => line.includes("GITHUB_ENV"))
+        .join("\n"),
+    ],
+  ] as const;
+  for (const [scope, value] of inheritedCronScopes) {
+    expect(JSON.stringify(value ?? {}), scope).not.toContain(cronEnv);
+  }
 });

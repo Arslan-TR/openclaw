@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
@@ -17,13 +18,11 @@ const workflow = parse(readFileSync(".github/workflows/openclaw-performance.yml"
   jobs: Record<string, Job>;
 };
 const job = workflow.jobs.gateway_concurrency!;
-const step = (name: string) => {
-  const value = job.steps.find((candidate) => candidate.name === name);
-  if (!value) {
-    throw new Error(`Missing Gateway concurrency step: ${name}`);
-  }
-  return value;
-};
+const step = (name: string, owner = job) =>
+  expectDefined(
+    owner.steps.find((candidate) => candidate.name === name),
+    name,
+  );
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const posixIt = it.skipIf(process.platform === "win32");
 
@@ -74,9 +73,8 @@ describe("Gateway concurrency workflow", () => {
     { requested: "true", eligible: "false", status: 1 },
     { requested: "true", eligible: "true", status: 0 },
   ])("admits requested=$requested eligible=$eligible without secrets", (fixture) => {
-    const root = tempDirs.make("gateway-concurrency-admission-");
     const result = runShell(step("Admit Gateway concurrency request").run!, {
-      CONCURRENCY_OUTPUT: root,
+      CONCURRENCY_OUTPUT: tempDirs.make("gateway-concurrency-admission-"),
       LIVE_REQUESTED: fixture.requested,
       SECRET_ELIGIBLE: fixture.eligible,
     });
@@ -92,9 +90,7 @@ describe("Gateway concurrency workflow", () => {
     const root = tempDirs.make("gateway-concurrency-resolution-");
     const output = join(root, "output");
     const sha = "a".repeat(40);
-    const resolver = workflow.jobs.resolve_target!.steps.find(
-      (candidate) => candidate.name === "Resolve OpenClaw target ref",
-    )!;
+    const resolver = step("Resolve OpenClaw target ref", workflow.jobs.resolve_target);
     const result = runShell(
       'python3() { printf "%s\\n" "$FIXTURE_SHA"; }\nnode() { return 91; }\n' + resolver.run,
       {

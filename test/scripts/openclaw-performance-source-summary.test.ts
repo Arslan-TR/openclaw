@@ -24,18 +24,9 @@ const mockHello = {
 const sqliteRun = {
   integrity: { agent: ["ok"], state: "ok" },
   profile: "smoke",
-  rows: {
-    agentCacheEntries: 1000,
-    agentDatabases: 2,
-    channelIngressEvents: 1000,
-    cronJobs: 100,
-    cronTaskRuns: 1000,
-    deliveryQueueEntries: 1000,
-    pluginStateEntries: 1000,
-    stateRows: 4100,
-  },
-  timingsMs: { checkpoint: 1, seed: 100, total: 150 },
-  walBytes: { agentAfter: [0], agentBefore: [1024], stateAfter: 0, stateBefore: 4096 },
+  rows: { agentCacheEntries: 1000, stateRows: 4100 },
+  timingsMs: { total: 150 },
+  walBytes: { stateAfter: 0, stateBefore: 4096 },
 };
 
 function writeJson(filePath: string, value: unknown) {
@@ -47,16 +38,8 @@ function runCli(...args: string[]) {
   return spawnSync(
     process.execPath,
     ["--import", "tsx", "scripts/openclaw-performance-source-summary.mts", ...args],
-    {
-      cwd: path.resolve("."),
-      encoding: "utf8",
-    },
+    { cwd: path.resolve("."), encoding: "utf8" },
   );
-}
-
-function expectNoNodeStack(stderr: string) {
-  expect(stderr).not.toContain("Node.js");
-  expect(stderr).not.toContain("\n    at ");
 }
 
 function writeSourceFixture(sourceDir = mkTmpRoot()) {
@@ -177,17 +160,23 @@ function sqliteQuery(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function writeSqliteV2Fixture(
-  sourceDir: string,
-  queries: Array<Record<string, unknown>> = [sqliteQuery()],
-) {
+function makeSqliteSource(queries: Array<Record<string, unknown>> = [sqliteQuery()]) {
+  const sourceDir = writeSourceFixture();
   writeJson(path.join(sourceDir, "sqlite-perf-smoke.json"), {
     ...sqliteRun,
     queries,
     schemaVersion: 2,
     versions: { agentSchema: 16, sqlite: "3.53.4", stateSchema: 13 },
   });
+  return sourceDir;
 }
+
+const scanPlan = {
+  fullTableScans: ["SCAN delivery_queue_entries"],
+  indexes: [],
+  raw: ["SCAN delivery_queue_entries"],
+  tempSorts: [],
+};
 
 describe("parseArgs", () => {
   it("parses source summary paths", () => {
@@ -209,34 +198,27 @@ describe("parseArgs", () => {
 
   it("rejects missing path values", () => {
     for (const flag of ["--source-dir", "--baseline-source-dir", "--output"]) {
-      expect(() => parseArgs([flag])).toThrow(`${flag} requires a value`);
-      expect(() => parseArgs([flag, ""])).toThrow(`${flag} requires a value`);
-      expect(() => parseArgs([flag, "-h"])).toThrow(`${flag} requires a value`);
-      expect(() => parseArgs([flag, "--source-dir", "reports/current"])).toThrow(
-        `${flag} requires a value`,
-      );
+      for (const args of [[], [""], ["-h"], ["--source-dir", "reports/current"]]) {
+        expect(() => parseArgs([flag, ...args])).toThrow(`${flag} requires a value`);
+      }
     }
   });
 
   it("reports CLI argument errors without a Node stack trace", () => {
-    const missingSource = runCli();
-    expect(missingSource.status).toBe(1);
-    expect(missingSource.stdout).toBe("");
-    expect(missingSource.stderr.trim()).toBe("--source-dir is required");
-    expectNoNodeStack(missingSource.stderr);
-
-    const unknownArg = runCli("--wat");
-    expect(unknownArg.status).toBe(1);
-    expect(unknownArg.stdout).toBe("");
-    expect(unknownArg.stderr.trim()).toBe("Unknown argument: --wat");
-    expectNoNodeStack(unknownArg.stderr);
+    for (const [args, error] of [
+      [[], "--source-dir is required"],
+      [["--wat"], "Unknown argument: --wat"],
+    ] as const) {
+      const result = runCli(...args);
+      expect(result).toMatchObject({ status: 1, stdout: "" });
+      expect(result.stderr.trim()).toBe(error);
+      expect(result.stderr).not.toMatch(/Node\.js|\n {4}at /);
+    }
   });
 });
 
 describe("buildMarkdown", () => {
   it("compares reordered v2 SQLite scenarios only by shared scenario ID", () => {
-    const sourceDir = writeSourceFixture();
-    const baselineDir = writeSourceFixture();
     const agentQuery = sqliteQuery({
       database: "agent",
       id: "agent-cache.plugin-model-catalog.list",
@@ -255,8 +237,8 @@ describe("buildMarkdown", () => {
       p95Ms: 15,
       sql: "SELECT id FROM delivery_queue_entries WHERE status = ?",
     });
-    writeSqliteV2Fixture(sourceDir, [currentQuery, agentQuery]);
-    writeSqliteV2Fixture(baselineDir, [
+    const sourceDir = makeSqliteSource([currentQuery, agentQuery]);
+    const baselineDir = makeSqliteSource([
       { ...agentQuery, id: "baseline-only", p50Ms: 3, p95Ms: 4 },
       { ...currentQuery, p50Ms: 18, p95Ms: 20 },
     ]);
@@ -279,11 +261,9 @@ describe("buildMarkdown", () => {
       { database: "agent" },
       { sql: "SELECT id FROM delivery_queue_entries WHERE status = ?" },
     ]) {
-      const sourceDir = writeSourceFixture();
-      const baselineDir = writeSourceFixture();
-      writeSqliteV2Fixture(sourceDir);
+      const sourceDir = makeSqliteSource();
       const baselineQuery = sqliteQuery({ ...overrides, p50Ms: 18, p95Ms: 20 });
-      writeSqliteV2Fixture(baselineDir, [baselineQuery]);
+      const baselineDir = makeSqliteSource([baselineQuery]);
 
       expect(buildMarkdown(sourceDir, baselineDir)).toContain(
         `| delivery.pending.load | state | 1000 | 12 | 10.0ms | 12.0ms | ${baselineQuery.rows} | ${baselineQuery.runs} | 20.0ms | n/a (workload differs) |`,
@@ -291,41 +271,17 @@ describe("buildMarkdown", () => {
     }
   });
 
-  it("rejects malformed v2 SQLite metrics and normalized plans", () => {
-    const plan = {
-      fullTableScans: ["SCAN delivery_queue_entries"],
-      indexes: [],
-      raw: ["SCAN delivery_queue_entries"],
-      tempSorts: [],
-    };
-    const query = sqliteQuery({ plan, sql: "SELECT id FROM delivery_queue_entries" });
-    const invalidQueries = [
-      { ...query, p95Ms: null },
-      { ...query, plan: { ...plan, fullTableScans: [42] } },
-      { ...query, plan: { ...plan, fullTableScans: [], indexes: ["idx_fake"] } },
-    ];
-
-    for (const invalidQuery of invalidQueries) {
-      const sourceDir = writeSourceFixture();
-      writeSqliteV2Fixture(sourceDir, [invalidQuery]);
-
-      expect(() => buildMarkdown(sourceDir, null)).toThrow(
-        /\[source-performance\] invalid SQLite scenario (metrics|plan):/,
-      );
-    }
-  });
-
-  it("rejects control characters in v2 SQLite display fields", () => {
-    const sourceDir = writeSourceFixture();
-    writeSqliteV2Fixture(sourceDir, [
-      sqliteQuery({
-        id: "delivery.pending\nload",
-        sql: "SELECT id FROM delivery_queue_entries",
-      }),
+  it.each<[Record<string, unknown>, string]>([
+    [{ p95Ms: null }, "metrics"],
+    [{ plan: { ...scanPlan, fullTableScans: [42] } }, "plan"],
+    [{ plan: { ...scanPlan, fullTableScans: [], indexes: ["idx_fake"] } }, "plan"],
+    [{ id: "delivery.pending\nload" }, "ID"],
+  ])("rejects malformed v2 SQLite scenario $1", (overrides, error) => {
+    const sourceDir = makeSqliteSource([
+      sqliteQuery({ plan: scanPlan, sql: "SELECT id FROM delivery_queue_entries", ...overrides }),
     ]);
-
     expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] invalid SQLite scenario ID:",
+      `[source-performance] invalid SQLite scenario ${error}:`,
     );
   });
 
@@ -343,30 +299,19 @@ describe("buildMarkdown", () => {
     );
   });
 
-  it.each<[string, string, unknown, string]>([
+  it.each<[string, unknown, string]>([
+    ["mock-hello/run-001/qa-suite-summary.json", {}, "invalid mock hello summary counts"],
     [
-      "rejects malformed mock hello summaries",
       "mock-hello/run-001/qa-suite-summary.json",
-      {},
-      "invalid mock hello summary counts",
-    ],
-    [
-      "rejects mock hello summaries without matching scenario evidence",
-      "mock-hello/run-001/qa-suite-summary.json",
-      {
-        ...mockHello,
-        scenarios: [{ id: "mock-hello", status: "fail" }],
-      },
+      { ...mockHello, scenarios: [{ id: "mock-hello", status: "fail" }] },
       "invalid mock hello scenario evidence",
     ],
     [
-      "rejects gateway startup artifacts without resource metrics",
       "gateway-cpu/gateway-startup-bench.json",
       { results: [{ id: "default", summary: { readyzMs: { p50: 12 } } }] },
       "incomplete gateway startup metrics for default",
     ],
     [
-      "rejects extension memory artifacts without combined-process context",
       "extension-memory.json",
       {
         topByDeltaMb: [
@@ -376,30 +321,19 @@ describe("buildMarkdown", () => {
       "incomplete extension memory context",
     ],
     [
-      "rejects malformed SQLite perf smoke artifacts",
       "sqlite-perf-smoke.json",
-      {
-        integrity: { agent: ["ok"], state: "ok" },
-        profile: "smoke",
-        rows: { stateRows: 4100 },
-        walBytes: { stateAfter: 1 },
-      },
+      { ...sqliteRun, rows: { stateRows: 4100 } },
       "incomplete SQLite perf metrics",
     ],
     [
-      "rejects SQLite perf smoke artifacts with failing agent integrity",
       "sqlite-perf-smoke.json",
       {
         integrity: { agent: ["ok", "database disk image is malformed"], state: "ok" },
         profile: "smoke",
-        queries: [{ p50Ms: 0.1, p95Ms: 0.2, query: "SELECT 1", rows: 1 }],
-        rows: { agentCacheEntries: 1000, stateRows: 4100 },
-        timingsMs: { total: 150 },
-        walBytes: { stateAfter: 0, stateBefore: 4096 },
       },
       "SQLite agent integrity check did not pass",
     ],
-  ])("%s", (_name, relative, artifact, message) => {
+  ])("rejects $2", (relative, artifact, message) => {
     const sourceDir = writeSourceFixture();
     writeJson(path.join(sourceDir, relative), artifact);
     expect(() => buildMarkdown(sourceDir, null)).toThrow(`[source-performance] ${message}:`);

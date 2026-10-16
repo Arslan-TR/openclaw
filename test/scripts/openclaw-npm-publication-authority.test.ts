@@ -20,24 +20,29 @@ const packageNames = [
   "openclaw",
 ];
 
-// Run the actual workflow body, trusted shell, CLI, full FRV verifier and
-// admission owner. Only GitHub subprocess transport and npm are replaced.
-// In-process transport avoids hundreds of fake-gh process boots per proof.
+// Execute the real workflow and admission owner; replace only GitHub/npm transport.
 async function fixture(candidateTrap = false) {
   const f = candidatePublicationFixture();
   const root = tempDirs.make("npm-publication-authority-");
   const bin = join(root, "bin");
   const statePath = join(root, "state.json");
-  mkdirSync(bin);
-  mkdirSync(join(root, "preflight-tarball"));
-  mkdirSync(join(root, "full-release-validation"));
-  mkdirSync(join(root, "package"));
-  mkdirSync(join(root, "scripts"));
+  for (const directory of [
+    "bin",
+    "preflight-tarball",
+    "full-release-validation",
+    "package",
+    "scripts",
+  ]) {
+    mkdirSync(join(root, directory));
+  }
+  const write = (path: string, content: string, executable = false) =>
+    writeFileSync(join(root, path), content, executable ? { mode: 0o755 } : undefined);
+  const json = (path: string, value: unknown) => write(path, JSON.stringify(value));
   const version = "2026.8.28-beta.1";
-  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "openclaw", version }));
+  json("package.json", { name: "openclaw", version });
   const tarballs = packageNames.map((name, i) => {
     const tarballName = "package-" + i + ".tgz";
-    writeFileSync(join(root, "package/package.json"), JSON.stringify({ name, version }));
+    json("package/package.json", { name, version });
     execFileSync("tar", [
       "-czf",
       join(root, "preflight-tarball", tarballName),
@@ -47,16 +52,9 @@ async function fixture(candidateTrap = false) {
     ]);
     return { packageName: name, tarballName };
   });
-  writeFileSync(
-    join(root, "preflight-tarball/preflight-manifest.json"),
-    JSON.stringify({ corePackageTarballs: tarballs.slice(0, 3) }),
-  );
-  writeFileSync(
-    join(root, "full-release-validation/full-release-validation-manifest.json"),
-    JSON.stringify(f.manifest),
-  );
-  // Keep the original mutation path executable for red-before proof. The
-  // separate trap case proves a frozen candidate need not ship the repaired P.
+  json("preflight-tarball/preflight-manifest.json", { corePackageTarballs: tarballs.slice(0, 3) });
+  json("full-release-validation/full-release-validation-manifest.json", f.manifest);
+  // Retain the mutation path for red-before proof; the trap verifies frozen candidates.
   for (const file of [
     "scripts/openclaw-npm-publish.sh",
     "scripts/openclaw-npm-extended-stable-release.mjs",
@@ -68,13 +66,10 @@ async function fixture(candidateTrap = false) {
     copyFileSync(file, join(root, file));
   }
   if (candidateTrap) {
-    writeFileSync(
-      join(root, "scripts/openclaw-npm-publish.sh"),
-      "echo CANDIDATE_PUBLISHER_EXECUTED >&2; exit 99\n",
-    );
+    write("scripts/openclaw-npm-publish.sh", "echo CANDIDATE_PUBLISHER_EXECUTED >&2; exit 99\n");
   }
-  writeFileSync(
-    join(root, "scripts/npm-preflight-tooling-identity.mjs"),
+  write(
+    "scripts/npm-preflight-tooling-identity.mjs",
     "throw new Error('CANDIDATE_GUARD_EXECUTED');\n",
   );
   symlinkSync(resolve("."), join(root, "trusted-workflow"), "dir");
@@ -140,39 +135,41 @@ async function fixture(candidateTrap = false) {
         .digest("hex"),
     };
   }
-  const manifestArchive = makeStoredZip({
-    "full-release-validation-manifest.json": JSON.stringify(f.manifest),
-  });
-  const manifestArtifact = {
-    ...f.client.loadManifest().artifact,
-    digest: "sha256:" + hash(manifestArchive),
-    size_in_bytes: manifestArchive.length,
+  const archive = (name: string, value: unknown) =>
+    makeStoredZip({ [name]: JSON.stringify(value) });
+  const artifact = <T extends { id: number }>(metadata: T, name: string, value: unknown) => {
+    const bytes = archive(name, value);
+    const result = { ...metadata, digest: "sha256:" + hash(bytes), size_in_bytes: bytes.length };
+    api["actions/artifacts/" + metadata.id] = result;
+    archives["actions/artifacts/" + metadata.id + "/zip"] = bytes.toString("base64");
+    return result;
   };
-  const planArchive = makeStoredZip({ "full-release-execution-plan.json": JSON.stringify(f.plan) });
-  const planArtifact = {
-    id: 903,
-    name: "full-release-execution-plan-" + f.runId,
-    digest: "sha256:" + hash(planArchive),
-    size_in_bytes: planArchive.length,
-    expired: false,
-    created_at: "2026-08-28T12:01:02.000Z",
-    workflow_run: { id: Number(f.runId), head_sha: f.q, head_branch: f.branch },
-  };
-  api["actions/artifacts/" + manifestArtifact.id] = manifestArtifact;
-  api["actions/artifacts/903"] = planArtifact;
-  archives["actions/artifacts/" + manifestArtifact.id + "/zip"] =
-    manifestArchive.toString("base64");
-  archives["actions/artifacts/903/zip"] = planArchive.toString("base64");
+  const manifestArtifact = artifact(
+    f.client.loadManifest().artifact,
+    "full-release-validation-manifest.json",
+    f.manifest,
+  );
+  const planArtifact = artifact(
+    {
+      id: 903,
+      name: "full-release-execution-plan-" + f.runId,
+      expired: false,
+      created_at: "2026-08-28T12:01:02.000Z",
+      workflow_run: { id: Number(f.runId), head_sha: f.q, head_branch: f.branch },
+    },
+    "full-release-execution-plan.json",
+    f.plan,
+  );
   api["actions/runs/" + f.runId + "/artifacts"] = {
     total_count: 2,
     artifacts: [manifestArtifact, planArtifact],
   };
-  writeFileSync(join(root, "transport.json"), JSON.stringify({ api, archives, logs, views }));
-  writeFileSync(statePath, JSON.stringify({ writes: [], calls: [], revoked: false }));
+  json("transport.json", { api, archives, logs, views });
+  json("state.json", { writes: [], calls: [], revoked: false });
 
   const preload = join(root, "transport.mjs");
-  writeFileSync(
-    preload,
+  write(
+    "transport.mjs",
     `
 import cp from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -248,13 +245,9 @@ cp.spawn = (command, args, options) => {
 syncBuiltinESMExports();
 `,
   );
-  writeFileSync(
-    join(bin, "gh"),
-    "#!/bin/sh\necho 'GitHub transport escaped the fixture' >&2; exit 90\n",
-    { mode: 0o755 },
-  );
-  writeFileSync(
-    join(bin, "npm"),
+  write("bin/gh", "#!/bin/sh\necho 'GitHub transport escaped the fixture' >&2; exit 90\n", true);
+  write(
+    "bin/npm",
     `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = process.env.NPM_AUTHORITY_FIXTURE + '/state.json';
@@ -270,12 +263,12 @@ state.writes.push(args);
 if (state.writes.length === state.revokeAfter) state.revoked = true;
 fs.writeFileSync(path, JSON.stringify(state));
 `,
-    { mode: 0o755 },
+    true,
   );
-  writeFileSync(
-    join(bin, "git"),
+  write(
+    "bin/git",
     "#!/bin/sh\n[ \"$*\" = 'rev-parse HEAD' ] || exit 90\nprintf '%s\\n' '" + f.q + "'\n",
-    { mode: 0o755 },
+    true,
   );
   const env = {
     ...process.env,
@@ -315,37 +308,24 @@ fs.writeFileSync(path, JSON.stringify(state));
     };
   const change = (values: Record<string, unknown>) =>
     writeFileSync(statePath, JSON.stringify({ ...state(), ...values }));
+  const run = (command: string, args: string[]) =>
+    spawnSync(command, args, { cwd: root, env, encoding: "utf8" });
   const preflight = () =>
-    spawnSync(
-      process.execPath,
-      [
-        resolve("scripts/npm-preflight-tooling-identity.mjs"),
-        "--verify-publication-lineage",
-        "--full-release-manifest",
-        "full-release-validation/full-release-validation-manifest.json",
-        "--repository",
-        f.repository,
-        "--source-sha",
-        f.q,
-        "--workflow-sha",
-        f.q,
-        "--publisher-sha",
-        f.p,
-        "--publisher-full-ref",
-        f.publisherFullRef,
-        "--run-id",
-        f.runId,
-        "--run-attempt",
-        "1",
-      ],
-      { cwd: root, env, encoding: "utf8" },
-    );
-  const publish = () =>
-    spawnSync("bash", ["--noprofile", "--norc", "-c", publishStep.run], {
-      cwd: root,
-      env,
-      encoding: "utf8",
-    });
+    run(process.execPath, [
+      resolve("scripts/npm-preflight-tooling-identity.mjs"),
+      "--verify-publication-lineage",
+      ...Object.entries({
+        "full-release-manifest": "full-release-validation/full-release-validation-manifest.json",
+        repository: f.repository,
+        "source-sha": f.q,
+        "workflow-sha": f.q,
+        "publisher-sha": f.p,
+        "publisher-full-ref": f.publisherFullRef,
+        "run-id": f.runId,
+        "run-attempt": "1",
+      }).flatMap(([key, value]) => ["--" + key, value]),
+    ]);
+  const publish = () => run("bash", ["--noprofile", "--norc", "-c", publishStep.run]);
   return { state, change, preflight, publish, env };
 }
 
@@ -376,63 +356,35 @@ describe("npm final publication authority", () => {
     expect(f.state().calls.filter((key) => key === "actions/runs/99")).toHaveLength(4);
   });
 
-  it("refuses revocation after successful preflight and during shell preparation", async () => {
+  const authorityError = "qualification authority";
+  it.each<[string, Record<string, unknown>, number[], string, string?]>([
+    ["preparation", { revokeAtPreparation: true }, [], authorityError, "prepare"],
+    ["publisher check", { revokeAtParent: true }, [], authorityError, "actions/runs/99"],
+    ["companions", { revokeAfter: 3 }, [0, 1, 2], authorityError],
+    ["moved ref", { movedRef: true }, [], "Protected publication tooling tag changed"],
+    ["parent completion", { parentCompleted: true }, [], "parent run state"],
+    ["manual recovery", { recovery: true, reuseFirst: true, revokeAfter: 1 }, [1], authorityError],
+  ])("stops publishing after %s revokes authority", async (_label, change, writes, error, call) => {
     const f = await fixture();
-    const preflight = f.preflight();
-    expect(preflight.status, preflight.stderr).toBe(0);
-    f.change({ revokeAtPreparation: true });
+    if (change.revokeAtPreparation) {
+      const preflight = f.preflight();
+      expect(preflight.status, preflight.stderr).toBe(0);
+    }
+    if (change.recovery) {
+      f.env.RELEASE_PUBLISH_PARENT_STATE_POLICY = "manual-recovery";
+    }
+    f.change(change);
     const result = f.publish();
-    expect(f.state().writes).toEqual([]);
+    expect(f.state().writes.map((args) => args[1])).toEqual(
+      writes.map((index) => `./preflight-tarball/package-${index}.tgz`),
+    );
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("qualification authority");
-    expect(f.state().calls).toContain("prepare");
-  });
-
-  it("refreshes the authenticated admission after the final publisher check", async () => {
-    const f = await fixture();
-    f.change({ revokeAtParent: true });
-    const result = f.publish();
-    expect(f.state().writes).toEqual([]);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("qualification authority");
-    expect(f.state().calls).toContain("actions/runs/99");
-  });
-
-  it.each([3])(
-    "stops every later write when admission is revoked after %i companions",
-    async (count) => {
-      const f = await fixture();
-      f.change({ revokeAfter: count });
-      const result = f.publish();
-      expect(f.state().writes).toHaveLength(count);
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("qualification authority");
-      expect(f.state().writes.some((args) => args[1]?.endsWith("package-3.tgz"))).toBe(false);
-    },
-  );
-
-  it.each(["movedRef", "parentCompleted"])(
-    "preserves the %s publisher guard",
-    async (condition) => {
-      const f = await fixture();
-      f.change({ [condition]: true });
-      const result = f.publish();
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain(
-        condition === "movedRef" ? "Protected publication tooling tag changed" : "parent run state",
-      );
-      expect(f.state().writes).toEqual([]);
-    },
-  );
-
-  it("rechecks admission for manual recovery while reusing a published companion", async () => {
-    const f = await fixture();
-    f.env.RELEASE_PUBLISH_PARENT_STATE_POLICY = "manual-recovery";
-    f.change({ recovery: true, reuseFirst: true, revokeAfter: 1 });
-    const result = f.publish();
-    expect(f.state().writes.map((args) => args[1])).toEqual(["./preflight-tarball/package-1.tgz"]);
-    expect(result.status).not.toBe(0);
-    expect(result.stdout).toContain("already published; reusing it");
-    expect(result.stderr).toContain("qualification authority");
+    expect(result.stderr).toContain(error);
+    if (call) {
+      expect(f.state().calls).toContain(call);
+    }
+    if (change.recovery) {
+      expect(result.stdout).toContain("already published; reusing it");
+    }
   });
 });

@@ -12,16 +12,11 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 type Step = {
   env?: Record<string, string>;
-  id?: string;
-  if?: string;
   name?: string;
   run?: string;
-  uses?: string;
   with?: Record<string, string>;
 };
 type Job = {
-  environment?: string;
-  "runs-on"?: string;
   steps?: Step[];
   uses?: string;
   with?: Record<string, unknown>;
@@ -29,23 +24,10 @@ type Job = {
 type Workflow = {
   on?: {
     workflow_dispatch?: {
-      inputs?: {
-        bypass_extended_stable_guard?: { default?: boolean; type?: string };
-        npm_dist_tag?: { options?: string[] };
-        plugin_sdk_api_acknowledgement?: {
-          default?: string;
-          required?: boolean;
-          type?: string;
-        };
-        plugin_npm_run_id?: { required?: boolean; type?: string };
-        release_candidate_branch?: { default?: string; required?: boolean; type?: string };
-        use_github_hosted_runners?: {
-          default?: boolean;
-          description?: string;
-          required?: boolean;
-          type?: string;
-        };
-      };
+      inputs?: Record<
+        string,
+        { default?: string | boolean; description?: string; required?: boolean; type?: string }
+      >;
     };
   };
   jobs?: Record<string, Job>;
@@ -58,6 +40,9 @@ function workflow(path = workflowPath): Workflow {
 const release = workflow();
 const preflight = workflow(preflightWorkflowPath);
 const publishJob = release.jobs?.publish_openclaw_npm;
+const sourceJob = preflight.jobs?.check_openclaw_npm;
+const sourceStep = (name: string) => step(sourceJob, name);
+const publishingStep = (name: string) => step(publishJob, name);
 
 function step(job: Job | undefined, name: string): Step {
   const found = job?.steps?.find((candidate) => candidate.name === name);
@@ -100,10 +85,7 @@ function runPluginCompatibilityGate(options: { hasScript: boolean; relationship:
     writeFileSync(path, script);
     chmodSync(path, 0o755);
   }
-  const gate = step(
-    preflight.jobs?.check_openclaw_npm,
-    "Enforce plugin compatibility release readiness",
-  );
+  const gate = sourceStep("Enforce plugin compatibility release readiness");
   const result = spawnSync("bash", ["--noprofile", "--norc", "-c", gate.run ?? ""], {
     cwd: root,
     encoding: "utf8",
@@ -153,10 +135,7 @@ describe("minimal npm extended-stable workflow", () => {
     mkdirSync(scripts, { recursive: true });
     writeFileSync(join(root, "package.json"), JSON.stringify({ version: "2026.9.1-alpha.1" }));
     writeFileSync(join(scripts, "package-source-preflight.mjs"), "process.exit(0);\n");
-    const run = step(
-      preflight.jobs?.check_openclaw_npm,
-      "Validate npm package source metadata",
-    ).run;
+    const run = sourceStep("Validate npm package source metadata").run;
     const result = spawnSync("bash", ["-c", run ?? ""], {
       cwd: root,
       encoding: "utf8",
@@ -180,22 +159,10 @@ describe("minimal npm extended-stable workflow", () => {
   });
 
   it("routes source history through the trusted ancestry owner", () => {
-    const sourceAncestry = step(
-      preflight.jobs?.check_openclaw_npm,
-      "Establish source ancestry with main",
-    );
-    const sourceCheck = step(
-      preflight.jobs?.check_openclaw_npm,
-      "Check source, test types, and architecture",
-    );
-    const pluginCompatibility = step(
-      preflight.jobs?.check_openclaw_npm,
-      "Enforce plugin compatibility release readiness",
-    );
-    const trustedCheckout = step(
-      preflight.jobs?.check_openclaw_npm,
-      "Checkout trusted package source preflight",
-    );
+    const sourceAncestry = sourceStep("Establish source ancestry with main");
+    const sourceCheck = sourceStep("Check source, test types, and architecture");
+    const pluginCompatibility = sourceStep("Enforce plugin compatibility release readiness");
+    const trustedCheckout = sourceStep("Checkout trusted package source preflight");
     const metadata = step(preflight.jobs?.check_dependencies_npm, "Validate release metadata").run;
 
     expect(trustedCheckout.with?.["sparse-checkout"]).toContain(".github/actions/git-owner");
@@ -207,15 +174,11 @@ describe("minimal npm extended-stable workflow", () => {
         RELEASE_ANCESTRY_TARGET_REF: "refs/heads/main",
       },
     });
-    for (const ancestry of [sourceAncestry]) {
-      expect(ancestry.env).not.toHaveProperty("RELEASE_ANCESTRY_TOTAL_SECONDS");
-      expect(ancestry.run).toContain(
-        "python3 -I -S .release-harness/.github/actions/git-owner/owner.py",
-      );
-      expect(ancestry.run).toContain(
-        "--policy .release-harness/.github/actions/git-owner/release-ancestry.py",
-      );
-    }
+    expect(sourceAncestry.env).not.toHaveProperty("RELEASE_ANCESTRY_TOTAL_SECONDS");
+    expectText(sourceAncestry.run, [
+      "python3 -I -S .release-harness/.github/actions/git-owner/owner.py",
+      "--policy .release-harness/.github/actions/git-owner/release-ancestry.py",
+    ]);
     expectText(sourceCheck.run, [
       'mv .release-harness "$harness_root"',
       "trap restore_harness EXIT",
@@ -287,9 +250,9 @@ describe("minimal npm extended-stable workflow", () => {
     const input = release.on?.workflow_dispatch?.inputs?.plugin_sdk_api_acknowledgement;
     const qualification = preflight.jobs?.check_sdk_npm;
     const preflightDiff = step(qualification, "Verify Plugin SDK API changes");
-    const publishProvenance = step(publishJob, "Verify prepared tarball provenance");
-    const downloadPreflight = step(publishJob, "Download prepared npm tarball");
-    const verifyPreflightRun = step(publishJob, "Verify preflight run metadata");
+    const publishProvenance = publishingStep("Verify prepared tarball provenance");
+    const downloadPreflight = publishingStep("Download prepared npm tarball");
+    const verifyPreflightRun = publishingStep("Verify preflight run metadata");
     const trustedToolingCheckout = step(qualification, "Checkout trusted Plugin SDK API tooling");
     const publishProvenanceRun = publishProvenance.run;
     if (!publishProvenanceRun) {
@@ -368,11 +331,11 @@ describe("minimal npm extended-stable workflow", () => {
     expect(input).toMatchObject({ default: false, type: "boolean" });
 
     const policySteps = [
-      step(preflight.jobs?.check_openclaw_npm, "Validate npm release request"),
+      sourceStep("Validate npm release request"),
       step(preflight.jobs?.prepare_openclaw_npm, "Validate npm release request"),
       step(release.jobs?.validate_publish_request, "Validate npm release request"),
-      step(publishJob, "Recheck npm release request"),
-      step(publishJob, "Publish"),
+      publishingStep("Recheck npm release request"),
+      publishingStep("Publish"),
     ];
     for (const policyStep of policySteps) {
       expect(policyStep.env?.BYPASS_EXTENDED_STABLE_GUARD).toBe(
@@ -448,17 +411,17 @@ describe("minimal npm extended-stable workflow", () => {
     expect(raw).toContain(
       "--json databaseId,attempt,workflowName,headBranch,headSha,event,status,conclusion,url",
     );
-    const verifier = step(publishJob, "Checkout trusted validation verifier");
-    expect(verifier.with?.ref).toBe("${{ github.workflow_sha }}");
-    expect(verifier.with?.path).toBe("trusted-workflow");
+    const verifier = publishingStep("Checkout trusted validation verifier");
+    expect(verifier.with).toMatchObject({
+      ref: "${{ github.workflow_sha }}",
+      path: "trusted-workflow",
+    });
 
-    const fullValidation = step(publishJob, "Verify full release validation evidence");
-    expect(fullValidation.env?.EXPECTED_WORKFLOW_BRANCH).toBe(
-      "${{ inputs.release_candidate_branch || github.ref_name }}",
-    );
-    expect(fullValidation.env?.FULL_RELEASE_VALIDATION_RUN_ATTEMPT).toBe(
-      "${{ inputs.full_release_validation_run_attempt }}",
-    );
+    const fullValidation = publishingStep("Verify full release validation evidence");
+    expect(fullValidation.env).toMatchObject({
+      EXPECTED_WORKFLOW_BRANCH: "${{ inputs.release_candidate_branch || github.ref_name }}",
+      FULL_RELEASE_VALIDATION_RUN_ATTEMPT: "${{ inputs.full_release_validation_run_attempt }}",
+    });
     expect(fullValidation.run).toContain(
       "actions/runs/${FULL_RELEASE_VALIDATION_RUN_ID}/attempts/${FULL_RELEASE_VALIDATION_RUN_ATTEMPT}",
     );
@@ -482,14 +445,14 @@ describe("minimal npm extended-stable workflow", () => {
     expect(required.env?.PLUGIN_NPM_RUN_ID).toBe("${{ inputs.plugin_npm_run_id }}");
     expect(required.run).toContain("Extended-stable publish requires plugin_npm_run_id");
 
-    const verify = step(publishJob, "Verify plugin npm release run metadata");
-    expect(verify.env?.RUN_KIND).toBe("plugin");
-    expect(verify.env?.EXPECTED_ORCHESTRATOR_BRANCH).toBe(
-      "${{ inputs.release_candidate_branch != '' && startsWith(github.ref, 'refs/tags/release-publish/') && github.ref_name || '' }}",
-    );
-    expect(verify.env?.EXPECTED_ORCHESTRATOR_SHA).toBe(
-      "${{ inputs.release_candidate_branch != '' && startsWith(github.ref, 'refs/tags/release-publish/') && github.workflow_sha || '' }}",
-    );
+    const verify = publishingStep("Verify plugin npm release run metadata");
+    expect(verify.env).toMatchObject({
+      RUN_KIND: "plugin",
+      EXPECTED_ORCHESTRATOR_BRANCH:
+        "${{ inputs.release_candidate_branch != '' && startsWith(github.ref, 'refs/tags/release-publish/') && github.ref_name || '' }}",
+      EXPECTED_ORCHESTRATOR_SHA:
+        "${{ inputs.release_candidate_branch != '' && startsWith(github.ref, 'refs/tags/release-publish/') && github.workflow_sha || '' }}",
+    });
     expect(verify.run).toContain(
       "node trusted-workflow/scripts/openclaw-npm-extended-stable-release.mjs verify-run",
     );
@@ -505,10 +468,8 @@ describe("minimal npm extended-stable workflow", () => {
     expect(provenance.run).toContain('has("corePackageTarballs")');
     expect(provenance.run).toContain("CORE_PACKAGE_TARBALL_COUNT=0");
     expect(provenance.run).toContain('echo "tarball_path=$ARTIFACT_TARBALL_PATH"');
-    expect(publishStep.env?.PUBLISH_TARBALL_PATH).toBe(
-      "${{ steps.preflight_provenance.outputs.tarball_path }}",
-    );
     expect(publishStep.env).toMatchObject({
+      PUBLISH_TARBALL_PATH: "${{ steps.preflight_provenance.outputs.tarball_path }}",
       PREFLIGHT_WORKFLOW_SHA: "${{ steps.preflight_run.outputs.head_sha }}",
       PREFLIGHT_RUN_ID: "${{ steps.preflight_run.outputs.run_id }}",
       PREFLIGHT_RUN_ATTEMPT: "${{ steps.preflight_run.outputs.run_attempt }}",

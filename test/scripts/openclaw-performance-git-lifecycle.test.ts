@@ -2,15 +2,13 @@ import { beforeAll, expect, it, vi } from "vitest";
 import { runCiGitStep } from "./ci-git-owner.test-support.js";
 import type { PerformanceFixtureOptions } from "./openclaw-performance-workflow.test-support.js";
 
-// Each case owns its checkout and process trees. Overlap their real timeout and
-// drain waits while keeping subprocess pressure bounded.
+// Each case owns its checkout; bound simultaneous process trees.
 beforeAll(() => {
   vi.setConfig({ maxConcurrency: 2 });
   return () => vi.resetConfig();
 });
 
-// Performance jobs run on Ubuntu. Exercise their POSIX bodies here; the shared
-// ci-platform-checkout suite owns native Windows Job Object proof.
+// Native Windows Job Object proof belongs to ci-platform-checkout.
 const posixIt = it.skipIf(process.platform === "win32").concurrent;
 
 const steps = {
@@ -39,9 +37,7 @@ function performanceRun(
   });
 }
 
-// The previous semantic tests used short-lived stubs or replayed Git by hand.
-// These actual workflow bodies must drain real parent/child/grandchild writers
-// before every command, output, consumer and exit, while a sentinel stays alive.
+// Real workflow bodies must drain writers while an unrelated sentinel stays alive.
 posixIt.for(Object.keys(steps) as PerformanceFixtureOptions["mode"][])(
   "Performance %s drains Git trees before every continuation",
   { timeout: 55_000 },
@@ -94,48 +90,61 @@ posixIt.for(["absent", "invalid", "trailing-newline"] as const)(
   },
 );
 
-posixIt.for(["ls-tree", "show"])(
-  "baseline %s failure never becomes absence or invalid JSON",
+posixIt.for([
+  ["baseline", "ls-tree", 128],
+  ["baseline", "show", 128],
+  ["prepare", "ls-tree", 128],
+  ["prepare", "ls-tree", 125],
+  ["publish", "ls-tree", 125],
+  ["publish", "ls-tree", 128],
+] as const)(
+  "%s %s failure %s is terminal, never absence",
   { timeout: 55_000 },
-  async (operation, { signal }) => {
-    const report = await performanceRun(signal, "baseline", {
-      gitFault: { match: `^${operation} `, code: 128 },
+  async ([mode, operation, code], { signal }) => {
+    const report = await performanceRun(signal, mode, {
+      gitFault: { match: `^${operation} `, code },
+      ...(mode === "publish" ? { pushResults: [23] } : {}),
     });
-    expect(report.code, report.output).toBe(128);
-    expect(report.githubSummary).toBe("");
-    expect(report.githubEnv).toBe("");
+    expect(report, report.output).toMatchObject({
+      code,
+      ...(mode === "baseline" ? { githubSummary: "", githubEnv: "" } : {}),
+      ...(mode === "prepare" ? { githubOutput: "ready=false\n" } : {}),
+      ...(mode === "publish" ? { githubSummary: "", checkouts: [] } : {}),
+    });
     expect(report.commands.at(-1)?.args[0]).toBe(operation);
   },
 );
 
 const terminalCases = [
-  ...["rev-parse"].map((operation) => ({ mode: "target" as const, operation })),
-  { mode: "record" as const, operation: "rev-parse" },
-  { mode: "tested" as const, operation: "rev-parse" },
-  ...["fetch", "checkout"].map((operation) => ({ mode: "kova" as const, operation })),
-  ...["fetch", "ls-tree", "show", "sparse-checkout init", "sparse-checkout set", "checkout"].map(
-    (operation) => ({ mode: "baseline" as const, operation }),
-  ),
-  ...["fetch", "ls-tree", "diff"].map((operation) => ({ mode: "prepare" as const, operation })),
-  ...[
-    "config",
-    "push",
-    "fetch",
-    "ls-tree",
-    "checkout",
-    "cherry-pick -X",
-    "cherry-pick --abort",
-    "rev-parse",
-  ].map((operation) => ({ mode: "publish" as const, operation })),
-];
+  ["target", ["rev-parse"]],
+  ["record", ["rev-parse"]],
+  ["tested", ["rev-parse"]],
+  ["kova", ["fetch", "checkout"]],
+  [
+    "baseline",
+    ["fetch", "ls-tree", "show", "sparse-checkout init", "sparse-checkout set", "checkout"],
+  ],
+  ["prepare", ["fetch", "ls-tree", "diff"]],
+  [
+    "publish",
+    [
+      "config",
+      "push",
+      "fetch",
+      "ls-tree",
+      "checkout",
+      "cherry-pick -X",
+      "cherry-pick --abort",
+      "rev-parse",
+    ],
+  ],
+] as const;
 // Every injected lifecycle failure must stop at its command, before later policy actions.
 posixIt.for(
-  terminalCases.flatMap((entry) =>
-    (["cleanup-failure", "cancel"] as const).map((code) => ({
-      mode: entry.mode,
-      operation: entry.operation,
-      code,
-    })),
+  terminalCases.flatMap(([mode, operations]) =>
+    operations.flatMap((operation) =>
+      (["cleanup-failure", "cancel"] as const).map((code) => ({ mode, operation, code })),
+    ),
   ),
 )(
   "$mode $operation $code fences every later action",
@@ -205,19 +214,6 @@ posixIt(
     ).toBe(true);
   },
   55_000,
-);
-
-posixIt.for([128, 125])(
-  "prepare duplicate inspection %s is terminal",
-  { timeout: 55_000 },
-  async (code, { signal }) => {
-    const report = await performanceRun(signal, "prepare", {
-      gitFault: { match: "^ls-tree ", code },
-    });
-    expect(report.code, report.output).toBe(code);
-    expect(report.githubOutput).toBe("ready=false\n");
-    expect(report.commands.at(-1)?.args[0]).toBe("ls-tree");
-  },
 );
 
 posixIt.for([0, 1, 125])(
@@ -363,21 +359,6 @@ posixIt.for([125, "hang"] as const)(
     expect(report.fetches).toHaveLength(1);
     expect(report.checkouts).toHaveLength(0);
     expect(report.output.match(/::warning::Unable to refresh/gu)).toHaveLength(1);
-  },
-);
-
-posixIt.for([125, 128])(
-  "remote duplicate read %s is terminal, never absence",
-  { timeout: 55_000 },
-  async (code, { signal }) => {
-    const report = await performanceRun(signal, "publish", {
-      pushResults: [23],
-      gitFault: { match: "^ls-tree ", code },
-    });
-    expect(report.code, report.output).toBe(code);
-    expect(report.commands.at(-1)?.args[0]).toBe("ls-tree");
-    expect(report.githubSummary).toBe("");
-    expect(report.checkouts).toHaveLength(0);
   },
 );
 

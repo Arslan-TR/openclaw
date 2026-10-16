@@ -20,9 +20,26 @@ const SCRIPT = resolve("scripts/openclaw-performance-crabbox.sh");
 const CONFIG = ".github/crabbox/openclaw-performance-untrusted.yaml";
 const SCHEMA = ".github/crabbox/openclaw-performance-evidence.schema.json";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const scriptSource = readFileSync(SCRIPT, "utf8");
+const definitions = scriptSource.slice(0, scriptSource.lastIndexOf('\ncase "${1:-}" in'));
+
+function shell(code: string, env: NodeJS.ProcessEnv, args: string[] = []) {
+  return spawnSync("/bin/bash", ["-euo", "pipefail", "-c", `${definitions}\n${code}`, ...args], {
+    env,
+    encoding: "utf8",
+  });
+}
+
+function readJson(file: string) {
+  return JSON.parse(readFileSync(file, "utf8"));
+}
 
 function writeJson(file: string, value: unknown) {
   writeFileSync(file, JSON.stringify(value));
+}
+
+function linesIfPresent(file: string) {
+  return existsSync(file) ? readFileSync(file, "utf8").trim().split("\n") : [];
 }
 
 function sha256(value: Buffer): string {
@@ -93,19 +110,16 @@ function fixture() {
   return { artifact, evidence, output, payload, root, timing, expected };
 }
 
-function verify(
-  files: ReturnType<typeof fixture>,
-  overrides: { evidence?: string; timing?: string } = {},
-) {
+function verify(files: ReturnType<typeof fixture>) {
   return spawnSync(
     "bash",
     [
       SCRIPT,
       "verify",
       "mock-provider",
-      overrides.timing ?? files.timing,
+      files.timing,
       "cbx_0123456789ab",
-      overrides.evidence ?? files.evidence,
+      files.evidence,
       files.payload,
       files.output,
       files.expected,
@@ -150,11 +164,9 @@ process.exit(code);
 `,
     { mode: 0o755 },
   );
-  const source = readFileSync(SCRIPT, "utf8");
-  const definitions = source.slice(0, source.lastIndexOf('\ncase "${1:-}" in'));
   const prepareName = options.runner ? "prepare_runner" : "prepare_sut";
-  const prepareStart = source.indexOf(`${prepareName}() {`);
-  const systemdStart = source.indexOf(
+  const prepareStart = scriptSource.indexOf(`${prepareName}() {`);
+  const systemdStart = scriptSource.indexOf(
     options.runner
       ? "\n  # The trusted runner can become only B."
       : '\n  loginctl enable-linger "$SUT_USER"',
@@ -163,7 +175,7 @@ process.exit(code);
   expect(prepareStart).toBeGreaterThan(0);
   expect(systemdStart).toBeGreaterThan(prepareStart);
   // Execute the real preparation gates; systemd startup is outside this fixture.
-  const preparation = source.slice(prepareStart, systemdStart);
+  const preparation = scriptSource.slice(prepareStart, systemdStart);
   const result = spawnSync(
     "/bin/bash",
     [
@@ -226,15 +238,10 @@ printf handoff > "$ROOT/handoff"
   return {
     result,
     handoff: existsSync(join(root, "handoff")),
-    rules: existsSync(join(root, "rules"))
-      ? readFileSync(join(root, "rules"), "utf8").trim().split("\n")
-      : [],
-    probes: existsSync(join(root, "curl-calls"))
-      ? readFileSync(join(root, "curl-calls"), "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line) as { args: string[]; env: Record<string, string> })
-      : [],
+    rules: linesIfPresent(join(root, "rules")),
+    probes: linesIfPresent(join(root, "curl-calls")).map(
+      (line) => JSON.parse(line) as { args: string[]; env: Record<string, string> },
+    ),
   };
 }
 
@@ -257,28 +264,18 @@ describe("OpenClaw performance Crabbox boundary", () => {
           ),
         ),
       );
-      const probes = run.probes.filter(({ args }) => !args.includes("--version"));
-      expect(probes.map(({ args }) => args.at(-1))).toEqual([
+      const urls = [
         "http://169.254.169.254/latest/meta-data/",
         "http://[fd00:ec2::254]/latest/meta-data/",
-      ]);
+      ];
+      const probes = run.probes.filter(({ args }) => !args.includes("--version"));
+      expect(probes).toHaveLength(urls.length);
       for (const [index, probe] of probes.entries()) {
-        expect(probe.args[0]).toBe("-q");
-        expect(probe.args).toContain(index === 0 ? "-4" : "-6");
-        for (const pair of [
-          ["--noproxy", "*"],
-          ["--connect-timeout", "1"],
-          ["--max-time", "2"],
-          ["--output", "/dev/null"],
-          ["--write-out", "%{http_code}"],
-        ] as const) {
-          expect(
-            probe.args.slice(probe.args.indexOf(pair[0]), probe.args.indexOf(pair[0]) + 2),
-          ).toEqual(pair);
-        }
-        expect(probe.args.some((arg) => /^-[^-]*[fL]/.test(arg))).toBe(false);
-        expect(probe.args).not.toContain("--fail");
-        expect(probe.args).not.toContain("--location");
+        expect(probe.args).toEqual(
+          `-q -${index === 0 ? 4 : 6} --noproxy * --silent --connect-timeout 1 --max-time 2 --output /dev/null --write-out %{http_code} ${urls[index]}`.split(
+            " ",
+          ),
+        );
         expect(probe.env.HOME).toBe(runner ? "/home/openclaw-bench" : "/home/openclaw-sut");
         expect(Object.keys(probe.env).some((key) => /proxy/i.test(key))).toBe(false);
       }
@@ -330,13 +327,8 @@ describe("OpenClaw performance Crabbox boundary", () => {
         mkdirSync(join(destination, ".artifacts/source"), { recursive: true });
         writeFileSync(join(destination, relative), "runner-owned");
       }
-      const script = readFileSync(SCRIPT, "utf8");
-      const definitions = script.slice(0, script.lastIndexOf('\ncase "${1:-}" in'));
-      const result = spawnSync(
-        "bash",
-        [
-          "-c",
-          `${definitions}
+      const result = shell(
+        `
 as_sut() {
   case "$1" in
     /usr/bin/realpath) shift; command realpath "$@" ;;
@@ -355,17 +347,13 @@ install() {
 chown() { :; }
 collect_diagnostics "$SOURCE" "$DESTINATION" "$SUBTREE"
 `,
-        ],
         {
-          encoding: "utf8",
-          env: {
-            PATH: process.env.PATH,
-            NODE: process.execPath,
-            PLATFORM: process.platform,
-            SOURCE: kind === "redirected-parent" ? join(root, "redirect") : source,
-            DESTINATION: destination,
-            SUBTREE: subtree,
-          },
+          PATH: process.env.PATH,
+          NODE: process.execPath,
+          PLATFORM: process.platform,
+          SOURCE: kind === "redirected-parent" ? join(root, "redirect") : source,
+          DESTINATION: destination,
+          SUBTREE: subtree,
         },
       );
       expect(result.status, result.stderr).toBe(kind === "regular" ? 0 : 1);
@@ -402,18 +390,11 @@ collect_diagnostics "$SOURCE" "$DESTINATION" "$SUBTREE"
     { name: "custom summary failure", admitted: false, summaryExit: 37, expected: 37 },
   ])("finalizes quiesced workloads with trusted phase policy: $name", (entry) => {
     const root = tempDirs.make("performance-failed-export-");
-    const source = readFileSync(SCRIPT, "utf8");
-    const start = source.indexOf('  set +e\n  (\n    set -e\n    as_sut "$0" __prepare');
-    const end = source.indexOf("\n}\n\nverify_payload()", start);
+    const start = scriptSource.indexOf('  set +e\n  (\n    set -e\n    as_sut "$0" __prepare');
+    const end = scriptSource.indexOf("\n}\n\nverify_payload()", start);
     expect(start).toBeGreaterThan(0);
-    const result = spawnSync(
-      "/bin/bash",
-      [
-        "-euo",
-        "pipefail",
-        "-c",
-        `
-${source.slice(0, source.lastIndexOf('\ncase "${1:-}" in'))}
+    const result = shell(
+      `
 as_sut() {
   case "\${2:-}" in
     __sut)
@@ -490,45 +471,37 @@ finish() {
   local run_id=123 run_attempt=1 crabbox_version=fixture
   local started_at=2026-09-07T00:00:00Z finished_at
   mkdir -p "$ROOT/.artifacts/performance-crabbox/$lane"
-${source.slice(start, end)}
+${scriptSource.slice(start, end)}
 }
 finish
 `,
-        SCRIPT,
-      ],
       {
-        env: {
-          HOME: root,
-          PATH: process.env.PATH,
-          ROOT: root,
-          SHA: "a".repeat(40),
-          LANE: entry.lane ?? "mock-provider",
-          SETUP_EXIT: String(entry.setupExit ?? 0),
-          BUILD_EXIT: "0",
-          MATRIX_EXIT: String(entry.matrixExit ?? 0),
-          BUNDLE_EXIT: String(entry.bundleExit ?? 0),
-          SUMMARY_EXIT: String(entry.summaryExit ?? 0),
-          COLLECTION_EXIT: String(entry.collectionExit ?? 0),
-          GATED: String(entry.gated ?? false),
-          ADAPTED: String(entry.adapted ?? false),
-          ADMITTED: String(entry.admitted ?? true),
-          VALIDATION_EXIT: String(entry.validationExit ?? 0),
-        },
-        encoding: "utf8",
+        HOME: root,
+        PATH: process.env.PATH,
+        ROOT: root,
+        SHA: "a".repeat(40),
+        LANE: entry.lane ?? "mock-provider",
+        SETUP_EXIT: String(entry.setupExit ?? 0),
+        BUILD_EXIT: "0",
+        MATRIX_EXIT: String(entry.matrixExit ?? 0),
+        BUNDLE_EXIT: String(entry.bundleExit ?? 0),
+        SUMMARY_EXIT: String(entry.summaryExit ?? 0),
+        COLLECTION_EXIT: String(entry.collectionExit ?? 0),
+        GATED: String(entry.gated ?? false),
+        ADAPTED: String(entry.adapted ?? false),
+        ADMITTED: String(entry.admitted ?? true),
+        VALIDATION_EXIT: String(entry.validationExit ?? 0),
       },
+      [SCRIPT],
     );
     expect(result.status, result.stderr).toBe(entry.expected);
     expect(existsSync(join(root, "quiesced"))).toBe(true);
-    expect(existsSync(join(root, "exported"))).toBe(true);
     expect(readFileSync(join(root, "exported"), "utf8")).toBe(`${entry.expected}\n`);
     expect(
-      JSON.parse(
-        readFileSync(
-          join(
-            root,
-            `.artifacts/performance-crabbox/${entry.lane ?? "mock-provider"}/workload-result.json`,
-          ),
-          "utf8",
+      readJson(
+        join(
+          root,
+          `.artifacts/performance-crabbox/${entry.lane ?? "mock-provider"}/workload-result.json`,
         ),
       ),
     ).toMatchObject({ exitCode: entry.expected, exportExitCode: entry.collectionExit ? 43 : 0 });
@@ -639,59 +612,47 @@ finish
       });
     });
 
+    const defaults = {
+      gated: false,
+      sutExit: 0,
+      records: true,
+      planFilter: "scenario:probe",
+      admitted: true,
+    };
+    const kovaCase = (name: string, overrides: Partial<typeof defaults>, expected: number) => ({
+      name,
+      ...defaults,
+      ...overrides,
+      expected,
+    });
     it.each([
-      {
-        name: "advisory BLOCKED",
-        sutExit: 17,
-        expected: 0,
-      },
-      {
-        name: "unadaptable gated BLOCKED",
-        gated: true,
-        sutExit: 17,
-        expected: 17,
-      },
-      {
-        name: "wrong plan filters",
-        planFilter: "scenario:wrong",
-        expected: 1,
-      },
-      {
-        name: "custom Kova cannot approve a gate",
-        gated: true,
-        admitted: false,
-        expected: 1,
-      },
-      {
-        name: "custom Kova invalid evidence",
-        records: false,
-        admitted: false,
-        expected: 1,
-      },
+      kovaCase("advisory BLOCKED", { sutExit: 17 }, 0),
+      kovaCase("unadaptable gated BLOCKED", { gated: true, sutExit: 17 }, 17),
+      kovaCase("wrong plan filters", { planFilter: "scenario:wrong" }, 1),
+      kovaCase("custom Kova cannot approve a gate", { gated: true, admitted: false }, 1),
+      kovaCase("custom Kova invalid evidence", { records: false, admitted: false }, 1),
     ])(
       "enforces native Kova evidence and gate semantics: $name",
-      ({
-        gated = false,
-        sutExit = 0,
-        records = true,
-        planFilter = "scenario:probe",
-        expected,
-        admitted = true,
-      }) => {
+      ({ gated, sutExit, records, planFilter, admitted, expected }) => {
         const root = tempDirs.make("openclaw-performance-kova-contract-");
         const openclaw = join(root, "openclaw");
-        mkdirSync(join(openclaw, ".artifacts/kova/reports/mock-provider"), { recursive: true });
-        mkdirSync(join(openclaw, ".artifacts/kova/plans"), { recursive: true });
-        mkdirSync(join(openclaw, ".artifacts/kova/bundles/mock-provider"), { recursive: true });
-        mkdirSync(join(openclaw, ".artifacts/kova/summaries"), { recursive: true });
+        const artifact = (path: string) => join(openclaw, ".artifacts/kova", path);
+        for (const path of [
+          "reports/mock-provider",
+          "plans",
+          "bundles/mock-provider",
+          "summaries",
+        ]) {
+          mkdirSync(artifact(path), { recursive: true });
+        }
         const common = { profile: { id: "diagnostic" }, target: `local-build:${openclaw}` };
-        writeJson(join(openclaw, ".artifacts/kova/plans/mock-provider.json"), {
+        writeJson(artifact("plans/mock-provider.json"), {
           ...common,
           schemaVersion: "kova.matrix.plan.v1",
           controls: { include: [planFilter], repeat: 1 },
           entries: [{ scenario: { id: "probe" }, state: { id: "fresh" }, status: "SELECTED" }],
         });
-        writeJson(join(openclaw, ".artifacts/kova/reports/mock-provider/report.json"), {
+        writeJson(artifact("reports/mock-provider/report.json"), {
           ...common,
           schemaVersion: "kova.report.v1",
           mode: "execution",
@@ -711,32 +672,20 @@ finish
               ]
             : [],
         });
-        writeFileSync(
-          join(openclaw, ".artifacts/kova/bundles/mock-provider/bundle.json"),
-          '{"files":[]}',
-        );
-        const script = readFileSync(SCRIPT, "utf8");
-        const definitions = script.slice(0, script.lastIndexOf('\ncase "${1:-}" in'));
-        const result = spawnSync(
-          "bash",
-          [
-            "-c",
-            `${definitions}
+        writeJson(artifact("bundles/mock-provider/bundle.json"), { files: [] });
+        const result = shell(
+          `
 node() { printf '%s\\n' "$*" >> "$ROOT/helper-calls"; command node "$@"; }
 validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HELPERS" mock-model true "$ROOT/openclaw" "$SUT_EXIT" "$ADMITTED"
 `,
-          ],
           {
-            env: {
-              ...process.env,
-              ROOT: root,
-              HELPERS: helpers,
-              HOME: root,
-              SUT_EXIT: String(sutExit),
-              GATED: String(gated),
-              ADMITTED: String(admitted),
-            },
-            encoding: "utf8",
+            ...process.env,
+            ROOT: root,
+            HELPERS: helpers,
+            HOME: root,
+            SUT_EXIT: String(sutExit),
+            GATED: String(gated),
+            ADMITTED: String(admitted),
           },
         );
         expect(result.status, result.stderr).toBe(expected);
@@ -750,9 +699,9 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
             expect(calls).toContain("--require-instrumented-performance-contract");
           }
           if (records) {
-            expect(
-              readFileSync(join(openclaw, ".artifacts/kova/summaries/mock-provider.md"), "utf8"),
-            ).toContain("fixture blocked prerequisite");
+            expect(readFileSync(artifact("summaries/mock-provider.md"), "utf8")).toContain(
+              "fixture blocked prerequisite",
+            );
           } else {
             expect(result.stderr).toContain("coverage");
           }
@@ -762,51 +711,44 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
   });
 
   it("uses dedicated AWS on-demand leases with no caches or forwarded environment", () => {
-    const config = parse(readFileSync(CONFIG, "utf8")) as {
-      provider?: string;
-      serverType?: string;
-      capacity?: { market?: string };
-      cache?: Record<string, boolean>;
-      env?: { allow?: string[] };
-      sync?: { gitSeed?: boolean; fingerprint?: boolean; include?: string[] };
-    };
-
-    expect(config.provider).toBe("aws");
-    expect(config.serverType).toBe("c7a.24xlarge");
-    expect(config.capacity?.market).toBe("on-demand");
-    expect(config.cache).toMatchObject({
-      pnpm: false,
-      npm: false,
-      docker: false,
-      git: false,
-      purgeOnRelease: true,
+    expect(parse(readFileSync(CONFIG, "utf8"))).toMatchObject({
+      provider: "aws",
+      serverType: "c7a.24xlarge",
+      capacity: { market: "on-demand" },
+      cache: { pnpm: false, npm: false, docker: false, git: false, purgeOnRelease: true },
+      env: { allow: ["OPENCLAW_PERFORMANCE_NO_ENV"] },
+      sync: {
+        gitSeed: false,
+        fingerprint: false,
+        include: [
+          SCHEMA,
+          "scripts/openclaw-performance-crabbox.sh",
+          ".github/crabbox/performance-control/ocm",
+          ".github/crabbox/performance-control/ocm.sha256",
+          ...[
+            "bench-cli-startup.mjs",
+            "kova-ci-summary.mjs",
+            "lib/kova-report-gate.mjs",
+            "lib/kova-report-selector.mjs",
+            "lib/kova-workflow-evidence.mjs",
+            "openclaw-performance-source-summary.mjs",
+          ].map((name) => `.github/crabbox/performance-control/helpers/${name}`),
+        ],
+      },
     });
-    expect(config.env?.allow).toEqual(["OPENCLAW_PERFORMANCE_NO_ENV"]);
-    expect(config.sync).toMatchObject({ gitSeed: false, fingerprint: false });
-    expect(config.sync?.include).toEqual([
-      SCHEMA,
-      "scripts/openclaw-performance-crabbox.sh",
-      ".github/crabbox/performance-control/ocm",
-      ".github/crabbox/performance-control/ocm.sha256",
-      ...[
-        "bench-cli-startup.mjs",
-        "kova-ci-summary.mjs",
-        "lib/kova-report-gate.mjs",
-        "lib/kova-report-selector.mjs",
-        "lib/kova-workflow-evidence.mjs",
-        "openclaw-performance-source-summary.mjs",
-      ].map((name) => `.github/crabbox/performance-control/helpers/${name}`),
-    ]);
   });
 
   it("pins UID handoff and post-quiescence Git commands to trusted executables", () => {
-    const script = readFileSync(SCRIPT, "utf8");
-    expect(script).toContain('runuser -u "$SUT_USER" -- /usr/bin/env -C "/home/${SUT_USER}" -i');
-    expect(script).toContain("GIT_CONFIG_GLOBAL=/dev/null");
-    expect(script).toContain('"$executor" /usr/bin/git -C "$destination" rev-parse HEAD');
-    expect(script).toContain('as_sut /usr/bin/git -C "$root/openclaw" rev-parse HEAD');
-    expect(script).toContain('"$executor" /usr/bin/git -C "$kova" rev-parse HEAD');
-    expect(script).toContain('pkill -KILL -u "$uid"');
+    for (const command of [
+      'runuser -u "$SUT_USER" -- /usr/bin/env -C "/home/${SUT_USER}" -i',
+      "GIT_CONFIG_GLOBAL=/dev/null",
+      '"$executor" /usr/bin/git -C "$destination" rev-parse HEAD',
+      'as_sut /usr/bin/git -C "$root/openclaw" rev-parse HEAD',
+      '"$executor" /usr/bin/git -C "$kova" rev-parse HEAD',
+      'pkill -KILL -u "$uid"',
+    ]) {
+      expect(scriptSource).toContain(command);
+    }
   });
 
   it("verifies tar paths, sizes, hashes, and lease cleanup before export", () => {
@@ -815,7 +757,8 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
 
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(join(files.root, files.artifact), "utf8")).toBe('{"status":"ok"}\n');
-    expect(JSON.parse(readFileSync(files.output, "utf8")).lease).toEqual({
+    const output = readJson(files.output);
+    expect(output.lease).toEqual({
       provider: "aws",
       market: "on-demand",
       cleanupPolicy: "always",
@@ -823,7 +766,7 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
       stopped: true,
       stopError: "",
     });
-    expect(JSON.parse(readFileSync(files.output, "utf8")).isolation).toMatchObject({
+    expect(output.isolation).toMatchObject({
       tailscaleRequested: false,
       tailscaleMetadataAbsent: true,
     });
@@ -831,9 +774,7 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
 
   it("rejects artifact hash drift", () => {
     const files = fixture();
-    const evidence = JSON.parse(readFileSync(files.evidence, "utf8")) as {
-      artifacts: Array<{ sha256: string }>;
-    };
+    const evidence = readJson(files.evidence) as { artifacts: Array<{ sha256: string }> };
     expectDefined(evidence.artifacts[0], "artifact evidence").sha256 = "0".repeat(64);
     writeJson(files.evidence, evidence);
 
@@ -846,7 +787,7 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
     "rejects a schema-valid payload with the wrong trusted %s",
     (field) => {
       const files = fixture();
-      const evidence = JSON.parse(readFileSync(files.evidence, "utf8"));
+      const evidence = readJson(files.evidence);
       if (field === "workflow") {
         evidence.workflow.runAttempt = "2";
       } else if (field === "crabbox") {
