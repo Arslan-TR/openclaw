@@ -59,30 +59,23 @@ function pause() {
   const entered = createDeferredCore();
   const release = createDeferredCore();
   return {
-    entered,
-    release,
-    wait: async () => {
+    wait: () => {
       entered.resolve();
-      await release.promise;
+      return release.promise;
+    },
+    async during(pending: Promise<unknown>, change: () => void) {
+      try {
+        await awaitGateBeforeSettlement(
+          entered.promise,
+          pending,
+          "Discovery preparation settled early",
+        );
+        change();
+      } finally {
+        release.resolve();
+      }
     },
   };
-}
-
-async function whilePaused(
-  blocked: ReturnType<typeof pause>,
-  pending: Promise<unknown>,
-  change: () => void,
-) {
-  try {
-    await awaitGateBeforeSettlement(
-      blocked.entered.promise,
-      pending,
-      "Discovery preparation settled early",
-    );
-    change();
-  } finally {
-    blocked.release.resolve();
-  }
 }
 
 function participant(): GatewayClient {
@@ -198,9 +191,7 @@ it.each(["commands.list", "skills.status"] as const)(
           policy.gateway!.roles!.default = "none";
           setConfig({ ...cfg, ...policy });
         },
-        projection: () => {
-          bindSessionRowProjection(context, () => undefined);
-        },
+        projection: () => bindSessionRowProjection(context, () => undefined),
         run: () => {},
         request: () => {},
         session: () => replace({ sessionId: "replacement" }),
@@ -249,7 +240,7 @@ it.each(["commands.list", "skills.status"] as const)(
           }
           return change !== "request" || !revoked;
         });
-        await whilePaused(blocked, pending, () => {
+        await blocked.during(pending, () => {
           revoked = true;
           mutate();
         });
@@ -275,7 +266,7 @@ it.each(["ready", "rejected", "replaced"] as const)(
       sessionChanges.emit({ agentId: "main", sessionKey, factsInvalidated: "category" });
       discovery.mockClear();
       const pending = call("commands.list");
-      await whilePaused(blocked, pending, () => {
+      await blocked.during(pending, () => {
         expect(discovery).not.toHaveBeenCalled();
         if (outcome === "replaced") {
           replaceSessionEntrySync(scope, {

@@ -101,27 +101,21 @@ function gate<T>(result: T) {
   return {
     entered,
     release,
-    wait: async () => {
+    wait: () => {
       entered.resolve();
-      await release.promise;
-      return result;
+      return release.promise.then(() => result);
+    },
+    async during(pending: Promise<unknown>, mutate: () => Promise<unknown>) {
+      const settled = pending.catch(() => undefined);
+      try {
+        await awaitGateBeforeSettlement(entered.promise, pending, "Preparation settled early");
+        await mutate();
+      } finally {
+        release.resolve();
+        await settled;
+      }
     },
   };
-}
-
-async function duringGate(
-  blocked: ReturnType<typeof gate>,
-  pending: Promise<unknown>,
-  mutate: () => Promise<unknown>,
-) {
-  const settled = pending.catch(() => undefined);
-  try {
-    await awaitGateBeforeSettlement(blocked.entered.promise, pending, "Preparation settled early");
-    await mutate();
-  } finally {
-    blocked.release.resolve();
-    await settled;
-  }
 }
 
 async function withoutHostSql(run: () => Promise<void>) {
@@ -165,7 +159,7 @@ it.each([false, true])(
     const options = request("tools.effective", { agentId: "main", sessionKey });
     await withoutHostSql(async () => {
       const pending = Promise.resolve(toolsEffectiveHandlers["tools.effective"]!(options));
-      await duringGate(blocked, pending, async () => {
+      await blocked.during(pending, async () => {
         if (replaced) {
           await replaceSessionEntry(
             { agentId: "main", sessionKey },
@@ -213,7 +207,7 @@ it("refuses terminal ownership after its actor session is replaced during catalo
     rows: 24,
     resolveCatalogPlan: blocked.wait,
   });
-  await duringGate(blocked, pending, () =>
+  await blocked.during(pending, () =>
     replaceSessionEntry({ agentId: "main", sessionKey }, { ...entry, sessionId: "replacement" }),
   );
   await expect(pending).rejects.toThrow(/session|current/i);
@@ -252,7 +246,7 @@ it("rejects a replaced actor source during approval lineage preparation", async 
   const blocked = gate(false);
   prepareRegistry.mockImplementationOnce(blocked.wait);
   const pending = resolveApprovalSessionAudienceWithFallback(sessionKey, "main");
-  await duringGate(blocked, pending, () =>
+  await blocked.during(pending, () =>
     replaceSessionEntry({ agentId: "main", sessionKey }, { ...entry, sessionId: "successor" }),
   );
   await expect(pending).rejects.toThrow(/session|current/i);
@@ -302,13 +296,7 @@ it("joins accepted actor node work, preserves changed session settings, and cano
               payloadJSON: JSON.stringify({ sessionKey, text: "Synthetic voice turn" }),
             },
             {
-              isConnectionCurrent: async () => {
-                connectionChecks += 1;
-                if (connectionChecks === 2) {
-                  return selection.wait();
-                }
-                return true;
-              },
+              isConnectionCurrent: async () => (++connectionChecks === 2 ? selection.wait() : true),
             },
           ),
         )
