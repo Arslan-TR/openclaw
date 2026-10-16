@@ -28,6 +28,36 @@ afterEach(() => {
 });
 
 describe("CronPage editor state sync", () => {
+  it("allows offline drafting but disables submission without a live connection", async () => {
+    const request = createRequest();
+    const gateway = createGateway({ request } as unknown as GatewayBrowserClient, false);
+    gateway.emitSnapshot({
+      phase: "reconnecting",
+      hello: operatorHello(["operator.admin"]),
+    });
+    const page = createPage(createContext(gateway), { render: true });
+    try {
+      await waitForCronPage(() =>
+        expect(page.querySelector('[data-test-id="cron-new-task"]')).not.toBeNull(),
+      );
+      page.querySelector<HTMLButtonElement>('[data-test-id="cron-new-task"]')!.click();
+      await page.settle();
+      page.patchForm({ name: "Offline draft", payloadText: "Review the garden" });
+      await page.settle();
+      expect(page.cron.cronFieldErrors).toEqual({});
+      expect(page.querySelector<HTMLInputElement>("#cron-name")!.matches(":disabled")).toBe(false);
+      for (const id of ["cron-submit", "cron-submit-run"]) {
+        const button = page.querySelector<HTMLButtonElement>(`[data-test-id="${id}"]`)!;
+        expect(button.disabled, id).toBe(true);
+        button.click();
+      }
+      expect(request).not.toHaveBeenCalledWith("cron.add", expect.anything());
+      expect(page.cron.cronForm.name).toBe("Offline draft");
+    } finally {
+      page.remove();
+    }
+  });
+
   it("does not treat an accepted edit as completion of a newer clone", async () => {
     const job = createCronViewJob("earlier-edit", { name: "Garden reminder" });
     const saved = createDeferred<CronJob>();

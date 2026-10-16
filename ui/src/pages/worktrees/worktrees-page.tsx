@@ -179,7 +179,11 @@ export function WorktreesView(props: { model: WorktreesModel }) {
                 <button
                   class="btn"
                   title={view().operatorAccess.canAdmin ? "" : t("worktrees.adminRequired")}
-                  disabled={!view().operatorAccess.canAdmin || view().operationPending}
+                  disabled={
+                    !model.gateway.connected ||
+                    !view().operatorAccess.canAdmin ||
+                    view().operationPending
+                  }
                   onClick={() => void model.gc()}
                 >
                   {view().loading ? t("common.loading") : t("worktrees.cleanNow")}
@@ -249,7 +253,11 @@ export function WorktreesView(props: { model: WorktreesModel }) {
                 control={
                   <button
                     class="btn btn--sm"
-                    disabled={view().operationPending || !view().createRepoRoot.trim()}
+                    disabled={
+                      !model.gateway.connected ||
+                      view().operationPending ||
+                      !view().createRepoRoot.trim()
+                    }
                     onClick={() => void model.createWorktree()}
                   >
                     {view().operation === "create" ? t("common.loading") : t("common.create")}
@@ -287,7 +295,11 @@ export function WorktreesView(props: { model: WorktreesModel }) {
                         <button
                           class={record().removedAt ? "btn btn--sm" : "btn btn--sm danger"}
                           title={view().operatorAccess.canAdmin ? "" : t("worktrees.adminRequired")}
-                          disabled={!view().operatorAccess.canAdmin || view().operationPending}
+                          disabled={
+                            !model.gateway.connected ||
+                            !view().operatorAccess.canAdmin ||
+                            view().operationPending
+                          }
                           onClick={() =>
                             void (record().removedAt
                               ? model.restore(record())

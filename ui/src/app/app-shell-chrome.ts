@@ -25,7 +25,7 @@ import {
 } from "../components/panel-toggle-contract.ts";
 import { focusWithoutTooltip } from "../components/tooltip.ts";
 import type { BoardFace } from "../lib/board/settings.ts";
-import { canCallGatewayMethod } from "../lib/gateway-methods.ts";
+import { canPresentGatewayMethod } from "../lib/gateway-methods.ts";
 import {
   KEYBOARD_SHORTCUT_COMBOS,
   type KeyboardShortcutsDialogElement,
@@ -573,7 +573,11 @@ export class ShellChromeOwner {
     if (
       home
         ? !isHomePanelAvailable(host.context?.gateway)
-        : !canCallGatewayMethod(host.context?.gateway.snapshot, "openclaw.chat", "operator.admin")
+        : !canPresentGatewayMethod(
+            host.context?.gateway.snapshot,
+            "openclaw.chat",
+            "operator.admin",
+          )
     ) {
       event.preventDefault();
       return;

@@ -182,7 +182,6 @@ export function createApplicationGateway(
       snapshot.suspensionPhase = availability.hasSuspensionDeadline()
         ? snapshot.suspensionPhase
         : undefined;
-      snapshot.pluginCapabilities = null;
       snapshot.usagePublications = undefined;
       scheduleOfflineIndicator();
     }
@@ -193,6 +192,7 @@ export function createApplicationGateway(
   const setConnectionSnapshot = (patch: Partial<ApplicationGatewaySnapshot>) =>
     setSnapshot({
       hello: null,
+      pluginCapabilities: null,
       canvasPluginSurfaceUrl: null,
       selfUser: undefined,
       lastError: null,
@@ -522,7 +522,10 @@ export function createApplicationGateway(
           return;
         }
         canvasSurface.stop();
-        if (readConnectionAuthReason(error?.details) || error?.code === "PAIRING_REQUIRED") {
+        const admissionRejected = Boolean(
+          readConnectionAuthReason(error?.details) || error?.code === "PAIRING_REQUIRED",
+        );
+        if (admissionRejected) {
           nextClient.retireOfflineRecoveryScope?.();
           everConnected = false;
           credentials.retire(false);
@@ -540,6 +543,10 @@ export function createApplicationGateway(
           return;
         }
         const lastErrorCode = resolveGatewayErrorDetailCode(error) ?? error?.code ?? null;
+        const retainPresentation =
+          !admissionRejected &&
+          lastErrorCode !== ConnectErrorDetailCodes.PROTOCOL_MISMATCH &&
+          lastErrorCode !== ConnectErrorDetailCodes.CONTROL_UI_BUILD_MISMATCH;
         if (lastErrorCode === ConnectErrorDetailCodes.AUTH_BOOTSTRAP_TOKEN_INVALID) {
           connection = { ...connection, bootstrapToken: "", bootstrapProfile: undefined };
         }
@@ -557,6 +564,9 @@ export function createApplicationGateway(
         const closeReason = formatUiExternalText(reason);
         setConnectionSnapshot({
           client: nextClient,
+          // Retained capabilities describe this client, never its live dispatch authority.
+          hello: retainPresentation ? snapshot.hello : null,
+          pluginCapabilities: retainPresentation ? snapshot.pluginCapabilities : null,
           phase:
             mismatchedBuildId !== null
               ? "reload-required"

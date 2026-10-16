@@ -398,7 +398,7 @@ function SidebarUpdateCardContent(props: SidebarUpdateCardProps, host: HTMLEleme
         {renderStatus()}
         {refreshFailed() ? (
           <div class="sidebar-update-card__status sidebar-update-card__status--warn" role="alert">
-            {t("connection.actionsUnavailable")}
+            {t("updates.refreshFailed")}
           </div>
         ) : null}
         <button
