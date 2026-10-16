@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
 import { expect, vi } from "vitest";
 import { createConfigIO } from "../../config/io.js";
 import * as nodeSqlite from "../../infra/node-sqlite.js";
 import { createRetainedPackageSwap } from "../../infra/package-update-swap.test-support.js";
+import { resolveSqliteDatabaseFilePath } from "../../infra/sqlite-database-admission.js";
 import { createUpdateRun, finishUpdateRun } from "../../infra/update-run-ledger.js";
 import * as childCommands from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -139,17 +139,30 @@ export async function expectMigratedPackageFinalization(
         const migrated = new DatabaseSync(databasePath);
         migrated.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION + 1}`);
         migrated.close();
+        const controlPath = path.join(base, "observer-control.sqlite");
+        new DatabaseSync(controlPath).close();
+        const migratedStateLocation = nodeSqlite.resolveNodeSqliteLocation(databasePath);
         const open = nodeSqlite.openNodeSqliteDatabase;
-        vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementation((...args) => {
-          const openedPath = args[0];
-          if (
-            (openedPath.startsWith("file:") ? fileURLToPath(openedPath) : openedPath) ===
-            databasePath
-          ) {
-            oldRuntimeOpens.push(args[0]);
-          }
-          return open(...args);
-        });
+        const observedOpen = vi
+          .spyOn(nodeSqlite, "openNodeSqliteDatabase")
+          .mockImplementation((...args) => {
+            const openedPath = nodeSqlite.resolveNodeSqliteLocation(
+              resolveSqliteDatabaseFilePath(args[0]),
+            );
+            if (openedPath === migratedStateLocation) {
+              oldRuntimeOpens.push(args[0]);
+            }
+            return open(...args);
+          });
+        // Exercise the observer with the native SQLite filename URI without
+        // reopening the migrated state database in the old runtime.
+        const controlUri = nodeSqlite.resolveExistingSqliteFileUri(controlPath);
+        const control = nodeSqlite.openNodeSqliteDatabase(controlUri);
+        try {
+          expect(observedOpen).toHaveBeenCalledExactlyOnceWith(controlUri);
+        } finally {
+          control.close();
+        }
       }
       await fs.writeFile(
         input.resultPath,
