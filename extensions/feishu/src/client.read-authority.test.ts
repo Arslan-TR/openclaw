@@ -3,6 +3,7 @@ import { Console } from "node:console";
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type ServerResponse } from "node:http";
 import { Writable } from "node:stream";
+import { text } from "node:stream/consumers";
 import { setImmediate } from "node:timers/promises";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
@@ -32,10 +33,8 @@ const AUTH_PATH = "/open-apis/auth/v3/tenant_access_token/internal";
 const MESSAGE_PATH = "/open-apis/im/v1/messages";
 const CLOSED_READ = "Feishu read authority closed";
 const authority = new AsyncLocalStorage<() => void>();
-type RequestTransform = Exclude<
-  NonNullable<typeof Lark.defaultHttpInstance.defaults.transformRequest>,
-  unknown[]
->;
+const http = Lark.defaultHttpInstance;
+type RequestTransform = Exclude<NonNullable<typeof http.defaults.transformRequest>, unknown[]>;
 type RecordedRequest = {
   method: string;
   path: string;
@@ -69,12 +68,9 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
   let pendingRequests: Promise<unknown>[];
   let interceptors: number[];
   let releases: Array<() => void>;
-  let handleRequest: (
-    request: RecordedRequest,
-    response: ServerResponse,
-  ) => boolean | Promise<boolean>;
-  let defaultTransforms: typeof Lark.defaultHttpInstance.defaults.transformRequest;
-  let defaultBeforeRedirect: typeof Lark.defaultHttpInstance.defaults.beforeRedirect;
+  let handleRequest: (req: RecordedRequest, res: ServerResponse) => boolean | Promise<boolean>;
+  let defaultTransforms: typeof http.defaults.transformRequest;
+  let defaultBeforeRedirect: typeof http.defaults.beforeRedirect;
 
   function gate() {
     const pending = createDeferred<void>();
@@ -82,13 +78,26 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     return pending;
   }
 
-  function read(messageId: string) {
-    return track(client.im.message.get({ path: { message_id: messageId } }));
+  function read(messageId: string, from = client) {
+    return track(from.im.message.get({ path: { message_id: messageId } }));
   }
 
   function track<T>(request: Promise<T>): Promise<T> {
     pendingRequests.push(request);
     return request;
+  }
+
+  const paths = () => requests.map(({ path }) => path);
+  const methods = () => requests.map(({ method, path }) => `${method} ${path}`);
+  function redirect(from: string, to: string) {
+    handleRequest = (request, response) => {
+      if (request.path !== from) {
+        return false;
+      }
+      response.writeHead(307, { location: to });
+      response.end();
+      return true;
+    };
   }
 
   beforeEach(async () => {
@@ -103,8 +112,8 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     interceptors = [];
     releases = [];
     handleRequest = () => false;
-    defaultTransforms = Lark.defaultHttpInstance.defaults.transformRequest;
-    defaultBeforeRedirect = Lark.defaultHttpInstance.defaults.beforeRedirect;
+    defaultTransforms = http.defaults.transformRequest;
+    defaultBeforeRedirect = http.defaults.beforeRedirect;
     const accountId = `read-authority-${randomUUID()}`;
     credentials = {
       accountId,
@@ -116,11 +125,7 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
 
     server = createServer((request, response) => {
       void (async () => {
-        const chunks: Buffer[] = [];
-        for await (const chunk of request) {
-          chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-        }
-        const rawBody = Buffer.concat(chunks).toString("utf8");
+        const rawBody = await text(request);
         const body = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : undefined;
         const record: RecordedRequest = {
           method: request.method ?? "",
@@ -167,7 +172,7 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     }
     const origin = `http://127.0.0.1:${address.port}`;
     interceptors.push(
-      Lark.defaultHttpInstance.interceptors.request.use(
+      http.interceptors.request.use(
         (options) => {
           const upstream = new URL(options.url ?? "");
           if (upstream.origin === "https://open.feishu.cn") {
@@ -189,10 +194,10 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     }
     await Promise.allSettled(pendingRequests);
     for (const interceptor of interceptors) {
-      Lark.defaultHttpInstance.interceptors.request.eject(interceptor);
+      http.interceptors.request.eject(interceptor);
     }
-    Lark.defaultHttpInstance.defaults.transformRequest = defaultTransforms;
-    Lark.defaultHttpInstance.defaults.beforeRedirect = defaultBeforeRedirect;
+    http.defaults.transformRequest = defaultTransforms;
+    http.defaults.beforeRedirect = defaultBeforeRedirect;
     resetFeishuProxyAgentForTest();
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
@@ -234,10 +239,7 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
       { status: "rejected", reason: { message: CLOSED_READ } },
       { status: "fulfilled", value: { code: 0 } },
     ]);
-    expect(requests.map((request) => request.path)).toEqual([
-      AUTH_PATH,
-      `${MESSAGE_PATH}/om_current`,
-    ]);
+    expect(paths()).toEqual([AUTH_PATH, `${MESSAGE_PATH}/om_current`]);
   });
 
   it.each([false, true])(
@@ -251,7 +253,7 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
       const releaseInterceptor = gate();
       const heldPath = cachedToken ? `${MESSAGE_PATH}/om_interceptor` : AUTH_PATH;
       interceptors.push(
-        Lark.defaultHttpInstance.interceptors.request.use(async (options) => {
+        http.interceptors.request.use(async (options) => {
           if (new URL(options.url ?? "").pathname === heldPath) {
             intercepted.resolve();
             await releaseInterceptor.promise;
@@ -286,13 +288,11 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
     expired.close();
     releaseAuth.resolve();
     await rejected;
-    expect(requests.map((request) => request.path)).toEqual([AUTH_PATH]);
+    expect(paths()).toEqual([AUTH_PATH]);
 
     const fresh = createReadScope();
     await expect(
-      fresh.run(() =>
-        track(createFeishuClient(credentials).im.message.get({ path: { message_id: "om_fresh" } })),
-      ),
+      fresh.run(() => read("om_fresh", createFeishuClient(credentials))),
     ).resolves.toMatchObject({ code: 0 });
     fresh.close();
     await expect(
@@ -307,7 +307,7 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
         }),
       ),
     ).resolves.toMatchObject({ code: 0 });
-    expect(requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+    expect(methods()).toEqual([
       `POST ${AUTH_PATH}`,
       `GET ${MESSAGE_PATH}/om_fresh`,
       `POST ${MESSAGE_PATH}`,
@@ -329,20 +329,11 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
       capturedConsole.log(...args);
     });
     try {
-      Lark.defaultHttpInstance.defaults.beforeRedirect = () => scope.close();
-      handleRequest = (request, response) => {
-        if (request.path !== AUTH_PATH) {
-          return false;
-        }
-        response.writeHead(307, { location: `${AUTH_PATH}/redirected` });
-        response.end();
-        return true;
-      };
+      http.defaults.beforeRedirect = () => scope.close();
+      redirect(AUTH_PATH, `${AUTH_PATH}/redirected`);
 
       await expect(scope.run(() => read("om_auth_redirect"))).rejects.toThrow(CLOSED_READ);
-      expect(requests.map((request) => `${request.method} ${request.path}`)).toEqual([
-        `POST ${AUTH_PATH}`,
-      ]);
+      expect(methods()).toEqual([`POST ${AUTH_PATH}`]);
       expect(diagnostics).toContain(CLOSED_READ);
       expect(diagnostics).not.toContain(credentials.appSecret);
       expect(diagnostics).not.toContain(token);
@@ -365,18 +356,11 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
           ? defaultTransforms
           : [defaultTransforms]
         : [];
-      Lark.defaultHttpInstance.defaults.transformRequest = [...transforms, addDefaultHeader];
-      Lark.defaultHttpInstance.defaults.beforeRedirect = (options) => {
+      http.defaults.transformRequest = [...transforms, addDefaultHeader];
+      http.defaults.beforeRedirect = (options) => {
         options.headers["X-Redirect-Callback"] = "default";
       };
-      handleRequest = (request, response) => {
-        if (request.path !== `${MESSAGE_PATH}/om_redirect`) {
-          return false;
-        }
-        response.writeHead(307, { location: `${MESSAGE_PATH}/om_destination` });
-        response.end();
-        return true;
-      };
+      redirect(`${MESSAGE_PATH}/om_redirect`, `${MESSAGE_PATH}/om_destination`);
       const result = track(
         scope.run(() =>
           client.request({
@@ -399,7 +383,7 @@ describe("Feishu read authority over the real Lark SDK transport", () => {
         await expect(result).resolves.toMatchObject({ code: 0 });
       }
 
-      expect(requests.map((request) => request.path)).toEqual([
+      expect(paths()).toEqual([
         AUTH_PATH,
         `${MESSAGE_PATH}/om_redirect`,
         ...(closeOnRedirect ? [] : [`${MESSAGE_PATH}/om_destination`]),

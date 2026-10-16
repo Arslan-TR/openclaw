@@ -4,7 +4,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 const resolveFeishuRuntimeAccountMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const createReplyPrefixContextMock = vi.hoisted(() => vi.fn());
-const createCommentTypingReactionLifecycleMock = vi.hoisted(() => vi.fn());
+const typingMock = vi.hoisted(() => vi.fn());
 const deliverCommentThreadTextMock = vi.hoisted(() => vi.fn());
 const getFeishuRuntimeMock = vi.hoisted(() => vi.fn());
 const resolvePinnedHostnameWithPolicyMock = vi.hoisted(() =>
@@ -21,13 +21,8 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => ({
   resolvePinnedHostnameWithPolicy: resolvePinnedHostnameWithPolicyMock,
 }));
 
-vi.mock("./accounts.js", () => ({
-  resolveFeishuRuntimeAccount: resolveFeishuRuntimeAccountMock,
-}));
-
-vi.mock("./client.js", () => ({
-  createFeishuClient: createFeishuClientMock,
-}));
+vi.mock("./accounts.js", () => ({ resolveFeishuRuntimeAccount: resolveFeishuRuntimeAccountMock }));
+vi.mock("./client.js", () => ({ createFeishuClient: createFeishuClientMock }));
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/channel-outbound")>()),
@@ -35,16 +30,10 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => ({
 }));
 
 vi.mock("./comment-reaction.js", () => ({
-  createCommentTypingReactionLifecycle: createCommentTypingReactionLifecycleMock,
+  createCommentTypingReactionLifecycle: typingMock,
 }));
-
-vi.mock("./drive.js", () => ({
-  deliverCommentThreadText: deliverCommentThreadTextMock,
-}));
-
-vi.mock("./runtime.js", () => ({
-  getFeishuRuntime: getFeishuRuntimeMock,
-}));
+vi.mock("./drive.js", () => ({ deliverCommentThreadText: deliverCommentThreadTextMock }));
+vi.mock("./runtime.js", () => ({ getFeishuRuntime: getFeishuRuntimeMock }));
 import { createFeishuCommentReplyDispatcher } from "./comment-dispatcher.js";
 
 const commandAction = (command: string) => ({ type: "command" as const, command });
@@ -125,7 +114,7 @@ describe("createFeishuCommentReplyDispatcher", () => {
       delivery_mode: "reply_comment",
       reply_id: "reply_1",
     });
-    createCommentTypingReactionLifecycleMock.mockReturnValue({
+    typingMock.mockReturnValue({
       start: vi.fn(async () => {}),
       cleanup: vi.fn(async () => {}),
     });
@@ -133,17 +122,9 @@ describe("createFeishuCommentReplyDispatcher", () => {
   });
 
   it("sends final comment text without waiting for typing cleanup", async () => {
-    let resolveCleanup: (() => void) | undefined;
-    const cleanup = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveCleanup = resolve;
-        }),
-    );
-    createCommentTypingReactionLifecycleMock.mockReturnValue({
-      start: vi.fn(async () => {}),
-      cleanup,
-    });
+    const { promise: cleanupPromise, resolve: resolveCleanup } = Promise.withResolvers<void>();
+    const cleanup = vi.fn(() => cleanupPromise);
+    typingMock.mockReturnValue({ start: vi.fn(async () => {}), cleanup });
 
     const created = createTestCommentReplyDispatcher();
     const deliverPromise = Promise.resolve(
@@ -168,7 +149,7 @@ describe("createFeishuCommentReplyDispatcher", () => {
     void created.dispatcherOptions.onCleanup?.();
     expect(cleanup).toHaveBeenCalledTimes(1);
 
-    resolveCleanup?.();
+    resolveCleanup();
     await deliverPromise;
   });
 
@@ -244,11 +225,7 @@ describe("createFeishuCommentReplyDispatcher", () => {
 
     expect(error).toMatchObject({
       code: "CHANNEL_PARTIAL_DELIVERY",
-      deliveryResult: {
-        messageIds: ["reply_native_1"],
-        content: "first",
-        visibleReplySent: true,
-      },
+      deliveryResult: { messageIds: ["reply_native_1"], content: "first", visibleReplySent: true },
     });
   });
 });

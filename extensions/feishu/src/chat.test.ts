@@ -1,21 +1,32 @@
-// Feishu tests cover chat plugin behavior.
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginRuntime } from "../runtime-api.js";
 import { registerFeishuChatTools } from "./chat.js";
 import type { FeishuConfig } from "./types.js";
 
-const createFeishuClientMock = vi.hoisted(() => vi.fn());
+const clientMock = vi.hoisted(() => vi.fn());
 const chatGetMock = vi.hoisted(() => vi.fn());
 const chatMembersGetMock = vi.hoisted(() => vi.fn());
 const contactUserGetMock = vi.hoisted(() => vi.fn());
-
-vi.mock("./client.js", () => ({
-  createFeishuClient: createFeishuClientMock,
-}));
+vi.mock("./client.js", () => ({ createFeishuClient: clientMock }));
 
 const ok = <T>(data: T) => ({ code: 0, data });
 const DIRECT_CHAT_RESPONSE = ok({ chat_mode: "p2p", chat_type: "private" });
+
+function read(
+  tool: {
+    execute: (
+      id: string,
+      params: { action: string; chat_id: string; member_id?: string },
+    ) => Promise<{ details: Record<string, unknown>; content: { text?: string }[] }>;
+  },
+  id: string,
+  action: "info" | "members" | "member_info",
+  chat_id = "oc_1",
+  member_id?: string,
+) {
+  return tool.execute(id, { action, chat_id, ...(member_id ? { member_id } : {}) });
+}
 
 describe("registerFeishuChatTools", () => {
   type RegisteredToolContext = {
@@ -110,14 +121,12 @@ describe("registerFeishuChatTools", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chatGetMock.mockResolvedValue(ok({ chat_mode: "group", chat_type: "private" }));
-    createFeishuClientMock.mockReturnValue({
+    clientMock.mockReturnValue({
       im: {
         chat: { get: chatGetMock },
         chatMembers: { get: chatMembersGetMock },
       },
-      contact: {
-        user: { get: contactUserGetMock },
-      },
+      contact: { user: { get: contactUserGetMock } },
     });
   });
 
@@ -128,19 +137,13 @@ describe("registerFeishuChatTools", () => {
     });
 
     expect(registerTool).toHaveBeenCalledTimes(1);
-    expect(registerTool.mock.calls[0]?.[1]).toEqual({
-      name: "feishu_chat",
-    });
+    expect(registerTool.mock.calls[0]?.[1]).toEqual({ name: "feishu_chat" });
     expect(tool?.name).toBe("feishu_chat");
     expect(tool.resultContentSource).toBe("network");
 
     chatGetMock.mockResolvedValueOnce(ok({ name: hostile, user_count: 3 }));
     const infoResult = await tool.execute("tc_1", { action: "info", chat_id: "oc_1" });
-    expect(infoResult.details).toMatchObject({
-      chat_id: "oc_1",
-      name: hostile,
-      user_count: 3,
-    });
+    expect(infoResult.details).toMatchObject({ chat_id: "oc_1", name: hostile, user_count: 3 });
     expect(infoResult.content[0]?.text).toContain("EXTERNAL_UNTRUSTED_CONTENT");
     expect(infoResult.content[0]?.text).not.toContain("<|im_start|>");
     expect(infoResult.content[0]?.text).not.toContain("<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>");
@@ -165,11 +168,7 @@ describe("registerFeishuChatTools", () => {
       }),
     );
     chatMembersGetMock.mockResolvedValueOnce(memberPage());
-    const memberInfoResult = await tool.execute("tc_3", {
-      action: "member_info",
-      member_id: "ou_1",
-      chat_id: "oc_1",
-    });
+    const memberInfoResult = await read(tool, "tc_3", "member_info", "oc_1", "ou_1");
     expect(memberInfoResult.details).toMatchObject({
       member_id: "ou_1",
       member_id_type: "open_id",
@@ -190,15 +189,14 @@ describe("registerFeishuChatTools", () => {
       ok({ user: { user_id: "u_mobile_only", name: "Mobile User" } }),
     );
 
-    const members = await tool.execute("tc_current_dm_members_user_id", {
-      action: "members",
-      chat_id: "oc_direct_chat",
-    });
-    const profile = await tool.execute("tc_current_dm_profile_user_id", {
-      action: "member_info",
-      chat_id: "oc_direct_chat",
-      member_id: "u_mobile_only",
-    });
+    const members = await read(tool, "tc_current_dm_members_user_id", "members", "oc_direct_chat");
+    const profile = await read(
+      tool,
+      "tc_current_dm_profile_user_id",
+      "member_info",
+      "oc_direct_chat",
+      "u_mobile_only",
+    );
 
     expect(members.details).toMatchObject({
       members: [{ member_id: "u_mobile_only", member_id_type: "user_id" }],
@@ -209,10 +207,7 @@ describe("registerFeishuChatTools", () => {
     });
     expect(contactUserGetMock).toHaveBeenCalledWith({
       path: { user_id: "u_mobile_only" },
-      params: {
-        user_id_type: "user_id",
-        department_id_type: "open_department_id",
-      },
+      params: { user_id_type: "user_id", department_id_type: "open_department_id" },
     });
   });
 
@@ -223,11 +218,13 @@ describe("registerFeishuChatTools", () => {
     });
     chatGetMock.mockResolvedValueOnce(DIRECT_CHAT_RESPONSE);
 
-    const result = await tool.execute("tc_current_dm_other_member", {
-      action: "member_info",
-      chat_id: "oc_direct_chat",
-      member_id: "ou_other",
-    });
+    const result = await read(
+      tool,
+      "tc_current_dm_other_member",
+      "member_info",
+      "oc_direct_chat",
+      "ou_other",
+    );
 
     expect(result.details.error).toContain("limited to the current sender");
     expect(contactUserGetMock).not.toHaveBeenCalled();
@@ -240,10 +237,7 @@ describe("registerFeishuChatTools", () => {
         groups: { oc_allowed: {}, oc_blocked: { enabled: false } },
       },
     });
-    const result = await tool.execute("tc_blocked_members", {
-      action: "members",
-      chat_id: "oc_blocked",
-    });
+    const result = await read(tool, "tc_blocked_members", "members", "oc_blocked");
 
     expect(result.details.error).toContain("Feishu read target is not allowed.");
     expect(chatGetMock).not.toHaveBeenCalled();
@@ -252,27 +246,13 @@ describe("registerFeishuChatTools", () => {
   });
 
   it.each([
-    {
-      name: "an existing blocked direct chat",
-      response: DIRECT_CHAT_RESPONSE,
-    },
-    {
-      name: "a failed metadata lookup",
-      response: {
-        code: 230001,
-        msg: "chat not found",
-      },
-    },
+    { name: "an existing blocked direct chat", response: DIRECT_CHAT_RESPONSE },
+    { name: "a failed metadata lookup", response: { code: 230001, msg: "chat not found" } },
   ])("does not expose whether an ambiguous target is $name", async ({ response }) => {
-    const [tool] = registerChatTool({
-      context: { nativeChannelId: "oc_current" },
-    });
+    const [tool] = registerChatTool({ context: { nativeChannelId: "oc_current" } });
     chatGetMock.mockResolvedValueOnce(response);
 
-    const result = await tool.execute("tc_ambiguous_target", {
-      action: "info",
-      chat_id: "oc_other",
-    });
+    const result = await read(tool, "tc_ambiguous_target", "info", "oc_other");
 
     expect(result.details.error).toContain("Feishu read target is not allowed.");
     expect(result.details.error).not.toContain("chat not found");
@@ -286,10 +266,7 @@ describe("registerFeishuChatTools", () => {
     const error = new Error("provider unavailable");
     chatGetMock.mockRejectedValueOnce(error);
 
-    const result = await tool.execute("tc_allowed_metadata_failure", {
-      action: "info",
-      chat_id: "oc_other",
-    });
+    const result = await read(tool, "tc_allowed_metadata_failure", "info", "oc_other");
 
     expect(result.details).toEqual({ error: '{"message":"provider unavailable"}' });
     expect(result.content[0]?.text).toContain(error.message);
@@ -303,15 +280,9 @@ describe("registerFeishuChatTools", () => {
     });
     chatGetMock.mockResolvedValueOnce(ok({ chat_mode: "group", name: "operator target" }));
 
-    const result = await tool.execute("tc_direct_operator", {
-      action: "info",
-      chat_id: "oc_unconfigured",
-    });
+    const result = await read(tool, "tc_direct_operator", "info", "oc_unconfigured");
 
-    expect(result.details).toMatchObject({
-      chat_id: "oc_unconfigured",
-      name: "operator target",
-    });
+    expect(result.details).toMatchObject({ chat_id: "oc_unconfigured", name: "operator target" });
   });
 
   it("routes chat reads through the contextual Feishu account", async () => {
@@ -320,30 +291,18 @@ describe("registerFeishuChatTools", () => {
         channels: {
           feishu: {
             defaultAccount: "a",
-            accounts: {
-              a: account("a"),
-              b: account("b"),
-            },
+            accounts: { a: account("a"), b: account("b") },
           },
         },
       },
-      context: {
-        agentAccountId: "b",
-        deliveryAccountId: "b",
-        nativeChannelId: "oc_1",
-      },
+      context: { agentAccountId: "b", deliveryAccountId: "b", nativeChannelId: "oc_1" },
     });
     chatGetMock.mockResolvedValueOnce(ok({ name: "account b chat" }));
 
     const result = await tool.execute("tc_account_b", { action: "info", chat_id: "oc_1" });
 
-    expect(result.details).toMatchObject({
-      chat_id: "oc_1",
-      name: "account b chat",
-    });
-    expect(createFeishuClientMock).toHaveBeenCalledWith(
-      expect.objectContaining({ accountId: "b" }),
-    );
+    expect(result.details).toMatchObject({ chat_id: "oc_1", name: "account b chat" });
+    expect(clientMock).toHaveBeenCalledWith(expect.objectContaining({ accountId: "b" }));
   });
 
   it("preserves Feishu diagnostics from rejected member lookups", async () => {
@@ -365,11 +324,7 @@ describe("registerFeishuChatTools", () => {
       }),
     );
 
-    const result = await tool.execute("tc_4", {
-      action: "member_info",
-      member_id: "ou_1",
-      chat_id: "oc_1",
-    });
+    const result = await read(tool, "tc_4", "member_info", "oc_1", "ou_1");
 
     expect(result.details.error).toContain('"http_status":400');
     expect(result.details.error).toContain('"feishu_code":99992360');
@@ -388,11 +343,7 @@ describe("registerFeishuChatTools", () => {
       ok({ has_more: true, page_token: "same-token", items: [] }),
     );
 
-    const result = await tool.execute("tc_repeated_page", {
-      action: "member_info",
-      member_id: "ou_missing",
-      chat_id: "oc_1",
-    });
+    const result = await read(tool, "tc_repeated_page", "member_info", "oc_1", "ou_missing");
 
     expect(result.details.error).toContain("pagination repeated token");
     expect(chatMembersGetMock).toHaveBeenCalledTimes(2);

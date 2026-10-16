@@ -64,10 +64,7 @@ export function createFeishuTestConfig(
   feishu: FeishuConfig,
   base: TestConfigBase = {},
 ): ClawdbotConfig {
-  return {
-    ...base,
-    channels: { ...base.channels, feishu },
-  } as ClawdbotConfig;
+  return { ...base, channels: { ...base.channels, feishu } } as ClawdbotConfig;
 }
 
 export function createFeishuSecretRefPolicyConfig({
@@ -100,19 +97,7 @@ export function createFeishuSecretRefPolicyConfig({
   );
 }
 
-export function createFeishuTestEvent({
-  messageId,
-  sender,
-  senderOpenId = "ou-attacker",
-  senderUserId,
-  senderType,
-  chatId = "oc-dm",
-  chatType = "p2p",
-  messageType = "text",
-  text = "hello",
-  content,
-  message,
-}: {
+export function createFeishuTestEvent(params: {
   messageId: string;
   sender?: FeishuSender;
   senderOpenId?: string;
@@ -126,20 +111,23 @@ export function createFeishuTestEvent({
   message?: Partial<FeishuMessage>;
 }): FeishuMessageEvent {
   return {
-    sender: sender ?? {
+    sender: params.sender ?? {
       sender_id: {
-        open_id: senderOpenId,
-        ...(senderUserId ? { user_id: senderUserId } : {}),
+        open_id: params.senderOpenId ?? "ou-attacker",
+        ...(params.senderUserId ? { user_id: params.senderUserId } : {}),
       },
-      ...(senderType ? { sender_type: senderType } : {}),
+      ...(params.senderType ? { sender_type: params.senderType } : {}),
     },
     message: {
-      message_id: messageId,
-      chat_id: chatId,
-      chat_type: chatType,
-      message_type: messageType,
-      ...message,
-      content: content ?? message?.content ?? JSON.stringify({ text }),
+      message_id: params.messageId,
+      chat_id: params.chatId ?? "oc-dm",
+      chat_type: params.chatType ?? "p2p",
+      message_type: params.messageType ?? "text",
+      ...params.message,
+      content:
+        params.content ??
+        params.message?.content ??
+        JSON.stringify({ text: params.text ?? "hello" }),
     },
   };
 }
@@ -186,6 +174,7 @@ export function createConfiguredFeishuRoute(): NonNullable<ConfiguredBindingRout
     sessionKey,
     agentId: "codex",
   });
+  const materialize = () => ({ record: record(), statefulTarget: statefulTarget() });
   return {
     bindingResolution: {
       conversation: conversation(),
@@ -208,27 +197,17 @@ export function createConfiguredFeishuRoute(): NonNullable<ConfiguredBindingRout
           compileConfiguredBinding: target,
           matchInboundConversation: target,
         },
-        targetFactory: {
-          driverId: "acp",
-          materialize: () => ({
-            record: record(),
-            statefulTarget: statefulTarget(),
-          }),
-        },
+        targetFactory: { driverId: "acp", materialize },
       },
       match: target(),
-      record: record(),
-      statefulTarget: statefulTarget(),
+      ...materialize(),
     },
-    route: {
+    route: createFeishuTestRoute({
       agentId: "codex",
-      channel: "feishu",
-      accountId: "default",
       sessionKey,
       mainSessionKey: "agent:codex:main",
-      lastRoutePolicy: "session",
       matchedBy: "binding.channel",
-    } as ResolvedAgentRoute,
+    }),
   };
 }
 
