@@ -1,10 +1,8 @@
 import { asNullableRecord as asConfigRecord } from "@openclaw/normalization-core/record-coerce";
 import { createEffect, createSignal, onSettled } from "solid-js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
-import type { ModelsProbeResult } from "../../api/types.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import { hasOperatorAdminAccess } from "../../app/operator-access.ts";
-import { showConfirmDialog } from "../../components/confirm-dialog.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import { GatewayPageBinding } from "../../lib/gateway-page-binding.ts";
@@ -33,33 +31,17 @@ import {
   type ModelProviderRowMessage,
 } from "./config-mutation.ts";
 import { ModelProviderCoreLoader, type ModelProviderRefreshReason } from "./core-load.ts";
-import {
-  buildModelProviderPresentation,
-  type DefaultsDraft,
-  type ModelProviderPendingLogout,
-} from "./data.ts";
+import { buildModelProviderPresentation, type DefaultsDraft } from "./data.ts";
 import { createModelProviderDiscovery } from "./discovery-controller.tsx";
 import { createInstalledAgents } from "./installed-agents.tsx";
-import { EMPTY_MODEL_PROVIDERS_DATA, type ModelProvidersData } from "./load.ts";
+import { EMPTY_MODEL_PROVIDERS_DATA } from "./load.ts";
 import { createModelProviderLogin } from "./login-controller.ts";
+import { createModelProvidersState, type ModelProvidersState } from "./page-state.ts";
 import { createModelProviderProfileActions } from "./profile-actions-controller.ts";
 import { updateRecordEntry } from "./record-state.ts";
 import type { ModelProvidersRouteData } from "./route.ts";
 import { ModelProviderSupplementalLoader } from "./supplemental-load.ts";
 import type { ModelProvidersViewProps } from "./view.tsx";
-type ModelProvidersState = {
-  data: ModelProvidersData | null;
-  busy: Record<string, boolean>;
-  messages: Record<string, ModelProviderRowMessage>;
-  probeResults: Record<string, ModelsProbeResult>;
-  keyEditorProvider: string | null;
-  keyDraft: string;
-  profileOrders: Record<string, string[]>;
-  addProviderId: string;
-  addProviderKey: string;
-  defaultsDraft: DefaultsDraft | null;
-  selectedAgentId: string;
-};
 
 export function createModelProviders(
   context: ApplicationContext,
@@ -82,20 +64,7 @@ export function createModelProviders(
   let loaderPending = false;
   let connected = false;
   const accountUsages = new Set<ModelAccountUsageElement>();
-  const state: ModelProvidersState = {
-    data: null,
-    busy: {},
-    messages: {},
-    probeResults: {},
-    keyEditorProvider: null,
-    keyDraft: "",
-    profileOrders: {},
-    addProviderId: "",
-    addProviderKey: "",
-    defaultsDraft: null,
-    selectedAgentId: "",
-  };
-  let logoutConfirmation: AbortController | null = null;
+  const state = createModelProvidersState();
   let pendingConnection = false;
   let pendingCredentialInvalidation = false;
   let profilesVisible = false;
@@ -411,7 +380,7 @@ export function createModelProviders(
   }
 
   function invalidateRequests() {
-    logoutConfirmation?.abort();
+    profileActions.cancelLogout();
     core.invalidate();
     supplemental.invalidate();
     login.invalidateInventory();
@@ -436,7 +405,7 @@ export function createModelProviders(
     setState("messages", {});
     setState("probeResults", {});
     closeKeyEditor();
-    logoutConfirmation?.abort();
+    profileActions.cancelLogout();
     profileActions.resetOrders();
     setAddProviderOpen(false);
     setState("addProviderId", "");
@@ -572,28 +541,6 @@ export function createModelProviders(
       }
     } else if (state.keyEditorProvider === provider && state.keyDraft.trim() === apiKey) {
       closeKeyEditor();
-    }
-  }
-
-  async function requestLogout(pending: ModelProviderPendingLogout) {
-    if (logoutConfirmation || !canMutate() || state.busy[`logout:${pending.cardId}`]) {
-      return;
-    }
-    // Agent changes, reconnects and navigation abort this decision before it can
-    // authorize a logout under a different scope.
-    const controller = new AbortController();
-    logoutConfirmation = controller;
-    const confirmed = await showConfirmDialog({
-      title: t("modelProviders.logout.actionFor", { account: pending.label }),
-      message: t("modelProviders.logout.confirm", { provider: pending.label }),
-      confirmLabel: t("modelProviders.logout.action"),
-      danger: true,
-      signal: controller.signal,
-    }).finally(() => {
-      logoutConfirmation = null;
-    });
-    if (confirmed && !controller.signal.aborted && canMutate()) {
-      await profileActions.logout(pending.cardId, pending.target);
     }
   }
 
@@ -733,7 +680,7 @@ export function createModelProviders(
         void mutateApiKey(provider, configKey, state.keyDraft.trim()),
       onRemoveKey: (provider, configKey) => void mutateApiKey(provider, configKey, null),
       onProbe: (cardId, providers) => void profileActions.probe(cardId, providers),
-      onRequestLogout: (pending) => void requestLogout(pending),
+      onRequestLogout: (pending) => void profileActions.requestLogout(pending),
       onProfileOrderChange: (cardId, provider, profileIds) =>
         profileActions.setOrder(cardId, provider, profileIds),
       onAddProviderToggle: () => {

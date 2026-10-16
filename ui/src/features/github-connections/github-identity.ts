@@ -114,9 +114,7 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     const clientChanged = client !== params.client;
     const becameConnected = !connected && params.connected;
     const transportChanged =
-      clientChanged ||
-      connected !== params.connected ||
-      clientRevision !== params.clientRevision;
+      clientChanged || connected !== params.connected || clientRevision !== params.clientRevision;
     const ownerChanged =
       githubConnectionOwnerKey(target) !== githubConnectionOwnerKey(params.target);
     const nextScope =
@@ -156,7 +154,9 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
         : params.target;
     target = nextTarget ? { ...nextTarget } : null;
     const resolved =
-      nextTarget?.kind === "shared" ? resolveAgentConfig(nextTarget.config, nextTarget.agentId) : null;
+      nextTarget?.kind === "shared"
+        ? resolveAgentConfig(nextTarget.config, nextTarget.agentId)
+        : null;
     const values = { system: resolved?.globalTools?.github, agent: resolved?.entry?.tools?.github };
     const fingerprint = JSON.stringify(
       nextScope === "personal"

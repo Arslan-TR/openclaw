@@ -4,6 +4,8 @@ import type {
 } from "../../../../src/gateway/server-methods/models-auth-status.types.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ModelsProbeResult } from "../../api/types.ts";
+import { showConfirmDialog } from "../../components/confirm-dialog.ts";
+import { t } from "../../i18n/index.ts";
 import type { RuntimeConfigCapability } from "../../lib/config/runtime-config-capability.ts";
 import { invalidateModelAuthStatusRequests } from "../../lib/model-auth-request-state.ts";
 import {
@@ -11,7 +13,7 @@ import {
   modelProviderErrorMessage,
   modelProviderMutationWarnings,
 } from "./config-mutation.ts";
-import type { ModelProviderLogoutTarget } from "./data.ts";
+import type { ModelProviderLogoutTarget, ModelProviderPendingLogout } from "./data.ts";
 import type { ModelProvidersData } from "./load.ts";
 import { showProfileActionError, showProfileLogoutSuccess } from "./profiles-view.tsx";
 import { updateRecordEntry } from "./record-state.ts";
@@ -43,6 +45,7 @@ type ProfileActionsOptions = {
 };
 
 export function createModelProviderProfileActions(options: ProfileActionsOptions) {
+  let logoutConfirmation: AbortController | null = null;
   let probeEpochs = new Map<string, number>();
   const pendingOrders = new Map<string, PendingProfileOrder>();
   const activeOrderProviders = new Set<string>();
@@ -117,6 +120,32 @@ export function createModelProviderProfileActions(options: ProfileActionsOptions
     }
     for (const provider of pendingOrders.keys()) {
       void flushOrder(provider);
+    }
+  }
+
+  function cancelLogout(): void {
+    logoutConfirmation?.abort();
+  }
+
+  async function requestLogout(pending: ModelProviderPendingLogout): Promise<void> {
+    if (logoutConfirmation || !options.canMutate() || options.isBusy(`logout:${pending.cardId}`)) {
+      return;
+    }
+    // Agent changes, reconnects and navigation abort this decision before it can
+    // authorize a logout under a different scope.
+    const controller = new AbortController();
+    logoutConfirmation = controller;
+    const confirmed = await showConfirmDialog({
+      title: t("modelProviders.logout.actionFor", { account: pending.label }),
+      message: t("modelProviders.logout.confirm", { provider: pending.label }),
+      confirmLabel: t("modelProviders.logout.action"),
+      danger: true,
+      signal: controller.signal,
+    }).finally(() => {
+      logoutConfirmation = null;
+    });
+    if (confirmed && !controller.signal.aborted && options.canMutate()) {
+      await logout(pending.cardId, pending.target);
     }
   }
 
@@ -279,6 +308,8 @@ export function createModelProviderProfileActions(options: ProfileActionsOptions
     resetOrders,
     setOrder,
     flushPendingOrders,
+    cancelLogout,
+    requestLogout,
     logout,
   };
 }

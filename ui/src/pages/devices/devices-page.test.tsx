@@ -402,15 +402,17 @@ describe("DevicesPage gateway lifecycle", () => {
     {
       name: "advertised",
       methods: ["system.info", "desktop.observe"],
+      read: true,
       systemInfo: true,
       desktop: true,
       scopes: ["operator.admin"],
     },
-    { name: "unadvertised", methods: [], systemInfo: false, desktop: false },
-    { name: "unknown features", methods: undefined, systemInfo: false, desktop: false },
+    { name: "unadvertised", methods: [], read: true, systemInfo: false, desktop: false },
+    { name: "unknown features", methods: undefined, read: true, systemInfo: false, desktop: false },
     {
       name: "read-only",
       methods: ["system.info", "desktop.observe"],
+      read: true,
       systemInfo: true,
       desktop: false,
       scopes: ["operator.read"],
@@ -418,6 +420,7 @@ describe("DevicesPage gateway lifecycle", () => {
     {
       name: "session-only",
       methods: ["system.info", "desktop.observe"],
+      read: false,
       systemInfo: false,
       desktop: false,
       scopes: ["operator.sessions.read", "operator.sessions.write"],
@@ -429,9 +432,14 @@ describe("DevicesPage gateway lifecycle", () => {
       delete snapshot.hello.features;
     }
     const page = mountPage(gatewayFixture(snapshot), { devicesList: { paired: [], pending: [] } });
-    await vi.waitFor(() => expect(page.container.textContent).toContain("Gateway host"));
+    await vi.waitFor(() =>
+      expect(page.container.textContent?.includes("Gateway host")).toBe(scenario.read),
+    );
     await Promise.resolve();
     flush();
+    for (const methodName of ["system-presence", "node.list"]) {
+      expect(request.mock.calls.some(([method]) => method === methodName)).toBe(scenario.read);
+    }
     expect(request.mock.calls.some(([method]) => method === "system.info")).toBe(
       scenario.systemInfo,
     );
