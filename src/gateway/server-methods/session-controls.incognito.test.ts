@@ -2,7 +2,7 @@ import "./tools-effective.test-support.js";
 import "../../test-utils/prepare-compiled-subprocesses.js";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
@@ -67,7 +67,7 @@ vi.mock("../../agents/subagents/registry/subagent-registry-state.js", async (ori
 }));
 
 const dirs = useAutoCleanupTempDirTracker(afterAll);
-let env: NodeJS.ProcessEnv;
+let stateDir: string;
 const context = createGatewayRequestContext(makeContextParams());
 context.getRuntimeConfig = () => cfg;
 context.getCommittedRuntimeConfig = () => cfg;
@@ -95,19 +95,48 @@ async function seedActor(
   return entry;
 }
 
-function ignoreRejection(pending: Promise<unknown>) {
-  return pending.then(
-    () => undefined,
-    () => undefined,
-  );
+function gate<T>(result: T) {
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  return {
+    entered,
+    release,
+    wait: async () => {
+      entered.resolve();
+      await release.promise;
+      return result;
+    },
+  };
 }
 
-beforeAll(() => {
-  env = { OPENCLAW_STATE_DIR: dirs.make("incognito-session-controls-") };
-  vi.stubEnv("OPENCLAW_STATE_DIR", env.OPENCLAW_STATE_DIR);
-});
+async function duringGate(
+  blocked: ReturnType<typeof gate>,
+  pending: Promise<unknown>,
+  mutate: () => Promise<unknown>,
+) {
+  const settled = pending.catch(() => undefined);
+  try {
+    await awaitGateBeforeSettlement(blocked.entered.promise, pending, "Preparation settled early");
+    await mutate();
+  } finally {
+    blocked.release.resolve();
+    await settled;
+  }
+}
+
+async function withoutHostSql(run: () => Promise<void>) {
+  const host = observeHostDataSql();
+  try {
+    await run();
+    expect(host.queries).toEqual([]);
+  } finally {
+    host.restore();
+  }
+}
+
 beforeEach(() => {
-  vi.stubEnv("OPENCLAW_STATE_DIR", env.OPENCLAW_STATE_DIR);
+  stateDir ??= dirs.make("incognito-session-controls-");
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
 });
 afterEach(() => {
   testing.resetToolsEffectiveCacheForTest();
@@ -131,56 +160,33 @@ it.each([false, true])(
       model: "gpt-4.1",
       modelProvider: "openai",
     });
-    const entered = createDeferredCore();
-    const release = createDeferredCore();
-    toolsEffectiveInventoryMocks.resolveEffectiveToolInventory.mockImplementationOnce(async () => {
-      entered.resolve();
-      await release.promise;
-      return { agentId: "main", profile: "coding", groups: [] };
-    });
+    const blocked = gate({ agentId: "main", profile: "coding", groups: [] });
+    toolsEffectiveInventoryMocks.resolveEffectiveToolInventory.mockImplementationOnce(blocked.wait);
     const options = request("tools.effective", { agentId: "main", sessionKey });
-    const host = observeHostDataSql();
-    try {
+    await withoutHostSql(async () => {
       const pending = Promise.resolve(toolsEffectiveHandlers["tools.effective"]!(options));
-      try {
-        await awaitGateBeforeSettlement(
-          entered.promise,
-          pending.then(() => {
-            const response = vi.mocked(options.respond).mock.calls[0];
-            if (response?.[2]) {
-              throw new Error(response[2].message);
-            }
-          }),
-          "Tool inventory handler settled before catalogue preparation",
-        );
+      await duringGate(blocked, pending, async () => {
         if (replaced) {
           await replaceSessionEntry(
             { agentId: "main", sessionKey },
             { ...entry, sessionId: "successor" },
           );
         }
-      } finally {
-        release.resolve();
-        await pending;
-      }
+      });
+      await pending;
       expect(options.respond).toHaveBeenCalledWith(
         !replaced,
         replaced ? undefined : expect.objectContaining({ groups: [] }),
         replaced ? expect.any(Object) : undefined,
       );
-      expect(host.queries).toEqual([]);
-    } finally {
-      release.resolve();
-      host.restore();
-    }
+    });
   },
 );
 
 it("refuses terminal ownership after its actor session is replaced during catalogue preparation", async () => {
   const sessionKey = "agent:main:dashboard:incognito-terminal";
   const entry = await seedActor(sessionKey, "terminal-source");
-  const entered = createDeferredCore();
-  const release = createDeferredCore();
+  const blocked = gate({ kind: "local" as const, argv: ["synthetic-shell"], cwd: "/synthetic" });
   const policy = createTerminalLaunchPolicy(cfg);
   const manager = new TerminalSessionManager({ emit: vi.fn() });
   const open = vi.spyOn(manager, "open").mockResolvedValue({
@@ -205,27 +211,11 @@ it("refuses terminal ownership after its actor session is replaced during catalo
     sessionKey,
     cols: 80,
     rows: 24,
-    resolveCatalogPlan: async () => {
-      entered.resolve();
-      await release.promise;
-      return { kind: "local", argv: ["synthetic-shell"], cwd: "/synthetic" };
-    },
+    resolveCatalogPlan: blocked.wait,
   });
-  const settled = ignoreRejection(pending);
-  try {
-    await awaitGateBeforeSettlement(
-      entered.promise,
-      pending,
-      "Terminal settled before catalogue preparation",
-    );
-    await replaceSessionEntry(
-      { agentId: "main", sessionKey },
-      { ...entry, sessionId: "replacement" },
-    );
-  } finally {
-    release.resolve();
-    await settled;
-  }
+  await duringGate(blocked, pending, () =>
+    replaceSessionEntry({ agentId: "main", sessionKey }, { ...entry, sessionId: "replacement" }),
+  );
   await expect(pending).rejects.toThrow(/session|current/i);
   expect(open).not.toHaveBeenCalled();
   manager.disposeAll();
@@ -243,8 +233,7 @@ it("routes actor system wakes and parent approval audiences without host SQL", a
     sessionKey: child,
     wake: true,
   });
-  const host = observeHostDataSql();
-  try {
+  await withoutHostSql(async () => {
     await systemHandlers["system-event"]!(options);
     expect(await resolveApprovalSessionAudienceWithFallback(child, "main")).toEqual([
       child,
@@ -254,38 +243,18 @@ it("routes actor system wakes and parent approval audiences without host SQL", a
     expect(options.respond).toHaveBeenCalledWith(true, { ok: true }, undefined);
     expect(peekSystemEvents(child)).toEqual(["Synthetic wake"]);
     expect(heartbeat).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: child }));
-    expect(host.queries).toEqual([]);
-  } finally {
-    host.restore();
-  }
+  });
 });
 
 it("rejects a replaced actor source during approval lineage preparation", async () => {
   const sessionKey = "agent:main:dashboard:incognito-approval-replaced";
   const entry = await seedActor(sessionKey, "approval-source");
-  const entered = createDeferredCore();
-  const finish = createDeferredCore();
-  prepareRegistry.mockImplementationOnce(async () => {
-    entered.resolve();
-    await finish.promise;
-    return false;
-  });
+  const blocked = gate(false);
+  prepareRegistry.mockImplementationOnce(blocked.wait);
   const pending = resolveApprovalSessionAudienceWithFallback(sessionKey, "main");
-  const settled = ignoreRejection(pending);
-  try {
-    await awaitGateBeforeSettlement(
-      entered.promise,
-      pending,
-      "Approval lineage settled before registry preparation",
-    );
-    await replaceSessionEntry(
-      { agentId: "main", sessionKey },
-      { ...entry, sessionId: "successor" },
-    );
-  } finally {
-    finish.resolve();
-    await settled;
-  }
+  await duringGate(blocked, pending, () =>
+    replaceSessionEntry({ agentId: "main", sessionKey }, { ...entry, sessionId: "successor" }),
+  );
   await expect(pending).rejects.toThrow(/session|current/i);
 });
 
@@ -306,15 +275,10 @@ it("preserves an unbound native wake without allocating another owner", async ()
 it("joins accepted actor node work, preserves changed session settings, and canonicalizes subscriptions without host SQL", async () => {
   const sessionKey = "agent:main:dashboard:incognito-node-event";
   await seedActor(sessionKey, "node-event", { sendPolicy: "allow" });
-  const selected = createDeferredCore();
-  const continueAdmission = createDeferredCore();
-  const entered = createDeferredCore();
-  const finish = createDeferredCore();
+  const selection = gate(true);
+  const ingressGate = gate(undefined);
   let connectionChecks = 0;
-  ingress.mockImplementationOnce(async () => {
-    entered.resolve();
-    await finish.promise;
-  });
+  ingress.mockImplementationOnce(ingressGate.wait);
   const subscribe = vi.fn();
   const nodeContext = {
     ...context,
@@ -325,76 +289,74 @@ it("joins accepted actor node work, preserves changed session settings, and cano
   };
   const admission = tryBeginGatewayRootWorkAdmission();
   assert(admission);
-  const host = observeHostDataSql();
   try {
-    let settled = false;
-    const pending = admission
-      .run(() =>
-        handleNodeEvent(
-          nodeContext,
-          "synthetic-node",
-          {
-            event: "voice.transcript",
-            payloadJSON: JSON.stringify({ sessionKey, text: "Synthetic voice turn" }),
-          },
-          {
-            isConnectionCurrent: async () => {
-              connectionChecks += 1;
-              if (connectionChecks === 2) {
-                selected.resolve();
-                await continueAdmission.promise;
-              }
-              return true;
+    await withoutHostSql(async () => {
+      let settled = false;
+      const pending = admission
+        .run(() =>
+          handleNodeEvent(
+            nodeContext,
+            "synthetic-node",
+            {
+              event: "voice.transcript",
+              payloadJSON: JSON.stringify({ sessionKey, text: "Synthetic voice turn" }),
             },
-          },
-        ),
-      )
-      .then(() => {
-        settled = true;
+            {
+              isConnectionCurrent: async () => {
+                connectionChecks += 1;
+                if (connectionChecks === 2) {
+                  return selection.wait();
+                }
+                return true;
+              },
+            },
+          ),
+        )
+        .then(() => {
+          settled = true;
+        });
+      try {
+        await awaitGateBeforeSettlement(
+          selection.entered.promise,
+          pending,
+          "Node event settled before session selection",
+        );
+        await upsertSessionEntryCore(
+          { agentId: "main", sessionKey },
+          { sendPolicy: "deny", thinkingLevel: "high", systemSent: true },
+        );
+        selection.release.resolve();
+        await awaitGateBeforeSettlement(
+          ingressGate.entered.promise,
+          pending,
+          "Node event settled before ingress admission",
+        );
+        expect(settled).toBe(false);
+      } finally {
+        selection.release.resolve();
+        ingressGate.release.resolve();
+        await pending;
+      }
+      expect(loadSessionEntry({ sessionKey })).toMatchObject({
+        sendPolicy: "deny",
+        thinkingLevel: "high",
+        systemSent: true,
       });
-    try {
-      await awaitGateBeforeSettlement(
-        selected.promise,
-        pending,
-        "Node event settled before session selection",
+      await handleNodeEvent(nodeContext, "synthetic-node", {
+        event: "chat.subscribe",
+        payloadJSON: JSON.stringify({ sessionKey }),
+      });
+      expect(ingress).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionKey, sessionId: "node-event" }),
+        expect.anything(),
+        expect.anything(),
       );
-      await upsertSessionEntryCore(
-        { agentId: "main", sessionKey },
-        { sendPolicy: "deny", thinkingLevel: "high", systemSent: true },
-      );
-      continueAdmission.resolve();
-      await awaitGateBeforeSettlement(
-        entered.promise,
-        pending,
-        "Node event settled before ingress admission",
-      );
-      expect(settled).toBe(false);
-    } finally {
-      continueAdmission.resolve();
-      finish.resolve();
-      await pending;
-    }
-    expect(loadSessionEntry({ sessionKey })).toMatchObject({
-      sendPolicy: "deny",
-      thinkingLevel: "high",
-      systemSent: true,
+      expect(subscribe).toHaveBeenCalledWith("synthetic-node", sessionKey, undefined);
     });
-    await handleNodeEvent(nodeContext, "synthetic-node", {
-      event: "chat.subscribe",
-      payloadJSON: JSON.stringify({ sessionKey }),
-    });
-    expect(ingress).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionKey, sessionId: "node-event" }),
-      expect.anything(),
-      expect.anything(),
-    );
-    expect(subscribe).toHaveBeenCalledWith("synthetic-node", sessionKey, undefined);
-    expect(host.queries).toEqual([]);
   } finally {
-    continueAdmission.resolve();
-    finish.resolve();
+    selection.release.resolve();
+    ingressGate.release.resolve();
     admission.release();
-    host.restore();
   }
 });
 

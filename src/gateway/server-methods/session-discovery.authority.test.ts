@@ -9,6 +9,7 @@ import {
   addSessionMember,
   removeSessionMember,
 } from "../../config/sessions/session-sharing-store.native.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { sessionChanges } from "../../sessions/session-row-changes.js";
 import { createDeferredCore } from "../../shared/deferred.js";
@@ -16,12 +17,12 @@ import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { bindSessionRowProjection } from "../session-row-projection-access.js";
 import { createSessionRowProjection } from "../session-row-projection.js";
 import * as sharingPreparation from "../session-sharing-preparation.js";
+import { rolePolicyConfig, sharingPolicyClient } from "../session-sharing.test-utils.js";
 import { commandsHandlers } from "./commands.js";
 import { handleSkillsStatus } from "./skills-status.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
 
 const { discovery } = vi.hoisted(() => ({ discovery: vi.fn(async () => {}) }));
-// Library storage, workspace discovery, and exec-policy storage have separate owners.
 // mock-isolation: Discovery authority tests isolate exec-policy storage from the session authorization boundary.
 vi.mock("../../agents/exec-defaults.js", () => ({
   resolveNodeExecEligibilityAsync: () => ({ canExec: false }),
@@ -47,22 +48,48 @@ const handlers = {
   "commands.list": commandsHandlers["commands.list"]!,
   "skills.status": handleSkillsStatus,
 };
+const entry: SessionEntry = {
+  sessionId: "discovery",
+  updatedAt: 1,
+  visibility: "read-only",
+  createdActor: { type: "human", source: "profile", id: "owner" },
+};
+
+function pause() {
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  return {
+    entered,
+    release,
+    wait: async () => {
+      entered.resolve();
+      await release.promise;
+    },
+  };
+}
+
+async function whilePaused(
+  blocked: ReturnType<typeof pause>,
+  pending: Promise<unknown>,
+  change: () => void,
+) {
+  try {
+    await awaitGateBeforeSettlement(
+      blocked.entered.promise,
+      pending,
+      "Discovery preparation settled early",
+    );
+    change();
+  } finally {
+    blocked.release.resolve();
+  }
+}
 
 function participant(): GatewayClient {
+  const client = sharingPolicyClient({ user: "alice", displayName: "Alice" });
+  delete client.authenticatedUserId;
   return {
-    connect: {
-      minProtocol: 1,
-      maxProtocol: 1,
-      client: { id: "openclaw-control-ui", version: "test", platform: "test", mode: "webchat" },
-      role: "operator",
-      scopes: ["operator.read", "operator.write"],
-    },
-    authenticatedUserProfile: {
-      profileId: "alice",
-      displayName: "Alice",
-      hasAvatar: false,
-      updatedAt: 1,
-    },
+    ...client,
     preparedSessionProfile: { profileId: "alice", aliases: new Set(["alice"]), role: null },
   };
 }
@@ -123,12 +150,7 @@ async function withDiscoveryState(
 }
 
 async function seed() {
-  await upsertSessionEntryCore(scope, {
-    sessionId: "discovery",
-    updatedAt: 1,
-    visibility: "read-only",
-    createdActor: { type: "human", source: "profile", id: "owner" },
-  });
+  await upsertSessionEntryCore(scope, entry);
   addSessionMember(scope, { identityId: "alice", addedBy: "owner" });
 }
 
@@ -138,17 +160,9 @@ it.each(["commands.list", "skills.status"] as const)(
     await withDiscoveryState(async ({ call }) => {
       const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
       const exec = vi.spyOn(DatabaseSync.prototype, "exec");
-      try {
-        expect((await call(method))[0]).toBe(true);
-        console.log(
-          `${method}: caller SQL prepare=${prepare.mock.calls.length} exec=${exec.mock.calls.length}`,
-        );
-        expect.soft(prepare).not.toHaveBeenCalled();
-        expect.soft(exec).not.toHaveBeenCalled();
-      } finally {
-        prepare.mockRestore();
-        exec.mockRestore();
-      }
+      expect((await call(method))[0]).toBe(true);
+      expect.soft(prepare).not.toHaveBeenCalled();
+      expect.soft(exec).not.toHaveBeenCalled();
     });
   },
 );
@@ -158,24 +172,57 @@ it.each(["commands.list", "skills.status"] as const)(
   async (method) => {
     await withDiscoveryState(async ({ call, projection, context, setConfig }) => {
       const cfg = context.getRuntimeConfig();
-      for (const change of [
-        "member",
-        "dirty",
-        "callback-dirty",
-        "profile",
-        "policy",
-        "projection",
-        "run",
-        "request",
-        "session",
-        "selection",
-        "route",
-      ] as const) {
+      let client: GatewayClient;
+      let dirtyOnCheck = false;
+      const invalidateMembership = () => {
+        const target = projection.sharingTarget({ key: sessionKey, agentId: "main" })!;
+        sessionChanges.emit({ all: true, scope: "stores" });
+        expect(projection.hasMembership(target.storePath, target.storeKey, "alice")).toBe(true);
+        expect(projection.sharingTargetState({ key: sessionKey, agentId: "main" }).status).toBe(
+          "pending",
+        );
+      };
+      const replace = (changes: Partial<SessionEntry>) =>
+        replaceSessionEntrySync(scope, { ...entry, updatedAt: 2, ...changes });
+      const changes = {
+        member: () => removeSessionMember(scope, "alice"),
+        dirty: invalidateMembership,
+        "callback-dirty": () => {
+          dirtyOnCheck = true;
+        },
+        profile: () => {
+          client.authenticatedUserProfile!.profileId = "bob";
+        },
+        policy: () => {
+          const policy = rolePolicyConfig();
+          policy.gateway!.roles!.default = "none";
+          setConfig({ ...cfg, ...policy });
+        },
+        projection: () => {
+          bindSessionRowProjection(context, () => undefined);
+        },
+        run: () => {},
+        request: () => {},
+        session: () => replace({ sessionId: "replacement" }),
+        selection: () =>
+          replace({
+            skillLibrarySelections: [
+              {
+                skillId: "selected",
+                revision: "second",
+                name: "Selected",
+                ownerProfileId: "owner",
+              },
+            ],
+          }),
+        route: () => setConfig({ ...cfg, session: { mainKey: "replacement" } }),
+      };
+      for (const [change, mutate] of Object.entries(changes)) {
         setConfig(cfg);
         bindSessionRowProjection(context, () => projection);
         await seed();
         await projection.prepareMembership();
-        const client = participant();
+        client = participant();
         let revoked = false;
         if (change === "run") {
           client.internal = {
@@ -192,21 +239,9 @@ it.each(["commands.list", "skills.status"] as const)(
             }),
           };
         }
-        const entered = createDeferredCore();
-        const release = createDeferredCore();
-        discovery.mockImplementationOnce(async () => {
-          entered.resolve();
-          await release.promise;
-        });
-        const invalidateMembership = () => {
-          const target = projection.sharingTarget({ key: sessionKey, agentId: "main" })!;
-          sessionChanges.emit({ all: true, scope: "stores" });
-          expect(projection.hasMembership(target.storePath, target.storeKey, "alice")).toBe(true);
-          expect(projection.sharingTargetState({ key: sessionKey, agentId: "main" }).status).toBe(
-            "pending",
-          );
-        };
-        let dirtyOnCheck = false;
+        const blocked = pause();
+        discovery.mockImplementationOnce(blocked.wait);
+        dirtyOnCheck = false;
         const pending = call(method, client, () => {
           if (dirtyOnCheck) {
             dirtyOnCheck = false;
@@ -214,71 +249,10 @@ it.each(["commands.list", "skills.status"] as const)(
           }
           return change !== "request" || !revoked;
         });
-        try {
-          await awaitGateBeforeSettlement(
-            entered.promise,
-            pending,
-            `${method}: ${change} did not reach discovery`,
-          );
+        await whilePaused(blocked, pending, () => {
           revoked = true;
-          if (change === "member") {
-            removeSessionMember(scope, "alice");
-          }
-          if (change === "dirty") {
-            invalidateMembership();
-          }
-          if (change === "callback-dirty") {
-            dirtyOnCheck = true;
-          }
-          if (change === "profile") {
-            client.authenticatedUserProfile!.profileId = "bob";
-          }
-          if (change === "projection") {
-            bindSessionRowProjection(context, () => undefined);
-          }
-          if (change === "route") {
-            setConfig({ ...cfg, session: { mainKey: "replacement" } });
-          }
-          if (change === "policy") {
-            setConfig({
-              ...cfg,
-              gateway: {
-                roles: {
-                  default: "blocked",
-                  definitions: {
-                    blocked: {
-                      sessions: { others: "none" },
-                      agents: "*",
-                      scopes: ["operator.read", "operator.write"],
-                    },
-                  },
-                },
-              },
-            });
-          }
-          if (change === "session" || change === "selection") {
-            replaceSessionEntrySync(scope, {
-              sessionId: change === "session" ? "replacement" : "discovery",
-              updatedAt: 2,
-              visibility: "read-only",
-              createdActor: { type: "human", source: "profile", id: "owner" },
-              ...(change === "selection"
-                ? {
-                    skillLibrarySelections: [
-                      {
-                        skillId: "selected",
-                        revision: "second",
-                        name: "Selected",
-                        ownerProfileId: "owner",
-                      },
-                    ],
-                  }
-                : {}),
-            });
-          }
-        } finally {
-          release.resolve();
-        }
+          mutate();
+        });
         expect(await pending, change).toMatchObject([false, undefined, expect.any(Object)]);
       }
     });
@@ -289,12 +263,10 @@ it.each(["ready", "rejected", "replaced"] as const)(
   "keeps the original target across membership preparation (%s)",
   async (outcome) => {
     await withDiscoveryState(async ({ call, projection }) => {
-      const entered = createDeferredCore();
-      const release = createDeferredCore();
+      const blocked = pause();
       const prepare = projection.prepareMembership.bind(projection);
       vi.spyOn(projection, "prepareMembership").mockImplementationOnce(async () => {
-        entered.resolve();
-        await release.promise;
+        await blocked.wait();
         if (outcome === "rejected") {
           throw new Error("membership unavailable");
         }
@@ -303,12 +275,7 @@ it.each(["ready", "rejected", "replaced"] as const)(
       sessionChanges.emit({ agentId: "main", sessionKey, factsInvalidated: "category" });
       discovery.mockClear();
       const pending = call("commands.list");
-      try {
-        await awaitGateBeforeSettlement(
-          entered.promise,
-          pending,
-          "discovery skipped membership preparation",
-        );
+      await whilePaused(blocked, pending, () => {
         expect(discovery).not.toHaveBeenCalled();
         if (outcome === "replaced") {
           replaceSessionEntrySync(scope, {
@@ -317,9 +284,7 @@ it.each(["ready", "rejected", "replaced"] as const)(
             visibility: "shared",
           });
         }
-      } finally {
-        release.resolve();
-      }
+      });
       expect((await pending)[0]).toBe(outcome === "ready");
       if (outcome !== "ready") {
         expect(discovery).not.toHaveBeenCalled();
