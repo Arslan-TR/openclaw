@@ -2,7 +2,7 @@ import { asNullableRecord as asConfigRecord } from "@openclaw/normalization-core
 import { createEffect, createSignal, onSettled } from "solid-js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ApplicationContext } from "../../app/context.ts";
-import { hasOperatorAdminAccess } from "../../app/operator-access.ts";
+import { hasOperatorAdminAccess, hasOperatorReadAccess } from "../../app/operator-access.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import { GatewayPageBinding } from "../../lib/gateway-page-binding.ts";
@@ -19,15 +19,13 @@ import { projectSource } from "../../lib/reactive/projection.ts";
 import { UsageRefreshPolicy } from "../usage/refresh-policy.ts";
 import type { ModelAccountUsageElement } from "./account-usage.tsx";
 import {
-  buildDefaultsPatch,
-  DEFAULT_MODELS_REPLACE_PATHS,
   modelProviderConfigBusy,
   modelProviderConfigMutationBlockedReason,
   modelDefaultsActions,
   modelProviderErrorMessage,
   readModelBehaviorConfig,
   runModelProviderApiKeyMutation,
-  runModelProviderConfigMutation,
+  runModelProviderDefaultsMutation,
   type ModelProviderRowMessage,
 } from "./config-mutation.ts";
 import { ModelProviderCoreLoader, type ModelProviderRefreshReason } from "./core-load.ts";
@@ -68,6 +66,7 @@ export function createModelProviders(
   let pendingConnection = false;
   let pendingCredentialInvalidation = false;
   let profilesVisible = false;
+  let readAccess = false;
 
   function setState<Key extends keyof ModelProvidersState>(
     key: Key,
@@ -140,10 +139,14 @@ export function createModelProviders(
       if (change.snapshot.phase === "connected") {
         const auth = change.snapshot.hello?.auth;
         const allowed = auth?.scopes !== undefined && hasOperatorAdminAccess(auth);
-        if (profilesVisible && !allowed) {
+        const canRead = hasOperatorReadAccess(auth ?? null);
+        if ((profilesVisible && !allowed) || (readAccess && !canRead)) {
+          gateway.invalidate();
+          invalidateRequests();
           resetConnectionState();
         }
         profilesVisible = allowed;
+        readAccess = canRead;
       }
       installedAgents.synchronize();
       if (change.becameConnected && !change.initial && routeDataObserved && !loaderPending) {
@@ -247,6 +250,7 @@ export function createModelProviders(
       routeDataObserved = true;
       setSelectedAgent(context.settingsAgentSelection.state.selectedId ?? "");
       if (
+        readAccess &&
         (data.agentId ?? "") === state.selectedAgentId &&
         data.selectionIntentRevision === context.settingsAgentSelection.intentRevision &&
         gateway.isRouteDataCurrent(data)
@@ -339,6 +343,9 @@ export function createModelProviders(
   });
 
   function ensureInitialData() {
+    if (!readAccess) {
+      return;
+    }
     if (
       !context.agents.state.agentsList &&
       !context.agents.state.agentsLoading &&
@@ -366,7 +373,7 @@ export function createModelProviders(
     const { client, epoch } = gateway;
     const agentId = state.selectedAgentId;
     const capturedAgentEpoch = agentEpoch;
-    if (!gateway.connected || !client || !agentId) {
+    if (!gateway.connected || !readAccess || !client || !agentId) {
       return;
     }
     void core.discoverCatalog(
@@ -388,6 +395,7 @@ export function createModelProviders(
 
   function resetConnectionState() {
     profilesVisible = false;
+    readAccess = false;
     setState("data", null);
     dataClient = null;
     refreshPolicy.resetPayload();
@@ -442,7 +450,7 @@ export function createModelProviders(
       return Promise.resolve();
     }
     const client = gateway.client;
-    if (!gateway.connected || !client) {
+    if (!gateway.connected || !readAccess || !client) {
       refreshPolicy.markLoadDeferred();
       return Promise.resolve();
     }
@@ -549,33 +557,14 @@ export function createModelProviders(
     if (!defaults) {
       return;
     }
-    const client = context.gateway.snapshot.client;
-    let mutation: Promise<boolean> | undefined;
-    // Global defaults remain editable when the configured roster is empty.
-    if (
-      client &&
-      !modelProviderConfigMutationBlockedReason(context) &&
-      !modelProviderConfigBusy(context) &&
-      !state.busy.defaults
-    ) {
-      const clientEpoch = gateway.epoch;
-      const capturedAgentEpoch = agentEpoch;
-      mutation = runModelProviderConfigMutation(
-        {
-          runtimeConfig: context.runtimeConfig,
-          isCurrentClient: () => gateway.isCurrent({ client, epoch: clientEpoch }),
-          isCurrentAgent: () => agentEpoch === capturedAgentEpoch,
-          setBusy: (busy) => setBusy("defaults", busy),
-          setMessage: (message) => setMessage("defaults", message),
-        },
-        {
-          raw: buildDefaultsPatch(defaults),
-          note: t("modelProviders.notes.defaultModel"),
-          replacePaths: DEFAULT_MODELS_REPLACE_PATHS,
-        },
-      );
-    }
-    const acknowledged = await mutation;
+    const capturedAgentEpoch = agentEpoch;
+    const acknowledged = await runModelProviderDefaultsMutation(context, gateway, {
+      defaults,
+      busy: Boolean(state.busy.defaults),
+      isCurrentAgent: () => agentEpoch === capturedAgentEpoch,
+      setBusy: (busy) => setBusy("defaults", busy),
+      setMessage: (message) => setMessage("defaults", message),
+    });
     // Global defaults outlive agent selection; only retire the acknowledged draft.
     if (acknowledged && state.defaultsDraft === defaults) {
       setState("defaultsDraft", null);
@@ -598,7 +587,7 @@ export function createModelProviders(
       currentConfigObject(configState) ??
       (dataClient && dataClient === gatewaySnapshot.client ? configState.configForm : null);
     const catalog = modelCatalog.readAgentModelCatalog(
-      gatewaySnapshot.client,
+      readAccess ? gatewaySnapshot.client : null,
       state.selectedAgentId,
     );
     const { configuredDefaults, cards, noSelectableAgents, rosterError, agentLabel, values } =

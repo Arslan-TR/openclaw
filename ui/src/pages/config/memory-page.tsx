@@ -14,7 +14,7 @@ import {
 import type { DoctorMemoryStatusPayload } from "../../../../src/gateway/server-methods/doctor.ts";
 import { pathForMemoryTab } from "../../app-route-paths.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
-import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
+import { hasOperatorReadAccess, readGatewayOperatorAccess } from "../../app/operator-access.ts";
 import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import { formatUiError } from "../../lib/format-error.ts";
@@ -716,6 +716,7 @@ export function MemorySettingsPage(props: MemorySettingsPageProps) {
           <MemoryMemories
             client={gateway.read().snapshot.client}
             connected={gateway.read().snapshot.phase === "connected"}
+            canRead={hasOperatorReadAccess(gateway.read().snapshot.hello?.auth ?? null)}
             methodAdvertised={
               isGatewayMethodAdvertised(gateway.read().snapshot, "memory.search") === true
             }

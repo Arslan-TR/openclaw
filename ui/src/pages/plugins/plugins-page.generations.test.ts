@@ -1,5 +1,6 @@
 /* @vitest-environment jsdom */
 
+import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
@@ -103,6 +104,74 @@ it("retains installed settings and an unfinished input across transport loss, bu
     refresh.resolve();
   }
 });
+
+it.each([
+  { access: "admin", granted: ["operator.admin"], revoked: ["operator.read"] },
+  { access: "read", granted: ["operator.read"], revoked: [] },
+])(
+  "retires a pending inventory refresh when $access access is revoked on the same client",
+  async ({ granted, revoked }) => {
+    const pending = deferred<ReturnType<typeof createResult>>();
+    let inventory = pending.promise;
+    const { client, request } = createClient(async (method) => {
+      if (method === "plugins.list") {
+        return inventory;
+      }
+      if (method === "plugins.inspect") {
+        return createInspectResult();
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    const harness = createGateway(client);
+    harness.emit(client, true, {
+      hello: {
+        ...harness.gateway.snapshot.hello!,
+        auth: { role: "operator", scopes: granted },
+      },
+    });
+    const location = createPluginsRouteLocation("/settings/plugins/workboard");
+    const { page } = await mountPage(
+      createContext(harness.gateway),
+      createPluginsRouteData(harness.gateway, createResult(), location),
+    );
+    await waitForSolid(() => expect(page.querySelector(".plugin-catalog-detail")).not.toBeNull());
+    harness.publishPlugins();
+    await waitForSolid(() =>
+      expect(request.mock.calls.filter(([method]) => method === "plugins.list")).toHaveLength(1),
+    );
+    const snapshot = harness.gateway.snapshot;
+    harness.emit(client, true, {
+      ...snapshot,
+      hello: {
+        ...snapshot.hello!,
+        auth: { role: "operator", scopes: revoked },
+      },
+    });
+    await page.updateComplete;
+    expect(page.querySelector(".plugin-catalog-detail")).toBeNull();
+    if (revoked.length === 0) {
+      expect(page.textContent).not.toContain("Workboard");
+    }
+
+    pending.resolve(createResult(createPlugin({ name: "Retired inventory" })));
+    await setImmediate();
+    await settlePlugins();
+    expect(page.querySelector(".plugin-catalog-detail")).toBeNull();
+    expect(page.textContent).not.toContain("Retired inventory");
+    expect(request.mock.calls.filter(([method]) => method === "plugins.inspect")).toHaveLength(1);
+
+    inventory = Promise.resolve({ ...createResult(), generation: 1 });
+    harness.emit(client, true, snapshot);
+    page.routeData = createPluginsRouteData(
+      harness.gateway,
+      { ...createResult(), generation: 1 },
+      location,
+    );
+    await waitForSolid(() =>
+      expect(page.querySelector(".plugin-catalog-detail")?.textContent).toContain("Workboard"),
+    );
+  },
+);
 
 it.each([
   ["/plugins", "discovery"],

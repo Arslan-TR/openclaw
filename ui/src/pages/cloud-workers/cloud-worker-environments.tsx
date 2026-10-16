@@ -96,6 +96,22 @@ export function CloudWorkerEnvironments(props: { machines: () => JSX.Element }) 
     });
   }
 
+  function invalidateRequests() {
+    refreshAgain = false;
+    activeLoad = undefined;
+    stopPolling();
+    setView((draft) => {
+      draft.preparing = false;
+      draft.destroying = null;
+      draft.loading = false;
+      draft.recovering = null;
+      draft.mutating = null;
+      draft.error = null;
+      draft.notice = null;
+    });
+    activeConfirmation?.abort();
+  }
+
   const gateway = useGatewayPage({
     getGateway: () => context.gateway,
     onIdentityChange: clearPresentation,
@@ -104,24 +120,12 @@ export function CloudWorkerEnvironments(props: { machines: () => JSX.Element }) 
         snapshot.phase === "connected" &&
         !canCallGatewayMethod(snapshot, "environments.list", "operator.admin")
       ) {
+        gateway.invalidate();
+        invalidateRequests();
         clearPresentation();
       }
     },
-    invalidateRequests: () => {
-      refreshAgain = false;
-      activeLoad = undefined;
-      stopPolling();
-      setView((draft) => {
-        draft.preparing = false;
-        draft.destroying = null;
-        draft.loading = false;
-        draft.recovering = null;
-        draft.mutating = null;
-        draft.error = null;
-        draft.notice = null;
-      });
-      activeConfirmation?.abort();
-    },
+    invalidateRequests,
     ensureInitialData: () => queueMicrotask(() => void load()),
     onPageActivation: () => void load(),
   });

@@ -13,6 +13,7 @@ type Request = (method: string, params: Record<string, unknown>) => Promise<unkn
 type MemoryMemoriesTestElement = HTMLElement & {
   client: GatewayBrowserClient | null;
   connected: boolean;
+  canRead: boolean;
   methodAdvertised: boolean;
   agentId: string | null;
 };
@@ -21,12 +22,13 @@ function createElement(request: Request, advertised = true) {
   const input: MemoryMemoriesProps = {
     client: { request } as unknown as GatewayBrowserClient,
     connected: true,
+    canRead: true,
     methodAdvertised: advertised,
     agentId: "main",
   };
   const element = Object.assign(document.createElement("div"), input);
   const [revision, setRevision] = createSignal(0);
-  for (const key of ["client", "connected", "methodAdvertised", "agentId"] as const) {
+  for (const key of ["client", "connected", "canRead", "methodAdvertised", "agentId"] as const) {
     Object.defineProperty(element, key, {
       get: () => input[key],
       set: (value: unknown) => {
@@ -41,6 +43,7 @@ function createElement(request: Request, advertised = true) {
       <MemoryMemories
         client={(revision(), input.client)}
         connected={(revision(), input.connected)}
+        canRead={(revision(), input.canRead)}
         methodAdvertised={(revision(), input.methodAdvertised)}
         agentId={(revision(), input.agentId)}
       />
@@ -385,6 +388,61 @@ describe("MemoryMemoriesElement", () => {
       element.remove();
     }
   });
+
+  it.each(["search", "detail"] as const)(
+    "retires a pending %s when read access is revoked on the same client",
+    async (pendingRead) => {
+      const pending = deferred<unknown>();
+      const searchResponse = {
+        agentId: "main",
+        provider: "local",
+        searchMode: "hybrid",
+        results: [result],
+      };
+      const request = vi.fn((method: string) =>
+        method === "memory.search" && pendingRead === "detail"
+          ? Promise.resolve(searchResponse)
+          : pending.promise,
+      );
+      const element = createElement(request);
+      try {
+        typeQuery(element, "Ada");
+        submit(element);
+        if (pendingRead === "detail") {
+          await waitForSolid(() =>
+            expect(element.querySelector("article > button")).not.toBeNull(),
+          );
+          element.querySelector<HTMLButtonElement>("article > button")?.click();
+          expect(request).toHaveBeenCalledWith("agents.workspace.get", {
+            agentId: "main",
+            path: result.path,
+          });
+        }
+        element.canRead = false;
+        flush();
+        expect(element.querySelector<HTMLInputElement>("#memory-search-input")?.value).toBe("");
+        expect(element.querySelector("article")).toBeNull();
+        expect(element.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(
+          true,
+        );
+
+        pending.resolve(
+          pendingRead === "search"
+            ? searchResponse
+            : memoryFileResponse("Restricted memory detail"),
+        );
+        await pending.promise;
+        flush();
+        expect(element.textContent).not.toContain(result.snippet);
+        expect(element.textContent).not.toContain("Restricted memory detail");
+        typeQuery(element, "Another query");
+        submit(element);
+        expect(request).toHaveBeenCalledTimes(pendingRead === "search" ? 1 : 2);
+      } finally {
+        element.remove();
+      }
+    },
+  );
 
   it.each(["resolves", "rejects"] as const)(
     "keeps the current file read when an earlier search's read %s",

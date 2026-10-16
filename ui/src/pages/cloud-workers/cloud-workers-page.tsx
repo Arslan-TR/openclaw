@@ -56,14 +56,25 @@ export function CloudWorkersPage() {
     value?: Map<string, ProfileSummary>;
     error?: string;
   }>({ pending: false });
+  function clearPresentation() {
+    setView((state) => {
+      state.editor = null;
+      state.draft = createCloudWorkerDraft();
+    });
+    setCatalog({ pending: false });
+  }
   const gateway = useGatewayPage({
     getGateway: () => context.gateway,
-    onIdentityChange: () => {
-      setView((state) => {
-        state.editor = null;
-        state.draft = createCloudWorkerDraft();
-      });
-      setCatalog({ pending: false });
+    onIdentityChange: clearPresentation,
+    onSnapshot: ({ snapshot }) => {
+      if (
+        snapshot.phase === "connected" &&
+        !canCallGatewayMethod(snapshot, "config.patch", "operator.admin")
+      ) {
+        gateway.invalidate();
+        configSave.update({ busy: false, error: null, notice: null });
+        clearPresentation();
+      }
     },
     invalidateRequests: () => configSave.update({ busy: false }),
   });

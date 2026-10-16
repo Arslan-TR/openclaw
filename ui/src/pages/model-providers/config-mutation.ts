@@ -5,6 +5,7 @@ import { t } from "../../i18n/index.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import type { RuntimeConfigCapability } from "../../lib/config/runtime-config-capability.ts";
 import { formatUiError } from "../../lib/format-error.ts";
+import type { GatewayPageBinding } from "../../lib/gateway-page-binding.ts";
 import { invalidateModelAuthStatusRequests } from "../../lib/model-auth-request-state.ts";
 import {
   modelSettingPrimary,
@@ -12,7 +13,7 @@ import {
   modelSettingPatch,
   withModelSettingPrimary,
 } from "../../lib/model-setting.ts";
-import type { DefaultModelSelection, ModelBehaviorConfig } from "./data.ts";
+import type { DefaultModelSelection, DefaultsDraft, ModelBehaviorConfig } from "./data.ts";
 
 function replaceFirstFallback(fallbacks: string[], model: string | null): string[] {
   return model ? [model, ...fallbacks.slice(1).filter((fallback) => fallback !== model)] : [];
@@ -174,6 +175,40 @@ type ModelProviderConfigMutationOwner = {
   setBusy: (busy: boolean) => void;
   setMessage: (message: ModelProviderRowMessage | null) => void;
 };
+
+export function runModelProviderDefaultsMutation(
+  context: ApplicationContext,
+  gateway: Pick<GatewayPageBinding, "capture" | "isCurrent">,
+  owner: Omit<ModelProviderConfigMutationOwner, "runtimeConfig" | "isCurrentClient"> & {
+    defaults: DefaultsDraft;
+    busy: boolean;
+  },
+): Promise<boolean> {
+  const scope = gateway.capture();
+  // Global defaults remain editable when the configured roster is empty.
+  if (
+    !scope ||
+    owner.busy ||
+    modelProviderConfigMutationBlockedReason(context) ||
+    modelProviderConfigBusy(context)
+  ) {
+    return Promise.resolve(false);
+  }
+  return runModelProviderConfigMutation(
+    {
+      runtimeConfig: context.runtimeConfig,
+      isCurrentClient: () => gateway.isCurrent(scope),
+      isCurrentAgent: owner.isCurrentAgent,
+      setBusy: owner.setBusy,
+      setMessage: owner.setMessage,
+    },
+    {
+      raw: buildDefaultsPatch(owner.defaults),
+      note: t("modelProviders.notes.defaultModel"),
+      replacePaths: DEFAULT_MODELS_REPLACE_PATHS,
+    },
+  );
+}
 
 export function modelProviderConfigMutationBlockedReason(
   context: Pick<ApplicationContext, "gateway" | "runtimeConfig">,

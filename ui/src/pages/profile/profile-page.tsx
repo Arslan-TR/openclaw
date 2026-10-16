@@ -12,7 +12,7 @@ import {
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context-types.ts";
-import { hasOperatorWriteAccess } from "../../app/operator-access.ts";
+import { hasOperatorReadAccess, hasOperatorWriteAccess } from "../../app/operator-access.ts";
 import { ShellLayoutBoundary } from "../../app/shell-layout-traits-solid.tsx";
 import { invalidateUserPreferences, saveUserPreferences } from "../../app/user-prefs-cache.ts";
 import type { AuthenticatedUser } from "../../app/user-profile.ts";
@@ -68,6 +68,7 @@ class ProfileState {
   connected = false;
   identityReady = false;
   connecting = false;
+  canRead = false;
   canWrite = false;
   connectionScopes: readonly string[] | null = null;
   identityRequestId = 0;
@@ -88,6 +89,7 @@ class ProfileState {
     const nextConnected = snapshot.phase === "connected";
     // Hello can precede users.self; unresolved identity is not a sign-out.
     const identityReady = nextConnected && snapshot.selfUser !== undefined;
+    const nextCanRead = hasOperatorReadAccess(snapshot.hello?.auth ?? null);
     const nextCanWrite = nextConnected && hasOperatorWriteAccess(snapshot.hello?.auth ?? null);
     const connectionChanged =
       nextConnected !== this.connected ||
@@ -107,12 +109,15 @@ class ProfileState {
       this.connectionScopes?.some(
         (scope) => scope === "operator.write" || scope === "operator.admin",
       );
-    const identitySourceChanged = clientChanged || selfProfileChanged || writeAccessLost;
+    const readAccessLost = nextConnected && this.canRead && !nextCanRead;
+    const identitySourceChanged =
+      clientChanged || selfProfileChanged || writeAccessLost || readAccessLost;
     this.client = snapshot.client;
     this.connected = nextConnected;
     this.identityReady = identityReady;
     this.hello = snapshot.hello;
     this.connecting = snapshot.phase === "connecting" || snapshot.phase === "reconnecting";
+    this.canRead = nextConnected ? nextCanRead : clientChanged ? false : this.canRead;
     this.canWrite = nextCanWrite && identityReady;
     // Hello records this connection's negotiated grants, not the profile's role ceiling.
     this.connectionScopes =
@@ -147,7 +152,7 @@ class ProfileState {
 
   async loadIdentity() {
     const client = this.client;
-    if (!client || !this.identityReady || this.identityLoading) {
+    if (!client || !this.identityReady || !this.canRead || this.identityLoading) {
       return;
     }
     const requestId = ++this.identityRequestId;

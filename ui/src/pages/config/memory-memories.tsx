@@ -23,6 +23,7 @@ type DetailState =
 export type MemoryMemoriesProps = {
   client: GatewayBrowserClient | null;
   connected: boolean;
+  canRead: boolean;
   methodAdvertised: boolean;
   agentId: string | null;
 };
@@ -80,14 +81,25 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
   }
 
   createEffect(
-    () => [props.agentId, props.client, props.connected, props.methodAdvertised] as const,
-    ([agentId, client, connected, advertised], previous) => {
+    () =>
+      [
+        props.agentId,
+        props.client,
+        props.connected,
+        props.methodAdvertised,
+        props.canRead,
+      ] as const,
+    ([agentId, client, connected, advertised, canRead], previous) => {
       if (!previous) {
         return;
       }
       searchRequest = null;
       detailRequests.clear();
-      if (agentId !== previous[0] || client !== previous[1] || (connected && !advertised)) {
+      if (
+        agentId !== previous[0] ||
+        client !== previous[1] ||
+        (connected && (!advertised || !canRead))
+      ) {
         resetSearch();
       } else if (connected && !previous[2] && lastSearchQuery) {
         const submittedQuery = lastSearchQuery;
@@ -105,7 +117,7 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
     const normalizedQuery = value.trim();
     const client = props.connected ? props.client : null;
     const agentId = props.agentId;
-    if (!normalizedQuery || !client || !agentId || !props.methodAdvertised) {
+    if (!normalizedQuery || !client || !agentId || !props.methodAdvertised || !props.canRead) {
       return;
     }
     const request = {};
@@ -156,7 +168,7 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
   async function loadDetail(path: string, refresh = false) {
     const client = props.connected ? props.client : null;
     const agentId = props.agentId;
-    if (!client || !agentId) {
+    if (!client || !agentId || !props.canRead) {
       return;
     }
     const request = {};
@@ -392,6 +404,7 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
                   type="submit"
                   disabled={
                     !props.connected ||
+                    !props.canRead ||
                     !props.agentId ||
                     !query().trim() ||
                     searchState().kind === "loading"

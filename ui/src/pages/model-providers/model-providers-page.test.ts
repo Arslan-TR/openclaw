@@ -281,6 +281,62 @@ describe("ModelProvidersPage agent scope", () => {
   });
 
   it.each([
+    { access: "admin", granted: ["operator.admin"], revoked: ["operator.read"] },
+    { access: "read", granted: ["operator.read"], revoked: [] },
+  ])(
+    "retires pending provider data when $access access is revoked on the same client",
+    async ({ granted, revoked }) => {
+      const { context, request, snapshot, gatewaySource } = createHarness("main");
+      const grantedSnapshot: typeof snapshot = {
+        ...snapshot,
+        hello: { ...snapshot.hello!, auth: { role: "operator", scopes: granted } },
+      };
+      gatewaySource.publish(grantedSnapshot);
+      const page = appendPage(context);
+      await waitForProviders(page);
+      const pending = deferred<ReturnType<typeof createAuthStatus>>();
+      const originalRequest = request.getMockImplementation()!;
+      request.mockImplementation(async (method: string) =>
+        method === "models.authStatus" ? pending.promise : originalRequest(method),
+      );
+      page.view.props.onOpenKeyEditor("openai");
+      page.view.props.onKeyDraftChange("synthetic-unsaved-key");
+      page.view.props.onRefresh();
+      await waitForSolid(() => expect(requestCount(request, "models.authStatus")).toBe(2));
+
+      gatewaySource.publish({
+        ...grantedSnapshot,
+        hello: {
+          ...grantedSnapshot.hello!,
+          auth: { role: "operator", scopes: revoked },
+        },
+      });
+      await page.updateComplete;
+      expect(page.view.props.authStatus).toBeNull();
+      expect(page.view.props.keyEditorProvider).toBeNull();
+      expect(page.view.props.keyDraft).toBe("");
+
+      pending.resolve(
+        createAuthStatus([
+          {
+            profiles: [{ profileId: "openai:retired@example.test", type: "oauth", status: "ok" }],
+          },
+        ]),
+      );
+      await drainPageUpdates(page);
+      expect(page.view.props.authStatus).toBeNull();
+      expect(page.view.props.refreshing).toBe(false);
+      expect(page.renderRoot.textContent).not.toContain("retired@example.test");
+
+      request.mockImplementation(originalRequest);
+      gatewaySource.publish(grantedSnapshot);
+      page.view.props.onRefresh();
+      await waitForProviders(page);
+      expect(page.view.props.authStatus?.providers).toEqual([]);
+    },
+  );
+
+  it.each([
     { selection: "xai/grok", expected: ["xai/grok", "google/gemini-pro", "openai/gpt-5-mini"] },
     { selection: "", expected: [] },
   ])(

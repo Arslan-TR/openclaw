@@ -1,6 +1,7 @@
 import { createMemo, onCleanup } from "solid-js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ApplicationContext } from "../../app/context.ts";
+import { hasOperatorReadAccess } from "../../app/operator-access.ts";
 import type { PluginListResult } from "../../lib/plugins/index.ts";
 import { projectSource } from "../../lib/reactive/projection.ts";
 import { PluginIconController, pluginIconFetchContext } from "../plugins/plugin-icon-controller.ts";
@@ -66,7 +67,12 @@ export function createChannelPluginPresentation(hooks: PluginPresentationHooks) 
   }
 
   function ensure(client: GatewayBrowserClient | null) {
-    if (!client || hooks.getContext().gateway.snapshot.phase !== "connected") {
+    const snapshot = hooks.getContext().gateway.snapshot;
+    if (!client || snapshot.phase !== "connected") {
+      return;
+    }
+    if (!hasOperatorReadAccess(snapshot.hello?.auth ?? null)) {
+      reset();
       return;
     }
     if (catalog) {

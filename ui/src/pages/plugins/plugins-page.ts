@@ -4,7 +4,7 @@ import {
   pluginSettingsIdFromPath,
 } from "../../app-route-paths.ts";
 import type { ApplicationContext } from "../../app/context.ts";
-import { hasOperatorAdminAccess } from "../../app/operator-access.ts";
+import { hasOperatorAdminAccess, hasOperatorReadAccess } from "../../app/operator-access.ts";
 import { showConfirmDialog } from "../../components/confirm-dialog.ts";
 import { registryFor } from "../../components/overlay-registry.ts";
 import { formatUiError } from "../../lib/format-error.ts";
@@ -109,6 +109,7 @@ export class PluginsPageController {
   private routeDataConsumed = false;
   private pluginGeneration: number | undefined;
   private adminAccess: boolean | undefined;
+  private readAccess: boolean | undefined;
   readonly icons = new PluginsPageIcons({
     getContext: () => this.context,
     isConnected: () => this.isConnected,
@@ -124,6 +125,7 @@ export class PluginsPageController {
     getGateway: () => this.context?.gateway,
     onIdentityChange: () => {
       this.adminAccess = undefined;
+      this.readAccess = undefined;
       this.setState({ result: null });
       this.setState({ error: null });
       this.setState({ messages: {} });
@@ -313,10 +315,16 @@ export class PluginsPageController {
     const snapshot = change.snapshot;
     if (snapshot.phase === "connected") {
       const allowed = hasOperatorAdminAccess(snapshot.hello?.auth ?? null);
-      if (this.adminAccess && !allowed) {
-        this.invalidateRequests(false);
+      const canRead = hasOperatorReadAccess(snapshot.hello?.auth ?? null);
+      if ((this.adminAccess && !allowed) || (this.readAccess && !canRead)) {
+        this.gateway.invalidate();
+        this.invalidateRequests(true);
+        if (!canRead) {
+          this.setState({ result: null, error: null, messages: {}, pageNotice: null });
+        }
       }
       this.adminAccess = allowed;
+      this.readAccess = canRead;
     }
     const generation = snapshot.pluginCapabilities?.generation;
     const pluginsChanged = generation !== undefined && generation !== this.pluginGeneration;
@@ -381,6 +389,9 @@ export class PluginsPageController {
             ? "configuration"
             : installedPluginDetailTabFromHash(data.location.hash),
       });
+    }
+    if (this.readAccess === false) {
+      return;
     }
     if (this.gateway.isRouteDataCurrent(data)) {
       // Route loading can complete after publication on the same connection.
@@ -475,6 +486,9 @@ export class PluginsPageController {
   }
 
   private ensureInitialData() {
+    if (this.readAccess === false) {
+      return;
+    }
     // Category navigation needs neither installed inventory nor catalog cards.
     // Start it as soon as this discovery page has a connection, even while the
     // route's plugins.list request is pending.
@@ -500,7 +514,7 @@ export class PluginsPageController {
   }
 
   async refreshCatalog(client = this.gateway.connected ? this.gateway.client : null) {
-    if (!client) {
+    if (!client || this.readAccess === false) {
       return;
     }
     this.setState({ error: null });

@@ -1,5 +1,6 @@
 import { createDeferredCore, type Deferred } from "../../../../src/shared/deferred.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import { hasOperatorReadAccess } from "../../app/operator-access.ts";
 import { t } from "../../i18n/index.ts";
 import { createConfigDraftDiscard } from "./config-draft-discard.ts";
 import {
@@ -365,9 +366,15 @@ export function createConfigWriteCoordinator({
     reconcileDraft: reconcileAutoSaveDraftConnection,
   });
   let pluginGeneration = gateway.snapshot.pluginCapabilities?.generation;
+  let canRead = hasOperatorReadAccess(gateway.snapshot.hello?.auth ?? null);
   const stopGateway = gateway.subscribe((snapshot) => {
     const clientChanged = state.client !== snapshot.client;
     const connectionChanged = state.connected !== (snapshot.phase === "connected");
+    const nextCanRead = hasOperatorReadAccess(snapshot.hello?.auth ?? null);
+    const accessLost = snapshot.phase === "connected" && canRead && !nextCanRead;
+    if (snapshot.phase === "connected") {
+      canRead = nextCanRead;
+    }
     const nextPluginGeneration = snapshot.pluginCapabilities?.generation;
     const pluginsChanged =
       nextPluginGeneration !== undefined && nextPluginGeneration !== pluginGeneration;
@@ -375,7 +382,7 @@ export function createConfigWriteCoordinator({
     state.client = snapshot.client;
     state.connected = snapshot.phase === "connected";
     state.applySessionKey = snapshot.sessionKey;
-    if (clientChanged || connectionChanged) {
+    if (clientChanged || connectionChanged || accessLost) {
       const unacknowledged = unacknowledgedDraftWrite();
       fieldDiscard.invalidate();
       reconciliation.retireConnection();
@@ -388,7 +395,7 @@ export function createConfigWriteCoordinator({
       resetLoads();
       // A retired flight cannot hold the replacement connection's FIFO.
       explicitOpQueue = null;
-      // Reconnect can reuse the client object; the epoch must still advance.
+      // Transport and authorization changes retire requests even when the client is reused.
       invalidateConfigConnection(state);
       cancelScheduledAutoSave();
       appliedRefresh.cancel();
@@ -413,7 +420,7 @@ export function createConfigWriteCoordinator({
       if (state.configAutoSaveStatus === "saving") {
         state.configAutoSaveStatus = "idle";
       }
-      if (state.connected && state.client) {
+      if (state.connected && state.client && !accessLost) {
         if (reconciliation.interrupted) {
           reconciliation.refreshInterrupted();
         } else if (state.configSnapshot || state.configFormDirty || !state.bootstrapConfig) {
