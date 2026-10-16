@@ -24,6 +24,65 @@ import {
 import { createReplyDispatcher } from "./reply-dispatcher.js";
 import { buildTestCtx } from "./test-ctx.js";
 
+type DispatchInput = Parameters<typeof dispatchReplyFromConfig>[0];
+
+async function dispatchStream({
+  channel = "qa-channel",
+  ...params
+}: Omit<DispatchInput, "ctx" | "cfg"> & { channel?: string }) {
+  const result = await dispatchReplyFromConfig({
+    ctx: buildTestCtx({ Provider: channel, Surface: channel }),
+    cfg: emptyConfig,
+    ...params,
+  });
+  params.dispatcher.markComplete();
+  await params.dispatcher.waitForIdle();
+  return result;
+}
+
+function collectingDispatcher() {
+  const delivered: ReplyPayload[] = [];
+  const dispatcher = createReplyDispatcher({
+    deliver: async (payload) => {
+      delivered.push(payload);
+    },
+  });
+  return { delivered, dispatcher };
+}
+
+function streamPipeline(options?: GetReplyOptions) {
+  return createBlockReplyPipeline({
+    onBlockReply: (payload, context) => options?.onBlockReply?.(payload, context),
+    timeoutMs: 0,
+  });
+}
+
+function buildStreamReplies(payload: ReplyPayload, pipeline: ReturnType<typeof streamPipeline>) {
+  return buildReplyPayloads({
+    payloads: [payload],
+    isHeartbeat: false,
+    didLogHeartbeatStrip: false,
+    blockStreamingEnabled: true,
+    blockReplyPipeline: pipeline,
+    replyToMode: "off",
+  });
+}
+
+function installPartialCleaner(onLiteral?: () => void) {
+  let buffered = false;
+  vi.spyOn(directives, "createTtsDirectiveTextStreamCleaner").mockReturnValue({
+    push: (text) => {
+      buffered = text === "See [";
+      if (!buffered) {
+        onLiteral?.();
+      }
+      return buffered ? "See " : text;
+    },
+    hasBufferedDirectiveText: () => buffered,
+    flush: () => "[",
+  });
+}
+
 beforeAll(globalBeforeAll0);
 beforeEach(() => {
   describe0BeforeEach0();
@@ -44,27 +103,14 @@ it.each([
   { name: "hidden end", chunks: ["[[tts:text]]hidden speech["], visible: "" },
 ])("dispatchReplyFromConfig settles $name once", async ({ chunks, visible }) => {
   ttsMocks.state.synthesizeFinalAudio = true;
-  const delivered: ReplyPayload[] = [];
-  const dispatcher = createReplyDispatcher({
-    deliver: async (payload) => {
-      delivered.push(payload);
-    },
-  });
-  await dispatchReplyFromConfig({
-    ctx: buildTestCtx({ Provider: "qa-channel", Surface: "qa-channel" }),
-    cfg: emptyConfig,
+  const { delivered, dispatcher } = collectingDispatcher();
+  await dispatchStream({
     dispatcher,
     replyResolver: async (_ctx, opts) => {
-      const pipeline = createBlockReplyPipeline({
-        onBlockReply: (block, context) => opts?.onBlockReply?.(block, context),
-        timeoutMs: 0,
-      });
+      const pipeline = streamPipeline(opts);
       try {
         for (const text of chunks) {
-          pipeline.enqueue({
-            text,
-            replyToId: "source-message",
-          });
+          pipeline.enqueue({ text, replyToId: "source-message" });
           await pipeline.flush({ force: true });
         }
       } finally {
@@ -72,8 +118,6 @@ it.each([
       }
     },
   });
-  dispatcher.markComplete();
-  await dispatcher.waitForIdle();
 
   expect(delivered.map((payload) => payload.text ?? "").join("")).toBe(visible);
   for (const payload of delivered.filter((entry) => entry.text)) {
@@ -97,17 +141,14 @@ it.each(["See [", "Example:\n```text\nkeep two spaces  \nkeep a tab\t\n```"])(
         delivered.push({ text: payload.text, kind });
       },
     });
-    await dispatchReplyFromConfig({
-      ctx: buildTestCtx({ Provider: "telegram", Surface: "telegram" }),
-      cfg: emptyConfig,
+    await dispatchStream({
+      channel: "telegram",
       dispatcher,
       replyResolver: async (_ctx, opts) => {
         await opts?.onBlockReply?.({ text });
         return undefined;
       },
     });
-    dispatcher.markComplete();
-    await dispatcher.waitForIdle();
     expect(delivered).toEqual([{ text, kind: "final" }]);
   },
 );
@@ -123,9 +164,7 @@ it("settles retained followup streams before external cleanup", async () => {
       }
     },
   });
-  await dispatchReplyFromConfig({
-    ctx: buildTestCtx({ Provider: "qa-channel", Surface: "qa-channel" }),
-    cfg: emptyConfig,
+  await dispatchStream({
     dispatcher,
     replyOptions: {
       onQueuedFollowupSettled: () => {
@@ -137,8 +176,6 @@ it("settles retained followup streams before external cleanup", async () => {
       return { text: "initial" };
     },
   });
-  dispatcher.markComplete();
-  await dispatcher.waitForIdle();
   for (const text of ["See [", "Intro [[tts:text]]hidden[", "After ["]) {
     await retained?.onBlockReply?.({ text });
     await dispatcher.waitForIdle();
@@ -158,8 +195,7 @@ describe("source completion", () => {
 
   type Failure = "before-send" | "ambiguous" | "pending";
 
-  it.each<{
-    name: string;
+  type Scenario = {
     prefix?: Failure;
     suffix?: Failure;
     media?: boolean;
@@ -167,277 +203,233 @@ describe("source completion", () => {
     finalMedia?: boolean;
     prepared?: boolean;
     fenced?: boolean;
-    expected: string[];
-    suffixCalls: number;
-  }>([
-    { name: "successful suffix", prepared: true, expected: ["See ", "["], suffixCalls: 1 },
-    {
-      name: "failed suffix after wrapped code",
-      fenced: true,
-      suffix: "before-send",
-      expected: [fencedFirst, fencedSecond, "See ", `${fencedSource}\n\nSee [`],
-      suffixCalls: 1,
-    },
-    {
-      name: "pending prefix with final-only media",
-      prefix: "pending",
-      finalMedia: true,
-      expected: [],
-      suffixCalls: 0,
-    },
-    {
-      name: "ambiguous prefix with final-only media",
-      prefix: "ambiguous",
-      prepared: true,
-      finalMedia: true,
-      expected: ["See "],
-      suffixCalls: 0,
-    },
-    {
-      name: "failed suffix with sent media",
-      suffix: "before-send",
-      media: true,
-      expected: ["See ", "["],
-      suffixCalls: 1,
-    },
-    {
-      name: "failed suffix after an unrelated bracket",
-      suffix: "before-send",
-      priorBracket: true,
-      expected: ["[", "See ", "["],
-      suffixCalls: 1,
-    },
-  ])("dispatchReplyFromConfig settles $name after producer filtering", async (scenario) => {
-    const actualSessions = scenario.prepared
-      ? await vi.importActual<typeof import("../../config/sessions/session-accessor.js")>(
-          "../../config/sessions/session-accessor.js",
-        )
-      : undefined;
-    const storePath = path.join(tempDirs.make("openclaw-source-completion-"), "sessions.json");
-    const preparedScope = actualSessions
-      ? {
-          storePath,
-          sessionKey: "agent:main:discord:direct:source-completion",
-        }
-      : undefined;
-    if (actualSessions) {
-      const actorScope = await import("../../config/sessions/session-actor-scope.js");
-      const actualActorScope = await vi.importActual<
-        typeof import("../../config/sessions/session-actor-scope.js")
-      >("../../config/sessions/session-actor-scope.js");
-      vi.spyOn(actorScope, "withSessionActor").mockImplementation(
-        actualActorScope.withSessionActor,
-      );
-      const sessionAccessors = await import("../../config/sessions/session-accessor.js");
-      const patch = actualSessions.patchSessionEntryCore;
-      vi.spyOn(sessionAccessors, "patchSessionEntryCore").mockImplementation((...args) =>
-        patch(...args),
-      );
-      const sqliteEntries = await import("../../config/sessions/session-accessor.sqlite-entry.js");
-      const actualSqliteEntries = await vi.importActual<
-        typeof import("../../config/sessions/session-accessor.sqlite-entry.js")
-      >("../../config/sessions/session-accessor.sqlite-entry.js");
-      vi.spyOn(sqliteEntries, "applySessionEntryOperation").mockImplementation(
-        actualSqliteEntries.applySessionEntryOperation,
-      );
-    }
-    let buffered = false;
-    // Hold the parser's future output fixed so this regression tests source accounting alone.
-    vi.spyOn(directives, "createTtsDirectiveTextStreamCleaner").mockReturnValue({
-      push: (text) => {
-        buffered = text === "See [";
-        return buffered ? "See " : text;
-      },
-      hasBufferedDirectiveText: () => buffered,
-      flush: () => "[",
-    });
-    const delivered: ReplyPayload[] = [];
-    let suffixCalls = 0;
-    let sourceStarted = false;
-    const dispatcher = createReplyDispatcher({
-      deliver: async (payload, { kind }) => {
-        const suffix = sourceStarted && kind === "block" && payload.text === "[";
-        if (suffix) {
-          suffixCalls++;
-        }
-        const failure =
-          kind === "block" && payload.text === "See "
-            ? scenario.prefix
-            : suffix
-              ? scenario.suffix
-              : undefined;
-        if (failure === "before-send") {
-          throw new PlatformMessageNotDispatchedError("fragment was not sent", {
-            cause: undefined,
-          });
-        }
-        if (failure === "pending") {
-          return {
-            visibleReplySent: false,
-            suppression: { reason: "adapter_returned_no_identity" },
-          };
-        }
-        delivered.push(payload);
-        if (failure === "ambiguous") {
-          if (scenario.prepared) {
-            return { visibleReplySent: true, ambiguous: true };
+  };
+  it.each<[string, Scenario, string[], number]>([
+    ["successful suffix", { prepared: true }, ["See ", "["], 1],
+    [
+      "failed suffix after wrapped code",
+      { fenced: true, suffix: "before-send" },
+      [fencedFirst, fencedSecond, "See ", `${fencedSource}\n\nSee [`],
+      1,
+    ],
+    ["pending prefix with final-only media", { prefix: "pending", finalMedia: true }, [], 0],
+    [
+      "ambiguous prefix with final-only media",
+      { prefix: "ambiguous", prepared: true, finalMedia: true },
+      ["See "],
+      0,
+    ],
+    ["failed suffix with sent media", { suffix: "before-send", media: true }, ["See ", "["], 1],
+    [
+      "failed suffix after an unrelated bracket",
+      { suffix: "before-send", priorBracket: true },
+      ["[", "See ", "["],
+      1,
+    ],
+  ])(
+    "dispatchReplyFromConfig settles %s after producer filtering",
+    async (_name, scenario, expected, expectedSuffixCalls) => {
+      const actualSessions = scenario.prepared
+        ? await vi.importActual<typeof import("../../config/sessions/session-accessor.js")>(
+            "../../config/sessions/session-accessor.js",
+          )
+        : undefined;
+      const storePath = path.join(tempDirs.make("openclaw-source-completion-"), "sessions.json");
+      const preparedScope = actualSessions
+        ? {
+            storePath,
+            sessionKey: "agent:main:discord:direct:source-completion",
           }
-          throw new Error("acknowledgement lost after sending");
-        }
-        return undefined;
-      },
-    });
-    const source: ReplyPayload = {
-      text: "See [",
-      ...(scenario.media ? { mediaUrl: "https://example.com/image.png" } : {}),
-    };
-    const result = await dispatchReplyFromConfig({
-      ctx: buildTestCtx({ Provider: "qa-channel", Surface: "qa-channel" }),
-      cfg: emptyConfig,
-      dispatcher,
-      replyResolver: async (_ctx, options) => {
-        if (scenario.priorBracket) {
-          await options?.onBlockReply?.({ text: "[" });
-          await dispatcher.waitForIdle();
-        }
-        sourceStarted = true;
-        const pipeline = createBlockReplyPipeline({
-          onBlockReply: (payload, context) => options?.onBlockReply?.(payload, context),
-          timeoutMs: 0,
-        });
-        try {
-          if (scenario.fenced) {
-            pipeline.enqueue(
-              setReplyPayloadMetadata(
-                { text: fencedFirst },
-                { blockSourceText: "```ts\nconst x = " },
-              ),
-            );
-            pipeline.enqueue(
-              setReplyPayloadMetadata({ text: fencedSecond }, { blockSourceText: "1;\n```" }),
-            );
-          }
-          pipeline.enqueue(source);
-          await pipeline.flush({ force: true });
-          if (!scenario.prefix) {
-            expect(delivered.at(-1)).toMatchObject({
-              text: "See ",
-              ...(scenario.media ? { mediaUrl: source.mediaUrl } : {}),
-            });
-          }
-          const finalPayload = {
-            ...source,
-            text: scenario.fenced ? `${fencedSource}\n\nSee [` : source.text,
-            ...(scenario.finalMedia ? { mediaUrl: "https://example.com/final.opus" } : {}),
-          };
-          if (scenario.finalMedia) {
-            setReplyPayloadMetadata(finalPayload, {
-              pendingFinalDeliveryCompletion: {
-                deliveryId: "source-delivery",
-                intentId: "source-intent",
-                sessionId: "session-1",
-                sessionKey: "agent:main:main",
-                storePath,
-              },
-            });
-          }
-          const { replyPayloads } = await buildReplyPayloads({
-            payloads: [finalPayload],
-            isHeartbeat: false,
-            didLogHeartbeatStrip: false,
-            blockStreamingEnabled: true,
-            blockReplyPipeline: pipeline,
-            replyToMode: "off",
-          });
-          if (actualSessions && preparedScope) {
-            setReplyPayloadMetadata(expectDefined(replyPayloads[0], "retained final"), {
-              pendingFinalDeliveryCompletion: {
-                ...preparedScope,
-                sessionId: "source-session",
-                intentId: "source-intent",
-                deliveryId: "source-delivery",
-              },
-            });
-            await actualSessions.replaceSessionEntry(preparedScope, {
-              sessionId: "source-session",
-              updatedAt: Date.now(),
-              pendingFinalDelivery: {
-                kind: "replayable",
-                text: "See [",
-                createdAt: Date.now(),
-                intentId: "source-intent",
-                deliveries: [{ id: "source-delivery", state: "prepared" }],
-              },
-            });
-            expect(
-              actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery?.deliveries,
-            ).toEqual([{ id: "source-delivery", state: "prepared" }]);
-          }
-          await options?.onBlockReply?.({ text: "[" });
-          return replyPayloads;
-        } finally {
-          pipeline.stop();
-        }
-      },
-    });
-    dispatcher.markComplete();
-    await dispatcher.waitForIdle();
-    if (actualSessions && preparedScope) {
-      const pending = actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery;
-      if (scenario.prefix === "ambiguous") {
-        expect(pending?.deliveries).toEqual([{ id: "source-delivery", state: "unknown" }]);
-      } else {
-        expect(pending).toBeUndefined();
+        : undefined;
+      if (actualSessions) {
+        const actorScope = await import("../../config/sessions/session-actor-scope.js");
+        const actualActorScope = await vi.importActual<
+          typeof import("../../config/sessions/session-actor-scope.js")
+        >("../../config/sessions/session-actor-scope.js");
+        vi.spyOn(actorScope, "withSessionActor").mockImplementation(
+          actualActorScope.withSessionActor,
+        );
+        const sessionAccessors = await import("../../config/sessions/session-accessor.js");
+        const patch = actualSessions.patchSessionEntryCore;
+        vi.spyOn(sessionAccessors, "patchSessionEntryCore").mockImplementation((...args) =>
+          patch(...args),
+        );
+        const sqliteEntries =
+          await import("../../config/sessions/session-accessor.sqlite-entry.js");
+        const actualSqliteEntries = await vi.importActual<
+          typeof import("../../config/sessions/session-accessor.sqlite-entry.js")
+        >("../../config/sessions/session-accessor.sqlite-entry.js");
+        vi.spyOn(sqliteEntries, "applySessionEntryOperation").mockImplementation(
+          actualSqliteEntries.applySessionEntryOperation,
+        );
       }
-      const recovery = await settlePendingFinalDelivery(
-        {
-          kind: "pending-final",
-          ...preparedScope,
-          sessionId: "source-session",
-          intentId: "source-intent",
-          deliveryId: "source-delivery",
+      // Fix parser output so this regression isolates source accounting.
+      installPartialCleaner();
+      const delivered: ReplyPayload[] = [];
+      let suffixCalls = 0;
+      let sourceStarted = false;
+      const dispatcher = createReplyDispatcher({
+        deliver: async (payload, { kind }) => {
+          const suffix = sourceStarted && kind === "block" && payload.text === "[";
+          if (suffix) {
+            suffixCalls++;
+          }
+          const failure =
+            kind === "block" && payload.text === "See "
+              ? scenario.prefix
+              : suffix
+                ? scenario.suffix
+                : undefined;
+          if (failure === "before-send") {
+            throw new PlatformMessageNotDispatchedError("fragment was not sent", {
+              cause: undefined,
+            });
+          }
+          if (failure === "pending") {
+            return {
+              visibleReplySent: false,
+              suppression: { reason: "adapter_returned_no_identity" },
+            };
+          }
+          delivered.push(payload);
+          if (failure === "ambiguous") {
+            if (scenario.prepared) {
+              return { visibleReplySent: true, ambiguous: true };
+            }
+            throw new Error("acknowledgement lost after sending");
+          }
+          return undefined;
         },
-        "queued",
-        ["prepared"],
-      );
-      expect(recovery.state).toBe("stale");
-      expect(actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery).toEqual(pending);
-    }
-    expect(delivered.flatMap((payload) => payload.text ?? [])).toEqual(scenario.expected);
-    expect(suffixCalls).toBe(scenario.suffixCalls);
-    if (scenario.media) {
-      expect(delivered.filter((payload) => payload.mediaUrl === source.mediaUrl)).toHaveLength(1);
-    }
-    if (scenario.finalMedia) {
-      expect(delivered).toHaveLength(scenario.expected.length + 1);
-      const media = delivered.filter(
-        (payload) => payload.mediaUrl === "https://example.com/final.opus",
-      );
-      expect(media).toHaveLength(1);
-      expect(result.queuedFinal).toBe(true);
-      expect(
-        getReplyPayloadMetadata(expectDefined(media[0], "final media"))
-          ?.pendingFinalDeliveryCompletion,
-      ).toBeUndefined();
-    }
-  });
+      });
+      const source: ReplyPayload = {
+        text: "See [",
+        ...(scenario.media ? { mediaUrl: "https://example.com/image.png" } : {}),
+      };
+      const result = await dispatchStream({
+        dispatcher,
+        replyResolver: async (_ctx, options) => {
+          if (scenario.priorBracket) {
+            await options?.onBlockReply?.({ text: "[" });
+            await dispatcher.waitForIdle();
+          }
+          sourceStarted = true;
+          const pipeline = streamPipeline(options);
+          try {
+            if (scenario.fenced) {
+              pipeline.enqueue(
+                setReplyPayloadMetadata(
+                  { text: fencedFirst },
+                  { blockSourceText: "```ts\nconst x = " },
+                ),
+              );
+              pipeline.enqueue(
+                setReplyPayloadMetadata({ text: fencedSecond }, { blockSourceText: "1;\n```" }),
+              );
+            }
+            pipeline.enqueue(source);
+            await pipeline.flush({ force: true });
+            if (!scenario.prefix) {
+              expect(delivered.at(-1)).toMatchObject({
+                text: "See ",
+                ...(scenario.media ? { mediaUrl: source.mediaUrl } : {}),
+              });
+            }
+            const finalPayload = {
+              ...source,
+              text: scenario.fenced ? `${fencedSource}\n\nSee [` : source.text,
+              ...(scenario.finalMedia ? { mediaUrl: "https://example.com/final.opus" } : {}),
+            };
+            if (scenario.finalMedia) {
+              setReplyPayloadMetadata(finalPayload, {
+                pendingFinalDeliveryCompletion: {
+                  deliveryId: "source-delivery",
+                  intentId: "source-intent",
+                  sessionId: "session-1",
+                  sessionKey: "agent:main:main",
+                  storePath,
+                },
+              });
+            }
+            const { replyPayloads } = await buildStreamReplies(finalPayload, pipeline);
+            if (actualSessions && preparedScope) {
+              setReplyPayloadMetadata(expectDefined(replyPayloads[0], "retained final"), {
+                pendingFinalDeliveryCompletion: {
+                  ...preparedScope,
+                  sessionId: "source-session",
+                  intentId: "source-intent",
+                  deliveryId: "source-delivery",
+                },
+              });
+              await actualSessions.replaceSessionEntry(preparedScope, {
+                sessionId: "source-session",
+                updatedAt: Date.now(),
+                pendingFinalDelivery: {
+                  kind: "replayable",
+                  text: "See [",
+                  createdAt: Date.now(),
+                  intentId: "source-intent",
+                  deliveries: [{ id: "source-delivery", state: "prepared" }],
+                },
+              });
+              expect(
+                actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery?.deliveries,
+              ).toEqual([{ id: "source-delivery", state: "prepared" }]);
+            }
+            await options?.onBlockReply?.({ text: "[" });
+            return replyPayloads;
+          } finally {
+            pipeline.stop();
+          }
+        },
+      });
+      if (actualSessions && preparedScope) {
+        const pending = actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery;
+        if (scenario.prefix === "ambiguous") {
+          expect(pending?.deliveries).toEqual([{ id: "source-delivery", state: "unknown" }]);
+        } else {
+          expect(pending).toBeUndefined();
+        }
+        const recovery = await settlePendingFinalDelivery(
+          {
+            kind: "pending-final",
+            ...preparedScope,
+            sessionId: "source-session",
+            intentId: "source-intent",
+            deliveryId: "source-delivery",
+          },
+          "queued",
+          ["prepared"],
+        );
+        expect(recovery.state).toBe("stale");
+        expect(actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery).toEqual(
+          pending,
+        );
+      }
+      expect(delivered.flatMap((payload) => payload.text ?? [])).toEqual(expected);
+      expect(suffixCalls).toBe(expectedSuffixCalls);
+      if (scenario.media) {
+        expect(delivered.filter((payload) => payload.mediaUrl === source.mediaUrl)).toHaveLength(1);
+      }
+      if (scenario.finalMedia) {
+        expect(delivered).toHaveLength(expected.length + 1);
+        const media = delivered.filter(
+          (payload) => payload.mediaUrl === "https://example.com/final.opus",
+        );
+        expect(media).toHaveLength(1);
+        expect(result.queuedFinal).toBe(true);
+        expect(
+          getReplyPayloadMetadata(expectDefined(media[0], "final media"))
+            ?.pendingFinalDeliveryCompletion,
+        ).toBeUndefined();
+      }
+    },
+  );
 
   it("dispatchReplyFromConfig reserves a source before concurrent fragment preparation", async () => {
     const prefixPreparing = createDeferred();
     const suffixParsed = createDeferred();
     const releasePrefix = createDeferred();
-    let buffered = false;
-    vi.spyOn(directives, "createTtsDirectiveTextStreamCleaner").mockReturnValue({
-      push: (text) => {
-        buffered = text === "See [";
-        if (!buffered) {
-          suffixParsed.resolve();
-        }
-        return buffered ? "See " : text;
-      },
-      hasBufferedDirectiveText: () => buffered,
-      flush: () => "[",
-    });
+    installPartialCleaner(suffixParsed.resolve);
     ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (input: unknown) => {
       const { payload, kind } = input as { payload: ReplyPayload; kind: string };
       if (kind === "block" && payload.text === "See ") {
@@ -461,15 +453,10 @@ describe("source completion", () => {
         }
       },
     });
-    await dispatchReplyFromConfig({
-      ctx: buildTestCtx({ Provider: "qa-channel", Surface: "qa-channel" }),
-      cfg: emptyConfig,
+    await dispatchStream({
       dispatcher,
       replyResolver: async (_ctx, options) => {
-        const pipeline = createBlockReplyPipeline({
-          onBlockReply: (payload, context) => options?.onBlockReply?.(payload, context),
-          timeoutMs: 0,
-        });
+        const pipeline = streamPipeline(options);
         try {
           pipeline.enqueue({ text: "See [" });
           const prefix = pipeline.flush({ force: true });
@@ -480,14 +467,7 @@ describe("source completion", () => {
           expect(attempted).toEqual([]);
           releasePrefix.resolve();
           await Promise.all([prefix, suffix]);
-          const { replyPayloads } = await buildReplyPayloads({
-            payloads: [{ text: "See [" }],
-            isHeartbeat: false,
-            didLogHeartbeatStrip: false,
-            blockStreamingEnabled: true,
-            blockReplyPipeline: pipeline,
-            replyToMode: "off",
-          });
+          const { replyPayloads } = await buildStreamReplies({ text: "See [" }, pipeline);
           return replyPayloads;
         } finally {
           releasePrefix.resolve();
@@ -495,8 +475,6 @@ describe("source completion", () => {
         }
       },
     });
-    dispatcher.markComplete();
-    await dispatcher.waitForIdle();
     expect(attempted).toEqual(["See ", "See ["]);
     expect(delivered).toEqual(["See ["]);
   });
