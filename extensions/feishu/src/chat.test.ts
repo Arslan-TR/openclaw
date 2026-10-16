@@ -4,11 +4,11 @@ import type { OpenClawPluginApi, PluginRuntime } from "../runtime-api.js";
 import { registerFeishuChatTools } from "./chat.js";
 import type { FeishuConfig } from "./types.js";
 
-const clientMock = vi.hoisted(() => vi.fn());
+const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const chatGetMock = vi.hoisted(() => vi.fn());
 const chatMembersGetMock = vi.hoisted(() => vi.fn());
 const contactUserGetMock = vi.hoisted(() => vi.fn());
-vi.mock("./client.js", () => ({ createFeishuClient: clientMock }));
+vi.mock("./client.js", () => ({ createFeishuClient: createFeishuClientMock }));
 
 const ok = <T>(data: T) => ({ code: 0, data });
 const DIRECT_CHAT_RESPONSE = ok({ chat_mode: "p2p", chat_type: "private" });
@@ -121,7 +121,7 @@ describe("registerFeishuChatTools", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chatGetMock.mockResolvedValue(ok({ chat_mode: "group", chat_type: "private" }));
-    clientMock.mockReturnValue({
+    createFeishuClientMock.mockReturnValue({
       im: {
         chat: { get: chatGetMock },
         chatMembers: { get: chatMembersGetMock },
@@ -302,7 +302,9 @@ describe("registerFeishuChatTools", () => {
     const result = await tool.execute("tc_account_b", { action: "info", chat_id: "oc_1" });
 
     expect(result.details).toMatchObject({ chat_id: "oc_1", name: "account b chat" });
-    expect(clientMock).toHaveBeenCalledWith(expect.objectContaining({ accountId: "b" }));
+    expect(createFeishuClientMock).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: "b" }),
+    );
   });
 
   it("preserves Feishu diagnostics from rejected member lookups", async () => {

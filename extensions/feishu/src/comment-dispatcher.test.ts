@@ -4,7 +4,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 const resolveFeishuRuntimeAccountMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const createReplyPrefixContextMock = vi.hoisted(() => vi.fn());
-const typingMock = vi.hoisted(() => vi.fn());
+const createCommentTypingReactionLifecycleMock = vi.hoisted(() => vi.fn());
 const deliverCommentThreadTextMock = vi.hoisted(() => vi.fn());
 const getFeishuRuntimeMock = vi.hoisted(() => vi.fn());
 const resolvePinnedHostnameWithPolicyMock = vi.hoisted(() =>
@@ -30,7 +30,7 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => ({
 }));
 
 vi.mock("./comment-reaction.js", () => ({
-  createCommentTypingReactionLifecycle: typingMock,
+  createCommentTypingReactionLifecycle: createCommentTypingReactionLifecycleMock,
 }));
 vi.mock("./drive.js", () => ({ deliverCommentThreadText: deliverCommentThreadTextMock }));
 vi.mock("./runtime.js", () => ({ getFeishuRuntime: getFeishuRuntimeMock }));
@@ -114,7 +114,7 @@ describe("createFeishuCommentReplyDispatcher", () => {
       delivery_mode: "reply_comment",
       reply_id: "reply_1",
     });
-    typingMock.mockReturnValue({
+    createCommentTypingReactionLifecycleMock.mockReturnValue({
       start: vi.fn(async () => {}),
       cleanup: vi.fn(async () => {}),
     });
@@ -124,7 +124,10 @@ describe("createFeishuCommentReplyDispatcher", () => {
   it("sends final comment text without waiting for typing cleanup", async () => {
     const { promise: cleanupPromise, resolve: resolveCleanup } = Promise.withResolvers<void>();
     const cleanup = vi.fn(() => cleanupPromise);
-    typingMock.mockReturnValue({ start: vi.fn(async () => {}), cleanup });
+    createCommentTypingReactionLifecycleMock.mockReturnValue({
+      start: vi.fn(async () => {}),
+      cleanup,
+    });
 
     const created = createTestCommentReplyDispatcher();
     const deliverPromise = Promise.resolve(

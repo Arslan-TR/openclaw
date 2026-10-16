@@ -70,7 +70,11 @@ export function createControlUiChatHistoryMessage(
   text: string,
   timestamp: number,
 ) {
-  return { content: [{ text, type: "text" }], role, timestamp };
+  return {
+    content: [{ text, type: "text" }],
+    role,
+    timestamp,
+  };
 }
 
 export function createControlUiSessionFixtures(
@@ -80,34 +84,15 @@ export function createControlUiSessionFixtures(
   },
   isRecord: (value: unknown) => value is Record<string, unknown>,
 ) {
-  type FixtureRecord = {
-    row: ControlUiSessionFixture;
-    changed: Set<string>;
-    lastRunEventSequence?: number;
-  };
-  const records = new Map<string, FixtureRecord>();
-  const patchFields =
-    "model thinkingLevel fastMode permissionMode label category icon color boardFace boardPresentation unread toolOverrides".split(
-      " ",
-    );
-  const activeRuns = (row: ControlUiSessionFixture) =>
-    Array.isArray(row.activeRunIds)
-      ? row.activeRunIds.filter((id): id is string => typeof id === "string")
-      : [];
-  const commitRun = (value: FixtureRecord, sequence: number, fields: Record<string, unknown>) => {
-    value.lastRunEventSequence = sequence;
-    value.row = { ...value.row, ...fields };
-    for (const field of Object.keys(fields)) {
-      value.changed.add(field);
-    }
-  };
+  const records = new Map<
+    string,
+    { row: ControlUiSessionFixture; changed: Set<string>; lastRunEventSequence?: number }
+  >();
   const listed = new Set<string>();
   const materialized = new Set<string>();
   let materializedSequence = 0;
   let timestamp = 1_800_000_000_000;
   const canonicalKey = (key: string) => (key === "main" ? input.mainKey : key);
-  const hasKey = (row: unknown): row is { key: string } =>
-    row !== null && typeof row === "object" && "key" in row && typeof row.key === "string";
   const record = (inputKey: string) => {
     const key = canonicalKey(inputKey);
     let value = records.get(key);
@@ -167,7 +152,20 @@ export function createControlUiSessionFixtures(
       next[field] = fieldValue;
       changed.add(field);
     };
-    for (const field of patchFields) {
+    for (const field of [
+      "model",
+      "thinkingLevel",
+      "fastMode",
+      "permissionMode",
+      "label",
+      "category",
+      "icon",
+      "color",
+      "boardFace",
+      "boardPresentation",
+      "unread",
+      "toolOverrides",
+    ]) {
       if (Object.hasOwn(fields, field)) {
         set(field, fields[field]);
       }
@@ -248,7 +246,9 @@ export function createControlUiSessionFixtures(
     const outcome = status === "running" ? (previous?.status ?? status) : status;
     const diagnostic = status === "running" ? previous?.errorMessage : errorMessage;
     const value = record(inputKey);
-    const activeRunIds = activeRuns(value.row);
+    const activeRunIds = Array.isArray(value.row.activeRunIds)
+      ? value.row.activeRunIds.filter((id): id is string => typeof id === "string")
+      : [];
     let sequence: number;
     if (status === "running") {
       // A send ACK consumes an earlier terminal outcome once; replay cannot revive it.
@@ -277,7 +277,7 @@ export function createControlUiSessionFixtures(
       outcome === "running"
         ? [...new Set([...activeRunIds, runId])]
         : activeRunIds.filter((id) => id !== runId);
-    commitRun(value, sequence, {
+    const fields = {
       // Like the Gateway projection, a newly started sole run has no execution
       // model until it publishes one; the previous fallback is not evidence.
       ...(outcome === "running" && activeRunIds.length === 0
@@ -289,7 +289,12 @@ export function createControlUiSessionFixtures(
       abortedLastRun: remaining.length === 0 && outcome === "killed",
       lastRunError: remaining.length === 0 && outcome === "failed" ? diagnostic : undefined,
       updatedAt: Date.now(),
-    });
+    };
+    value.lastRunEventSequence = sequence;
+    value.row = { ...value.row, ...fields };
+    for (const field of Object.keys(fields)) {
+      value.changed.add(field);
+    }
   };
   const abortRuns = (
     inputKey: string,
@@ -304,7 +309,9 @@ export function createControlUiSessionFixtures(
     if (!value) {
       return { ...response, aborted: false, runIds: [] as string[] };
     }
-    const activeRunIds = activeRuns(value.row);
+    const activeRunIds = Array.isArray(value.row.activeRunIds)
+      ? value.row.activeRunIds.filter((id): id is string => typeof id === "string")
+      : [];
     // Explicit abort receipts can precede the send ACK that lists the run locally.
     const candidates = confirmedRunIds ?? activeRunIds;
     const runIds = runId ? candidates.filter((id) => id === runId) : candidates;
@@ -317,15 +324,20 @@ export function createControlUiSessionFixtures(
       runsFor(key).set(id, { status: "killed", acknowledged: true, sequence });
     }
     const remaining = activeRunIds.filter((id) => !runIds.includes(id));
-    // Lifecycle writes override stale wire fixtures like other committed edits.
-    commitRun(value, sequence, {
+    const fields = {
       activeRunIds: remaining,
       hasActiveRun: remaining.length > 0,
       status: remaining.length > 0 ? "running" : "killed",
       abortedLastRun: remaining.length === 0,
       lastRunError: undefined,
       updatedAt: Date.now(),
-    });
+    };
+    value.lastRunEventSequence = sequence;
+    value.row = { ...value.row, ...fields };
+    // Lifecycle writes must override stale wire fixtures like other committed edits.
+    for (const field of Object.keys(fields)) {
+      value.changed.add(field);
+    }
     return { ...response, aborted, runIds };
   };
   // sessions.abort settles the session and its controlled descendants; the Gateway
@@ -336,7 +348,9 @@ export function createControlUiSessionFixtures(
     if (!value) {
       return;
     }
-    const activeRunIds = activeRuns(value.row);
+    const activeRunIds = Array.isArray(value.row.activeRunIds)
+      ? value.row.activeRunIds.filter((id): id is string => typeof id === "string")
+      : [];
     if (
       activeRunIds.length === 0 &&
       value.row.hasActiveRun !== true &&
@@ -348,14 +362,19 @@ export function createControlUiSessionFixtures(
     for (const id of activeRunIds) {
       runsFor(key).set(id, { status: "killed", acknowledged: true, sequence });
     }
-    commitRun(value, sequence, {
+    const fields = {
       activeRunIds: [],
       hasActiveRun: false,
       hasActiveSubagentRun: false,
       status: aborted ? "killed" : value.row.status === "running" ? "done" : value.row.status,
       ...(aborted ? { abortedLastRun: true, lastRunError: undefined } : {}),
       updatedAt: Math.max(Date.now(), (value.row.updatedAt ?? 0) + 1),
-    });
+    };
+    value.lastRunEventSequence = sequence;
+    value.row = { ...value.row, ...fields };
+    for (const field of Object.keys(fields)) {
+      value.changed.add(field);
+    }
   };
   // Abort receipts are lifecycle writes; a returned receipt replaces the chat.abort reply.
   const commitAbort = (method: string, params: unknown, response: unknown) => {
@@ -427,10 +446,16 @@ export function createControlUiSessionFixtures(
   };
   const list = (wireRows?: unknown[]) => {
     const rows = wireRows ?? [...listed].map(read);
-    const keys = new Set(rows.flatMap((row) => (hasKey(row) ? [canonicalKey(row.key)] : [])));
+    const keys = new Set(
+      rows.flatMap((row) =>
+        row && typeof row === "object" && "key" in row && typeof row.key === "string"
+          ? [canonicalKey(row.key)]
+          : [],
+      ),
+    );
     return [
       ...rows.map((row) => {
-        if (!hasKey(row)) {
+        if (!row || typeof row !== "object" || !("key" in row) || typeof row.key !== "string") {
           return row;
         }
         const value = record(row.key);
@@ -508,22 +533,25 @@ export function createControlUiSessionFixtures(
       (!isRecord(params) || params.offset === undefined || params.offset === 0) &&
       response.hasMore !== true &&
       response.nextOffset == null;
-    const filteredSessions = options.archiveFiltering
-      ? childSessions.filter(
-          (row) =>
-            isRecord(row) &&
-            (archivedFilter === "all" ||
-              (row.archived === true) === (archivedFilter === "archived")),
-        )
-      : childSessions;
+    if (!options.archiveFiltering) {
+      return {
+        ...response,
+        ...(completeChildFixture ? { totalCount: childSessions.length } : {}),
+        ...(childSessions.length !== projectedSessions.length || materializedSequence > 0
+          ? { count: childSessions.length }
+          : {}),
+        sessions: childSessions,
+      };
+    }
+    const filteredSessions = childSessions.filter(
+      (row) =>
+        isRecord(row) &&
+        (archivedFilter === "all" || (row.archived === true) === (archivedFilter === "archived")),
+    );
     return {
       ...response,
       ...(completeChildFixture ? { totalCount: filteredSessions.length } : {}),
-      ...(options.archiveFiltering ||
-      childSessions.length !== projectedSessions.length ||
-      materializedSequence > 0
-        ? { count: filteredSessions.length }
-        : {}),
+      count: filteredSessions.length,
       sessions: filteredSessions,
     };
   }
@@ -617,7 +645,7 @@ export function createControlUiSessionFixtures(
     replaceCanonicalList(rows: unknown[]) {
       const replacements: ControlUiSessionFixture[] = [];
       for (const row of rows) {
-        if (!hasKey(row)) {
+        if (!row || typeof row !== "object" || !("key" in row) || typeof row.key !== "string") {
           throw new Error("Canonical sessions.list rows require a string key");
         }
         replacements.push({ ...row, key: canonicalKey(row.key) });

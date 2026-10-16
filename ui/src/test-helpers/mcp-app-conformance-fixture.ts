@@ -6,7 +6,6 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import type { ConsoleMessage, Frame, Locator, Page } from "playwright";
 import { expect } from "vitest";
-import type { GatewayBrowserClient as BrowserClient } from "../api/gateway.ts";
 
 const require = createRequire(import.meta.url);
 
@@ -36,11 +35,12 @@ export function observeMcpAppNetwork(
   label: string,
   diagnostics: Array<Record<string, unknown>>,
 ) {
-  const record = (event: string, detail: Record<string, unknown>) =>
-    diagnostics.push({ host: label, atMs: Date.now(), event, ...detail });
   page.on("request", (request) => {
     if (request.url().includes("mcp-app")) {
-      record("request", {
+      diagnostics.push({
+        host: label,
+        atMs: Date.now(),
+        event: "request",
         method: request.method(),
         pathname: new URL(request.url()).pathname,
       });
@@ -48,21 +48,30 @@ export function observeMcpAppNetwork(
   });
   page.on("response", (response) => {
     if (response.url().includes("mcp-app")) {
-      record("response", {
+      diagnostics.push({
+        host: label,
+        atMs: Date.now(),
+        event: "response",
         status: response.status(),
         pathname: new URL(response.url()).pathname,
       });
     }
   });
   page.on("requestfailed", (request) =>
-    record("requestfailed", {
+    diagnostics.push({
+      host: label,
+      atMs: Date.now(),
+      event: "requestfailed",
       method: request.method(),
       pathname: new URL(request.url()).pathname,
       error: request.failure()?.errorText,
     }),
   );
   page.on("pageerror", (error) =>
-    record("pageerror", {
+    diagnostics.push({
+      host: label,
+      atMs: Date.now(),
+      event: "pageerror",
       message: error.message,
     }),
   );
@@ -167,8 +176,15 @@ export async function requestStandaloneUrl(
 ): Promise<string> {
   return await page.evaluate(
     async (params) => {
-      const client = Reflect.get(window, "mcpConformanceClient") as BrowserClient;
-      const payload = await client.request<{ standaloneUrl: string }>("mcp.app.view", params);
+      const client = Reflect.get(window, "mcpConformanceClient") as {
+        request(method: string, params: unknown): Promise<unknown>;
+      };
+      const payload = (await client.request("mcp.app.view", {
+        sessionKey: params.sessionKey,
+        viewId: params.viewId,
+      })) as {
+        standaloneUrl: string;
+      };
       return payload.standaloneUrl;
     },
     { sessionKey, viewId },
@@ -286,22 +302,30 @@ window.mcpConformanceUnmount = async () => {
       const GatewayBrowserClient = Reflect.get(
         window,
         "mcpConformanceGatewayBrowserClient",
-      ) as typeof BrowserClient;
-      const client = await Promise.race([
-        new Promise<BrowserClient>((resolve, reject) => {
-          const connectedClient = new GatewayBrowserClient({
-            url: params.gatewayUrl,
-            token: params.authValue,
-            onHello: () => resolve(connectedClient),
-            onClose: (info) => {
-              if (!info.willRetry) {
-                reject(new Error(`Gateway connection closed: ${JSON.stringify(info)}`));
-              }
-            },
-          });
-          connectedClient.start();
-        }),
-        new Promise<never>((_, reject) => {
+      ) as new (options: Record<string, unknown>) => {
+        start(): void;
+        request(method: string, params: unknown): Promise<unknown>;
+      };
+      let resolveHello!: () => void;
+      let rejectHello!: (error: Error) => void;
+      const connected = new Promise<void>((resolve, reject) => {
+        resolveHello = resolve;
+        rejectHello = reject;
+      });
+      const client = new GatewayBrowserClient({
+        url: params.gatewayUrl,
+        token: params.authValue,
+        onHello: () => resolveHello(),
+        onClose: (info: { code: number; reason: string; error?: unknown; willRetry: boolean }) => {
+          if (!info.willRetry) {
+            rejectHello(new Error(`Gateway connection closed: ${JSON.stringify(info)}`));
+          }
+        },
+      });
+      client.start();
+      await Promise.race([
+        connected,
+        new Promise((_, reject) => {
           setTimeout(() => reject(new Error("Gateway connection timed out")), 60_000);
         }),
       ]);
@@ -403,10 +427,21 @@ export function appHtml(appModuleUrl: string): string {
 <button id="send-message">Send message</button>
 <button id="request-teardown">Request teardown</button>
 <output id="initialized">pending</output>
-${"capabilities ping tools input result app-tool model-tool resource context-update message teardown isolation host-theme host-variables computed-theme"
-  .split(" ")
-  .map((id) => `<output id="${id}"></output>`)
-  .join("\n")}
+<output id="capabilities"></output>
+<output id="ping"></output>
+<output id="tools"></output>
+<output id="input"></output>
+<output id="result"></output>
+<output id="app-tool"></output>
+<output id="model-tool"></output>
+<output id="resource"></output>
+<output id="context-update"></output>
+<output id="message"></output>
+<output id="teardown"></output>
+<output id="isolation"></output>
+<output id="host-theme"></output>
+<output id="host-variables"></output>
+<output id="computed-theme"></output>
 <script type="module">
 import {
   App,
@@ -414,12 +449,6 @@ import {
   applyHostStyleVariables,
 } from ${JSON.stringify(appModuleUrl)};
 const write = (id, value) => { document.getElementById(id).textContent = value; };
-const action = (id, output, run) => {
-  document.getElementById(id).onclick = async () => {
-    try { write(output, await run()); }
-    catch (error) { write(output, "denied:" + error); }
-  };
-};
 try { void window.top.document; write("isolation", "failed"); } catch { write("isolation", "isolated"); }
 const app = new App({ name: "OpenClaw conformance fixture", version: "1.0.0" });
 const applyHostContext = () => {
@@ -448,11 +477,13 @@ app.onteardown = async () => {
   return {};
 };
 app.onerror = (error) => console.error("mcp-conformance-app", error);
-action("arm-refresh", "arm-result", async () => {
+document.getElementById("arm-refresh").onclick = async () => {
   write("arm-result", "pending");
-  await app.callServerTool({ name: "arm_refresh", arguments: {} });
-  return "armed";
-});
+  try {
+    await app.callServerTool({ name: "arm_refresh", arguments: {} });
+    write("arm-result", "armed");
+  } catch (error) { write("arm-result", "denied:" + error); }
+};
 let activeCall;
 const callAppTool = async (timeout) => {
   activeCall = new AbortController();
@@ -465,25 +496,37 @@ const callAppTool = async (timeout) => {
   } catch (error) { write("app-tool", "denied:" + error); }
 };
 document.getElementById("call-app").onclick = () => callAppTool();
-action("list-tools", "tools", async () => JSON.stringify(await app.request({ method: "tools/list", params: {} })));
+document.getElementById("list-tools").onclick = async () => {
+  try { write("tools", JSON.stringify(await app.request({ method: "tools/list", params: {} }))); }
+  catch (error) { write("tools", "denied:" + error); }
+};
 document.getElementById("call-expiring").onclick = () => callAppTool(3000);
 document.getElementById("cancel-call").onclick = () => activeCall?.abort(new Error("fixture caller cancelled"));
-action("call-model", "model-tool", async () => {
-  await app.callServerTool({ name: "model_only", arguments: {} });
-  return "allowed";
-});
-action("read-resource", "resource", async () => JSON.stringify(await app.readServerResource({ uri: "data://conformance/value" })));
-action("update-context", "context-update", async () => {
-  await app.updateModelContext({ content: [{ type: "text", text: "selected item 42" }] });
-  return "accepted";
-});
-action("send-message", "message", async () => {
-  const value = await app.sendMessage({
-    role: "user",
-    content: [{ type: "text", text: "summarize selection" }],
-  });
-  return value.isError ? "denied" : "accepted";
-});
+document.getElementById("call-model").onclick = async () => {
+  try { await app.callServerTool({ name: "model_only", arguments: {} }); write("model-tool", "allowed"); }
+  catch (error) { write("model-tool", "denied:" + error); }
+};
+document.getElementById("read-resource").onclick = async () => {
+  try {
+    const value = await app.readServerResource({ uri: "data://conformance/value" });
+    write("resource", JSON.stringify(value));
+  } catch (error) { write("resource", "denied:" + error); }
+};
+document.getElementById("update-context").onclick = async () => {
+  try {
+    await app.updateModelContext({ content: [{ type: "text", text: "selected item 42" }] });
+    write("context-update", "accepted");
+  } catch (error) { write("context-update", "denied:" + error); }
+};
+document.getElementById("send-message").onclick = async () => {
+  try {
+    const value = await app.sendMessage({
+      role: "user",
+      content: [{ type: "text", text: "summarize selection" }],
+    });
+    write("message", value.isError ? "denied" : "accepted");
+  } catch (error) { write("message", "denied:" + error); }
+};
 document.getElementById("request-teardown").onclick = () => app.requestTeardown();
 await app.connect();
 applyHostContext();
@@ -611,16 +654,20 @@ await server.connect(new ObservedStdioTransport());
 }
 
 export async function findAppFrame(page: Page): Promise<Frame> {
-  const initializedFrame = async () => {
-    for (const frame of page.frames()) {
-      if ((await frame.locator("#initialized").count()) > 0) {
-        return frame;
-      }
-    }
-    return undefined;
-  };
   try {
-    await expect.poll(initializedFrame, { timeout: 20_000 }).toBeDefined();
+    await expect
+      .poll(
+        async () => {
+          for (const frame of page.frames()) {
+            if ((await frame.locator("#initialized").count()) > 0) {
+              return 1;
+            }
+          }
+          return 0;
+        },
+        { timeout: 20_000 },
+      )
+      .toBeGreaterThan(0);
   } catch (error) {
     const component = await page.evaluate(() => {
       const view = document.querySelector("mcp-app-view");
@@ -652,7 +699,13 @@ export async function findAppFrame(page: Page): Promise<Frame> {
       { cause: error },
     );
   }
-  const frame = await initializedFrame();
+  let frame: Frame | undefined;
+  for (const candidate of page.frames()) {
+    if ((await candidate.locator("#initialized").count()) > 0) {
+      frame = candidate;
+      break;
+    }
+  }
   if (!frame) {
     throw new Error("MCP App inner frame not found");
   }

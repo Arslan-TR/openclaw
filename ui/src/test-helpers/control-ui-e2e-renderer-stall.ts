@@ -33,8 +33,12 @@ function recordLongAnimationFrames() {
   const frames: unknown[] = [];
   // Only bundle paths reach CI logs; origins, query strings and blob/data URLs stay out.
   const pathOf = (url: string) => {
-    const parsed = URL.parse(url);
-    return parsed && /^https?:$/u.test(parsed.protocol) ? parsed.pathname : "";
+    try {
+      const parsed = new URL(url);
+      return /^https?:$/u.test(parsed.protocol) ? parsed.pathname : "";
+    } catch {
+      return "";
+    }
   };
   // Listener invokers name their element by id or src; keep only the tag and event.
   const invokerOf = (script: ScriptTiming) => {
@@ -86,8 +90,11 @@ function recordLongAnimationFrames() {
 }
 
 /**
- * Arm before navigation: long frames record completed stalls. For stuck tasks,
- * V8 services pause/metrics requests but not Debugger.enable, so enable it now.
+ * Arm stalled-renderer evidence when a page is created, before navigation and
+ * before the test opens CDP sessions. A stall that ends leaves a script-attributed
+ * long animation frame. For one that never ends, V8 services `Debugger.pause` and
+ * `Performance.getMetrics` inside the busy task, but `Debugger.enable` waits for
+ * it, so the agent must already be enabled.
  */
 export async function installControlUiE2eRendererStallProbe(page: Page): Promise<void> {
   if (controlUiE2eRendererStallProbes.has(page)) {
@@ -112,7 +119,8 @@ export async function installControlUiE2eRendererStallProbe(page: Page): Promise
       await session.send("Performance.enable");
       return { session, scripts, cleanup: () => session.off("Debugger.scriptParsed", parsed) };
     } catch {
-      // Closed pages, non-Chromium contexts, and test doubles may have no probe.
+      // Evidence is best effort: closed pages, non-Chromium contexts, and test
+      // doubles run without a probe.
       return null;
     }
   })();
@@ -121,14 +129,18 @@ export async function installControlUiE2eRendererStallProbe(page: Page): Promise
 }
 
 function stallScriptPath(url: string) {
-  const parsed = URL.parse(url);
-  return parsed &&
-    /^https?:$/u.test(parsed.protocol) &&
-    /^\/assets\/[A-Za-z0-9_.-]+\.js$/u.test(parsed.pathname)
-    ? parsed.pathname
-    : "";
+  try {
+    const parsed = new URL(url);
+    return /^https?:$/u.test(parsed.protocol) &&
+      /^\/assets\/[A-Za-z0-9_.-]+\.js$/u.test(parsed.pathname)
+      ? parsed.pathname
+      : "";
+  } catch {
+    return "";
+  }
 }
 
+/** Read the work holding a renderer that missed the failure-read deadline, then release it. */
 export async function captureControlUiE2eRendererStall(
   page: Page,
   rendererRead: "completed" | "rejected" | "deadline",
@@ -153,6 +165,7 @@ export async function captureControlUiE2eRendererStall(
       return (name: string) => metrics.find((metric) => metric.name === name)?.value ?? 0;
     };
     const before = await sample();
+    // Leave at least half of the remaining budget for the stack and cleanup.
     stall.sampleMs = Math.round(Math.min(RENDERER_STALL_SAMPLE_MS, remaining() / 2));
     await new Promise((resolve) => {
       setTimeout(resolve, stall.sampleMs);
@@ -168,7 +181,10 @@ export async function captureControlUiE2eRendererStall(
     const paused = new Promise<void>((resolve) => {
       session.on("Debugger.paused", ({ callFrames }) => {
         try {
-          stall.stack ??= callFrames.slice(0, RENDERER_STALL_FRAME_LIMIT).map((frame) => ({
+          if (stall.stack !== null) {
+            return;
+          }
+          stall.stack = callFrames.slice(0, RENDERER_STALL_FRAME_LIMIT).map((frame) => ({
             functionName: frame.functionName || "(anonymous)",
             script: stallScriptPath(frame.url) || scripts.get(frame.location.scriptId) || "",
             line: frame.location.lineNumber + 1,

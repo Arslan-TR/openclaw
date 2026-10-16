@@ -415,15 +415,15 @@ describe("openrouter provider hooks", () => {
     async (modelId) => {
       getLoadedOpenRouterModelCapabilitiesMock.mockClear();
       loadOpenRouterModelCapabilitiesMock.mockClear();
-      const provider = await registerSingleProviderPlugin(openrouterPlugin);
+      const jevProvider = await registerSingleProviderPlugin(openrouterPlugin);
       const context = {
         provider: "openrouter",
         modelId,
         modelRegistry: { find: vi.fn(() => null) },
       } as never;
 
-      await provider.prepareDynamicModel?.(context);
-      expect(provider.resolveDynamicModel?.(context)).toBeUndefined();
+      await jevProvider.prepareDynamicModel?.(context);
+      expect(jevProvider.resolveDynamicModel?.(context)).toBeUndefined();
       expect(loadOpenRouterModelCapabilitiesMock).not.toHaveBeenCalled();
       expect(getLoadedOpenRouterModelCapabilitiesMock).not.toHaveBeenCalled();
     },

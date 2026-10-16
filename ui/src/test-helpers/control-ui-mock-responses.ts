@@ -18,6 +18,12 @@ export function createControlUiMockResponses(
     match?: Record<string, unknown>;
     response?: unknown;
   };
+  type BrowserMethodResponseCases = {
+    cases?: BrowserMethodResponseCase[];
+  };
+  type BrowserMethodResponseSequence = {
+    sequence?: unknown[];
+  };
   const methodResponseSequenceIndexes = new Map<string, number>();
   const sessions = input.sessions;
 
@@ -65,15 +71,21 @@ export function createControlUiMockResponses(
     if (!input.agentModel || !isRecord(value)) {
       return value;
     }
-    if (method === "agents.list" && Array.isArray(value.agents)) {
+    const applyAgentsList = (agentsList: unknown): unknown => {
+      if (!isRecord(agentsList) || !Array.isArray(agentsList.agents)) {
+        return agentsList;
+      }
       return {
-        ...value,
-        agents: value.agents.map((agent) =>
+        ...agentsList,
+        agents: agentsList.agents.map((agent) =>
           isRecord(agent) && !Object.hasOwn(agent, "model")
             ? { ...agent, model: { primary: input.agentModel } }
             : agent,
         ),
       };
+    };
+    if (method === "agents.list") {
+      return applyAgentsList(value);
     }
     return value;
   }
@@ -99,22 +111,35 @@ export function createControlUiMockResponses(
   }
 
   function paramsMatch(params: unknown, match: Record<string, unknown> | undefined): boolean {
-    const entries = Object.entries(match ?? {});
-    return (
-      entries.length === 0 ||
-      (isRecord(params) &&
-        entries.every(
-          ([key, expected]) => Object.hasOwn(params, key) && valuesEqual(params[key], expected),
-        ))
+    if (!match) {
+      return true;
+    }
+    const entries = Object.entries(match);
+    if (entries.length === 0) {
+      return true;
+    }
+    if (!isRecord(params)) {
+      return false;
+    }
+    return entries.every(
+      ([key, expected]) => Object.hasOwn(params, key) && valuesEqual(params[key], expected),
     );
   }
 
   function responseCases(value: unknown): BrowserMethodResponseCase[] | null {
-    return isRecord(value) && Array.isArray(value.cases) ? value.cases : null;
+    if (!isRecord(value)) {
+      return null;
+    }
+    const maybeCases = (value as BrowserMethodResponseCases).cases;
+    return Array.isArray(maybeCases) ? maybeCases : null;
   }
 
   function responseSequence(value: unknown): unknown[] | null {
-    return isRecord(value) && Array.isArray(value.sequence) ? value.sequence : null;
+    if (!isRecord(value)) {
+      return null;
+    }
+    const maybeSequence = (value as BrowserMethodResponseSequence).sequence;
+    return Array.isArray(maybeSequence) ? maybeSequence : null;
   }
 
   function configuredResponse(
@@ -155,7 +180,11 @@ export function createControlUiMockResponses(
     const rows = payload?.sessions ?? sessions.list();
     const baseline = {
       count: rows.length,
-      defaults: { contextTokens: null, model: "gpt-5.5", modelProvider: "openai" },
+      defaults: {
+        contextTokens: null,
+        model: "gpt-5.5",
+        modelProvider: "openai",
+      },
       path: "",
       sessions: rows,
       ts: Date.now(),

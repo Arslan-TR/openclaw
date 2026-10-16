@@ -7,7 +7,12 @@ const mocks = vi.hoisted(() => ({
   isActiveMemoryProviderNative: vi.fn(),
 }));
 
-vi.mock("../plugins/memory-runtime.js", () => mocks);
+vi.mock("../plugins/memory-runtime.js", () => ({
+  authorizeActiveMemorySearchHits: mocks.authorizeActiveMemorySearchHits,
+  getActiveMemoryProviderCore: mocks.getActiveMemoryProviderCore,
+  getActiveMemorySearchManagerCore: mocks.getActiveMemorySearchManagerCore,
+  isActiveMemoryProviderNative: mocks.isActiveMemoryProviderNative,
+}));
 
 import { resolveRealtimeVoiceFastContextConsult } from "./fast-context-runtime.js";
 
