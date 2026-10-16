@@ -20,7 +20,7 @@ export function DevicesView(props: DevicesProps) {
   return (
     <SettingsPage wide={true}>
       <>
-        {!props.canManagePairing || !props.canAdmin ? (
+        {props.connected && (!props.canManagePairing || !props.canAdmin) ? (
           <div class="callout info" role="note">
             {t(
               !props.canManagePairing && !props.canAdmin
@@ -61,7 +61,7 @@ function Bindings(props: BindingState) {
   const saveButton = (
     <button
       class="btn"
-      disabled={props.disabled || !props.configDirty}
+      disabled={!props.connected || props.disabled || !props.configDirty}
       onClick={() => props.onSaveBindings()}
     >
       {props.configSaving ? t("common.saving") : t("common.save")}
@@ -69,7 +69,9 @@ function Bindings(props: BindingState) {
   );
   const rows = (
     <>
-      {!props.canAdmin ? <SettingsRow title={t("devices.readOnly.adminRequired")} /> : undefined}
+      {props.connected && !props.canAdmin ? (
+        <SettingsRow title={t("devices.readOnly.adminRequired")} />
+      ) : undefined}
       {props.configFormMode === "raw" ? (
         <SettingsRow title={t("devices.binding.formModeHint")} />
       ) : undefined}
@@ -77,7 +79,11 @@ function Bindings(props: BindingState) {
         <SettingsRow
           title={t("devices.binding.loadConfigHint")}
           control={
-            <button class="btn" disabled={props.configLoading} onClick={props.onLoadConfig}>
+            <button
+              class="btn"
+              disabled={!props.connected || props.configLoading}
+              onClick={props.onLoadConfig}
+            >
               {props.configLoading ? t("common.loading") : t("common.loadConfig")}
             </button>
           }

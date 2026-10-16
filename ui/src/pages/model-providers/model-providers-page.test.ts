@@ -7,6 +7,7 @@ import { createAgentSelectionCapability } from "../../app/agent-selection.ts";
 import type { SelectPicker } from "../../components/select-picker.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import "../../lib/toast-host.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import { choosePickerValue, openPicker, updatePickers } from "../../test-helpers/select-picker.ts";
 import { waitForSolid } from "../../test-helpers/solid-settle.ts";
 import { EMPTY_MODEL_PROVIDERS_DATA } from "./load.ts";
@@ -147,21 +148,91 @@ describe("ModelProvidersPage agent scope", () => {
       }
       return originalRequest(method);
     });
+    await openApiKeyProvider(page, "anthropic");
+    page.view.props.onAddProviderKeyChange("synthetic-added-key");
+    page.view.props.onOpenKeyEditor("openai");
+    page.view.props.onKeyDraftChange("synthetic-unsaved-key");
+    await page.view.scope.onConnect();
+    await page.updateComplete;
+    const search = page.querySelector<HTMLInputElement>("[data-models-login-search]")!;
+    search.value = "Draft provider search";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
     const release = deferNextAuthStatus();
-
     source.publish({ ...snapshot, phase: "reconnecting" });
+    page.view.props.onPrimaryChange("openai/draft-model");
+    await page.updateComplete;
+    expect(page.view.props.authStatus).toBe(previousData);
+    expect(page.querySelector(".model-providers__defaults")).not.toBeNull();
+    expect(page.view.props.keyDraft).toBe("synthetic-unsaved-key");
+    expect(page.view.props.addProviderKey).toBe("synthetic-added-key");
+    expect(page.view.props.defaultModels.primary).toBe("openai/draft-model");
+    expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.value).toBe(
+      "Draft provider search",
+    );
+    expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.disabled).toBe(true);
     source.publish({ ...snapshot, phase: "connected" });
     await vi.waitFor(() => expect(requestCount(request, "models.authStatus")).toBe(2));
     expect(page.view.props.authStatus).toBe(previousData);
 
     release();
     await waitForSolid(() => expect(page.view.props.authStatus).not.toBe(previousData));
+    expect(page.view.props.keyEditorProvider).toBe("openai");
+    expect(page.view.props.addProviderOpen).toBe(true);
+    expect(page.view.props.defaultModels.primary).toBe("openai/draft-model");
+    expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.value).toBe(
+      "Draft provider search",
+    );
+    expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.disabled).toBe(
+      false,
+    );
     await waitForSolid(() =>
       expect(currentConfigObject(page.context.runtimeConfig.state)).toEqual({
         agents: { defaults: { model: "openai/replacement-model" } },
       }),
     );
+    source.publish({ ...snapshot, phase: "reconnecting" });
+    await page.updateComplete;
+    expect(currentConfigObject(context.runtimeConfig.state)).toBeNull();
+    expect(context.runtimeConfig.state.configForm).toMatchObject({
+      agents: { defaults: { model: "openai/replacement-model" } },
+    });
+    expect(page.view.props.defaultModels.primary).toBe("openai/draft-model");
+    source.publish({ ...snapshot, client: createTestGatewayClient(request) });
+    await page.updateComplete;
+    expect(page.view.props.keyEditorProvider).toBeNull();
+    expect(page.view.props.keyDraft).toBe("");
+    expect(page.view.props.addProviderOpen).toBe(false);
+    expect(page.view.props.addProviderKey).toBe("");
+    expect(page.view.props.defaultModels.primary).not.toBe("openai/draft-model");
+    expect(page.view.props.profileOrders).toEqual({});
+    expect(page.querySelector("[data-models-login-search]")).toBeNull();
   });
+
+  it.each(["rejected", "not dispatched", "offline"] as const)(
+    "keeps defaults until acknowledged when the save is %s",
+    async (outcome) => {
+      const { context, runtimeConfig, publishPhase } = createHarness("main");
+      const page = appendPage(context);
+      await waitForProviders(page);
+      if (outcome === "rejected") {
+        runtimeConfig.patch.mockRejectedValueOnce(new Error("Synthetic save failure"));
+      } else if (outcome === "not dispatched") {
+        runtimeConfig.patch.mockResolvedValueOnce(false);
+      } else {
+        publishPhase("offline");
+      }
+      page.view.props.onPrimaryChange("openai/draft-model");
+      await drainPageUpdates(page);
+      expect(page.view.props.defaultModels.primary).toBe("openai/draft-model");
+      if (outcome === "offline") {
+        expect(runtimeConfig.patch).not.toHaveBeenCalled();
+      } else {
+        page.view.props.onPrimaryChange("openai/draft-model");
+        await drainPageUpdates(page);
+        expect(page.view.props.defaultModels.primary).not.toBe("openai/draft-model");
+      }
+    },
+  );
 
   it.each([
     {
@@ -548,7 +619,7 @@ describe("ModelProvidersPage agent scope", () => {
     ]);
   });
 
-  it("restores committed priority and keeps controls available after a rejected save", async () => {
+  it("keeps the desired priority and controls available after a rejected save", async () => {
     const { context, request, snapshot } = createHarness("main");
     snapshot.hello = {
       ...snapshot.hello,
@@ -583,7 +654,7 @@ describe("ModelProvidersPage agent scope", () => {
       [...page.querySelectorAll<HTMLElement>(".model-providers__profile")].map(
         (row) => row.dataset.profileId,
       ),
-    ).toEqual(["openai:one", "openai:two"]);
+    ).toEqual(["openai:two", "openai:one"]);
     expect(
       page.querySelector<HTMLButtonElement>(
         '[data-profile-id="openai:two"] .model-providers__profile-grip',

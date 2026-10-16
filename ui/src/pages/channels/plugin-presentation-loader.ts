@@ -66,7 +66,7 @@ export function createChannelPluginPresentation(hooks: PluginPresentationHooks) 
   }
 
   function ensure(client: GatewayBrowserClient | null) {
-    if (!client) {
+    if (!client || hooks.getContext().gateway.snapshot.phase !== "connected") {
       return;
     }
     if (catalog) {
@@ -99,9 +99,14 @@ export function createChannelPluginPresentation(hooks: PluginPresentationHooks) 
       });
   }
 
-  function reset() {
+  function invalidateRequests() {
     request?.controller.abort();
     request = null;
+    icons.reconcileKeys(new Set(Object.keys(iconUrls)));
+  }
+
+  function reset() {
+    invalidateRequests();
     catalog = null;
     icons.reset();
   }
@@ -111,6 +116,7 @@ export function createChannelPluginPresentation(hooks: PluginPresentationHooks) 
   });
   return {
     ensure,
+    invalidateRequests,
     reset,
     get pluginCatalog() {
       return presentation.read().catalog;

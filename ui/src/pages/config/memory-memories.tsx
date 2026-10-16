@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import type { AgentsWorkspaceGetResult } from "../../../../packages/gateway-protocol/src/index.js";
 import type { MemorySearchResponse } from "../../../../src/gateway/server-methods/memory-search.ts";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
@@ -66,10 +66,12 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
   const [openResultKey, setOpenResultKey] = createSignal<string | null>(null);
   const [details, setDetails] = createSignal(new Map<string, DetailState>());
   let searchRequest: object | null = null;
+  let lastSearchQuery: string | null = null;
   const detailRequests = new Map<string, object>();
 
   function resetSearch() {
     searchRequest = null;
+    lastSearchQuery = null;
     detailRequests.clear();
     setQuery("");
     setSearchState({ kind: "idle" });
@@ -79,9 +81,18 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
 
   createEffect(
     () => [props.agentId, props.client, props.connected, props.methodAdvertised] as const,
-    (_identity, previous) => {
-      if (previous) {
+    ([agentId, client, connected, advertised], previous) => {
+      if (!previous) {
+        return;
+      }
+      searchRequest = null;
+      detailRequests.clear();
+      if (agentId !== previous[0] || client !== previous[1] || (connected && !advertised)) {
         resetSearch();
+      } else if (connected && !previous[2] && lastSearchQuery) {
+        const submittedQuery = lastSearchQuery;
+        // The connection tuple owns reruns; search captures a dispatch-time snapshot.
+        void untrack(() => search(submittedQuery, true));
       }
     },
   );
@@ -90,7 +101,7 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
     detailRequests.clear();
   });
 
-  async function search(value: string) {
+  async function search(value: string, refresh = false) {
     const normalizedQuery = value.trim();
     const client = props.connected ? props.client : null;
     const agentId = props.agentId;
@@ -99,11 +110,14 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
     }
     const request = {};
     searchRequest = request;
+    lastSearchQuery = normalizedQuery;
     detailRequests.clear();
-    setQuery(normalizedQuery);
-    setSearchState({ kind: "loading" });
-    setOpenResultKey(null);
-    setDetails(new Map());
+    if (!refresh) {
+      setQuery(normalizedQuery);
+      setSearchState({ kind: "loading" });
+      setOpenResultKey(null);
+      setDetails(new Map());
+    }
     try {
       const result = await client.request<MemorySearchResponse>("memory.search", {
         query: normalizedQuery,
@@ -113,11 +127,21 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
         return;
       }
       setSearchState({ kind: "ready", query: normalizedQuery, ...result });
+      if (refresh) {
+        const open = result.results.find(
+          (entry, index) => resultKey(entry, index) === openResultKey(),
+        );
+        if (open) {
+          void loadDetail(open.path, true);
+        }
+      }
     } catch (error) {
       if (searchRequest !== request || props.agentId !== agentId || props.client !== client) {
         return;
       }
-      setSearchState({ kind: "error", query: normalizedQuery, message: formatUiError(error) });
+      if (!refresh || searchState().kind !== "ready") {
+        setSearchState({ kind: "error", query: normalizedQuery, message: formatUiError(error) });
+      }
     }
   }
 
@@ -129,7 +153,7 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
     }
   }
 
-  async function loadDetail(path: string) {
+  async function loadDetail(path: string, refresh = false) {
     const client = props.connected ? props.client : null;
     const agentId = props.agentId;
     if (!client || !agentId) {
@@ -137,7 +161,9 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
     }
     const request = {};
     detailRequests.set(path, request);
-    setDetails((current) => new Map(current).set(path, { kind: "loading" }));
+    if (!refresh) {
+      setDetails((current) => new Map(current).set(path, { kind: "loading" }));
+    }
     try {
       const response = await client.request<AgentsWorkspaceGetResult>("agents.workspace.get", {
         agentId,
@@ -163,9 +189,11 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
       ) {
         return;
       }
-      setDetails((current) =>
-        new Map(current).set(path, { kind: "error", message: formatUiError(error) }),
-      );
+      if (!refresh || details().get(path)?.kind !== "ready") {
+        setDetails((current) =>
+          new Map(current).set(path, { kind: "error", message: formatUiError(error) }),
+        );
+      }
     }
   }
 
@@ -310,7 +338,11 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
           {(error) => (
             <div class="memory-memories__state" role="alert">
               <p>{t("memoryPage.memories.error", { message: error.message })}</p>
-              <button class="btn btn--sm" onClick={() => void search(error.query)}>
+              <button
+                class="btn btn--sm"
+                disabled={!props.connected}
+                onClick={() => void search(error.query)}
+              >
                 {t("memoryPage.memories.retry")}
               </button>
             </div>
@@ -330,7 +362,7 @@ export function MemoryMemories(props: MemoryMemoriesProps) {
     <openclaw-memory-memories>
       <ShellLayoutBoundary traits={{ settingsPage: true }}>
         <div class="settings-page memory-memories">
-          {!props.methodAdvertised ? (
+          {props.connected && !props.methodAdvertised ? (
             <p class="memory-memories__unavailable">
               {t("memoryPage.memories.gatewayUpdateRequired")}
             </p>

@@ -118,7 +118,7 @@ export function createConfigWriteCoordinator({
       }
     }
   };
-  // Stale bases and previous connections require explicit recovery, including teardown.
+  // A retained draft needs a fresh, unchanged base before autosave can resume.
   const canAutoSaveDraft = () =>
     state.configAutoSaveStatus !== "conflict" &&
     state.configRecoveryError === null &&
@@ -382,6 +382,9 @@ export function createConfigWriteCoordinator({
       patches.clear();
       const draftBelongsToPreviousConnection =
         state.configFormDirty || inFlight !== null || unacknowledged !== null;
+      if (clientChanged || inFlight !== null || unacknowledged !== null) {
+        autoSaveDraftConnection = null;
+      }
       resetLoads();
       // A retired flight cannot hold the replacement connection's FIFO.
       explicitOpQueue = null;
@@ -390,8 +393,7 @@ export function createConfigWriteCoordinator({
       cancelScheduledAutoSave();
       appliedRefresh.cancel();
       if (draftBelongsToPreviousConnection) {
-        // Retain the draft, visibly paused until Save/Apply or reload binds it
-        // to the new connection; silent suspension would make later edits look saved.
+        // Keep the pause visible until the reconnect read proves autosave safe.
         pauseAutoSaveDraftConnection();
       }
       if (inFlight !== null || unacknowledged !== null) {
@@ -415,7 +417,37 @@ export function createConfigWriteCoordinator({
         if (reconciliation.interrupted) {
           reconciliation.refreshInterrupted();
         } else if (state.configSnapshot || state.configFormDirty || !state.bootstrapConfig) {
-          void refreshDraft(state, refreshConnectionState, publish, appliedRefresh.reconcile);
+          const draftConnection = autoSaveDraftConnection;
+          const draftBaseHash = state.configDraftBaseHash ?? state.configSnapshot?.hash ?? null;
+          const client = state.client;
+          const epoch = currentConfigConnectionEpoch(state);
+          void refreshDraft(
+            state,
+            async () => {
+              const loaded = await refreshConnectionState();
+              if (
+                loaded &&
+                isCurrentConfigConnection(state, client, epoch) &&
+                draftConnection !== null &&
+                autoSaveDraftConnection === draftConnection
+              ) {
+                if (
+                  draftConnection.client === client &&
+                  draftBaseHash !== null &&
+                  draftBaseHash === state.configSnapshot?.hash
+                ) {
+                  captureAutoSaveDraftConnection(true);
+                  scheduleAutoSave();
+                  publish();
+                } else {
+                  autoSaveDraftConnection = null;
+                }
+              }
+              return loaded;
+            },
+            publish,
+            appliedRefresh.reconcile,
+          );
         }
       }
     } else if (pluginsChanged && state.connected && state.configSnapshot) {

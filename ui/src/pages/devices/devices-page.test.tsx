@@ -9,6 +9,7 @@ import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gatewa
 import type { PresenceEntry } from "../../api/types.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context-types.ts";
 import { t } from "../../i18n/index.ts";
+import { invalidateConfigConnection } from "../../lib/config/config-state-model.ts";
 import {
   createInitialDevicesState,
   type DevicesPageDataState,
@@ -167,6 +168,7 @@ function mountPage(
   cleanups.push(dispose);
   return {
     container,
+    config: context.runtimeConfig.state,
     dispose,
     refreshPresentation() {
       setPresentation({ routeData });
@@ -314,6 +316,45 @@ describe("DevicesPage gateway lifecycle", () => {
     page.replaceGateway(gatewayFixture(gatewaySnapshot(null, false)));
     expect(page.container.textContent).not.toContain("Preloaded Mac");
     expect(page.container.textContent).not.toContain("Stale presence");
+  });
+
+  it("retains inventory and an edited approval policy through a same-client reconnect", async () => {
+    const { client } = clientFor();
+    const snapshot = gatewaySnapshot(client, true, [], ["operator.admin"]);
+    const fixture = gatewayFixture(snapshot);
+    const page = mountPage(fixture, {
+      nodes: [{ nodeId: "retained", displayName: "Retained Mac" }],
+      execApprovalsSnapshot: {
+        path: "/synthetic/exec-approvals.json",
+        exists: true,
+        hash: "original-base",
+        file: { version: 1, defaults: { security: "deny" } },
+      },
+      execApprovalsForm: { version: 1, defaults: { security: "deny" } },
+    });
+    const policy = page.container.querySelector<HTMLSelectElement>('select[aria-label="Mode"]')!;
+    expect(policy).not.toBeNull();
+    policy.value = "allowlist";
+    policy.dispatchEvent(new Event("change", { bubbles: true }));
+    flush();
+    page.config.configForm = { tools: { exec: { node: "draft-node" } } };
+    invalidateConfigConnection(page.config);
+    fixture.emitSnapshot({ ...snapshot, phase: "reconnecting", hello: null });
+    expect(page.container.textContent).toContain("Retained Mac");
+    expect(
+      page.container.querySelector<HTMLSelectElement>('select[aria-label="Mode"]')?.value,
+    ).toBe("allowlist");
+    expect(button(page.container, "Save").disabled).toBe(true);
+    expect(
+      page.container.querySelector<HTMLSelectElement>('select[aria-label="Node"]')?.value,
+    ).toBe("draft-node");
+    fixture.emitSnapshot(snapshot);
+    expect(
+      page.container.querySelector<HTMLSelectElement>('select[aria-label="Mode"]')?.value,
+    ).toBe("allowlist");
+    page.replaceGateway(gatewayFixture(gatewaySnapshot(null, false)));
+    expect(page.container.textContent).not.toContain("Retained Mac");
+    expect(page.container.querySelector('select[aria-label="Mode"]')).toBeNull();
   });
 
   it("rejects preloaded data after a same-client gateway epoch change", async () => {
@@ -703,16 +744,40 @@ describe("DevicesPage gateway lifecycle", () => {
   );
 
   it.each(["removal", "alias"])(
-    "cancels a pending %s dialog when the connection resets",
+    "retains a pending %s dialog through reconnect and cancels it on fresh pairing denial",
     async (kind) => {
       const request = vi.fn(async (method: string) => responseFor(method));
       const page = mountPaired(request);
       await selectEntryAction(page.container, kind === "alias" ? "editAlias" : "remove");
       await waitForRenderedModalDialog(document.body);
+      if (kind === "alias") {
+        const input = document.body.querySelector<HTMLInputElement>('input[name="value"]')!;
+        input.value = "Draft device alias";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        flush();
+      }
+      const label = kind === "alias" ? t("common.save") : t("devices.inventory.remove");
+      expect(dialogButton(label).disabled).toBe(false);
       request.mockClear();
       page.fixture.emitSnapshot(gatewaySnapshot(page.client, false));
-      await expectNoModal();
+      expect(document.body.querySelector("openclaw-modal-dialog")).not.toBeNull();
+      expect(dialogButton(label).disabled).toBe(true);
       expect(request).not.toHaveBeenCalled();
+      page.fixture.emitSnapshot(gatewaySnapshot(page.client));
+      expect(dialogButton(label).disabled).toBe(false);
+      if (kind === "alias") {
+        expect(document.body.querySelector<HTMLInputElement>('input[name="value"]')?.value).toBe(
+          "Draft device alias",
+        );
+      }
+      page.fixture.emitSnapshot(gatewaySnapshot(page.client, true, [], ["operator.read"]));
+      await expectNoModal();
+      expect(page.container.textContent).not.toContain("MacBook Pro");
+      expect(page.container.textContent).toContain("Office Mac");
+      page.fixture.emitSnapshot(gatewaySnapshot(page.client, true, [], []));
+      expect(page.container.querySelector(".device-entry")).toBeNull();
+      expect(request.mock.calls.map(([method]) => method)).not.toContain("device.pair.remove");
+      expect(request.mock.calls.map(([method]) => method)).not.toContain("device.pair.rename");
     },
   );
 
@@ -774,7 +839,12 @@ describe("DevicesPage gateway lifecycle", () => {
         page.fixture.emitSnapshot(
           gatewaySnapshot(page.client, true, ["device.token.revoke"], ["operator.read"]),
         );
+      }
+      if (transition === "connection resets") {
+        expect(dialogButton(t("devices.inventory.revoke")).disabled).toBe(true);
         dialogButton(t("devices.inventory.revoke")).click();
+        expect(document.body.querySelector("openclaw-modal-dialog")).not.toBeNull();
+        dialogButton(t("common.cancel")).click();
       }
       await expectNoModal();
       expect(request.mock.calls.map(([method]) => method)).not.toContain("device.token.revoke");

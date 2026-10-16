@@ -30,6 +30,80 @@ beforeEach(async () => {
 });
 afterEach(resetPluginsPageTestState);
 
+it("retains installed settings and an unfinished input across transport loss, but retires them for a new client", async () => {
+  const refresh = deferred();
+  const { client } = createClient(async (method) => {
+    if (method === "plugins.list") {
+      await refresh.promise;
+      return createResult();
+    }
+    if (method === "plugins.inspect") {
+      return createInspectResult();
+    }
+    throw new Error(`Unexpected request: ${method}`);
+  });
+  const harness = createGateway(client);
+  const context = createContext(harness.gateway);
+  context.runtimeConfig.state.connected = true;
+  context.runtimeConfig.state.configForm = {
+    plugins: { entries: { workboard: { config: { greeting: "Saved greeting" } } } },
+  };
+  context.runtimeConfig.state.configSchema = {
+    type: "object",
+    properties: {
+      plugins: {
+        type: "object",
+        properties: {
+          entries: {
+            type: "object",
+            properties: {
+              workboard: {
+                type: "object",
+                properties: {
+                  config: {
+                    type: "object",
+                    properties: { greeting: { type: "string" } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const { page } = await mountPage(
+    context,
+    createPluginsRouteData(
+      harness.gateway,
+      createResult(),
+      createPluginsRouteLocation("/settings/plugins/workboard?view=settings"),
+    ),
+  );
+  try {
+    await waitForSolid(() =>
+      expect(page.querySelector('[data-setting="greeting"] input')).not.toBeNull(),
+    );
+    const input = page.querySelector<HTMLInputElement>('[data-setting="greeting"] input')!;
+    input.value = "Unfinished greeting";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    harness.emit(client, false);
+    await page.updateComplete;
+    expect(page.querySelector('[data-setting="greeting"] input')).toBe(input);
+    expect(input.value).toBe("Unfinished greeting");
+    harness.emit(client, true);
+    await page.updateComplete;
+    expect(page.querySelector('[data-setting="greeting"] input')).toBe(input);
+    expect(input.value).toBe("Unfinished greeting");
+    const replacement = createClient(async () => refresh.promise);
+    harness.emit(replacement.client, true);
+    await page.updateComplete;
+    expect(page.contains(input)).toBe(false);
+  } finally {
+    refresh.resolve();
+  }
+});
+
 it.each([
   ["/plugins", "discovery"],
   ["/plugins/catalog-workboard", "discovery"],

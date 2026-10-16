@@ -159,9 +159,9 @@ function InstalledInventory(props: InventoryProps): JSX.Element {
   );
   return (
     <>
-      {!props.connected ? (
+      {!props.connected && !props.result ? (
         <SettingsEmpty message={t("pluginsPage.connectToManage")} carapace />
-      ) : props.loading ? (
+      ) : props.loading && !props.result ? (
         <SettingsLoadingSkeleton rows={4} carapace />
       ) : props.error && !props.result ? (
         renderRetryError(props.error, props.onRefresh)
@@ -243,7 +243,7 @@ function AdvancedSettings(options: InventoryProps): JSX.Element {
   });
   return (
     <Show
-      when={options.connected}
+      when={options.connected || Boolean(config())}
       fallback={<SettingsEmpty message={t("pluginsPage.connectToManage")} carapace />}
     >
       <Show
@@ -425,7 +425,7 @@ export function renderPluginSettingsDetail(props: DetailProps): JSX.Element {
   );
   return (
     <>
-      {!props.connected ? (
+      {!props.connected && !props.result ? (
         <SettingsPage carapace={true}>
           <SettingsEmpty message={t("pluginsPage.connectToManage")} carapace={true} />
         </SettingsPage>

@@ -108,6 +108,7 @@ export class PluginsPageController {
   pluginConfigEditPending = false;
   private routeDataConsumed = false;
   private pluginGeneration: number | undefined;
+  private adminAccess: boolean | undefined;
   readonly icons = new PluginsPageIcons({
     getContext: () => this.context,
     isConnected: () => this.isConnected,
@@ -122,6 +123,7 @@ export class PluginsPageController {
   readonly gateway = new GatewayPageBinding(() => this.requestUpdate(), {
     getGateway: () => this.context?.gateway,
     onIdentityChange: () => {
+      this.adminAccess = undefined;
       this.setState({ result: null });
       this.setState({ error: null });
       this.setState({ messages: {} });
@@ -130,6 +132,7 @@ export class PluginsPageController {
     invalidateRequests: (change) =>
       this.invalidateRequests(
         change.identityChanged || change.snapshot.phase !== "connected" || !change.snapshot.client,
+        change.identityChanged,
       ),
     onSnapshot: (change) => this.handleGatewaySnapshot(change),
   });
@@ -308,6 +311,13 @@ export class PluginsPageController {
 
   private handleGatewaySnapshot(change: GatewayPageChange) {
     const snapshot = change.snapshot;
+    if (snapshot.phase === "connected") {
+      const allowed = hasOperatorAdminAccess(snapshot.hello?.auth ?? null);
+      if (this.adminAccess && !allowed) {
+        this.invalidateRequests(false);
+      }
+      this.adminAccess = allowed;
+    }
     const generation = snapshot.pluginCapabilities?.generation;
     const pluginsChanged = generation !== undefined && generation !== this.pluginGeneration;
     this.pluginGeneration = generation;
@@ -393,7 +403,7 @@ export class PluginsPageController {
     this.ensureInitialData();
   }
 
-  private invalidateRequests(invalidateCatalog: boolean) {
+  private invalidateRequests(invalidateCatalog: boolean, retirePresentation = true) {
     if (this.active) {
       this.mcpLogin.reset();
     }
@@ -402,9 +412,10 @@ export class PluginsPageController {
       this.discovery.invalidate();
     }
     this.skillPreview.close();
-    // Inspection results belong to one connection epoch, including same-client reconnects.
-    this.setState({ detail: null });
-    this.setState({ catalogDetail: null });
+    if (retirePresentation) {
+      this.setState({ detail: null });
+      this.setState({ catalogDetail: null });
+    }
     this.installRequestGeneration += 1;
     this.consentController.reset();
   }

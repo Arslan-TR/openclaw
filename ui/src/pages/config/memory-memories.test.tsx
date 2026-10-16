@@ -317,6 +317,73 @@ describe("MemoryMemoriesElement", () => {
     }
   });
 
+  it("keeps drafts and loaded memories through a reconnect but resets for another client", async () => {
+    const refreshed = deferred<unknown>();
+    const request = vi.fn((method: string) =>
+      method === "memory.search"
+        ? Promise.resolve({
+            agentId: "main",
+            provider: "local",
+            searchMode: "hybrid",
+            results: [result],
+          })
+        : Promise.resolve(memoryFileResponse("first\nRemember Ada\nthird")),
+    );
+    const element = createElement(request);
+    try {
+      typeQuery(element, "Ada");
+      submit(element);
+      await waitForSolid(() => expect(element.querySelector("article > button")).not.toBeNull());
+      element.querySelector<HTMLButtonElement>("article > button")?.click();
+      await waitForSolid(() => expect(element.textContent).toContain("Remember Ada"));
+      typeQuery(element, "Unsubmitted question");
+
+      element.connected = false;
+      element.methodAdvertised = false;
+      flush();
+      expect(element.querySelector<HTMLInputElement>("#memory-search-input")?.value).toBe(
+        "Unsubmitted question",
+      );
+      expect(element.textContent).toContain("Remember Ada");
+      expect(element.textContent).not.toContain("Update the gateway");
+      expect(element.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(
+        true,
+      );
+
+      request.mockImplementation((method) =>
+        method === "memory.search"
+          ? refreshed.promise
+          : Promise.resolve(memoryFileResponse("first\nFresh memory\nthird")),
+      );
+      element.connected = true;
+      element.methodAdvertised = true;
+      flush();
+      expect(element.textContent).toContain("Remember Ada");
+      expect(element.querySelector<HTMLInputElement>("#memory-search-input")?.value).toBe(
+        "Unsubmitted question",
+      );
+      refreshed.resolve({
+        agentId: "main",
+        provider: "local",
+        searchMode: "hybrid",
+        results: [{ ...result, snippet: "Refreshed Ada" }],
+      });
+      await waitForSolid(() => expect(element.textContent).toContain("Refreshed Ada"));
+      await waitForSolid(() => expect(element.textContent).toContain("Fresh memory"));
+      expect(element.querySelector<HTMLInputElement>("#memory-search-input")?.value).toBe(
+        "Unsubmitted question",
+      );
+
+      element.client = { request } as unknown as GatewayBrowserClient;
+      flush();
+      expect(element.querySelector<HTMLInputElement>("#memory-search-input")?.value).toBe("");
+      expect(element.textContent).not.toContain("Refreshed Ada");
+      expect(element.textContent).not.toContain("Fresh memory");
+    } finally {
+      element.remove();
+    }
+  });
+
   it.each(["resolves", "rejects"] as const)(
     "keeps the current file read when an earlier search's read %s",
     async (outcome) => {

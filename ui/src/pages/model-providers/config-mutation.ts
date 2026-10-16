@@ -209,14 +209,14 @@ export async function modelProviderMutationWarnings(
 export async function runModelProviderConfigMutation(
   owner: ModelProviderConfigMutationOwner,
   params: ModelProviderConfigMutation,
-): Promise<void> {
+): Promise<boolean> {
   const { runtimeConfig } = owner;
   owner.setBusy(true);
   owner.setMessage(null);
   try {
     await runtimeConfig.ensureLoaded();
     if (!owner.isCurrentClient()) {
-      return;
+      return false;
     }
     const patched = await runtimeConfig.patch({
       raw: params.raw,
@@ -224,7 +224,7 @@ export async function runModelProviderConfigMutation(
       ...(params.replacePaths ? { replacePaths: params.replacePaths } : {}),
     });
     if (!owner.isCurrentClient()) {
-      return;
+      return false;
     }
     if (!patched && owner.isCurrentAgent()) {
       owner.setMessage({
@@ -232,10 +232,12 @@ export async function runModelProviderConfigMutation(
         text: runtimeConfig.state.lastError ?? t("modelProviders.configUnavailable"),
       });
     }
+    return patched;
   } catch (error) {
     if (owner.isCurrentClient() && owner.isCurrentAgent()) {
       owner.setMessage({ kind: "error", text: modelProviderErrorMessage(error) });
     }
+    return false;
   } finally {
     if (owner.isCurrentClient() && owner.isCurrentAgent()) {
       owner.setBusy(false);

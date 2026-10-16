@@ -111,8 +111,10 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     authorizable: boolean;
     clientRevision: number;
   }) {
-    const clientChanged =
-      client !== params.client ||
+    const clientChanged = client !== params.client;
+    const becameConnected = !connected && params.connected;
+    const transportChanged =
+      clientChanged ||
       connected !== params.connected ||
       clientRevision !== params.clientRevision;
     const ownerChanged =
@@ -125,7 +127,13 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
       statusReadable !== params.statusReadable ||
       configurable !== nextConfigurable ||
       authorizable !== params.authorizable;
-    const contextChanged = clientChanged || ownerChanged || scopeChanged || capabilityChanged;
+    const contextChanged = transportChanged || ownerChanged || scopeChanged || capabilityChanged;
+    const accessLost =
+      params.connected &&
+      ((statusReadable && !params.statusReadable) ||
+        (configurable && !nextConfigurable) ||
+        (authorizable && !params.authorizable));
+    const presentationChanged = clientChanged || ownerChanged || scopeChanged || accessLost;
     if (contextChanged) {
       deviceAuthorization.retire(true);
       requestRevision += 1;
@@ -138,11 +146,17 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     statusReadable = params.statusReadable;
     configurable = nextConfigurable;
     authorizable = params.authorizable;
-    target = params.target ? { ...params.target } : null;
+    // An unavailable config is not evidence that the selected identity was removed.
+    const nextTarget =
+      params.target?.kind === "shared" &&
+      params.target.config === null &&
+      !presentationChanged &&
+      target?.kind === "shared"
+        ? { ...params.target, config: target.config }
+        : params.target;
+    target = nextTarget ? { ...nextTarget } : null;
     const resolved =
-      params.target?.kind === "shared"
-        ? resolveAgentConfig(params.target.config, params.target.agentId)
-        : null;
+      nextTarget?.kind === "shared" ? resolveAgentConfig(nextTarget.config, nextTarget.agentId) : null;
     const values = { system: resolved?.globalTools?.github, agent: resolved?.entry?.tools?.github };
     const fingerprint = JSON.stringify(
       nextScope === "personal"
@@ -166,19 +180,21 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
       deviceAuthorization.retire(true);
     }
     if (contextChanged || (identityChanged && !mutationOwnsIdentityChange)) {
+      loading = false;
+      busy = false;
+      setTokenRevealed(false);
+      confirmationPending = false;
+    }
+    if (presentationChanged || (identityChanged && !mutationOwnsIdentityChange)) {
       status = null;
       personal = null;
       system = null;
       error = null;
-      loading = false;
-      busy = false;
-      setTokenRevealed(false);
       setPatVisible(false);
-      confirmationPending = false;
     }
     const selected = nextScope === "personal" ? undefined : values[nextScope];
     const selectedFingerprint = JSON.stringify(selected ?? null);
-    const resetDraft = clientChanged || ownerChanged || scopeChanged;
+    const resetDraft = presentationChanged;
     if (resetDraft || (!draftDirty && configFingerprint !== selectedFingerprint)) {
       selectedDraft = readGitHubIdentityDraft(selected);
       draftDirty = false;
@@ -188,7 +204,7 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     if (clientChanged || ownerChanged) {
       return;
     }
-    if (identityChanged && !mutationOwnsIdentityChange) {
+    if (becameConnected || (identityChanged && !mutationOwnsIdentityChange)) {
       queueVerification();
     }
   }

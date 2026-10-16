@@ -98,6 +98,7 @@ export function createModelProviders(
   let logoutConfirmation: AbortController | null = null;
   let pendingConnection = false;
   let pendingCredentialInvalidation = false;
+  let profilesVisible = false;
 
   function setState<Key extends keyof ModelProvidersState>(
     key: Key,
@@ -164,8 +165,16 @@ export function createModelProviders(
       if (change.initial) {
         resetConnectionState();
       } else if (change.connectionChanged && !change.identityChanged) {
-        // Keep the last snapshot visible while the canonical reconnect load replaces it.
-        resetConnectionState({ preserveVisibleData: true });
+        setState("busy", {});
+        installedAgents.reset({ preserveVisibleData: true });
+      }
+      if (change.snapshot.phase === "connected") {
+        const auth = change.snapshot.hello?.auth;
+        const allowed = auth?.scopes !== undefined && hasOperatorAdminAccess(auth);
+        if (profilesVisible && !allowed) {
+          resetConnectionState();
+        }
+        profilesVisible = allowed;
       }
       installedAgents.synchronize();
       if (change.becameConnected && !change.initial && routeDataObserved && !loaderPending) {
@@ -405,16 +414,16 @@ export function createModelProviders(
     logoutConfirmation?.abort();
     core.invalidate();
     supplemental.invalidate();
+    login.invalidateInventory();
   }
 
-  function resetConnectionState(options: { preserveVisibleData?: boolean } = {}) {
-    if (!options.preserveVisibleData) {
-      setState("data", null);
-      dataClient = null;
-    }
+  function resetConnectionState() {
+    profilesVisible = false;
+    setState("data", null);
+    dataClient = null;
     refreshPolicy.resetPayload();
     discovery.cancelLoading();
-    installedAgents.reset(options);
+    installedAgents.reset();
     resetAgentScopeState();
     profileActions.resetProbes();
     setState("defaultsDraft", null);
@@ -594,7 +603,7 @@ export function createModelProviders(
       return;
     }
     const client = context.gateway.snapshot.client;
-    let mutation: Promise<void> | undefined;
+    let mutation: Promise<boolean> | undefined;
     // Global defaults remain editable when the configured roster is empty.
     if (
       client &&
@@ -619,10 +628,9 @@ export function createModelProviders(
         },
       );
     }
-    await mutation;
-    // Global defaults outlive agent selection. Connection resets clear the draft;
-    // object identity protects newer edits.
-    if (state.defaultsDraft === defaults) {
+    const acknowledged = await mutation;
+    // Global defaults outlive agent selection; only retire the acknowledged draft.
+    if (acknowledged && state.defaultsDraft === defaults) {
       setState("defaultsDraft", null);
     }
   }
@@ -636,9 +644,12 @@ export function createModelProviders(
     selection.read();
     overlays.read();
     const gatewaySnapshot = context.gateway.snapshot;
-    const operatorAuth = gatewaySnapshot.hello?.auth;
     const data = state.data ?? EMPTY_MODEL_PROVIDERS_DATA;
-    const configObject = currentConfigObject(context.runtimeConfig.state);
+    const configState = context.runtimeConfig.state;
+    // Retained config is presentation only; mutation admission still requires a current snapshot.
+    const configObject =
+      currentConfigObject(configState) ??
+      (dataClient && dataClient === gatewaySnapshot.client ? configState.configForm : null);
     const catalog = modelCatalog.readAgentModelCatalog(
       gatewaySnapshot.client,
       state.selectedAgentId,
@@ -678,11 +689,7 @@ export function createModelProviders(
         return () => accountUsages.delete(element);
       },
       connected: gatewaySnapshot.phase === "connected",
-      loading:
-        gatewaySnapshot.phase === "connected" &&
-        state.data === null &&
-        !rosterError &&
-        !noSelectableAgents,
+      loading: state.data === null && !rosterError && !noSelectableAgents,
       refreshing: core.loading,
       error: rosterError ?? (noSelectableAgents ? t("agents.noAgents") : data.error),
       providerUsageFailed: data.providerUsage?.ok === false,
@@ -694,10 +701,7 @@ export function createModelProviders(
       catalogDiscovering: core.catalogLoading || Boolean(catalog?.pendingProviders?.length),
       catalogDiscoveryError: core.catalogLoading ? null : (core.catalogError ?? data.catalogError),
       configBusy: modelProviderConfigBusy(context),
-      canViewProfiles:
-        gatewaySnapshot.phase === "connected" &&
-        operatorAuth?.scopes !== undefined &&
-        hasOperatorAdminAccess(operatorAuth),
+      canViewProfiles: profilesVisible,
       mutationBlockedReason: mutationBlockedReason(),
       defaultsMutationBlockedReason: modelProviderConfigMutationBlockedReason(context),
       providerUsageStalled: refreshPolicy.incompleteUsageExhausted,

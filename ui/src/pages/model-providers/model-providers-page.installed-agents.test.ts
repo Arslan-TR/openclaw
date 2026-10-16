@@ -53,6 +53,31 @@ function agentRow(page: ModelProvidersPageTestElement, id: string) {
 }
 
 describe("ModelProvidersPage installed agents", () => {
+  it("keeps the loaded inventory visible across a same-client reconnect, but not a new client", async () => {
+    const refreshing = deferred<{ agents: ReturnType<typeof agent>[] }>();
+    let replace = false;
+    const { context, snapshot, gatewaySource, publishPhase } = createAgentsHarness(async () =>
+      replace ? refreshing.promise : { agents: [agent("opencode", "OpenCode")] },
+    );
+    const page = appendPage(context);
+    try {
+      await waitForSolid(() => expect(agentRow(page, "opencode")).not.toBeNull());
+      const row = agentRow(page, "opencode");
+      replace = true;
+      publishPhase("offline");
+      await page.updateComplete;
+      expect(agentRow(page, "opencode")).toBe(row);
+      publishPhase("connected");
+      await page.updateComplete;
+      expect(agentRow(page, "opencode")).toBe(row);
+      gatewaySource.publish({ ...snapshot, client: { ...snapshot.client! } });
+      await page.updateComplete;
+      expect(agentRow(page, "opencode")).toBeNull();
+    } finally {
+      refreshing.resolve({ agents: [] });
+    }
+  });
+
   it("enables for the selected agent through the shared consent wizard", async () => {
     const restoreDialog = installDialogPolyfill();
     let enabled = false;

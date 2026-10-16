@@ -190,6 +190,9 @@ export function createInstalledAgents(options: InstalledAgentsOptions) {
   }
 
   function available(): boolean {
+    if (!options.gateway.connected && installed !== null) {
+      return true;
+    }
     return canCallGatewayMethod(
       gatewayState.read().snapshot,
       INSTALLED_AGENTS_METHOD,
