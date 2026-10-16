@@ -1,5 +1,6 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   TelegramIngressWorkerCommand,
   TelegramIngressWorkerMessage,
@@ -8,19 +9,7 @@ import { runTelegramIngressWorkerRuntime } from "./telegram-ingress-worker.runti
 
 type RuntimePort = Parameters<typeof runTelegramIngressWorkerRuntime>[0]["port"];
 
-function jsonResponse(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-function htmlResponse(status: number, body: string): Response {
-  return new Response(body, {
-    status,
-    headers: { "content-type": "text/html" },
-  });
-}
+const jsonResponse = (status: number, body: unknown) => Response.json(body, { status });
 
 function createRuntime(
   responses: Response[],
@@ -33,13 +22,8 @@ function createRuntime(
   const calls: number[] = [];
   const pollBodies: Array<Record<string, unknown>> = [];
   const messages: TelegramIngressWorkerMessage[] = [];
-  const listeners = new Set<(message: TelegramIngressWorkerCommand) => void>();
+  let sendCommand!: (message: TelegramIngressWorkerCommand) => void;
   let pollSuccesses = 0;
-  const sendCommand = (message: TelegramIngressWorkerCommand) => {
-    for (const listener of listeners) {
-      listener(message);
-    }
-  };
   const port: RuntimePort = {
     postMessage(message) {
       messages.push(message);
@@ -64,7 +48,7 @@ function createRuntime(
       }
     },
     onMessage(listener) {
-      listeners.add(listener);
+      sendCommand = listener;
     },
     close() {},
   };
@@ -100,17 +84,17 @@ function expectMessage(
   expect(messages).toContainEqual(expect.objectContaining(fields));
 }
 
-async function flushRuntime(): Promise<void> {
-  await vi.advanceTimersByTimeAsync(0);
-}
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-07-01T12:00:00.000Z"));
+});
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("telegram ingress worker poll cadence", () => {
+describe("telegram ingress worker", () => {
   it("keeps short polling until a getUpdates request succeeds", async () => {
-    vi.useFakeTimers();
     const runtime = createRuntime(
       [
         jsonResponse(502, { ok: false, error_code: 502, description: "Bad Gateway" }),
@@ -120,10 +104,10 @@ describe("telegram ingress worker poll cadence", () => {
       { stopAfterPollSuccesses: 2, timeoutSeconds: 30 },
     );
 
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     expectMessage(runtime.messages, { type: "poll-error", errorCode: 502 });
     await vi.advanceTimersByTimeAsync(1_000);
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     await runtime.done;
 
     expect(runtime.pollBodies.map((body) => body.timeout)).toEqual([0, 0, 30]);
@@ -137,15 +121,13 @@ describe("telegram ingress worker poll cadence", () => {
   });
 
   it("backs off consecutive empty polls without hot spinning", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-01T12:00:00.000Z"));
     const runtime = createRuntime(
       Array.from({ length: 9 }, () => jsonResponse(200, { ok: true, result: [] })),
       { stopAfterPollSuccesses: 9 },
     );
 
     expect(runtime.calls).toHaveLength(1);
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     expect(runtime.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(3_550);
     await runtime.done;
@@ -157,8 +139,6 @@ describe("telegram ingress worker poll cadence", () => {
   });
 
   it("resets to immediate polling when activity resumes", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-01T12:00:00.000Z"));
     const runtime = createRuntime(
       [
         jsonResponse(200, { ok: true, result: [] }),
@@ -169,7 +149,7 @@ describe("telegram ingress worker poll cadence", () => {
       { stopAfterPollSuccesses: 4 },
     );
 
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(50);
     await runtime.done;
 
@@ -177,15 +157,8 @@ describe("telegram ingress worker poll cadence", () => {
     expect(runtime.calls.map((calledAt) => calledAt - firstCall)).toEqual([0, 0, 50, 50]);
     expectMessage(runtime.messages, { type: "spooled", updateId: 42 });
   });
-});
-
-describe("telegram ingress worker durable-before-offset", () => {
   it("advances getUpdates offset only after parent spool-ack commits", async () => {
-    vi.useFakeTimers();
-    let releaseSpool!: () => void;
-    const spoolGate = new Promise<void>((resolve) => {
-      releaseSpool = resolve;
-    });
+    const { promise: spoolGate, resolve: releaseSpool } = createDeferred<void>();
     const { messages, calls, pollBodies, done } = createRuntime(
       [
         jsonResponse(200, { ok: true, result: [{ update_id: 42, message: { text: "hi" } }] }),
@@ -194,28 +167,21 @@ describe("telegram ingress worker durable-before-offset", () => {
       { stopAfterPollSuccesses: 2, spoolGate },
     );
 
-    await flushRuntime();
-    // First poll delivered an update; spool-ack is still held.
+    await vi.advanceTimersByTimeAsync(0);
     expect(messages.some((m) => m.type === "update")).toBe(true);
     expect(messages.some((m) => m.type === "spooled")).toBe(false);
     expect(calls).toHaveLength(1);
 
     releaseSpool();
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(0);
     await done;
 
     expectMessage(messages, { type: "spooled", updateId: 42 });
-    // Second getUpdates must use offset = lastUpdateId + 1 only after spool-ack.
     expect(pollBodies[1]?.offset).toBe(43);
     expect(pollBodies.map((body) => body.timeout)).toEqual([0, 1]);
   });
-});
-
-describe("telegram ingress worker retry policy", () => {
   it("honors Telegram retry_after for getUpdates 429 responses", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-01T12:00:00.000Z"));
     const runtime = createRuntime([
       jsonResponse(429, {
         ok: false,
@@ -227,7 +193,7 @@ describe("telegram ingress worker retry policy", () => {
     ]);
 
     expect(runtime.calls).toHaveLength(1);
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     expectMessage(runtime.messages, { type: "poll-error", errorCode: 429, retryAfterMs: 50 });
     await vi.advanceTimersByTimeAsync(49);
     expect(runtime.calls).toHaveLength(1);
@@ -242,15 +208,20 @@ describe("telegram ingress worker retry policy", () => {
   });
 
   it.each([
-    { name: "non-JSON", response: () => htmlResponse(502, "<html>Bad Gateway</html>") },
+    {
+      name: "non-JSON",
+      response: () =>
+        new Response("<html>Bad Gateway</html>", {
+          status: 502,
+          headers: { "content-type": "text/html" },
+        }),
+    },
     { name: "JSON-null", response: () => jsonResponse(502, null) },
   ])("retries a $name getUpdates 502 response as a server error", async ({ response }) => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-01T12:00:00.000Z"));
     const runtime = createRuntime([response(), jsonResponse(200, { ok: true, result: [] })]);
 
     expect(runtime.calls).toHaveLength(1);
-    await flushRuntime();
+    await vi.advanceTimersByTimeAsync(0);
     expectMessage(runtime.messages, {
       type: "poll-error",
       errorCode: 502,
