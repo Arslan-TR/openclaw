@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import type { ConsoleMessage, Frame, Locator, Page } from "playwright";
 import { expect } from "vitest";
+import type { GatewayBrowserClient as BrowserClient } from "../api/gateway.ts";
 
 const require = createRequire(import.meta.url);
 
@@ -166,15 +167,8 @@ export async function requestStandaloneUrl(
 ): Promise<string> {
   return await page.evaluate(
     async (params) => {
-      const client = Reflect.get(window, "mcpConformanceClient") as {
-        request(method: string, params: unknown): Promise<unknown>;
-      };
-      const payload = (await client.request("mcp.app.view", {
-        sessionKey: params.sessionKey,
-        viewId: params.viewId,
-      })) as {
-        standaloneUrl: string;
-      };
+      const client = Reflect.get(window, "mcpConformanceClient") as BrowserClient;
+      const payload = await client.request<{ standaloneUrl: string }>("mcp.app.view", params);
       return payload.standaloneUrl;
     },
     { sessionKey, viewId },
@@ -292,30 +286,22 @@ window.mcpConformanceUnmount = async () => {
       const GatewayBrowserClient = Reflect.get(
         window,
         "mcpConformanceGatewayBrowserClient",
-      ) as new (options: Record<string, unknown>) => {
-        start(): void;
-        request(method: string, params: unknown): Promise<unknown>;
-      };
-      let resolveHello!: () => void;
-      let rejectHello!: (error: Error) => void;
-      const connected = new Promise<void>((resolve, reject) => {
-        resolveHello = resolve;
-        rejectHello = reject;
-      });
-      const client = new GatewayBrowserClient({
-        url: params.gatewayUrl,
-        token: params.authValue,
-        onHello: () => resolveHello(),
-        onClose: (info: { code: number; reason: string; error?: unknown; willRetry: boolean }) => {
-          if (!info.willRetry) {
-            rejectHello(new Error(`Gateway connection closed: ${JSON.stringify(info)}`));
-          }
-        },
-      });
-      client.start();
-      await Promise.race([
-        connected,
-        new Promise((_, reject) => {
+      ) as typeof BrowserClient;
+      const client = await Promise.race([
+        new Promise<BrowserClient>((resolve, reject) => {
+          const connectedClient = new GatewayBrowserClient({
+            url: params.gatewayUrl,
+            token: params.authValue,
+            onHello: () => resolve(connectedClient),
+            onClose: (info) => {
+              if (!info.willRetry) {
+                reject(new Error(`Gateway connection closed: ${JSON.stringify(info)}`));
+              }
+            },
+          });
+          connectedClient.start();
+        }),
+        new Promise<never>((_, reject) => {
           setTimeout(() => reject(new Error("Gateway connection timed out")), 60_000);
         }),
       ]);

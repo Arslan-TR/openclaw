@@ -175,19 +175,14 @@ export function createTeamScaleSidebarListOwner(input: TeamScaleSidebarListInven
 }
 
 /** Applies membership churn to the existing 125-frame, 20-second live stream. */
-export function prepareTeamScaleSidebarListChurn({
-  sessions,
-  people,
-  liveEvents,
-  selectedSessionKey,
-  now,
-}: {
+export function prepareTeamScaleSidebarListChurn(input: {
   sessions: GatewaySessionRow[];
   people: ControlUiMockPresenceUser[];
   liveEvents: TeamScaleLiveEvent[];
   selectedSessionKey: string;
   now: number;
 }): void {
+  const { sessions, people, liveEvents, selectedSessionKey, now } = input;
   const working = new Map<string, GatewaySessionRow>(sessions.map((row) => [row.key, row]));
   const rowAt = (index: number) => working.get(sessions[index]!.key)!;
   const pendingCreatedKeys: string[] = [];
@@ -252,15 +247,12 @@ export function prepareTeamScaleSidebarListChurn({
       kind = ["create.cron", "create.subagent", "create.other-user"][index]!;
       const source = sessions[241 + index]!;
       const key = `agent:main:${["cron", "subagent", "chat"][index]}:team-scale-created-${index}`;
-      row = {
-        ...source,
+      row = update(source, {
         key,
         sessionId: `team-scale-created-${index}`,
         label: `Synthetic ${kind}`,
         displayName: `Synthetic ${kind}`,
         createdAt: ts,
-        updatedAt: ts,
-        snapshotAt: ts,
         owner: owner(other),
         participants:
           index === 2 ? [{ identity: { type: "profile", id: self.id }, label: self.name }] : [],
@@ -271,7 +263,7 @@ export function prepareTeamScaleSidebarListChurn({
         ...(index === 1
           ? { spawnedBy: selectedSessionKey, childOwnerSessionKeys: [selectedSessionKey] }
           : {}),
-      };
+      });
       pendingCreatedKeys.push(key);
       if (index === 1) {
         const parent = working.get(selectedSessionKey)!;

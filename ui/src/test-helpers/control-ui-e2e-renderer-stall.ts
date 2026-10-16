@@ -33,12 +33,8 @@ function recordLongAnimationFrames() {
   const frames: unknown[] = [];
   // Only bundle paths reach CI logs; origins, query strings and blob/data URLs stay out.
   const pathOf = (url: string) => {
-    try {
-      const parsed = new URL(url);
-      return /^https?:$/u.test(parsed.protocol) ? parsed.pathname : "";
-    } catch {
-      return "";
-    }
+    const parsed = URL.parse(url);
+    return parsed && /^https?:$/u.test(parsed.protocol) ? parsed.pathname : "";
   };
   // Listener invokers name their element by id or src; keep only the tag and event.
   const invokerOf = (script: ScriptTiming) => {
@@ -125,15 +121,12 @@ export async function installControlUiE2eRendererStallProbe(page: Page): Promise
 }
 
 function stallScriptPath(url: string) {
-  try {
-    const parsed = new URL(url);
-    return /^https?:$/u.test(parsed.protocol) &&
-      /^\/assets\/[A-Za-z0-9_.-]+\.js$/u.test(parsed.pathname)
-      ? parsed.pathname
-      : "";
-  } catch {
-    return "";
-  }
+  const parsed = URL.parse(url);
+  return parsed &&
+    /^https?:$/u.test(parsed.protocol) &&
+    /^\/assets\/[A-Za-z0-9_.-]+\.js$/u.test(parsed.pathname)
+    ? parsed.pathname
+    : "";
 }
 
 export async function captureControlUiE2eRendererStall(
@@ -175,10 +168,7 @@ export async function captureControlUiE2eRendererStall(
     const paused = new Promise<void>((resolve) => {
       session.on("Debugger.paused", ({ callFrames }) => {
         try {
-          if (stall.stack !== null) {
-            return;
-          }
-          stall.stack = callFrames.slice(0, RENDERER_STALL_FRAME_LIMIT).map((frame) => ({
+          stall.stack ??= callFrames.slice(0, RENDERER_STALL_FRAME_LIMIT).map((frame) => ({
             functionName: frame.functionName || "(anonymous)",
             script: stallScriptPath(frame.url) || scripts.get(frame.location.scriptId) || "",
             line: frame.location.lineNumber + 1,

@@ -70,11 +70,7 @@ export function createControlUiChatHistoryMessage(
   text: string,
   timestamp: number,
 ) {
-  return {
-    content: [{ text, type: "text" }],
-    role,
-    timestamp,
-  };
+  return { content: [{ text, type: "text" }], role, timestamp };
 }
 
 export function createControlUiSessionFixtures(
@@ -90,6 +86,10 @@ export function createControlUiSessionFixtures(
     lastRunEventSequence?: number;
   };
   const records = new Map<string, FixtureRecord>();
+  const patchFields =
+    "model thinkingLevel fastMode permissionMode label category icon color boardFace boardPresentation unread toolOverrides".split(
+      " ",
+    );
   const activeRuns = (row: ControlUiSessionFixture) =>
     Array.isArray(row.activeRunIds)
       ? row.activeRunIds.filter((id): id is string => typeof id === "string")
@@ -167,20 +167,7 @@ export function createControlUiSessionFixtures(
       next[field] = fieldValue;
       changed.add(field);
     };
-    for (const field of [
-      "model",
-      "thinkingLevel",
-      "fastMode",
-      "permissionMode",
-      "label",
-      "category",
-      "icon",
-      "color",
-      "boardFace",
-      "boardPresentation",
-      "unread",
-      "toolOverrides",
-    ]) {
+    for (const field of patchFields) {
       if (Object.hasOwn(fields, field)) {
         set(field, fields[field]);
       }

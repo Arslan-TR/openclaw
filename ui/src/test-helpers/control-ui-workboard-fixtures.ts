@@ -24,6 +24,12 @@ export function buildWorkboardMocks(
   const handoffSessionKey = "agent:main:workboard-handoff";
   const onboardingSessionKey = "agent:main:workboard-onboarding";
   const accessibilitySessionKey = "agent:main:workboard-accessibility";
+  const inFlightRun = {
+    runId: "workboard-onboarding-run",
+    text: "Checking first-task navigation and recovery after a validation error…",
+    startedAt: baseTime - 8 * 60_000,
+    events: [],
+  };
   const card = (
     id: string,
     title: string,
@@ -50,42 +56,10 @@ export function buildWorkboardMocks(
     ...(
       [
         ["brief", "Draft weekly product brief", "todo", "low", 2, "writing", briefSessionKey],
-        [
-          "ready",
-          "Prepare launch readiness checklist",
-          "ready",
-          "high",
-          1,
-          "launch",
-          launchSessionKey,
-        ],
-        [
-          "running",
-          "Validate onboarding flow",
-          "running",
-          "urgent",
-          1,
-          "quality",
-          onboardingSessionKey,
-        ],
-        [
-          "review",
-          "Review accessibility audit",
-          "review",
-          "high",
-          1,
-          "frontend",
-          accessibilitySessionKey,
-        ],
-        [
-          "blocked",
-          "Confirm staging environment access",
-          "blocked",
-          "normal",
-          1,
-          "ops",
-          stagingSessionKey,
-        ],
+        ["ready", "Launch readiness", "ready", "high", 1, "launch", launchSessionKey],
+        ["running", "Onboarding", "running", "urgent", 1, "quality", onboardingSessionKey],
+        ["review", "Accessibility audit", "review", "high", 1, "frontend", accessibilitySessionKey],
+        ["blocked", "Staging access", "blocked", "normal", 1, "ops", stagingSessionKey],
         ["done", "Publish support handoff notes", "done", "low", 1, "docs", handoffSessionKey],
       ] as const
     ).map(([id, title, status, priority, position, label, key]) =>
@@ -127,6 +101,27 @@ export function buildWorkboardMocks(
     ),
     metadata: { automation: { boardId: "card-states" } },
   });
+  const proof = (id: string, status: string, age: number) => ({
+    id,
+    status,
+    label: "Synthetic accessibility review",
+    note: "Illustrative evidence only; no test was executed.",
+    createdAt: baseTime - age,
+  });
+  const attempt = (id: string, status: string, start: number, end: number, error?: string) => ({
+    id,
+    status,
+    startedAt: baseTime - start,
+    endedAt: baseTime - end,
+    ...(error ? { error } : {}),
+  });
+  const notification = (id: string, kind: string, runId: string, age: number) => ({
+    id: `state-${id}`,
+    kind,
+    runId: `state-${runId}`,
+    createdAt: baseTime - age,
+    message: `Synthetic ${kind} notification.`,
+  });
   const stateCards = [
     {
       ...stateCard(
@@ -155,43 +150,14 @@ export function buildWorkboardMocks(
           },
         ],
         proof: [
-          {
-            id: "state-proof-failed",
-            status: "failed",
-            label: "Initial keyboard check",
-            note: "Synthetic earlier failed evidence.",
-            createdAt: baseTime - 1_000_000,
-          },
-          {
-            id: "state-proof-skipped",
-            status: "skipped",
-            label: "Mobile device check",
-            note: "No device attached to this synthetic example.",
-            createdAt: baseTime - 150_000,
-          },
-          {
-            id: "state-proof",
-            status: "passed",
-            label: "Synthetic accessibility review",
-            note: "Illustrative evidence only; no test was executed.",
-            createdAt: baseTime - 120_000,
-          },
+          proof("state-proof-failed", "failed", 1_000_000),
+          proof("state-proof-skipped", "skipped", 150_000),
+          proof("state-proof", "passed", 120_000),
         ],
         failureCount: 1,
         attempts: [
-          {
-            id: "state-first-attempt",
-            status: "failed",
-            startedAt: baseTime - 1_200_000,
-            endedAt: baseTime - 1_000_000,
-            error: "Synthetic first pass did not complete.",
-          },
-          {
-            id: "state-attempt",
-            status: "succeeded",
-            startedAt: baseTime - 900_000,
-            endedAt: baseTime - 240_000,
-          },
+          attempt("state-first-attempt", "failed", 1_200_000, 1_000_000, "Synthetic failure."),
+          attempt("state-attempt", "succeeded", 900_000, 240_000),
         ],
         claim: {
           ownerId: "main",
@@ -258,40 +224,18 @@ export function buildWorkboardMocks(
     stateCard("stopped", "Resume a task stopped by the operator", "blocked", 3000),
     stateCard("completed", "Review a completed background task", "review", 2000),
     {
-      ...stateCard(
-        "failed",
-        "Inspect a failed task after its session was stopped",
-        "blocked",
-        4000,
-      ),
+      ...stateCard("failed", "Inspect a failed task", "blocked", 4000),
       runId: "state-current-failed-run",
       metadata: {
         automation: { boardId: "card-states" },
         notifications: [
-          {
-            id: "state-current-failure",
-            kind: "failed",
-            createdAt: baseTime - 60_000,
-            runId: "state-current-failed-run",
-            message: "The current task failed while checking the release environment.",
-          },
-          {
-            id: "state-old-completion",
-            kind: "completed",
-            createdAt: baseTime - 30_000,
-            runId: "state-previous-run",
-            message: "An earlier execution completed; this is not the current blocker.",
-          },
+          notification("current-failure", "failed", "current-failed-run", 60_000),
+          notification("old-completion", "completed", "previous-run", 30_000),
         ],
       },
     },
     {
-      ...stateCard(
-        "ambiguous",
-        "Choose the owner of an ambiguous shared session link",
-        "todo",
-        2000,
-      ),
+      ...stateCard("ambiguous", "Choose a shared-session owner", "todo", 2000),
       sessionKey: "global",
     },
   ];
@@ -363,8 +307,8 @@ export function buildWorkboardMocks(
     sessionRow(onboardingSessionKey, "Onboarding validation", baseTime, {
       status: "running",
       hasActiveRun: true,
-      activeRunIds: ["workboard-onboarding-run"],
-      startedAt: baseTime - 8 * 60_000,
+      activeRunIds: [inFlightRun.runId],
+      startedAt: inFlightRun.startedAt,
       totalTokens: 12_400,
     }),
     sessionRow(accessibilitySessionKey, "Accessibility audit", baseTime - 3 * 60_000, {
@@ -382,14 +326,7 @@ export function buildWorkboardMocks(
         `Synthetic ${state} session`,
         baseTime - 60_000,
         {
-          status:
-            state === "timeout"
-              ? "timeout"
-              : state === "stopped"
-                ? "killed"
-                : state === "completed"
-                  ? "done"
-                  : state,
+          status: state === "stopped" ? "killed" : state === "completed" ? "done" : state,
           hasActiveRun: state === "running",
         },
       ),
@@ -398,90 +335,52 @@ export function buildWorkboardMocks(
   if (matrix) {
     cardSessions.splice(0, cardSessions.length, ...buildWorkboardStateSessions(baseTime));
   }
-  const history = (...messages: Parameters<typeof chatHistoryMessage>[]) => ({
-    messages: messages.map((message) =>
-      Object.assign(
-        chatHistoryMessage(...message),
-        message[0] === "user"
-          ? { __openclaw: { senderId: actor.id, senderName: actor.label } }
-          : {},
-      ),
-    ),
-  });
-  const conversation = (
-    user: string,
-    userMinutes: number,
-    assistant: string,
-    assistantMinutes: number,
-  ) =>
-    history(
-      ["user", user, baseTime - userMinutes * 60_000],
-      ["assistant", assistant, baseTime - assistantMinutes * 60_000],
-    );
-  const cardSessionHistories = {
-    ...Object.fromEntries(
-      cardSessions
-        .filter((session) => session.key.includes(":card-states-"))
-        .map((session) => [
-          session.key,
-          history([
-            "user",
-            "Synthetic card-state example: inspect this execution and its recorded outcome.",
-            baseTime - 700_000,
-          ]),
-        ]),
-    ),
-    [briefSessionKey]: history([
-      "user",
-      "Draft this week's product brief from the latest feedback and delivery notes.",
-      baseTime - 2 * 60_000,
-    ]),
-    [launchSessionKey]: conversation(
-      "Prepare the launch readiness checklist. I will provide the release scope before we start.",
-      15,
-      "The checklist outline is ready. Share the release scope when you are ready to continue.",
-      12,
-    ),
-    [stagingSessionKey]: conversation(
-      "Confirm that the staging environment is accessible for the release review.",
-      7,
-      "The staging access check failed: the environment returned HTTP 403. An operator needs to restore access before I can retry.",
-      5,
-    ),
-    [handoffSessionKey]: conversation(
-      "Prepare the support handoff notes covering the launch checklist and known limitations.",
-      40,
-      "The support handoff notes are complete, including escalation contacts and known limitations. The operator has reviewed and published them.",
-      30,
-    ),
-    [onboardingSessionKey]: {
-      ...conversation(
-        "Validate the onboarding flow, including account setup and the first successful task.",
-        8,
-        "Account setup is working. I am checking the first-task flow and its empty and error states.",
-        1,
-      ),
-      inFlightRun: {
-        runId: "workboard-onboarding-run",
-        text: "Checking first-task navigation and recovery after a validation error…",
-        startedAt: baseTime - 8 * 60_000,
-        events: [],
-      },
-    },
-    [accessibilitySessionKey]: conversation(
-      "Review keyboard navigation, focus visibility, and form labels in the onboarding flow.",
-      20,
-      "The accessibility review is complete. Keyboard navigation, visible focus, and form labels are ready for operator review.",
-      3,
-    ),
+  type HistoryMessage = ReturnType<typeof chatHistoryMessage> & {
+    __openclaw?: { senderId: string; senderName: string };
   };
+  const timelines: [key: string, userAge: number, assistantAge?: number][] = [
+    ...cardSessions
+      .filter((session) => session.key.includes(":card-states-"))
+      .map((session): [string, number] => [session.key, 700_000]),
+    [briefSessionKey, 2 * 60_000],
+    [launchSessionKey, 15 * 60_000, 12 * 60_000],
+    [stagingSessionKey, 7 * 60_000, 5 * 60_000],
+    [handoffSessionKey, 40 * 60_000, 30 * 60_000],
+    [onboardingSessionKey, 8 * 60_000, 60_000],
+    [accessibilitySessionKey, 20 * 60_000, 3 * 60_000],
+  ];
+  const cardSessionHistories = Object.fromEntries(
+    timelines.map(([key, userAge, assistantAge]) => {
+      const user = chatHistoryMessage(
+        "user",
+        "Review this task and its recorded outcome.",
+        baseTime - userAge,
+      );
+      Object.assign(user, { __openclaw: { senderId: actor.id, senderName: actor.label } });
+      const messages: HistoryMessage[] = [user];
+      if (assistantAge !== undefined) {
+        const text =
+          key === stagingSessionKey
+            ? "Staging access failed: HTTP 403. Restore access before retrying."
+            : key === onboardingSessionKey
+              ? "Checking first-task navigation and recovery."
+              : key === launchSessionKey
+                ? "The checklist is ready. Share the release scope to continue."
+                : key === handoffSessionKey
+                  ? "The support handoff notes are complete and published."
+                  : "The accessibility review is complete.";
+        messages.push(chatHistoryMessage("assistant", text, baseTime - assistantAge));
+      }
+      return [key, { messages, ...(key === onboardingSessionKey ? { inFlightRun } : {}) }];
+    }),
+  );
   return {
     board,
     boards,
     cards: allCards,
     sessionKey,
     cardSessions,
-    cardSessionHistories: Object.fromEntries(Object.entries(cardSessionHistories)),
+    cardSessionHistories,
     methodResponses: {
       "agents.list": {
         agents: [
