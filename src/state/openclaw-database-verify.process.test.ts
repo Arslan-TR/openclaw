@@ -221,7 +221,7 @@ describe("database verifier worker lifetime", () => {
     },
   );
 
-  it("preserves a native spawn failure without waiting for an exit event", async () => {
+  it("classifies a removed runtime without waiting for an exit event", async () => {
     const executable = process.execPath;
     let worker: ChildProcess | undefined;
     let closed = false;
@@ -246,7 +246,10 @@ describe("database verifier worker lifetime", () => {
       process.execPath = executable;
     }
 
-    await expect(verification).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(verification).rejects.toMatchObject({
+      code: "NODE_RUNTIME_UNAVAILABLE",
+      message: expect.stringContaining("Restart the Gateway."),
+    });
     expect(worker?.pid).toBeUndefined();
     expect(worker?.exitCode === null || (worker?.exitCode ?? 0) < 0).toBe(true);
     expect(releasedAfterClose).toBe(true);

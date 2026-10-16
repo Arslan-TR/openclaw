@@ -1,6 +1,10 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { toStructuredErrorObject } from "@openclaw/normalization-core/error-coercion";
+import {
+  assertChildRuntimeAvailable,
+  observeChildRuntime,
+} from "../infra/child-runtime-viability.js";
 import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { parseSqliteFileGeneration } from "../infra/sqlite-file-generation.js";
@@ -113,16 +117,18 @@ export function runDatabaseVerifyWorker(
   const execArgv = workerUrl.pathname.endsWith(".ts") ? ["--import", "tsx"] : undefined;
   let worker: ChildProcess;
   try {
+    assertChildRuntimeAvailable();
     // Closing a source reader can release the Gateway's process-owned SQLite
     // locks, so verification keeps its own process.
     worker = fork(fileURLToPath(workerUrl), [DATABASE_VERIFY_CHILD_ARG], {
       execArgv,
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
   } catch (error) {
     return Promise.reject(toStructuredErrorObject(error));
   }
   // Capture the lifetime before publishing the child so stop joins this same boundary.
+  const runtimeFailure = observeChildRuntime(worker);
   const lifecycle = ownDatabaseVerifyWorker(worker);
   let result: OpenClawDatabaseVerifyResult[] | undefined;
   let failure: Error | undefined;
@@ -141,11 +147,23 @@ export function runDatabaseVerifyWorker(
   };
   worker.once("message", onMessage);
   worker.on("error", fail);
-  const completion = lifecycle.settled.then((exit) => {
+  const outputClosed = new Promise<void>((resolve) => {
+    if (!worker.stderr || worker.stderr.closed) {
+      resolve();
+    } else {
+      worker.stderr.once("close", resolve);
+    }
+  });
+  const completion = lifecycle.settled.then(async (exit) => {
+    await outputClosed;
     settled = true;
     worker.off("message", onMessage);
     worker.off("error", fail);
     options.onWorker?.(undefined);
+    const launchFailure = runtimeFailure();
+    if (launchFailure) {
+      throw launchFailure;
+    }
     if (failure) {
       throw failure;
     }

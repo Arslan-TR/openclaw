@@ -4,6 +4,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emitChildProcessSpawnSample } from "../process/spawn-diagnostics.js";
+import { readChildRuntimeViability } from "./child-runtime-viability.js";
 import { onDiagnosticEvent, setDiagnosticsEnabledForProcess } from "./diagnostic-events.js";
 import { encodeSqliteAuthTransferFrame } from "./sqlite-readonly-auth-transfer.js";
 import { captureSqliteReadOnlyWorkerScope } from "./sqlite-readonly-worker-context.js";
@@ -133,6 +134,15 @@ describe("SQLite read-only session operation custody", () => {
       await session.close();
     },
   );
+
+  it("does not mark a runnable runtime unavailable after an ordinary worker abort", async () => {
+    const { session, child } = createSession();
+    const result = session.run("/fixture/snapshot", { mode: "staging-create" });
+    child.emit("spawn");
+    child.emit("close", null, "SIGABRT");
+    await expect(result).rejects.toThrow("SQLite read-only worker exited with signal SIGABRT");
+    expect(readChildRuntimeViability().available).toBe(true);
+  });
 
   it.each(["staging-create"] as const)(
     "reuses its child after a well-formed %s refusal",

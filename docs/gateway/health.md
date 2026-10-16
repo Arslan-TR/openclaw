@@ -123,6 +123,16 @@ and secrets. Recovery uses the existing four-attempt startup publication budget 
 reopening or migrating the database again. A failed publication or exhausted budget
 keeps the agent unavailable and records its reason and repair hint in readiness.
 
+If Node.js is upgraded or removed while the Gateway is running, its retained
+runtime may stop launching child workers even though the Gateway process is
+still alive. A confirmed missing executable or runtime loader failure marks
+`childRuntime.available` as `false` in health/status and makes `/readyz` return
+`503` with `failing: ["child-runtime"]`. Worker requests explain which runtime
+failed and ask you to restart the Gateway. The diagnosis is logged once and
+further worker launches fail immediately; ordinary worker crashes do not mark
+the runtime unavailable. The Gateway stays running for operator diagnosis;
+restart it with `openclaw gateway restart` after the Node upgrade completes.
+
 A broken Telegram or other channel account can also make `/readyz` return `503` while `/startupz` remains started. Neither check replaces the other: startup completion alone does not certify agent or channel availability.
 
 Disabled, unconfigured, and ordinarily unlinked accounts do not fail channel readiness. An enabled, configured account with a recorded terminal disconnect, blocked lifecycle, or unavailable ingress still fails its health check even if it becomes unlinked. For example, a terminal WhatsApp logout makes `/readyz` return `503` with `failing: ["whatsapp"]` in detailed responses. Terminal disconnects and blocked accounts require operator action; the health monitor does not restart them.
