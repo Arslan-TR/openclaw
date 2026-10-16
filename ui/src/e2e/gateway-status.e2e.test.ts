@@ -254,10 +254,10 @@ suite.define(() => {
         expect(await identityStatus.getAttribute("aria-label")).toContain("Reconnecting…");
         expect(await identityStatus.textContent()).toContain("Alex");
         expect(await identityStatus.locator("[role=status]").count()).toBe(0);
-        const announcement = footer.locator(":scope > [role=status]");
+        const announcement = page.locator(".shell > .sr-only[role=status]");
         expect(await announcement.count()).toBe(1);
-        expect(await announcement.textContent()).toBe("");
-        expect(await chip.locator("[role=status]").textContent()).toContain("Reconnecting…");
+        expect(await announcement.textContent()).toBe("Reconnecting… · 2 queued");
+        expect(await chip.locator("[role=status]").count()).toBe(0);
         expect(await footer.textContent()).not.toContain("in outbox");
         expect(await gateway.getRequests("chat.send")).toHaveLength(0);
 

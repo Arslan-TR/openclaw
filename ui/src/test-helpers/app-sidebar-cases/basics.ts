@@ -342,10 +342,6 @@ describe("AppSidebar agent chip", () => {
     expect(card?.getAttribute("data-connection-status")).toBe("reconnecting");
     expect(card?.querySelector(".sidebar-identity-card__status")).not.toBeNull();
     expect(card?.getAttribute("aria-label")).toBe("Identity and app menu for Owner: Reconnecting…");
-    const announcement = sidebar.querySelector('.sidebar-footer-bar > [role="status"]');
-    expect(announcement?.getAttribute("aria-live")).toBe("polite");
-    // The bottom-left chip owns unhealthy announcements; the footer only reports recovery.
-    expect(announcement?.textContent).toBe("");
     expect(sidebar.querySelector(".sidebar-agent-card__subtitle-row")).toBeNull();
 
     card?.click();
@@ -360,7 +356,6 @@ describe("AppSidebar agent chip", () => {
     expect(sidebar.querySelector(".sidebar-identity-card__subtitle")).toBeNull();
     expect(sidebar.querySelector(".gateway-status")).toBeNull();
     expect(card?.getAttribute("data-connection-status")).toBeNull();
-    expect(announcement?.textContent).toBe("");
   });
 
   it("keeps the sessions list flat for the selected agent and flags other-agent unread", async () => {

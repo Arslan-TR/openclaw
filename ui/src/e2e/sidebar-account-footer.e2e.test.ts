@@ -67,9 +67,7 @@ async function expectRailConnectionStatus(footer: Locator, kind: string, label: 
           ?.textContent?.trim(),
     ),
   ).toBe(`Identity and app menu for Riley: ${label}`);
-  const lifecycle = footer.locator(":scope > [role=status]");
-  expect(await lifecycle.count()).toBe(1);
-  expect(await lifecycle.textContent()).toBe("");
+  expect(await footer.locator(":scope > [role=status]").count()).toBe(0);
   expect(await identity.getByRole("status").count()).toBe(0);
 }
 
@@ -323,6 +321,7 @@ suite.define(() => {
       const footer = sidebar.locator(".sidebar-footer-bar");
       const identity = footer.locator(".sidebar-identity-card");
       const chip = page.locator(".shell-connection-status");
+      const announcement = page.locator(".shell > .sr-only[role=status]");
       await setSidebarProofTheme(page, "dark");
       await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
       await waitForControlUiGatewayReady(page);
@@ -338,7 +337,7 @@ suite.define(() => {
       await gateway.emitGatewayEvent("gateway.suspension", { phase: "accepting" });
       await expect.poll(() => identity.getAttribute("data-connection-status")).toBe("connected");
       await expect.poll(() => chip.count()).toBe(0);
-      expect(await footer.locator(":scope > [role=status]").textContent()).toBe("Connected");
+      expect(await announcement.textContent()).toBe("Connected");
 
       for (const [phase, label] of [
         ["preparing", "Suspending…"],
@@ -352,6 +351,7 @@ suite.define(() => {
           label,
         );
         await expect.poll(() => chip.locator(".gateway-status__label").textContent()).toBe(label);
+        expect(await announcement.textContent()).toBe(label);
         await captureUnionProof(
           suite,
           page,
@@ -414,7 +414,7 @@ suite.define(() => {
         .poll(() => identity.getAttribute("data-connection-status"), { timeout: 10_000 })
         .toBe("connected");
       await expect.poll(() => chip.count()).toBe(0);
-      expect(await footer.locator(":scope > [role=status]").textContent()).toBe("Connected");
+      expect(await announcement.textContent()).toBe("Connected");
       await gateway.emitGatewayEvent("gateway.suspension", { phase: "prepared" });
       await gateway.emitGatewayEvent("shutdown", {
         reason: "gateway restart",

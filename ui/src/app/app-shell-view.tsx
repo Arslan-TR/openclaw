@@ -2,7 +2,7 @@ import "../lib/toast-host.ts";
 import type { JSX as SolidJSX } from "@solidjs/web";
 import { createEffect, createMemo, createSignal, Show } from "solid-js";
 import { LazySettingsSidebar } from "../components/settings-sidebar-lazy.tsx";
-import { renderGatewayStatus } from "../components/solid/gateway-status.tsx";
+import { gatewayStatusLabel, renderGatewayStatus } from "../components/solid/gateway-status.tsx";
 import { Icon } from "../components/solid/icon.tsx";
 import { ConnectingSplash } from "../components/solid/loading-skeleton.tsx";
 import {
@@ -60,6 +60,14 @@ function ApplicationShell(props: { host: ShellViewHost }): SolidJSX.Element {
     return readShellView(props.host);
   });
   const shellConnectionStatus = createMemo(() => view().shellConnectionStatus);
+  const connectionAnnouncement = createMemo(() => {
+    const kind = shellConnectionStatus();
+    return kind
+      ? gatewayStatusLabel(kind, view().sidebarProperties.storedOutboxes?.total)
+      : view().gatewayConnected
+        ? t("nav.gateway.connected")
+        : "";
+  });
   const routeReady = () => {
     props.host.shellRevision();
     return props.host.routeState.routeId !== undefined || props.host.routeState.routeFailed;
@@ -342,6 +350,9 @@ function ApplicationShell(props: { host: ShellViewHost }): SolidJSX.Element {
             />
           </ShellLayoutProvider>
         </main>
+        <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {connectionAnnouncement()}
+        </span>
         <Show when={shellConnectionStatus()}>
           <div class="shell-connection-status">
             {renderGatewayStatus({
@@ -353,6 +364,7 @@ function ApplicationShell(props: { host: ShellViewHost }): SolidJSX.Element {
                 return view().sidebarProperties.storedOutboxes?.total ?? 0;
               },
               onRetry: props.host.viewCallbacks.retryGateway,
+              announce: false,
             })}
           </div>
         </Show>

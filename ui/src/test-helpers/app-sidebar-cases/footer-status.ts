@@ -176,7 +176,7 @@ describe("AppSidebar gateway footer subtitle", () => {
     ).not.toContain("git@e8cbc62");
   });
 
-  it("shows nonhealthy state as the avatar dot and leaves announcing to the chip", async () => {
+  it("shows nonhealthy state as the avatar dot and leaves announcing to the shell", async () => {
     const label = "Suspended";
     setNativeGatewayTestState(twoGateways);
     const gateway = createGateway({} as GatewayBrowserClient);
@@ -191,8 +191,7 @@ describe("AppSidebar gateway footer subtitle", () => {
     expect(card?.getAttribute("data-connection-status")).toBe("suspended");
     expect(card?.querySelector(".sidebar-identity-card__status")).not.toBeNull();
     expect(card?.getAttribute("aria-label")).toBe(`Identity and app menu for Owner: ${label}`);
-    expect(footer?.querySelectorAll("[role=status]")).toHaveLength(1);
-    expect(footer?.querySelector("[role=status]")?.textContent).toBe("");
+    expect(footer?.querySelector(":scope > [role=status]")).toBeNull();
     expect(footer?.querySelector(".sidebar-identity-card__name")?.textContent).toBe("Owner");
     expect(footer?.querySelector(".sidebar-identity-card__gateway")?.textContent).toContain(
       "Local Gateway",
@@ -214,9 +213,6 @@ describe("AppSidebar gateway footer subtitle", () => {
     expect(card()?.getAttribute("data-connection-status")).toBe("connected");
     expect(card()?.getAttribute("aria-label")).toBe(
       "Identity and app menu for Owner: Local Gateway, primary",
-    );
-    expect(sidebar.querySelector(".sidebar-footer-bar [role=status]")?.textContent).toBe(
-      "Connected",
     );
     sidebar.querySelector<HTMLButtonElement>(".sidebar-identity-card")?.click();
     await sidebar.updateComplete;

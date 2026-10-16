@@ -1,21 +1,24 @@
 import type { JSX } from "@solidjs/web";
 import { redactLoginFailureError } from "../../lib/connection-hints.ts";
+import type { GatewayStatus } from "../../lib/gateway-status.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { canRetryGatewayStatus, type GatewayStatusProps } from "../gateway-status.ts";
 import { Icon } from "./icon.tsx";
 import "../tooltip.ts";
+
+export function gatewayStatusLabel(kind: GatewayStatus, queuedCount = 0): string {
+  const status = t(`connection.${kind}`);
+  return queuedCount
+    ? `${status} · ${t("connection.queued", { count: String(queuedCount) })}`
+    : status;
+}
 
 export function renderGatewayStatus(params: GatewayStatusProps): JSX.Element {
   const kind = params.kind;
   if (!kind) {
     return null;
   }
-  const label = () => {
-    const status = t(`connection.${kind}`);
-    return params.queuedCount
-      ? `${status} · ${t("connection.queued", { count: String(params.queuedCount) })}`
-      : status;
-  };
+  const label = () => gatewayStatusLabel(kind, params.queuedCount);
   const content = () => (
     <span class="gateway-status__state">
       <span class="gateway-status__icon" aria-hidden="true">
@@ -38,7 +41,10 @@ export function renderGatewayStatus(params: GatewayStatusProps): JSX.Element {
       class="gateway-status-tooltip"
       prop:content={params.lastError ? redactLoginFailureError(params.lastError) : ""}
     >
-      <span role="status" aria-live="polite">
+      <span
+        role={params.announce === false ? undefined : "status"}
+        aria-live={params.announce === false ? undefined : "polite"}
+      >
         {params.onRetry && canRetryGatewayStatus(kind) ? (
           <button
             type="button"

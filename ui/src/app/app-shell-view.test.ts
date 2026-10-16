@@ -376,6 +376,46 @@ it("keeps the focused gateway retry button across shell and error updates", asyn
   expect(view.queryByRole("button", { name: "Disconnected — Retry now" })).toBeNull();
 });
 
+it("keeps one connection announcement through outage and recovery with the mobile drawer closed", async () => {
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn(() => ({ matches: true })),
+  );
+  const { owner, runtime, view } = await mountShell();
+  const connected = {
+    ...runtime.context.gateway.snapshot,
+    phase: "connected" as const,
+    offlineStable: false,
+  };
+  const snapshot = vi.spyOn(runtime.context.gateway, "snapshot", "get").mockReturnValue(connected);
+  owner.invalidate();
+  flush();
+
+  const announcement = view.container.querySelector(".shell > .sr-only[role=status]")!;
+  expect(announcement).not.toBeNull();
+  expect(announcement.textContent).toBe("Connected");
+  expect(announcement.getAttribute("aria-live")).toBe("polite");
+  expect(announcement.getAttribute("aria-atomic")).toBe("true");
+  expect(view.container.querySelector(".shell-nav")?.hasAttribute("inert")).toBe(true);
+  expect(announcement.closest("[inert]")).toBeNull();
+
+  snapshot.mockReturnValue({ ...connected, phase: "offline", offlineStable: true });
+  owner.invalidate();
+  flush();
+  expect(view.container.querySelector(".shell > .sr-only[role=status]")).toBe(announcement);
+  expect(announcement.textContent).toBe("Disconnected");
+  const chip = view.container.querySelector(".shell-connection-status")!;
+  expect(chip.textContent).toContain("Disconnected");
+  expect(chip.querySelector("[role=status], [aria-live]")).toBeNull();
+
+  snapshot.mockReturnValue(connected);
+  owner.invalidate();
+  flush();
+  expect(view.container.querySelector(".shell > .sr-only[role=status]")).toBe(announcement);
+  expect(announcement.textContent).toBe("Connected");
+  expect(view.container.querySelector(".shell-connection-status")).toBeNull();
+});
+
 it("shows one recovery chip across web layouts without changing the content frame", async () => {
   let mobile = false;
   vi.stubGlobal(

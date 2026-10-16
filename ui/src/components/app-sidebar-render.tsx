@@ -275,14 +275,8 @@ export function renderAppSidebarFooterBar(host: AppSidebarRenderHost): JSX.Eleme
         : buildSubtitle())
     );
   };
-  // The shell chip announces unhealthy states; the footer announces only recovery.
-  const announcement = () =>
-    !connectionStatus() && host.connected ? t("nav.gateway.connected") : "";
   return (
     <div class="sidebar-footer-bar sidebar-footer-bar--one-action">
-      <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {announcement()}
-      </span>
       <span class="sidebar-footer-actions">
         <openclaw-tooltip>
           <span slot="content">
