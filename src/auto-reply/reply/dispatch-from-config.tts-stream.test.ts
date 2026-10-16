@@ -7,10 +7,16 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import * as sessions from "../../config/sessions/session-accessor.js";
+import * as sqliteEntries from "../../config/sessions/session-accessor.sqlite-entry.js";
+import * as sessionActor from "../../config/sessions/session-actor-scope.js";
 import { PlatformMessageNotDispatchedError } from "../../infra/outbound/deliver-types.js";
 import { settlePendingFinalDelivery } from "../../infra/outbound/delivery-completion.js";
 import * as directives from "../../tts/directives.js";
-import { getReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-payload.js";
+import {
+  getReplyPayloadMetadata as metadata,
+  setReplyPayloadMetadata as withMetadata,
+} from "../reply-payload.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { buildReplyPayloads } from "./agent-runner-payloads.js";
 import { createBlockReplyPipeline } from "./block-reply-pipeline.js";
@@ -68,6 +74,46 @@ function buildStreamReplies(payload: ReplyPayload, pipeline: ReturnType<typeof s
   });
 }
 
+async function withStream<T>(
+  options: GetReplyOptions | undefined,
+  run: (pipeline: ReturnType<typeof streamPipeline>) => Promise<T>,
+) {
+  const pipeline = streamPipeline(options);
+  try {
+    return await run(pipeline);
+  } finally {
+    pipeline.stop();
+  }
+}
+
+async function restoreSessionPersistence() {
+  const actual = await vi.importActual<typeof sessions>(
+    "../../config/sessions/session-accessor.js",
+  );
+  const actor = await vi.importActual<typeof sessionActor>(
+    "../../config/sessions/session-actor-scope.js",
+  );
+  const sqlite = await vi.importActual<typeof sqliteEntries>(
+    "../../config/sessions/session-accessor.sqlite-entry.js",
+  );
+  vi.spyOn(sessionActor, "withSessionActor").mockImplementation(actor.withSessionActor);
+  vi.spyOn(sessions, "patchSessionEntryCore").mockImplementation(actual.patchSessionEntryCore);
+  vi.spyOn(sqliteEntries, "applySessionEntryOperation").mockImplementation(
+    sqlite.applySessionEntryOperation,
+  );
+  return actual;
+}
+
+const deliveryIdentity = { intentId: "source-intent", deliveryId: "source-delivery" };
+function completion(storePath: string, prepared = false) {
+  return {
+    ...deliveryIdentity,
+    storePath,
+    sessionId: prepared ? "source-session" : "session-1",
+    sessionKey: prepared ? "agent:main:discord:direct:source-completion" : "agent:main:main",
+  };
+}
+
 function installPartialCleaner(onLiteral?: () => void) {
   let buffered = false;
   vi.spyOn(directives, "createTtsDirectiveTextStreamCleaner").mockReturnValue({
@@ -89,34 +135,23 @@ beforeEach(() => {
   setNoAbort();
 });
 
-it.each([
-  {
-    name: "opening bracket pair",
-    chunks: ["Intro [", "[tts:text]]hidden speech[[/tts:text]] visible"],
-    visible: "Intro  visible",
-  },
-  {
-    name: "closing tag bracket pair",
-    chunks: ["Intro [[tts:text]]hidden speech[", "[/tts:text]] visible"],
-    visible: "Intro  visible",
-  },
-  { name: "hidden end", chunks: ["[[tts:text]]hidden speech["], visible: "" },
-])("dispatchReplyFromConfig settles $name once", async ({ chunks, visible }) => {
+it.each<[string[], string]>([
+  [["Intro [", "[tts:text]]hidden[[/tts:text]] visible"], "Intro  visible"],
+  [["Intro [[tts:text]]hidden[", "[/tts:text]] visible"], "Intro  visible"],
+  [["[[tts:text]]hidden["], ""],
+])("settles split directives %j once", async (chunks, visible) => {
   ttsMocks.state.synthesizeFinalAudio = true;
   const { delivered, dispatcher } = collectingDispatcher();
   await dispatchStream({
     dispatcher,
-    replyResolver: async (_ctx, opts) => {
-      const pipeline = streamPipeline(opts);
-      try {
+    replyResolver: (_ctx, opts) =>
+      withStream(opts, async (pipeline) => {
         for (const text of chunks) {
           pipeline.enqueue({ text, replyToId: "source-message" });
           await pipeline.flush({ force: true });
         }
-      } finally {
-        pipeline.stop();
-      }
-    },
+        return undefined;
+      }),
   });
 
   expect(delivered.map((payload) => payload.text ?? "").join("")).toBe(visible);
@@ -155,20 +190,14 @@ it.each(["See [", "Example:\n```text\nkeep two spaces  \nkeep a tab\t\n```"])(
 
 it("settles retained followup streams before external cleanup", async () => {
   let retained: GetReplyOptions | undefined;
-  const delivered: string[] = [];
+  const { delivered, dispatcher } = collectingDispatcher();
+  const transcript = () => delivered.map((payload) => payload.text ?? "").join("");
   const settled: string[] = [];
-  const dispatcher = createReplyDispatcher({
-    deliver: async (payload) => {
-      if (payload.text) {
-        delivered.push(payload.text);
-      }
-    },
-  });
   await dispatchStream({
     dispatcher,
     replyOptions: {
       onQueuedFollowupSettled: () => {
-        settled.push(delivered.join(""));
+        settled.push(transcript());
       },
     },
     replyResolver: async (_ctx, opts) => {
@@ -181,7 +210,7 @@ it("settles retained followup streams before external cleanup", async () => {
     await dispatcher.waitForIdle();
     await retained?.onQueuedFollowupSettled?.();
   }
-  expect(delivered.join("")).toBe("initialSee [Intro After [");
+  expect(transcript()).toBe("initialSee [Intro After [");
   expect(settled).toEqual(["initialSee [", "initialSee [Intro ", "initialSee [Intro After ["]);
 });
 
@@ -195,74 +224,36 @@ describe("source completion", () => {
 
   type Failure = "before-send" | "ambiguous" | "pending";
 
-  type Scenario = {
+  type Scenario = Partial<
+    Record<"media" | "priorBracket" | "finalMedia" | "prepared" | "fenced", boolean>
+  > & {
     prefix?: Failure;
     suffix?: Failure;
-    media?: boolean;
-    priorBracket?: boolean;
-    finalMedia?: boolean;
-    prepared?: boolean;
-    fenced?: boolean;
   };
   it.each<[string, Scenario, string[], number]>([
     ["successful suffix", { prepared: true }, ["See ", "["], 1],
     [
-      "failed suffix after wrapped code",
+      "failed wrapped suffix",
       { fenced: true, suffix: "before-send" },
       [fencedFirst, fencedSecond, "See ", `${fencedSource}\n\nSee [`],
       1,
     ],
     ["pending prefix with final-only media", { prefix: "pending", finalMedia: true }, [], 0],
     [
-      "ambiguous prefix with final-only media",
+      "ambiguous media prefix",
       { prefix: "ambiguous", prepared: true, finalMedia: true },
       ["See "],
       0,
     ],
     ["failed suffix with sent media", { suffix: "before-send", media: true }, ["See ", "["], 1],
-    [
-      "failed suffix after an unrelated bracket",
-      { suffix: "before-send", priorBracket: true },
-      ["[", "See ", "["],
-      1,
-    ],
+    ["failed bracket suffix", { suffix: "before-send", priorBracket: true }, ["[", "See ", "["], 1],
   ])(
     "dispatchReplyFromConfig settles %s after producer filtering",
     async (_name, scenario, expected, expectedSuffixCalls) => {
-      const actualSessions = scenario.prepared
-        ? await vi.importActual<typeof import("../../config/sessions/session-accessor.js")>(
-            "../../config/sessions/session-accessor.js",
-          )
-        : undefined;
+      const actualSessions = scenario.prepared ? await restoreSessionPersistence() : undefined;
       const storePath = path.join(tempDirs.make("openclaw-source-completion-"), "sessions.json");
-      const preparedScope = actualSessions
-        ? {
-            storePath,
-            sessionKey: "agent:main:discord:direct:source-completion",
-          }
-        : undefined;
-      if (actualSessions) {
-        const actorScope = await import("../../config/sessions/session-actor-scope.js");
-        const actualActorScope = await vi.importActual<
-          typeof import("../../config/sessions/session-actor-scope.js")
-        >("../../config/sessions/session-actor-scope.js");
-        vi.spyOn(actorScope, "withSessionActor").mockImplementation(
-          actualActorScope.withSessionActor,
-        );
-        const sessionAccessors = await import("../../config/sessions/session-accessor.js");
-        const patch = actualSessions.patchSessionEntryCore;
-        vi.spyOn(sessionAccessors, "patchSessionEntryCore").mockImplementation((...args) =>
-          patch(...args),
-        );
-        const sqliteEntries =
-          await import("../../config/sessions/session-accessor.sqlite-entry.js");
-        const actualSqliteEntries = await vi.importActual<
-          typeof import("../../config/sessions/session-accessor.sqlite-entry.js")
-        >("../../config/sessions/session-accessor.sqlite-entry.js");
-        vi.spyOn(sqliteEntries, "applySessionEntryOperation").mockImplementation(
-          actualSqliteEntries.applySessionEntryOperation,
-        );
-      }
+      const preparedScope = completion(storePath, true);
+      const pending = () => actualSessions?.loadSessionEntry(preparedScope)?.pendingFinalDelivery;
       // Fix parser output so this regression isolates source accounting.
       installPartialCleaner();
       const delivered: ReplyPayload[] = [];
@@ -313,18 +304,14 @@ describe("source completion", () => {
             await dispatcher.waitForIdle();
           }
           sourceStarted = true;
-          const pipeline = streamPipeline(options);
-          try {
+          return withStream(options, async (pipeline) => {
             if (scenario.fenced) {
-              pipeline.enqueue(
-                setReplyPayloadMetadata(
-                  { text: fencedFirst },
-                  { blockSourceText: "```ts\nconst x = " },
-                ),
-              );
-              pipeline.enqueue(
-                setReplyPayloadMetadata({ text: fencedSecond }, { blockSourceText: "1;\n```" }),
-              );
+              for (const [text, blockSourceText] of [
+                [fencedFirst, "```ts\nconst x = "],
+                [fencedSecond, "1;\n```"],
+              ]) {
+                pipeline.enqueue(withMetadata({ text }, { blockSourceText }));
+              }
             }
             pipeline.enqueue(source);
             await pipeline.flush({ force: true });
@@ -340,25 +327,14 @@ describe("source completion", () => {
               ...(scenario.finalMedia ? { mediaUrl: "https://example.com/final.opus" } : {}),
             };
             if (scenario.finalMedia) {
-              setReplyPayloadMetadata(finalPayload, {
-                pendingFinalDeliveryCompletion: {
-                  deliveryId: "source-delivery",
-                  intentId: "source-intent",
-                  sessionId: "session-1",
-                  sessionKey: "agent:main:main",
-                  storePath,
-                },
+              withMetadata(finalPayload, {
+                pendingFinalDeliveryCompletion: completion(storePath),
               });
             }
             const { replyPayloads } = await buildStreamReplies(finalPayload, pipeline);
-            if (actualSessions && preparedScope) {
-              setReplyPayloadMetadata(expectDefined(replyPayloads[0], "retained final"), {
-                pendingFinalDeliveryCompletion: {
-                  ...preparedScope,
-                  sessionId: "source-session",
-                  intentId: "source-intent",
-                  deliveryId: "source-delivery",
-                },
+            if (actualSessions) {
+              withMetadata(expectDefined(replyPayloads[0], "retained final"), {
+                pendingFinalDeliveryCompletion: preparedScope,
               });
               await actualSessions.replaceSessionEntry(preparedScope, {
                 sessionId: "source-session",
@@ -371,39 +347,27 @@ describe("source completion", () => {
                   deliveries: [{ id: "source-delivery", state: "prepared" }],
                 },
               });
-              expect(
-                actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery?.deliveries,
-              ).toEqual([{ id: "source-delivery", state: "prepared" }]);
+              expect(pending()?.deliveries).toEqual([{ id: "source-delivery", state: "prepared" }]);
             }
             await options?.onBlockReply?.({ text: "[" });
             return replyPayloads;
-          } finally {
-            pipeline.stop();
-          }
+          });
         },
       });
-      if (actualSessions && preparedScope) {
-        const pending = actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery;
+      if (actualSessions) {
+        const beforeRecovery = pending();
         if (scenario.prefix === "ambiguous") {
-          expect(pending?.deliveries).toEqual([{ id: "source-delivery", state: "unknown" }]);
+          expect(beforeRecovery?.deliveries).toEqual([{ id: "source-delivery", state: "unknown" }]);
         } else {
-          expect(pending).toBeUndefined();
+          expect(beforeRecovery).toBeUndefined();
         }
         const recovery = await settlePendingFinalDelivery(
-          {
-            kind: "pending-final",
-            ...preparedScope,
-            sessionId: "source-session",
-            intentId: "source-intent",
-            deliveryId: "source-delivery",
-          },
+          { kind: "pending-final", ...preparedScope },
           "queued",
           ["prepared"],
         );
         expect(recovery.state).toBe("stale");
-        expect(actualSessions.loadSessionEntry(preparedScope)?.pendingFinalDelivery).toEqual(
-          pending,
-        );
+        expect(pending()).toEqual(beforeRecovery);
       }
       expect(delivered.flatMap((payload) => payload.text ?? [])).toEqual(expected);
       expect(suffixCalls).toBe(expectedSuffixCalls);
@@ -418,8 +382,7 @@ describe("source completion", () => {
         expect(media).toHaveLength(1);
         expect(result.queuedFinal).toBe(true);
         expect(
-          getReplyPayloadMetadata(expectDefined(media[0], "final media"))
-            ?.pendingFinalDeliveryCompletion,
+          metadata(expectDefined(media[0], "final media"))?.pendingFinalDeliveryCompletion,
         ).toBeUndefined();
       }
     },
