@@ -192,7 +192,11 @@ export function SessionsView(props: SessionsProps) {
                 <Icon name="trash" /> {t("sessionsView.deleteAllArchived")}
               </button>
             ) : undefined}
-            <button class="btn" disabled={props.refreshing} onClick={() => props.onRefresh()}>
+            <button
+              class="btn"
+              disabled={props.refreshing || props.refreshDisabled}
+              onClick={() => props.onRefresh()}
+            >
               {props.refreshing ? t("common.loading") : t("common.refresh")}
             </button>
           </>

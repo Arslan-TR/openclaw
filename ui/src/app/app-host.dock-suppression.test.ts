@@ -13,9 +13,10 @@ import {
   mountShellView,
   refreshShellView,
 } from "./app-host-solid.test-support.ts";
+import { resetAppHostTestGlobals } from "./app-host.test-support.ts";
 // This test owns shell panel routing, not lazy sidebar loading; settle that module at setup.
 import "../components/app-sidebar.tsx";
-import { resetAppHostTestGlobals } from "./app-host.test-support.ts";
+import { readShellView } from "./app-shell-view-state.ts";
 import type { ApplicationRuntime } from "./bootstrap.ts";
 import type { ApplicationContext } from "./context.ts";
 import { loadSettings } from "./settings.ts";
@@ -292,6 +293,11 @@ describe("OpenClaw shell dock suppression", () => {
     expect(container.querySelector(".shell-chrome-controls__home")).toBeNull();
     expect(container.querySelector(".shell--navigation-rail openclaw-app-sidebar")).not.toBeNull();
     expect(homeAvailable()).toBe(true);
+    for (const phase of ["connected", "reconnecting", "offline", "connected"] as const) {
+      context.gateway.snapshot.phase = phase;
+      refreshShellView(shell);
+      expect(readShellView(shell).desktopPanelAvailable).toBe(phase === "connected");
+    }
     context.gateway.snapshot.hello!.auth = {
       role: "operator",
       scopes: ["operator.read", "operator.write"],

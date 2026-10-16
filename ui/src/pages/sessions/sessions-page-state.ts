@@ -1365,6 +1365,7 @@ export function createSessionsPage(
     return {
       loading: state.loading || details.loading,
       refreshing: state.refreshing,
+      refreshDisabled: context.gateway.snapshot.phase !== "connected",
       result: state.result,
       error: details.error ?? state.error,
       activeMinutes: state.activeMinutes,
