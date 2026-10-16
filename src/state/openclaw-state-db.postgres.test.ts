@@ -34,6 +34,7 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
+import { statePostgresRuntime } from "./postgres-schema.generated/runtime.js";
 import { ensureUserBackgroundSchema } from "./user-background.store.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
@@ -42,9 +43,9 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 type Result = { namespace: string; admissionId: string; catalogReads: number; threadId: number };
 const legacyWriteIndexesSql = `
   DROP INDEX idx_state_leases_owner;
-  CREATE INDEX idx_state_leases_owner ON state_leases (owner, updated_at DESC);
-  CREATE INDEX idx_skill_usage_key ON skill_usage (skill_key, skill_file);
-  CREATE INDEX idx_acp_replay_events_session_seq ON acp_replay_events (session_id, seq);
+  ${statePostgresRuntime.preWriteIndexesV27Sql.state_leases}
+  ${statePostgresRuntime.preWriteIndexesV27Sql.skill_usage}
+  ${statePostgresRuntime.preWriteIndexesV27Sql.acp_replay_events}
 `;
 
 describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
@@ -238,7 +239,9 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       await client.query(`SET search_path = "${namespace}"`);
       await client.query(`BEGIN;
         ${legacyWriteIndexesSql}
-        UPDATE openclaw_schema_meta SET version = 24 WHERE store = 'state';
+        UPDATE openclaw_schema_meta
+          SET version = 24, fingerprint = NULL, ddl_hash = NULL, server_major = NULL
+          WHERE store = 'state';
         UPDATE schema_meta SET schema_version = 24 WHERE meta_key = 'primary';
         UPDATE config_machine_state SET value_json = '24'
           WHERE state_key = 'state.schema.contentVersion';

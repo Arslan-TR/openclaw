@@ -27,6 +27,7 @@ import type {
   OpenClawStateReadCommand,
   OpenClawStateReadLocation,
 } from "../../state/openclaw-state-read.types.js";
+import { statePostgresRuntime } from "../../state/postgres-schema.generated/runtime.js";
 import { stateBootstrapReadOperations } from "../../state/state-bootstrap-read.worker.js";
 import { acquireGatewayLock } from "../gateway-lock.js";
 import { inspectGatewayOwnerLease } from "../gateway-owner-lease.worker.js";
@@ -264,13 +265,23 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
     }
   }
 
-  it.each([24, 25])(
+  it.each([24, 25, 26])(
     "backs up and restores the real version %s before the registered migration",
     async (sourceVersion) => {
       closeOpenClawStateDatabaseForTest();
       stateEngineSchema.postgresMigrations = originalMigrations;
-      const sourceSchema = { ...stateEngineSchema, version: sourceVersion };
+      const sourceSchema = {
+        ...stateEngineSchema,
+        ...originalMigrations!.find((migration) => migration.version === sourceVersion + 1)!
+          .fromSchema,
+        version: sourceVersion,
+      };
       await client.query(`
+        SET search_path TO "${namespace}";
+        DROP INDEX IF EXISTS idx_state_leases_owner;
+        DROP INDEX IF EXISTS idx_skill_usage_key;
+        DROP INDEX IF EXISTS idx_acp_replay_events_session_seq;
+        ${Object.values(statePostgresRuntime.preWriteIndexesV27Sql).join("\n")}
         UPDATE "${namespace}".openclaw_schema_meta
           SET version = ${sourceVersion}, fingerprint = NULL, ddl_hash = NULL, server_major = NULL;
         UPDATE "${namespace}".schema_meta SET schema_version = ${sourceVersion};
