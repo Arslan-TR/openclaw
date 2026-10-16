@@ -14,10 +14,8 @@ vi.mock("./client.js", () => ({
   createFeishuClient: createFeishuClientMock,
 }));
 
-const DIRECT_CHAT_RESPONSE = {
-  code: 0,
-  data: { chat_mode: "p2p", chat_type: "private" },
-};
+const ok = <T>(data: T) => ({ code: 0, data });
+const DIRECT_CHAT_RESPONSE = ok({ chat_mode: "p2p", chat_type: "private" });
 
 describe("registerFeishuChatTools", () => {
   type RegisteredToolContext = {
@@ -50,36 +48,6 @@ describe("registerFeishuChatTools", () => {
       : registered;
   }
 
-  function createChatToolApi(params: {
-    config: OpenClawPluginApi["config"];
-    registerTool: OpenClawPluginApi["registerTool"];
-  }): OpenClawPluginApi {
-    return createTestPluginApi({
-      id: "feishu-test",
-      name: "Feishu Test",
-      source: "local",
-      config: params.config,
-      runtime: {} as PluginRuntime,
-      logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-      registerTool: params.registerTool,
-    });
-  }
-
-  function createChatConfig(overrides: Partial<FeishuConfig> = {}): OpenClawPluginApi["config"] {
-    return {
-      channels: {
-        feishu: {
-          enabled: true,
-          appId: "app_id",
-          appSecret: "app_secret", // pragma: allowlist secret
-          tools: { chat: true },
-          groupPolicy: "open",
-          ...overrides,
-        },
-      },
-    };
-  }
-
   function currentDirectContext(requesterSenderId?: string): RegisteredToolContext {
     return {
       deliveryTo: `user:${requesterSenderId ?? "ou_sender"}`,
@@ -97,13 +65,42 @@ describe("registerFeishuChatTools", () => {
   ) {
     const registerTool = vi.fn();
     registerFeishuChatTools(
-      createChatToolApi({
-        config: params.config ?? createChatConfig(params.account),
+      createTestPluginApi({
+        id: "feishu-test",
+        name: "Feishu Test",
+        source: "local",
+        runtime: {} as PluginRuntime,
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        config: params.config ?? {
+          channels: {
+            feishu: {
+              enabled: true,
+              appId: "app_id",
+              appSecret: "app_secret", // pragma: allowlist secret
+              tools: { chat: true },
+              groupPolicy: "open",
+              ...params.account,
+            },
+          },
+        },
         registerTool,
       }),
     );
     return [resolveRegisteredTool(registerTool, params.context), registerTool] as const;
   }
+
+  const memberPage = (page_token?: string) =>
+    ok({
+      has_more: false,
+      page_token,
+      items: [{ member_id: "ou_1", name: "member1", member_id_type: "open_id" }],
+    });
+  const account = (id: string) => ({
+    appId: `app_${id}`,
+    appSecret: `secret_${id}`,
+    tools: { chat: true },
+    groupPolicy: "allowlist" as const,
+  });
 
   afterAll(() => {
     vi.doUnmock("./client.js");
@@ -112,10 +109,7 @@ describe("registerFeishuChatTools", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    chatGetMock.mockResolvedValue({
-      code: 0,
-      data: { chat_mode: "group", chat_type: "private" },
-    });
+    chatGetMock.mockResolvedValue(ok({ chat_mode: "group", chat_type: "private" }));
     createFeishuClientMock.mockReturnValue({
       im: {
         chat: { get: chatGetMock },
@@ -140,10 +134,7 @@ describe("registerFeishuChatTools", () => {
     expect(tool?.name).toBe("feishu_chat");
     expect(tool.resultContentSource).toBe("network");
 
-    chatGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: { name: hostile, user_count: 3 },
-    });
+    chatGetMock.mockResolvedValueOnce(ok({ name: hostile, user_count: 3 }));
     const infoResult = await tool.execute("tc_1", { action: "info", chat_id: "oc_1" });
     expect(infoResult.details).toMatchObject({
       chat_id: "oc_1",
@@ -154,46 +145,26 @@ describe("registerFeishuChatTools", () => {
     expect(infoResult.content[0]?.text).not.toContain("<|im_start|>");
     expect(infoResult.content[0]?.text).not.toContain("<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>");
 
-    chatMembersGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: {
-        has_more: false,
-        page_token: "",
-        items: [{ member_id: "ou_1", name: "member1", member_id_type: "open_id" }],
-      },
-    });
+    chatMembersGetMock.mockResolvedValueOnce(memberPage(""));
     const membersResult = await tool.execute("tc_2", { action: "members", chat_id: "oc_1" });
     expect(membersResult.details).toMatchObject({
       chat_id: "oc_1",
       has_more: false,
       page_token: "",
-      members: [
-        {
-          member_id: "ou_1",
-          name: "member1",
-          member_id_type: "open_id",
-        },
-      ],
+      members: [{ member_id: "ou_1", name: "member1", member_id_type: "open_id" }],
     });
 
-    contactUserGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: {
+    contactUserGetMock.mockResolvedValueOnce(
+      ok({
         user: {
           open_id: "ou_1",
           name: "member1",
           email: "member1@example.com",
           department_ids: ["od_1"],
         },
-      },
-    });
-    chatMembersGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: {
-        has_more: false,
-        items: [{ member_id: "ou_1", name: "member1", member_id_type: "open_id" }],
-      },
-    });
+      }),
+    );
+    chatMembersGetMock.mockResolvedValueOnce(memberPage());
     const memberInfoResult = await tool.execute("tc_3", {
       action: "member_info",
       member_id: "ou_1",
@@ -215,10 +186,9 @@ describe("registerFeishuChatTools", () => {
       context: currentDirectContext("u_mobile_only"),
     });
     chatGetMock.mockResolvedValue(DIRECT_CHAT_RESPONSE);
-    contactUserGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: { user: { user_id: "u_mobile_only", name: "Mobile User" } },
-    });
+    contactUserGetMock.mockResolvedValueOnce(
+      ok({ user: { user_id: "u_mobile_only", name: "Mobile User" } }),
+    );
 
     const members = await tool.execute("tc_current_dm_members_user_id", {
       action: "members",
@@ -263,36 +233,28 @@ describe("registerFeishuChatTools", () => {
     expect(contactUserGetMock).not.toHaveBeenCalled();
   });
 
-  it.each(["members"] as const)(
-    "rejects a blocked %s target before reading provider metadata",
-    async (action) => {
-      const [tool] = registerChatTool({
-        account: {
-          groupPolicy: "allowlist",
-          groups: { oc_allowed: {}, oc_blocked: { enabled: false } },
-        },
-      });
-      const input = {
-        action,
-        chat_id: "oc_blocked",
-      };
+  it("rejects a blocked members target before reading provider metadata", async () => {
+    const [tool] = registerChatTool({
+      account: {
+        groupPolicy: "allowlist",
+        groups: { oc_allowed: {}, oc_blocked: { enabled: false } },
+      },
+    });
+    const result = await tool.execute("tc_blocked_members", {
+      action: "members",
+      chat_id: "oc_blocked",
+    });
 
-      const result = await tool.execute(`tc_blocked_${action}`, input);
-
-      expect(result.details.error).toContain("Feishu read target is not allowed.");
-      expect(chatGetMock).not.toHaveBeenCalled();
-      expect(chatMembersGetMock).not.toHaveBeenCalled();
-      expect(contactUserGetMock).not.toHaveBeenCalled();
-    },
-  );
+    expect(result.details.error).toContain("Feishu read target is not allowed.");
+    expect(chatGetMock).not.toHaveBeenCalled();
+    expect(chatMembersGetMock).not.toHaveBeenCalled();
+    expect(contactUserGetMock).not.toHaveBeenCalled();
+  });
 
   it.each([
     {
       name: "an existing blocked direct chat",
-      response: {
-        code: 0,
-        data: { chat_mode: "p2p", chat_type: "private" },
-      },
+      response: DIRECT_CHAT_RESPONSE,
     },
     {
       name: "a failed metadata lookup",
@@ -339,10 +301,7 @@ describe("registerFeishuChatTools", () => {
       account: { groupPolicy: "allowlist" },
       context: { conversationReadOrigin: "direct-operator" },
     });
-    chatGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: { chat_mode: "group", name: "operator target" },
-    });
+    chatGetMock.mockResolvedValueOnce(ok({ chat_mode: "group", name: "operator target" }));
 
     const result = await tool.execute("tc_direct_operator", {
       action: "info",
@@ -362,18 +321,8 @@ describe("registerFeishuChatTools", () => {
           feishu: {
             defaultAccount: "a",
             accounts: {
-              a: {
-                appId: "app_a",
-                appSecret: "secret_a", // pragma: allowlist secret
-                tools: { chat: true },
-                groupPolicy: "allowlist",
-              },
-              b: {
-                appId: "app_b",
-                appSecret: "secret_b", // pragma: allowlist secret
-                tools: { chat: true },
-                groupPolicy: "allowlist",
-              },
+              a: account("a"),
+              b: account("b"),
             },
           },
         },
@@ -384,15 +333,9 @@ describe("registerFeishuChatTools", () => {
         nativeChannelId: "oc_1",
       },
     });
-    chatGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: { name: "account b chat" },
-    });
+    chatGetMock.mockResolvedValueOnce(ok({ name: "account b chat" }));
 
-    const result = await tool.execute("tc_account_b", {
-      action: "info",
-      chat_id: "oc_1",
-    });
+    const result = await tool.execute("tc_account_b", { action: "info", chat_id: "oc_1" });
 
     expect(result.details).toMatchObject({
       chat_id: "oc_1",
@@ -405,13 +348,7 @@ describe("registerFeishuChatTools", () => {
 
   it("preserves Feishu diagnostics from rejected member lookups", async () => {
     const [tool] = registerChatTool();
-    chatMembersGetMock.mockResolvedValueOnce({
-      code: 0,
-      data: {
-        has_more: false,
-        items: [{ member_id: "ou_1", name: "member1", member_id_type: "open_id" }],
-      },
-    });
+    chatMembersGetMock.mockResolvedValueOnce(memberPage());
     contactUserGetMock.mockRejectedValueOnce(
       Object.assign(new Error("Request failed with status code 400"), {
         response: {
@@ -447,14 +384,9 @@ describe("registerFeishuChatTools", () => {
 
   it("rejects repeated member-list page tokens", async () => {
     const [tool] = registerChatTool();
-    chatMembersGetMock.mockResolvedValue({
-      code: 0,
-      data: {
-        has_more: true,
-        page_token: "same-token",
-        items: [],
-      },
-    });
+    chatMembersGetMock.mockResolvedValue(
+      ok({ has_more: true, page_token: "same-token", items: [] }),
+    );
 
     const result = await tool.execute("tc_repeated_page", {
       action: "member_info",

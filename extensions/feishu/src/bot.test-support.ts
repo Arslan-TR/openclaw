@@ -100,7 +100,19 @@ export function createFeishuSecretRefPolicyConfig({
   );
 }
 
-export function createFeishuTestEvent(params: {
+export function createFeishuTestEvent({
+  messageId,
+  sender,
+  senderOpenId = "ou-attacker",
+  senderUserId,
+  senderType,
+  chatId = "oc-dm",
+  chatType = "p2p",
+  messageType = "text",
+  text = "hello",
+  content,
+  message,
+}: {
   messageId: string;
   sender?: FeishuSender;
   senderOpenId?: string;
@@ -113,19 +125,6 @@ export function createFeishuTestEvent(params: {
   content?: string;
   message?: Partial<FeishuMessage>;
 }): FeishuMessageEvent {
-  const {
-    messageId,
-    sender,
-    senderOpenId = "ou-attacker",
-    senderUserId,
-    senderType,
-    chatId = "oc-dm",
-    chatType = "p2p",
-    messageType = "text",
-    text = "hello",
-    content,
-    message,
-  } = params;
   return {
     sender: sender ?? {
       sender_id: {
@@ -167,13 +166,29 @@ type BoundConversation = ReturnType<
 type BindingReadiness = Awaited<ReturnType<typeof ensureConfiguredBindingRouteReady>>;
 
 export function createConfiguredFeishuRoute(): NonNullable<ConfiguredBindingRoute> {
+  type Resolution = NonNullable<ConfiguredBindingRoute["bindingResolution"]>;
+  const conversationId = "ou_sender_1";
+  const sessionKey = "agent:codex:acp:binding:feishu:default:abc123";
+  const conversation = () => ({ channel: "feishu", accountId: "default", conversationId });
+  const target = () => ({ conversationId });
+  const record = (): Resolution["record"] => ({
+    bindingId: "config:acp:feishu:default:ou_sender_1",
+    targetSessionKey: sessionKey,
+    targetKind: "session",
+    conversation: conversation(),
+    status: "active",
+    boundAt: 0,
+    metadata: { source: "config" },
+  });
+  const statefulTarget = (): Resolution["statefulTarget"] => ({
+    kind: "stateful",
+    driverId: "acp",
+    sessionKey,
+    agentId: "codex",
+  });
   return {
     bindingResolution: {
-      conversation: {
-        channel: "feishu",
-        accountId: "default",
-        conversationId: "ou_sender_1",
-      },
+      conversation: conversation(),
       compiledBinding: {
         channel: "feishu",
         accountPattern: "default",
@@ -183,71 +198,33 @@ export function createConfiguredFeishuRoute(): NonNullable<ConfiguredBindingRout
           match: {
             channel: "feishu",
             accountId: "default",
-            peer: { kind: "direct", id: "ou_sender_1" },
+            peer: { kind: "direct", id: conversationId },
           },
         },
-        bindingConversationId: "ou_sender_1",
-        target: {
-          conversationId: "ou_sender_1",
-        },
+        bindingConversationId: conversationId,
+        target: target(),
         agentId: "codex",
         provider: {
-          compileConfiguredBinding: () => ({ conversationId: "ou_sender_1" }),
-          matchInboundConversation: () => ({ conversationId: "ou_sender_1" }),
+          compileConfiguredBinding: target,
+          matchInboundConversation: target,
         },
         targetFactory: {
           driverId: "acp",
           materialize: () => ({
-            record: {
-              bindingId: "config:acp:feishu:default:ou_sender_1",
-              targetSessionKey: "agent:codex:acp:binding:feishu:default:abc123",
-              targetKind: "session",
-              conversation: {
-                channel: "feishu",
-                accountId: "default",
-                conversationId: "ou_sender_1",
-              },
-              status: "active",
-              boundAt: 0,
-              metadata: { source: "config" },
-            },
-            statefulTarget: {
-              kind: "stateful",
-              driverId: "acp",
-              sessionKey: "agent:codex:acp:binding:feishu:default:abc123",
-              agentId: "codex",
-            },
+            record: record(),
+            statefulTarget: statefulTarget(),
           }),
         },
       },
-      match: {
-        conversationId: "ou_sender_1",
-      },
-      record: {
-        bindingId: "config:acp:feishu:default:ou_sender_1",
-        targetSessionKey: "agent:codex:acp:binding:feishu:default:abc123",
-        targetKind: "session",
-        conversation: {
-          channel: "feishu",
-          accountId: "default",
-          conversationId: "ou_sender_1",
-        },
-        status: "active",
-        boundAt: 0,
-        metadata: { source: "config" },
-      },
-      statefulTarget: {
-        kind: "stateful",
-        driverId: "acp",
-        sessionKey: "agent:codex:acp:binding:feishu:default:abc123",
-        agentId: "codex",
-      },
+      match: target(),
+      record: record(),
+      statefulTarget: statefulTarget(),
     },
     route: {
       agentId: "codex",
       channel: "feishu",
       accountId: "default",
-      sessionKey: "agent:codex:acp:binding:feishu:default:abc123",
+      sessionKey,
       mainSessionKey: "agent:codex:main",
       lastRoutePolicy: "session",
       matchedBy: "binding.channel",
