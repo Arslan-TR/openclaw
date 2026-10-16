@@ -40,6 +40,7 @@ import {
 import { readCodexAppServerBinding } from "./session-binding.test-helpers.js";
 
 const CODEX_TURN_START_TEXT_INPUT_MAX_CHARS = 1 << 20;
+type ThreadHarness = ReturnType<typeof createStartedThreadHarness>;
 const bootstrapPolicy =
   '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}';
 const sender = {
@@ -92,16 +93,12 @@ function projectionEngine(epoch: string | undefined, text = "reprojected context
 function threadHarness(fresh: string, resume: string | Error, persistedThreads: string[] = []) {
   return createStartedThreadHarness(
     async (method) => {
-      if (method === "thread/start") {
-        return threadStartResult(fresh);
+      const thread =
+        method === "thread/start" ? fresh : method === "thread/resume" ? resume : undefined;
+      if (thread instanceof Error) {
+        throw thread;
       }
-      if (method === "thread/resume") {
-        if (resume instanceof Error) {
-          throw resume;
-        }
-        return threadStartResult(resume);
-      }
-      return undefined;
+      return thread === undefined ? undefined : threadStartResult(thread);
     },
     { persistedThreads },
   );
@@ -116,10 +113,7 @@ function transcriptRecorder(message: AgentMessage) {
   } as NonNullable<EmbeddedRunAttemptParams["userTurnTranscriptRecorder"]>;
 }
 
-async function startAttempt(
-  params: EmbeddedRunAttemptParams,
-  harness: ReturnType<typeof createStartedThreadHarness>,
-) {
+async function startAttempt(params: EmbeddedRunAttemptParams, harness: ThreadHarness) {
   const run = runCodexAppServerAttempt(params);
   await awaitGateBeforeSettlement(
     harness.waitForMethod("turn/start"),
@@ -152,51 +146,20 @@ async function createSqliteParams(workspaceDir: string, storeName: string) {
   };
 }
 
-function requireRequestParams(
-  harness: ReturnType<typeof createStartedThreadHarness>,
-  method: string,
-): Record<string, unknown> {
-  const request = harness.requests.find((entry) => entry.method === method);
-  return requireRecord(request?.params, `${method} params`);
-}
-
-function expectInput(
-  harness: ReturnType<typeof createStartedThreadHarness>,
-  contains: string[],
-  excludes: string[] = [],
-): void {
+function expectInput(harness: ThreadHarness, ...contains: string[]): void {
   const input = getRequestInputText(harness);
   for (const text of contains) {
     expect(input).toContain(text);
   }
-  for (const text of excludes) {
-    expect(input).not.toContain(text);
-  }
 }
 
-function expectMethods(
-  harness: ReturnType<typeof createStartedThreadHarness>,
-  methods: string[],
-  requirements = true,
-) {
+function expectMethods(harness: ThreadHarness, methods: string[], requirements = true) {
   expect(requestMethodsExcludingSkillDiscovery(harness)).toEqual([
     "config/read",
     ...(requirements ? ["configRequirements/read"] : []),
     ...methods,
     "turn/start",
   ]);
-}
-
-function expectSender(
-  harness: ReturnType<typeof createStartedThreadHarness>,
-  prompt: string,
-  prefix = "",
-) {
-  expectInput(
-    harness,
-    [`${prefix}Current user request:\n${senderLabel}\n${prompt}`],
-    ["$deploy", "[@probe]"],
-  );
 }
 
 setupRunAttemptTestHooks();
@@ -230,9 +193,7 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     params.degradedReason = "context_overflow";
     params.config = { memory: { citations: "on" } } as EmbeddedRunAttemptParams["config"];
     setRuntimeConfigSnapshot(params.config ?? {});
-
     const finish = await startAttempt(params, harness);
-
     const runtimeSettings = {
       runtime: { mode: "degraded" },
       model: { requested: "gpt-5.4-codex-primary", resolved: "gpt-5.4-codex" },
@@ -249,7 +210,6 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
         runtimeSettings,
       }),
     );
-
     expect(contextEngine["assemble"]).toHaveBeenCalledTimes(1);
     const assembleParams = vi.mocked(contextEngine.assemble).mock.calls[0]![0];
     expect(assembleParams).toMatchObject({
@@ -261,26 +221,29 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
       runtimeSettings,
       prompt: params.prompt,
     });
-    const summaryRole = "compactionSummary";
     expect(assembleParams.messages.map((message) => message.role)).toEqual([
-      summaryRole,
+      "compactionSummary",
       "assistant",
     ]);
     expect(assembleParams.availableTools).toEqual(new Set());
-
-    expect(requireRequestParams(harness, "thread/start")).toMatchObject({
+    expect(harness.requests.find(({ method }) => method === "thread/start")?.params).toMatchObject({
       developerInstructions: expect.stringContaining("context-engine system"),
     });
-    expectInput(harness, [
+    expectInput(
+      harness,
       "OpenClaw assembled context for this turn:",
-      `[${summaryRole}]\n${summary}`,
+      `[compactionSummary]\n${summary}`,
       "[assistant]\nACK: existing context",
-    ]);
+    );
     expect(getRequestInputText(harness).trim().startsWith("Current inbound reply context")).toBe(
       true,
     );
-    expectSender(harness, params.prompt, "</conversation_context>\n\n");
-
+    expectInput(
+      harness,
+      `</conversation_context>\n\nCurrent user request:\n${senderLabel}\n${params.prompt}`,
+    );
+    expect(getRequestInputText(harness)).not.toContain("$deploy");
+    expect(getRequestInputText(harness)).not.toContain("[@probe]");
     await finish();
     expect(openSpy).not.toHaveBeenCalled();
   });
@@ -306,12 +269,11 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
       ...recorder,
       message: admittedMessage,
       resolveMessage: async () => admittedMessage,
-    } as EmbeddedRunAttemptParams["userTurnTranscriptRecorder"];
-
+    };
     const finish = await startAttempt(params, harness);
-
-    expectSender(harness, params.prompt);
-
+    expectInput(harness, `Current user request:\n${senderLabel}\n${params.prompt}`);
+    expect(getRequestInputText(harness)).not.toContain("$deploy");
+    expect(getRequestInputText(harness)).not.toContain("[@probe]");
     await finish();
   });
 
@@ -324,9 +286,7 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
       workspaceDir,
       "image-only",
     );
-
     const finish = await startAttempt(params, harness);
-
     expect(beforePromptBuild).toHaveBeenCalledTimes(2);
     const events = beforePromptBuild.mock.calls.map(
       ([event]) =>
@@ -432,19 +392,22 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
       const inputText = getRequestInputText(harness);
       if (active) {
         expect(inputText.length).toBe(CODEX_TURN_START_TEXT_INPUT_MAX_CHARS);
-        expectInput(harness, [
+        expectInput(
+          harness,
           "recent anchor",
           "current inbound context survives",
           "current prompt survives",
           "hook append marker",
-        ]);
+        );
       } else {
         expect(inputText.length).toBeLessThanOrEqual(CODEX_TURN_START_TEXT_INPUT_MAX_CHARS);
         expectInput(
           harness,
-          [empty ? "hook tail" : "Current user request:\ncurrent prompt survives"],
-          empty ? [] : ["hook context"],
+          empty ? "hook tail" : "Current user request:\ncurrent prompt survives",
         );
+        if (!empty) {
+          expect(inputText).not.toContain("hook context");
+        }
       }
       await finish();
     },
@@ -521,18 +484,17 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
         expect(inputText).toBe("hello");
         expect(assemble).toHaveBeenCalledWith(expect.objectContaining({ tokenBudget: 258_400 }));
       } else if (active) {
-        expectInput(harness, ["OpenClaw assembled context for this turn:", "reprojected context"]);
+        expectInput(harness, "OpenClaw assembled context for this turn:", "reprojected context");
       } else {
-        expectInput(
-          harness,
-          ["hello"],
-          [
-            "OpenClaw assembled context for this turn:",
-            "previous stale-bootstrap request",
-            "previous stale-bootstrap answer",
-            "Current user request:",
-          ],
-        );
+        expect(inputText).toContain("hello");
+        for (const text of [
+          "OpenClaw assembled context for this turn:",
+          "previous stale-bootstrap request",
+          "previous stale-bootstrap answer",
+          "Current user request:",
+        ]) {
+          expect(inputText).not.toContain(text);
+        }
       }
       await finish(resumed ? "thread-bootstrapped" : "thread-fresh");
     },
@@ -554,27 +516,24 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     const finish = await startAttempt(params, harness);
 
     expectMethods(harness, ["thread/start"]);
-    expectInput(harness, [
+    expectInput(
+      harness,
       "OpenClaw assembled context for this turn:",
       "previous per-turn request",
       "previous per-turn answer",
       "Current user request:",
       "hello",
-    ]);
+    );
 
     await finish("thread-fresh");
   });
 
   it.each([
-    { change: "policy", epoch: "epoch-1", tokenBudget: 80_000 },
-    {
-      change: "per-turn projection",
-      epoch: undefined,
-      tokenBudget: undefined,
-    },
-  ])(
-    "starts fresh and reprojects after a context-engine $change change",
-    async ({ epoch, tokenBudget }) => {
+    ["policy", "epoch-1", 80_000],
+    ["per-turn projection", undefined, undefined],
+  ] as const)(
+    "starts fresh and reprojects after a context-engine %s change",
+    async (_change, epoch, tokenBudget) => {
       const { sessionFile, workspaceDir, params } = fixture();
       await writeCodexAppServerBinding(sessionFile, bootstrapBinding(workspaceDir));
       const contextEngine = projectionEngine(epoch);
@@ -584,7 +543,7 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
 
       const finish = await startAttempt(params, harness);
       expectMethods(harness, ["thread/start"]);
-      expectInput(harness, ["OpenClaw assembled context for this turn:", "reprojected context"]);
+      expectInput(harness, "OpenClaw assembled context for this turn:", "reprojected context");
       await finish("thread-new");
 
       const savedBinding = await readCodexAppServerBinding(sessionFile);
@@ -643,10 +602,7 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
       const finish = await startAttempt(params, harness);
 
       expectMethods(harness, ["thread/start"], false);
-      expectInput(harness, [
-        "OpenClaw assembled context for this turn:",
-        "native-disabled context",
-      ]);
+      expectInput(harness, "OpenClaw assembled context for this turn:", "native-disabled context");
 
       await finish("thread-transient");
     } finally {
@@ -780,11 +736,8 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     expect(String(details.error)).not.toContain("sk-abcdefghijklmnopqrstuv");
     expect(promptHookMessages).toEqual(preassemblyMessages);
     expect(promptHookMessages.map((message) => message.role)).toEqual(["assistant", "user"]);
-    expectInput(harness, [params.prompt]);
+    expectInput(harness, params.prompt);
   });
-});
-
-describe("Codex configured context budget", () => {
   it.each(["text", "images", "no authored cap"] as const)(
     "reserves native overhead only with an authored exact-model cap (%s)",
     async (scenario) => {
@@ -822,7 +775,7 @@ describe("Codex configured context budget", () => {
         expect(assembly?.runtimeSettings?.limits.maxOutputTokens).toBe(20_000);
         const bootstrapCall = vi.mocked(contextEngine.bootstrap!).mock.calls[0]?.[0];
         expect(bootstrapCall?.runtimeSettings?.limits.promptTokenBudget).toBe(500_000);
-        expectInput(harness, [params.prompt, "CURRENT_INBOUND_REFERENCE"]);
+        expectInput(harness, params.prompt, "CURRENT_INBOUND_REFERENCE");
       } else {
         expect(assembly?.tokenBudget).toBe(500_000);
       }
