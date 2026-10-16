@@ -12,7 +12,7 @@ import type {
 import { createAssistantMessageEventStream, transformMessages } from "openclaw/plugin-sdk/llm";
 import { asNonNegativeFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
 import type { ProviderRuntimeModel } from "openclaw/plugin-sdk/plugin-entry";
-import { isNonSecretApiKeyMarker } from "openclaw/plugin-sdk/provider-auth";
+import { isNonSecretApiKeyMarker } from "openclaw/plugin-sdk/provider-auth-markers";
 import { readProviderResponseErrorText } from "openclaw/plugin-sdk/provider-http";
 import {
   createPlainTextToolCallCompatWrapper,

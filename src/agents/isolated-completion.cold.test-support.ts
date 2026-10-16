@@ -129,6 +129,7 @@ export function traceIsolatedCompletionColdStart(
         "plugin-config-runtime",
         "plugin-entry",
         "provider-auth",
+        "provider-auth-markers",
         "provider-catalog-live-runtime",
         "provider-model-metadata",
         "provider-model-shared",

@@ -119,7 +119,7 @@ describe("runIsolatedCompletion native authorization", () => {
               }
             })
           : undefined;
-      using _trace = {
+      using trace = {
         [Symbol.dispose]() {
           costSpy?.mockRestore();
           if (apiSibling === "profile") {
@@ -130,6 +130,7 @@ describe("runIsolatedCompletion native authorization", () => {
           }
         },
       };
+      void trace;
       const runIsolatedCompletionV2 = vi.fn(async () => {
         record("runtime-result");
         return { assistant: isolatedAssistant([{ type: "text", text: "API sibling reply" }]) };

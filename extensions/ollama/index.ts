@@ -16,7 +16,7 @@ import {
   type ProviderPlugin,
   type ProviderRuntimeModel,
 } from "openclaw/plugin-sdk/plugin-entry";
-import { coerceSecretRef, isNonSecretApiKeyMarker } from "openclaw/plugin-sdk/provider-auth";
+import { isNonSecretApiKeyMarker } from "openclaw/plugin-sdk/provider-auth-markers";
 import { runLiveProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import { findNormalizedProviderKey } from "openclaw/plugin-sdk/provider-model-metadata";
 import type {
@@ -25,7 +25,10 @@ import type {
 } from "openclaw/plugin-sdk/provider-model-shared";
 import { buildOpenAICompatibleReplayPolicy } from "openclaw/plugin-sdk/provider-model-shared";
 import { buildProviderToolCompatFamilyHooks } from "openclaw/plugin-sdk/provider-tools";
-import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/secret-input-runtime";
+import {
+  coerceSecretRef,
+  resolveConfiguredSecretInputString,
+} from "openclaw/plugin-sdk/secret-input-runtime";
 import {
   normalizeResolvedModel,
   resolveThinkingProfile as resolveOllamaThinkingProfile,

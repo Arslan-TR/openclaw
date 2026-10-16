@@ -968,6 +968,9 @@
       ],
       "openclaw/plugin-sdk/meeting-config": [
         "../../packages/plugin-sdk/dist/src/plugin-sdk/meeting-config.d.ts"
+      ],
+      "openclaw/plugin-sdk/provider-auth-markers": [
+        "../../packages/plugin-sdk/dist/src/plugin-sdk/provider-auth-markers.d.ts"
       ]
     }
   }
