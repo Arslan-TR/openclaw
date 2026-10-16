@@ -42,6 +42,26 @@ function mountWorkspace(workspace: SessionWorkspaceProps) {
   };
 }
 
+type WorkspaceFile = NonNullable<SessionWorkspaceProps["list"]>["files"][number];
+function file(path: string, kind: WorkspaceFile["kind"] = "modified"): WorkspaceFile {
+  return { path, name: path.split(/[\\/]/).at(-1)!, kind, missing: false };
+}
+
+function artifact(id: string, title: string) {
+  return { id, title, type: "file", download: { mode: "bytes" as const } };
+}
+
+function fileNames(mount: ParentNode) {
+  return Array.from(
+    mount.querySelectorAll(".chat-workspace-rail__file-name"),
+    (row) => row.textContent,
+  );
+}
+
+function button(mount: ParentNode, label: string) {
+  return mount.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+}
+
 afterEach(() => {
   document.body.replaceChildren();
   vi.unstubAllGlobals();
@@ -75,8 +95,8 @@ describe("session workspace path actions", () => {
 
   it("keeps path-only rows selected and their actions focused after read and refresh", async () => {
     vi.stubGlobal("navigator", { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
-    const file = { kind: "modified", path: "README.md", name: "README.md", missing: false };
-    const result = { sessionKey: "agent:main:current", root: "/workspace", files: [file] };
+    const entry = file("README.md");
+    const result = { sessionKey: "agent:main:current", root: "/workspace", files: [entry] };
     const state = {
       client: { request: vi.fn().mockResolvedValue({ artifacts: [] }) },
       connected: true,
@@ -89,7 +109,7 @@ describe("session workspace path actions", () => {
         listFiles: vi.fn().mockResolvedValue(result),
         getFile: vi.fn().mockResolvedValue({
           ...result,
-          file: { ...file, previewKind: "text", contentEncoding: "utf8", content: "# Readme" },
+          file: { ...entry, previewKind: "text", contentEncoding: "utf8", content: "# Readme" },
         }),
       },
     } as unknown as SessionWorkspaceHost;
@@ -100,7 +120,7 @@ describe("session workspace path actions", () => {
     );
     const renderRows = () => update(createSessionWorkspaceProps(state, { expanded: true }));
     renderRows();
-    const preview = container.querySelector<HTMLButtonElement>('button[aria-label="Preview"]');
+    const preview = button(container, "Preview");
     assert(preview);
     preview.focus();
     preview.click();
@@ -112,7 +132,7 @@ describe("session workspace path actions", () => {
       "README.md",
     );
     expect(document.activeElement).toBe(preview);
-    const copy = container.querySelector<HTMLButtonElement>('button[aria-label="Copy path"]');
+    const copy = button(container, "Copy path");
     assert(copy);
     copy.focus();
     copy.click();
@@ -141,22 +161,14 @@ describe("session workspace path actions", () => {
         list: {
           sessionKey: "agent:main:workspace",
           root,
-          files: paths.map((filePath, index) => ({
-            kind: index === 2 ? "read" : "modified",
-            path: filePath,
-            name: index === 0 ? "inventory.csv" : "index.ts",
-            missing: false,
-          })),
+          files: paths.map((filePath, index) => file(filePath, index === 2 ? "read" : "modified")),
         },
         activeId: `file:${paths[1]}`,
         onOpenFile,
       });
       const { container: mount, update } = mountWorkspace(workspace);
       const renderRows = () => update(workspace);
-      const labels = () =>
-        [...mount.querySelectorAll(".chat-workspace-rail__file-name")].map(
-          (row) => row.textContent,
-        );
+      const labels = () => fileNames(mount);
       renderRows();
       expect(labels()).toEqual([
         "inventory.csv",
@@ -185,15 +197,7 @@ describe("session workspace path actions", () => {
     },
   );
 
-  it.each([
-    {
-      surface: "session Files",
-      selector: ".chat-workspace-rail__list:not(.chat-workspace-rail__list--browser)",
-      path: "src/edited.ts",
-      origin: "session" as const,
-      feedback: "Copy failed",
-    },
-  ])("shows $feedback when copying a $surface path", async (testCase) => {
+  it("shows Copy failed when copying a session Files path", async () => {
     const writeText = vi
       .fn()
       .mockRejectedValue(new DOMException("Clipboard access denied", "NotAllowedError"));
@@ -203,7 +207,7 @@ describe("session workspace path actions", () => {
       list: {
         sessionKey: "agent:main:workspace",
         root: "/synthetic/project",
-        files: [{ kind: "modified", name: "edited.ts", path: "src/edited.ts", missing: false }],
+        files: [file("src/edited.ts")],
         browser: {
           path: "",
           entries: [{ kind: "file", name: "browser.ts", path: "src/browser.ts" }],
@@ -213,34 +217,36 @@ describe("session workspace path actions", () => {
     });
     const { container: mount } = mountWorkspace(workspace);
 
-    const row = mount.querySelector<HTMLElement>(`${testCase.selector} .chat-workspace-rail__file`);
+    const row = mount.querySelector<HTMLElement>(
+      ".chat-workspace-rail__list:not(.chat-workspace-rail__list--browser) .chat-workspace-rail__file",
+    );
     expect(row).toBeInstanceOf(HTMLElement);
     const rowClick = vi.fn();
     row!.addEventListener("click", rowClick);
-    const copy = row!.querySelector<HTMLButtonElement>('button[aria-label="Copy path"]');
+    const copy = button(row!, "Copy path");
     expect(copy).toBeInstanceOf(HTMLButtonElement);
 
     copy!.click();
-    await vi.waitFor(() => expect(copy!.getAttribute("aria-label")).toBe(testCase.feedback));
+    await vi.waitFor(() => expect(copy!.getAttribute("aria-label")).toBe("Copy failed"));
 
-    expect(writeText).toHaveBeenCalledWith(testCase.path);
+    expect(writeText).toHaveBeenCalledWith("src/edited.ts");
     const feedback = copy!.parentElement?.querySelector<HTMLElement>('[role="status"]');
-    expect(feedback?.textContent).toBe(testCase.feedback);
+    expect(feedback?.textContent).toBe("Copy failed");
     expect(feedback?.hidden).toBe(false);
     expect(rowClick).not.toHaveBeenCalled();
     expect(onOpenFile).not.toHaveBeenCalled();
 
-    const preview = row!.querySelector<HTMLButtonElement>('button[aria-label="Preview"]');
+    const preview = button(row!, "Preview");
     expect(preview).toBeInstanceOf(HTMLButtonElement);
     preview!.click();
-    expect(onOpenFile).toHaveBeenCalledWith(testCase.path, testCase.origin);
+    expect(onOpenFile).toHaveBeenCalledWith("src/edited.ts", "session");
   });
 
   it("preserves disclosure toggles across renders and opens matching groups during search", () => {
     const workspace = createWorkspace({
       list: {
         sessionKey: "agent:main:workspace",
-        files: [{ kind: "modified", name: "edited.ts", path: "src/edited.ts", missing: false }],
+        files: [file("src/edited.ts")],
         artifacts: [
           {
             id: "portrait-1",
@@ -299,11 +305,8 @@ describe("session workspace path actions", () => {
       const workspace = createWorkspace({
         list: {
           sessionKey: "agent:main:workspace",
-          files: [
-            { kind: "modified", name: "report.csv", path: "report.csv", missing: false },
-            { kind: "read", name: "report.md", path: "report.md", missing: false },
-          ],
-          artifacts: [{ id: "report", title: "Report", type: "file", download: { mode: "bytes" } }],
+          files: [file("report.csv"), file("report.md", "read")],
+          artifacts: [artifact("report", "Report")],
           ...(scenario.browser ? { browser: { path: "", entries: [] } } : {}),
         },
       });
@@ -326,7 +329,7 @@ describe("session workspace path actions", () => {
       search.dispatchEvent(new Event("input", { bubbles: true }));
       const label = scenario.filter === "all" ? "All" : `1 ${scenario.filter}`;
       const chip = [...mount.querySelectorAll<HTMLButtonElement>("button[aria-pressed]")].find(
-        (button) => button.textContent?.trim() === label,
+        (candidate) => candidate.textContent?.trim() === label,
       );
       assert(chip, "Expected the selected Files filter to remain available");
       chip.click();
@@ -358,62 +361,35 @@ describe("session workspace path actions", () => {
     },
   );
 
-  it.each(["  INVENTORY  REPORT  "])(
-    "matches every Files group consistently for %j without collapsing internal spaces",
-    (query) => {
-      const workspace = createWorkspace({
-        browserSearch: query,
-        list: {
-          sessionKey: "agent:main:workspace",
-          files: [
-            {
-              kind: "modified",
-              name: "inventory  report.csv",
-              path: "inventory  report.csv",
-              missing: false,
-            },
-            {
-              kind: "read",
-              name: "inventory  report.md",
-              path: "inventory  report.md",
-              missing: false,
-            },
-            {
-              kind: "modified",
-              name: "inventory report.csv",
-              path: "inventory report.csv",
-              missing: false,
-            },
-          ],
-          artifacts: [
-            { id: "report", title: "Inventory  report", type: "file", download: { mode: "bytes" } },
-            { id: "other", title: "Inventory report", type: "file", download: { mode: "bytes" } },
-          ],
-          browser: {
-            path: "",
-            search: "inventory  report",
-            entries: [
-              { kind: "file", name: "inventory  report.csv", path: "inventory  report.csv" },
-            ],
-          },
+  it("matches every Files group without collapsing internal spaces", () => {
+    const query = "  INVENTORY  REPORT  ";
+    const workspace = createWorkspace({
+      browserSearch: query,
+      list: {
+        sessionKey: "agent:main:workspace",
+        files: [
+          file("inventory  report.csv"),
+          file("inventory  report.md", "read"),
+          file("inventory report.csv"),
+        ],
+        artifacts: [artifact("report", "Inventory  report"), artifact("other", "Inventory report")],
+        browser: {
+          path: "",
+          search: "inventory  report",
+          entries: [{ kind: "file", name: "inventory  report.csv", path: "inventory  report.csv" }],
         },
-      });
-      const { container: mount, update } = mountWorkspace(workspace);
-      expect(
-        Array.from(
-          mount.querySelectorAll(".chat-workspace-rail__file-name"),
-          (row) => row.textContent,
-        ),
-      ).toEqual([
-        "inventory  report.csv",
-        "inventory  report.md",
-        "Inventory  report",
-        "inventory  report.csv",
-      ]);
-      expect(mount.querySelector<HTMLInputElement>('input[type="search"]')?.value).toBe(query);
+      },
+    });
+    const { container: mount, update } = mountWorkspace(workspace);
+    expect(fileNames(mount)).toEqual([
+      "inventory  report.csv",
+      "inventory  report.md",
+      "Inventory  report",
+      "inventory  report.csv",
+    ]);
+    expect(mount.querySelector<HTMLInputElement>('input[type="search"]')?.value).toBe(query);
 
-      update({ ...workspace, browserSearch: "   " });
-      expect(mount.querySelectorAll(".chat-workspace-rail__file-name")).toHaveLength(6);
-    },
-  );
+    update({ ...workspace, browserSearch: "   " });
+    expect(mount.querySelectorAll(".chat-workspace-rail__file-name")).toHaveLength(6);
+  });
 });

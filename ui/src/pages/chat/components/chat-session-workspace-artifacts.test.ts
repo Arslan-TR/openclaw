@@ -8,11 +8,18 @@ import {
   createSessionWorkspaceProps,
   type SessionWorkspaceHost,
 } from "./chat-session-workspace.ts";
-import type {
-  AttachmentSidebarRuntime,
-  SidebarContent,
-  SidebarSelection,
-} from "./chat-sidebar-content-types.ts";
+import type { SidebarContent, SidebarSelection } from "./chat-sidebar-content-types.ts";
+
+const httpOptions = {
+  credentials: "same-origin",
+  redirect: "error",
+  signal: expect.any(AbortSignal),
+};
+const artifactQuery = {
+  sessionKey: "agent:main:current",
+  agentId: "main",
+  artifactId: "artifact-1",
+};
 
 describe("session workspace artifacts", () => {
   afterEach(() => {
@@ -126,11 +133,7 @@ describe("session workspace artifacts", () => {
     if (content.kind !== "attachment" || !content.download) {
       throw new Error("Binary artifact must expose a download action");
     }
-    const panel = document.createElement("openclaw-chat-detail-panel") as HTMLElement & {
-      content: SidebarContent;
-      attachmentRuntime: AttachmentSidebarRuntime;
-      updateComplete: Promise<unknown>;
-    };
+    const panel = document.createElement("openclaw-chat-detail-panel");
     panel.content = content;
     panel.attachmentRuntime = { connectionEpoch: 1, sessionKey: fixture.state.sessionKey };
     document.body.append(panel);
@@ -201,28 +204,12 @@ describe("session workspace artifacts", () => {
       expect(fixture.clicked[0]?.download).toBe("archive.zip");
       expect(fixture.fetchMock).toHaveBeenCalledExactlyOnceWith(
         "/mount/api/artifacts/download/connection/ticket-2",
-        {
-          credentials: "same-origin",
-          redirect: "error",
-          signal: expect.any(AbortSignal),
-        },
+        httpOptions,
       );
       expect(fixture.request.mock.calls.map(([, params]) => params)).toEqual([
-        {
-          sessionKey: fixture.state.sessionKey,
-          agentId: "main",
-          artifactId: "artifact-1",
-          transport: "http",
-        },
-        {
-          sessionKey: fixture.state.sessionKey,
-          agentId: "main",
-          artifactId: "artifact-1",
-          transport: "http",
-        },
-        ...(httpFails
-          ? [{ sessionKey: fixture.state.sessionKey, agentId: "main", artifactId: "artifact-1" }]
-          : []),
+        { ...artifactQuery, transport: "http" },
+        { ...artifactQuery, transport: "http" },
+        ...(httpFails ? [artifactQuery] : []),
       ]);
       vi.runOnlyPendingTimers();
       expect(fixture.revokeObjectURL).toHaveBeenCalledWith("blob:artifact-download");
@@ -323,11 +310,7 @@ describe("session workspace artifacts", () => {
         rawText: testCase.content,
       });
       if (testCase.http) {
-        expect(fetchMock).toHaveBeenCalledExactlyOnceWith(url, {
-          credentials: "same-origin",
-          redirect: "error",
-          signal: expect.any(AbortSignal),
-        });
+        expect(fetchMock).toHaveBeenCalledExactlyOnceWith(url, httpOptions);
       }
     },
   );
@@ -350,11 +333,7 @@ describe("session workspace artifacts", () => {
       src: `data:image/png;base64,${data}`,
       title: "preview.png",
     });
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(url, {
-      credentials: "same-origin",
-      redirect: "error",
-      signal: expect.any(AbortSignal),
-    });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(url, httpOptions);
   });
 
   it("reauthorizes HTML artifact bytes when the proxy returns inline application HTML", async () => {
@@ -380,20 +359,11 @@ describe("session workspace artifacts", () => {
       kind: "markdown",
       rawText: source,
     });
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(url, {
-      credentials: "same-origin",
-      redirect: "error",
-      signal: expect.any(AbortSignal),
-    });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(url, httpOptions);
     expect(request.mock.contexts).toEqual([state.client, state.client]);
     expect(request.mock.calls.map(([, query]) => query)).toEqual([
-      {
-        sessionKey: state.sessionKey,
-        agentId: "main",
-        artifactId: "artifact-1",
-        transport: "http",
-      },
-      { sessionKey: state.sessionKey, agentId: "main", artifactId: "artifact-1" },
+      { ...artifactQuery, transport: "http" },
+      artifactQuery,
     ]);
   });
 });

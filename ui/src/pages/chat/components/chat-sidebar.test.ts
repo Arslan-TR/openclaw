@@ -9,6 +9,7 @@ import {
 } from "../../../test-helpers/native-gateways.ts";
 import "./chat-detail-panel.tsx";
 import { waitForSolid } from "../../../test-helpers/solid-settle.ts";
+import type { ChatDetailPanel as DetailPanel } from "./chat-detail-panel.tsx";
 import { setFileDraft } from "./chat-file-drafts.ts";
 import type { ChatHtmlPreviewElement } from "./chat-html-preview-element.tsx";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
@@ -36,17 +37,16 @@ vi.mock("./file-editor-view.ts", () => ({
   },
 }));
 
-type DetailPanel = HTMLElement & {
-  content: unknown;
-  basePath?: string;
-  execNode: string | null;
-  updateComplete: Promise<unknown>;
-  onOpenWorkspaceFile?: (target: { path: string; line?: number | null }) => void;
-  onOpenSessionLink?: (target: { sessionKey: string; agentId: string }) => void;
-  onOpenImage?: (item: { src: string; title: string }) => void;
-  embedSandboxMode: "trusted";
-  canvasPluginSurfaceUrl: string;
-};
+async function mountPanel(
+  content: SidebarContent,
+  props: Partial<DetailPanel> = {},
+): Promise<DetailPanel> {
+  const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
+  Object.assign(panel, { content }, props);
+  container.append(panel);
+  await panel.updateComplete;
+  return panel;
+}
 
 let container: HTMLElement;
 beforeEach(() => {
@@ -91,16 +91,13 @@ describe("file sidebar editor locality", () => {
 
   it("removes editor controls when the native gateway switches to remote", async () => {
     setNativeGatewayTestState("local");
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    panel.content = {
+    const panel = await mountPanel({
       kind: "file",
       path: "src/example.ts",
       name: "example.ts",
       root: "/workspace",
       content: "const answer = 42;",
-    };
-    container.append(panel);
-    await panel.updateComplete;
+    });
     expect(panel.querySelector('[aria-label="Open in editor"]')).not.toBeNull();
     expect(panel.querySelectorAll(".sidebar-file-view__editor-item")).toHaveLength(4);
     expect(panel.querySelector(".sidebar-file-view__editor")).not.toBeNull();
@@ -228,13 +225,12 @@ describe("markdown sidebar", () => {
   });
 
   it("handles markdown preview session links with click", async () => {
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
     const onOpenSessionLink = vi.fn();
     const sessionKey = "agent:roboclaw:dashboard:2139bddb-3211-4641-b993-10f619f124e6";
-    panel.content = { kind: "markdown", content: `Open \`${sessionKey}\`` };
-    panel.onOpenSessionLink = onOpenSessionLink;
-    container.append(panel);
-    await panel.updateComplete;
+    const panel = await mountPanel(
+      { kind: "markdown", content: `Open \`${sessionKey}\`` },
+      { onOpenSessionLink },
+    );
 
     const link = panel.querySelector<HTMLAnchorElement>("a.markdown-session-link");
     link?.setAttribute("href", "/chat/roboclaw/2139bddb");
@@ -253,15 +249,13 @@ describe("markdown sidebar", () => {
   it.each(["click", "Enter"])(
     "SPA-routes markdown preview session hrefs with %s",
     async (action) => {
-      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
       const onOpenSessionLink = vi.fn();
       const literalUuid = "12345678-90ab-cdef-1234-567890abcdef";
       const href = `${window.location.origin}/control/dashboard/main/~key/${literalUuid}`;
-      panel.basePath = "/control";
-      panel.content = { kind: "markdown", content: `[Open session](${href})` };
-      panel.onOpenSessionLink = onOpenSessionLink;
-      container.append(panel);
-      await panel.updateComplete;
+      const panel = await mountPanel(
+        { kind: "markdown", content: `[Open session](${href})` },
+        { basePath: "/control", onOpenSessionLink },
+      );
 
       const link = panel.querySelector<HTMLAnchorElement>(`a[href^="${window.location.origin}"]`);
       const event =
@@ -280,12 +274,11 @@ describe("markdown sidebar", () => {
   );
 
   it("activates Markdown images only when a chat owner opts in", async () => {
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
     const onOpenImage = vi.fn();
-    panel.content = { kind: "markdown", content: "![Preview](data:image/png;base64,cG5n)" };
-    panel.onOpenImage = onOpenImage;
-    container.append(panel);
-    await panel.updateComplete;
+    const panel = await mountPanel(
+      { kind: "markdown", content: "![Preview](data:image/png;base64,cG5n)" },
+      { onOpenImage },
+    );
 
     panel.querySelector<HTMLButtonElement>(".markdown-inline-image-button")?.click();
     expect(onOpenImage).toHaveBeenCalledWith({
@@ -294,28 +287,24 @@ describe("markdown sidebar", () => {
     });
     panel.remove();
 
-    const fallbackPanel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    fallbackPanel.content = {
+    const fallbackPanel = await mountPanel({
       kind: "markdown",
       content: "![Preview](data:image/png;base64,cG5n)",
-    };
-    container.append(fallbackPanel);
-    await fallbackPanel.updateComplete;
+    });
     expect(fallbackPanel.querySelector(".markdown-inline-image-button")).toBeNull();
     fallbackPanel.remove();
   });
 
   it("opens image artifacts through the shared lightbox callback", async () => {
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
     const onOpenImage = vi.fn();
-    panel.content = {
-      kind: "image",
-      title: "Artifact preview",
-      src: "data:image/png;base64,cG5n",
-    };
-    panel.onOpenImage = onOpenImage;
-    container.append(panel);
-    await panel.updateComplete;
+    const panel = await mountPanel(
+      {
+        kind: "image",
+        title: "Artifact preview",
+        src: "data:image/png;base64,cG5n",
+      },
+      { onOpenImage },
+    );
 
     panel.querySelector<HTMLButtonElement>(".chat-tool-card__preview-image-button")?.click();
 
@@ -325,14 +314,11 @@ describe("markdown sidebar", () => {
     });
     panel.remove();
 
-    const fallbackPanel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    fallbackPanel.content = {
+    const fallbackPanel = await mountPanel({
       kind: "image",
       title: "Artifact preview",
       src: "data:image/png;base64,cG5n",
-    };
-    container.append(fallbackPanel);
-    await fallbackPanel.updateComplete;
+    });
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
     fallbackPanel
       .querySelector<HTMLButtonElement>(".chat-tool-card__preview-image-button")
@@ -349,8 +335,7 @@ describe("markdown sidebar", () => {
   it("preserves authenticated transcoded video playback in Files", async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    panel.content = {
+    const panel = await mountPanel({
       kind: "attachment",
       title: "clip.mov",
       src: "/api/chat/media/outgoing/session/artifact/full?mediaTicket=ticket",
@@ -360,9 +345,7 @@ describe("markdown sidebar", () => {
       authToken: "session-token",
       width: 9,
       height: 16,
-    };
-    container.append(panel);
-    await panel.updateComplete;
+    });
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     const [url, init] = fetchMock.mock.calls[0] ?? [];
@@ -376,16 +359,13 @@ describe("markdown sidebar", () => {
   });
 
   it("plays normalized base64 audio from Files", async () => {
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    panel.content = {
+    const panel = await mountPanel({
       kind: "attachment",
       attachmentKind: "audio",
       title: "inline.wav",
       src: "data:audio/wav;base64,UklGRg==",
       mimeType: "audio/wav",
-    };
-    container.append(panel);
-    await panel.updateComplete;
+    });
 
     const player = panel.querySelector("openclaw-chat-audio-player");
     expect(player?.src).toBe("data:audio/wav;base64,UklGRg==");
@@ -401,16 +381,13 @@ describe("markdown sidebar", () => {
     async (title, src, mimeType) => {
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
-      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-      panel.content = {
+      const panel = await mountPanel({
         kind: "attachment",
         attachmentKind: "document",
         title,
         src,
         mimeType,
-      };
-      container.append(panel);
-      await panel.updateComplete;
+      });
 
       expect(panel.querySelector("iframe, table, audio, video")).toBeNull();
       expect(panel.querySelector(".chat-assistant-attachment-card--compact")).not.toBeNull();
@@ -567,16 +544,13 @@ describe("markdown sidebar", () => {
   ])(
     "keeps external SVG attachments as Files cards with title $title and MIME $mimeType",
     async ({ title, mimeType, src }) => {
-      const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-      panel.content = {
+      const panel = await mountPanel({
         kind: "attachment",
         attachmentKind: "image",
         title,
         src,
         mimeType,
-      };
-      container.append(panel);
-      await panel.updateComplete;
+      });
 
       expect(panel.querySelector(".sidebar-attachment-preview__image")).toBeNull();
       expect(
@@ -589,9 +563,6 @@ describe("markdown sidebar", () => {
   );
 
   it("keeps a canvas scripts ceiling under a trusted global sandbox", async () => {
-    const panel = document.createElement("openclaw-chat-detail-panel") as DetailPanel;
-    panel.embedSandboxMode = "trusted";
-    panel.canvasPluginSurfaceUrl = "https://canvas.example";
     const content = {
       kind: "canvas",
       docId: "preview-1",
@@ -599,9 +570,10 @@ describe("markdown sidebar", () => {
       entryUrl: "https://canvas.example/previews/preview-1",
       sandbox: "scripts",
     } satisfies SidebarContent;
-    panel.content = content;
-    container.append(panel);
-    await panel.updateComplete;
+    const panel = await mountPanel(content, {
+      embedSandboxMode: "trusted",
+      canvasPluginSurfaceUrl: "https://canvas.example",
+    });
 
     const frame = panel.querySelector("iframe");
     expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
