@@ -384,41 +384,32 @@ it("presents current recipient roles without SQLite while rejecting source overr
     }
     try {
       const captured = projection.describe(query)!;
-      const present = (client?: GatewayWsClient) =>
-        prepareProjectedSessionPresentation(projection, client);
-      const broadcast = () =>
-        connection.broadcast("sessions.changed", { sessionKey: query.key, agentId: query.agentId });
-      const clearSends = () =>
-        clients.forEach((client) => vi.mocked(client.socket).send.mockClear());
-      const expectRun = (index: number, activeRunIds: string[]) => {
-        const send = vi.mocked(clients[index]!.socket).send;
-        expect(send.mock.calls).toHaveLength(1);
-        expect(JSON.parse(String(send.mock.lastCall?.[0])).payload.session).toMatchObject({
-          hasActiveRun: activeRunIds.length > 0,
-          activeRunIds,
-        });
-      };
       const prepares = vi.spyOn(DatabaseSync.prototype, "prepare");
       const exec = vi.spyOn(DatabaseSync.prototype, "exec");
-      expect(present().present(captured)).toMatchObject({
-        sharingRole: undefined,
-        sendDisabledReason: undefined,
-      });
+      expect(
+        prepareProjectedSessionPresentation(projection).present(captured)?.sharingRole,
+      ).toBeUndefined();
+      expect(
+        prepareProjectedSessionPresentation(projection).present(captured)?.sendDisabledReason,
+      ).toBeUndefined();
       for (const [index, expectedRole, visible] of [
         [0, "owner", true],
         [1, "member", true],
         [2, "viewer", false],
       ] as const) {
         const client = clients[index]!;
-        const presentation = present(client);
+        const presentation = prepareProjectedSessionPresentation(projection, client);
         expect(
           presentation.present(captured, { excludedChildKeys: new Set(["agent:main:child"]) }),
         ).toMatchObject({
           sharingRole: expectedRole,
           sendDisabledReason:
             expectedRole === "viewer" ? `Session "${query.key}" was not found.` : null,
-          childSessions: undefined,
         });
+        expect(
+          presentation.present(captured, { excludedChildKeys: new Set(["agent:main:child"]) })
+            ?.childSessions,
+        ).toBeUndefined();
         expect(
           canReceiveSessionEvent({
             cfg,
@@ -475,7 +466,7 @@ it("presents current recipient roles without SQLite while rejecting source overr
         }
       }
       expect(
-        present(clients[0]!).authorizeDescription({
+        prepareProjectedSessionPresentation(projection, clients[0]!).authorizeDescription({
           agentId: "main",
           key: "agent:main:dashboard:incognito-private",
         }),
@@ -497,7 +488,7 @@ it("presents current recipient roles without SQLite while rejecting source overr
         });
       }
       const controllerScans = vi.spyOn(connection.chatAbortControllers, Symbol.iterator);
-      broadcast();
+      connection.broadcast("sessions.changed", { sessionKey: query.key, agentId: query.agentId });
       expect(controllerScans).toHaveBeenCalledTimes(1);
       controllerScans.mockRestore();
       for (const client of clients.slice(0, 2)) {
@@ -505,7 +496,9 @@ it("presents current recipient roles without SQLite while rejecting source overr
           JSON.parse(String(vi.mocked(client.socket).send.mock.lastCall?.[0])).payload.session,
         ).toMatchObject({ hasActiveRun: true, activeRunIds: ["old-run"] });
       }
-      clearSends();
+      for (const client of clients) {
+        vi.mocked(client.socket).send.mockClear();
+      }
       vi.mocked(clients[0]!.socket).send.mockImplementationOnce(() => {
         connection.chatAbortControllers.delete("old-run");
         connection.chatAbortControllers.set("replacement-run", {
@@ -523,7 +516,12 @@ it("presents current recipient roles without SQLite while rejecting source overr
         [0, "old-run"],
         [1, "replacement-run"],
       ] as const) {
-        expectRun(index, [runId]);
+        const sends = vi.mocked(clients[index]!.socket).send.mock.calls;
+        expect(sends).toHaveLength(1);
+        expect(JSON.parse(String(sends[0]?.[0])).payload.session).toMatchObject({
+          hasActiveRun: true,
+          activeRunIds: [runId],
+        });
       }
       expect(vi.mocked(clients[2]!.socket).send.mock.calls).toHaveLength(0);
       const replacement = connection.chatAbortControllers.get("replacement-run")!;
@@ -539,7 +537,9 @@ it("presents current recipient roles without SQLite while rejecting source overr
         replacement.agentId = query.agentId;
         replacement.projectSessionActive = true;
         replacement.controlUiVisible = true;
-        clearSends();
+        for (const client of clients) {
+          vi.mocked(client.socket).send.mockClear();
+        }
         vi.mocked(clients[0]!.socket).send.mockImplementationOnce(() => {
           if (change === "session-id") {
             replacement.sessionId = "adopted-session";
@@ -553,24 +553,36 @@ it("presents current recipient roles without SQLite while rejecting source overr
             replacement.agentId = "other";
           }
         });
-        broadcast();
+        connection.broadcast("sessions.changed", { sessionKey: query.key, agentId: query.agentId });
         for (const [index, hasActiveRun] of [true, false].entries()) {
-          expectRun(index, hasActiveRun ? ["replacement-run"] : []);
+          const sends = vi.mocked(clients[index]!.socket).send.mock.calls;
+          expect(sends).toHaveLength(1);
+          expect(JSON.parse(String(sends[0]?.[0])).payload.session).toMatchObject({
+            hasActiveRun,
+            activeRunIds: hasActiveRun ? ["replacement-run"] : [],
+          });
         }
         expect(vi.mocked(clients[2]!.socket).send.mock.calls).toHaveLength(0);
       }
       Object.assign(replacement, activeRun);
       const joining = connection.chatAbortControllers.get("unrelated-0")!;
-      clearSends();
+      for (const client of clients) {
+        vi.mocked(client.socket).send.mockClear();
+      }
       vi.mocked(clients[0]!.socket).send.mockImplementationOnce(() => {
         joining.sessionKey = query.key;
       });
-      broadcast();
+      connection.broadcast("sessions.changed", { sessionKey: query.key, agentId: query.agentId });
       for (const [index, activeRunIds] of [
         [0, ["replacement-run"]],
         [1, ["replacement-run", "unrelated-0"]],
       ] as const) {
-        expectRun(index, activeRunIds);
+        const sends = vi.mocked(clients[index]!.socket).send.mock.calls;
+        expect(sends).toHaveLength(1);
+        expect(JSON.parse(String(sends[0]?.[0])).payload.session).toMatchObject({
+          hasActiveRun: true,
+          activeRunIds,
+        });
       }
       connection.chatAbortControllers.clear();
       expect(prepares).not.toHaveBeenCalled();
@@ -579,10 +591,15 @@ it("presents current recipient roles without SQLite while rejecting source overr
       exec.mockRestore();
       removeSessionMember(scope, member.id);
       await projection.ensureMaterialized();
-      expect(present(clients[1]!).snapshot(query).row?.sharingRole).toBe("viewer");
+      expect(
+        prepareProjectedSessionPresentation(projection, clients[1]!).snapshot(query).row
+          ?.sharingRole,
+      ).toBe("viewer");
       replaceSessionEntrySync(scope, { ...entry, sessionId: "replacement-session" });
       await projection.ensureMaterialized();
-      expect(present(clients[0]!).present(captured)).toBeNull();
+      expect(
+        prepareProjectedSessionPresentation(projection, clients[0]!).present(captured),
+      ).toBeNull();
       const socket = vi.mocked(clients[0]!.socket);
       socket.send.mockClear();
       for (const payload of [

@@ -44,9 +44,11 @@ afterEach(() => {
   closeOpenClawStateDatabaseForTest();
 });
 
-function createQueue(): ChannelIngressQueue<StoredEvent> {
+async function withQueue(
+  run: (queue: ChannelIngressQueue<StoredEvent>) => Promise<void>,
+): Promise<void> {
   const stateDir = tempDirs.make("openclaw-ingress-restart-lifecycle-");
-  return createChannelIngressQueue<StoredEvent>({ channelId: "test", accountId: "a", stateDir });
+  await run(createChannelIngressQueue({ channelId: "test", accountId: "a", stateDir }));
 }
 
 function createMonitor(
@@ -78,13 +80,6 @@ function createMonitor(
   });
 }
 
-const event = (id: string, text = "deliver me", lane = "a"): RawEvent => ({ id, lane, text });
-const stored = (raw: RawEvent): StoredEvent => ({ version: 1, rawEvent: JSON.stringify(raw) });
-const adoptingDelivery = () =>
-  vi.fn(async (_raw: RawEvent, lifecycle: ChannelIngressMonitorLifecycle) => {
-    await lifecycle.onAdopted();
-  });
-
 function runRestartDrainFixture(stateDir: string): Promise<RestartDrainProof> {
   return new Promise((resolve, reject) => {
     const fixture = resolveRuntimeWorkerUrl(channelIngressGatewayRestartEntrypoint);
@@ -103,14 +98,10 @@ function runRestartDrainFixture(stateDir: string): Promise<RestartDrainProof> {
     let failure: Error | undefined;
     let stderr = "";
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    const fail = (message: string) => {
-      failure = new Error(message);
+    const completionTimer = setTimeout(() => {
+      failure = new Error("Gateway restart fixture did not finish within 30 seconds");
       child.kill();
-    };
-    const completionTimer = setTimeout(
-      () => fail("Gateway restart fixture did not finish within 30 seconds"),
-      30_000,
-    );
+    }, 30_000);
     childStderr.setEncoding("utf8");
     childStderr.on("data", (chunk: string) => {
       stderr += chunk;
@@ -120,10 +111,10 @@ function runRestartDrainFixture(stateDir: string): Promise<RestartDrainProof> {
         return;
       }
       if (message.type === "ingress-restart-drain-committed") {
-        idleTimer = setTimeout(
-          () => fail("Ingress did not become idle within 3 seconds of restart drain"),
-          3_000,
-        );
+        idleTimer = setTimeout(() => {
+          failure = new Error("Ingress did not become idle within 3 seconds of restart drain");
+          child.kill();
+        }, 3_000);
         return;
       }
       if (message.type === "ingress-restart-idle") {
@@ -140,16 +131,24 @@ function runRestartDrainFixture(stateDir: string): Promise<RestartDrainProof> {
     child.on("close", (code, signal) => {
       clearTimeout(completionTimer);
       clearTimeout(idleTimer);
-      if (!failure && code === 0 && proof) {
-        resolve(proof);
-      } else {
-        const reason = failure?.message ?? "Gateway restart fixture failed";
+      if (failure) {
         reject(
-          new Error(`${reason}; code=${String(code)} signal=${String(signal)} stderr=${stderr}`, {
-            cause: failure,
-          }),
+          new Error(
+            `${failure.message}; code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
+            { cause: failure },
+          ),
         );
+        return;
       }
+      if (code !== 0 || !proof) {
+        reject(
+          new Error(
+            `Gateway restart fixture failed: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
+          ),
+        );
+        return;
+      }
+      resolve(proof);
     });
   });
 }
@@ -166,284 +165,341 @@ it("reaches ingress idle after the Gateway commits restart drain", async () => {
   expect(proof.idleMs).toBeLessThan(1_000);
 }, 40_000);
 
-it.each(["rollback", "drain", "pause", "stop"] as const)(
-  "settles waiting ingress through restart-fence %s",
-  async (action) => {
-    const deliver = adoptingDelivery();
-    const activity: boolean[] = [];
-    const monitor = createMonitor(createQueue(), deliver, (active) => activity.push(active));
+it("rearms queued ingress after a restart signal rolls back without an idle observer", async () => {
+  await withQueue(async (queue) => {
+    const deliver = vi.fn(async (_raw: RawEvent, lifecycle: ChannelIngressMonitorLifecycle) => {
+      await lifecycle.onAdopted();
+    });
+    const monitor = createMonitor(queue, deliver);
     let signal: ReturnType<typeof beginGatewayRestartSignalAdmission> = null;
     try {
       monitor.start();
       await monitor.waitForIdle();
-      activity.length = 0;
       signal = beginGatewayRestartSignalAdmission();
       expect(signal).not.toBeNull();
-      if (action === "rollback") {
-        await monitor.admit(event("event-signal-rollback"));
-        expect(deliver).not.toHaveBeenCalled();
-        expect(signal?.rollback()).toBe(true);
-        // Rearming must not depend on an idle observer.
-        await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce());
-      } else {
-        monitor.requestDrain();
-        if (action === "drain") {
-          expect(activity.at(-1)).toBe(true);
-          markGatewayRestartDraining();
-          await monitor.waitForIdle();
-          expect(activity.at(-1)).toBe(false);
-        } else {
-          const idle = monitor.waitForIdle();
-          await monitor[action]();
-          await expect(idle).resolves.toBeUndefined();
-        }
-      }
+      await monitor.admit({ id: "event-signal-rollback", lane: "a", text: "deliver me" });
+      expect(deliver).not.toHaveBeenCalled();
+
+      expect(signal?.rollback()).toBe(true);
+      await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce());
     } finally {
       signal?.rollback();
       await monitor.stop();
     }
-  },
-);
+  });
+});
 
 it("holds queued ingress until host suspension reopens admission", async () => {
-  const queue = createQueue();
-  const deliver = adoptingDelivery();
-  const monitor = createMonitor(queue, deliver);
-  const suspension = tryBeginGatewaySuspendAdmission(() => {});
-  expect(suspension).not.toBeNull();
-  try {
-    const raw = event("event-suspend-release");
-    await queue.enqueue(raw.id, stored(raw), { laneKey: "lane:a" });
-    monitor.start();
-
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
+  await withQueue(async (queue) => {
+    const deliver = vi.fn(async (_raw: RawEvent, lifecycle: ChannelIngressMonitorLifecycle) => {
+      await lifecycle.onAdopted();
     });
-    expect(deliver).not.toHaveBeenCalled();
+    const monitor = createMonitor(queue, deliver);
+    const suspension = tryBeginGatewaySuspendAdmission(() => {});
+    expect(suspension).not.toBeNull();
+    try {
+      await queue.enqueue(
+        "event-suspend-release",
+        {
+          version: 1,
+          rawEvent: JSON.stringify({ id: "event-suspend-release", lane: "a", text: "deliver me" }),
+        },
+        { laneKey: "lane:a" },
+      );
+      monitor.start();
 
-    expect(suspension?.rollback()).toBe(true);
-    await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce());
-    await monitor.waitForIdle();
-  } finally {
-    suspension?.rollback();
-    await monitor.stop();
-  }
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+      expect(deliver).not.toHaveBeenCalled();
+
+      expect(suspension?.rollback()).toBe(true);
+      await vi.waitFor(() => expect(deliver).toHaveBeenCalledOnce());
+      await monitor.waitForIdle();
+    } finally {
+      suspension?.rollback();
+      await monitor.stop();
+    }
+  });
 });
 
 it("releases a claim without an attempt when suspension closes during the claim", async () => {
-  const queue = createQueue();
-  const raw = event("event-suspend-claim", "deliver after suspension");
-  const payload = stored(raw);
-  const claimReady = createDeferredCore();
-  const returnClaim = createDeferredCore();
-  const claimNext = queue.claimNext.bind(queue);
-  const claimNextSpy = vi.spyOn(queue, "claimNext").mockImplementationOnce(async (...args) => {
-    const claim = await claimNext(...args);
-    // Keep the monitor awaiting the result after the real SQLite claim commits.
-    claimReady.resolve();
-    await returnClaim.promise;
-    return claim;
-  });
-  const deliver = adoptingDelivery();
-  const activity: boolean[] = [];
-  const monitor = createMonitor(queue, deliver, (active) => activity.push(active));
-  let suspension: ReturnType<typeof tryBeginGatewaySuspendAdmission> = null;
-  try {
-    await queue.enqueue(raw.id, payload, { laneKey: "lane:a" });
-    monitor.start();
-    await claimReady.promise;
-    expect(await queue.listClaims()).toEqual([
-      expect.objectContaining({ id: raw.id, payload, attempts: 0 }),
-    ]);
-
-    suspension = tryBeginGatewaySuspendAdmission(() => {});
-    expect(suspension?.drain()).toBe(true);
-    expect(getGatewaySuspendAdmissionPhase()).toBe("draining");
-    returnClaim.resolve();
-    await monitor.waitForIdle();
-
-    expect(deliver).not.toHaveBeenCalled();
-    expect(await queue.listClaims()).toEqual([]);
-    const pending = await queue.listPending();
-    expect(pending).toEqual([
-      expect.objectContaining({ id: raw.id, payload, laneKey: "lane:a", attempts: 0 }),
-    ]);
-    expect(pending[0]).not.toHaveProperty("lastAttemptAt");
-    expect(pending[0]).not.toHaveProperty("lastError");
-    expect(claimNextSpy).toHaveBeenCalledOnce();
-    expect(activity.at(-1)).toBe(false);
-
-    expect(suspension?.release()).toBe(true);
-    await monitor.waitForIdle();
-
-    expect(deliver).toHaveBeenCalledExactlyOnceWith(raw, expect.anything());
-    expect(await queue.listPending()).toEqual([]);
-    expect(await queue.listClaims()).toEqual([]);
-    expect(await queue.enqueue(raw.id, payload, { laneKey: "lane:a" })).toMatchObject({
-      kind: "completed",
-      duplicate: true,
+  await withQueue(async (queue) => {
+    const raw: RawEvent = {
+      id: "event-suspend-claim",
+      lane: "a",
+      text: "deliver after suspension",
+    };
+    const payload: StoredEvent = { version: 1, rawEvent: JSON.stringify(raw) };
+    const claimReady = createDeferredCore();
+    const returnClaim = createDeferredCore();
+    const claimNext = queue.claimNext.bind(queue);
+    const claimNextSpy = vi.spyOn(queue, "claimNext").mockImplementationOnce(async (...args) => {
+      const claim = await claimNext(...args);
+      // Keep the monitor awaiting the result after the real SQLite claim commits.
+      claimReady.resolve();
+      await returnClaim.promise;
+      return claim;
     });
-  } finally {
-    returnClaim.resolve();
-    await monitor.stop();
-    suspension?.rollback();
-    suspension?.release();
-    claimNextSpy.mockRestore();
-  }
+    const deliver = vi.fn(async (_raw: RawEvent, lifecycle: ChannelIngressMonitorLifecycle) => {
+      await lifecycle.onAdopted();
+    });
+    const activity: boolean[] = [];
+    const monitor = createMonitor(queue, deliver, (active) => activity.push(active));
+    let suspension: ReturnType<typeof tryBeginGatewaySuspendAdmission> = null;
+    try {
+      await queue.enqueue(raw.id, payload, { laneKey: "lane:a" });
+      monitor.start();
+      await claimReady.promise;
+      expect(await queue.listClaims()).toEqual([
+        expect.objectContaining({ id: raw.id, payload, attempts: 0 }),
+      ]);
+
+      suspension = tryBeginGatewaySuspendAdmission(() => {});
+      expect(suspension?.drain()).toBe(true);
+      expect(getGatewaySuspendAdmissionPhase()).toBe("draining");
+      returnClaim.resolve();
+      await monitor.waitForIdle();
+
+      expect(deliver).not.toHaveBeenCalled();
+      expect(await queue.listClaims()).toEqual([]);
+      const pending = await queue.listPending();
+      expect(pending).toEqual([
+        expect.objectContaining({ id: raw.id, payload, laneKey: "lane:a", attempts: 0 }),
+      ]);
+      expect(pending[0]).not.toHaveProperty("lastAttemptAt");
+      expect(pending[0]).not.toHaveProperty("lastError");
+      expect(claimNextSpy).toHaveBeenCalledOnce();
+      expect(activity.at(-1)).toBe(false);
+
+      expect(suspension?.release()).toBe(true);
+      await monitor.waitForIdle();
+
+      expect(deliver).toHaveBeenCalledOnce();
+      expect(deliver.mock.calls[0]?.[0]).toEqual(raw);
+      expect(await queue.listPending()).toEqual([]);
+      expect(await queue.listClaims()).toEqual([]);
+      expect(await queue.enqueue(raw.id, payload, { laneKey: "lane:a" })).toMatchObject({
+        kind: "completed",
+        duplicate: true,
+      });
+    } finally {
+      returnClaim.resolve();
+      await monitor.stop();
+      suspension?.rollback();
+      suspension?.release();
+      claimNextSpy.mockRestore();
+    }
+  });
 });
 
-it("propagates a rejected pump wrapper without spinning idle or stop waits", async () => {
-  const queue = createQueue();
-  const rejection = new Error("pump wrapper rejected");
-  const monitor = createMonitor(
-    queue,
-    async () => {},
-    undefined,
-    async () => {
-      throw rejection;
-    },
-  );
-  monitor.start();
+it("clears activity when a restart signal commits to one-way drain", async () => {
+  await withQueue(async (queue) => {
+    const activity: boolean[] = [];
+    const monitor = createMonitor(
+      queue,
+      async () => {},
+      (active) => activity.push(active),
+    );
+    try {
+      monitor.start();
+      await monitor.waitForIdle();
+      activity.length = 0;
 
-  await expect(monitor.waitForIdle()).rejects.toBe(rejection);
-  await expect(monitor.stop()).rejects.toBe(rejection);
+      expect(beginGatewayRestartSignalAdmission()).not.toBeNull();
+      monitor.requestDrain();
+      expect(activity.at(-1)).toBe(true);
+
+      markGatewayRestartDraining();
+      await monitor.waitForIdle();
+      expect(activity.at(-1)).toBe(false);
+    } finally {
+      await monitor.stop();
+    }
+  });
+});
+
+it.each(["pause", "stop"] as const)(
+  "releases idle waiters when %s ends a restart fence wait",
+  async (action) => {
+    await withQueue(async (queue) => {
+      const monitor = createMonitor(queue, async () => {});
+      let signal: ReturnType<typeof beginGatewayRestartSignalAdmission> = null;
+      try {
+        monitor.start();
+        await monitor.waitForIdle();
+        signal = beginGatewayRestartSignalAdmission();
+        expect(signal).not.toBeNull();
+        monitor.requestDrain();
+        const idle = monitor.waitForIdle();
+
+        await monitor[action]();
+        await expect(idle).resolves.toBeUndefined();
+      } finally {
+        signal?.rollback();
+        await monitor.stop();
+      }
+    });
+  },
+);
+
+it("propagates a rejected pump wrapper without spinning idle or stop waits", async () => {
+  await withQueue(async (queue) => {
+    const rejection = new Error("pump wrapper rejected");
+    const monitor = createMonitor(
+      queue,
+      async () => {},
+      undefined,
+      async () => {
+        throw rejection;
+      },
+    );
+    monitor.start();
+
+    await expect(monitor.waitForIdle()).rejects.toBe(rejection);
+    await expect(monitor.stop()).rejects.toBe(rejection);
+  });
 });
 
 it("retains adopted webhook delivery through restart while plugin cleanup owns its separate tail", async () => {
-  const queue = createQueue();
-  const adoptGate = createDeferredCore();
-  const dispatchGate = createDeferredCore();
-  const cleanupStarted = createDeferredCore();
-  const cleanupGate = createDeferredCore();
-  const cancelled = createDeferredCore();
-  const instance = new PluginInstance("ingress-cleanup");
-  const activity: boolean[] = [];
-  const delivered: string[] = [];
-  const pumpSignals: AbortSignal[] = [];
-  const facts = {
-    adopted: false,
-    stoppingSettled: false,
-    dispatchRetainedRoot: false,
-    dispatchAdmissionClosed: false,
-    cleanupSettled: false,
-    disposalSettled: false,
-  };
-  const first = event("adopted", "already delivered");
-  const interrupted = event("cancelled", "resume once", "b");
-  const next = event("next", "next queued delivery", "b");
-  const monitor = createMonitor(
-    queue,
-    async (raw, lifecycle) => {
-      delivered.push(raw.id);
-      if (raw.id === first.id) {
-        await adoptGate.promise;
-        await trackAsyncWork(() =>
-          instance.run(() => {
-            instance.lifecycle.onDispose(async () => {
-              cleanupStarted.resolve();
-              await cleanupGate.promise;
-              await trackAsyncWork(() => {
-                facts.cleanupSettled = true;
+  await withQueue(async (queue) => {
+    const adoptGate = createDeferredCore();
+    let adopted = false;
+    const dispatchGate = createDeferredCore();
+    const cleanupStarted = createDeferredCore();
+    const cleanupGate = createDeferredCore();
+    const cancelled = createDeferredCore();
+    const instance = new PluginInstance("ingress-cleanup");
+    const activity: boolean[] = [];
+    const delivered: string[] = [];
+    const pumpSignals: AbortSignal[] = [];
+    let stoppingSettled = false;
+    let dispatchRetainedRoot = false;
+    let dispatchAdmissionClosed = false;
+    let cleanupSettled = false;
+    let disposalSettled = false;
+    const first: RawEvent = { id: "adopted", lane: "a", text: "already delivered" };
+    const interrupted: RawEvent = { id: "cancelled", lane: "b", text: "resume once" };
+    const next: RawEvent = { id: "next", lane: "b", text: "next queued delivery" };
+    const monitor = createMonitor(
+      queue,
+      async (raw, lifecycle) => {
+        delivered.push(raw.id);
+        if (raw.id === first.id) {
+          await adoptGate.promise;
+          await trackAsyncWork(() =>
+            instance.run(() => {
+              instance.lifecycle.onDispose(async () => {
+                cleanupStarted.resolve();
+                await cleanupGate.promise;
+                await trackAsyncWork(() => {
+                  cleanupSettled = true;
+                });
               });
-            });
-          }),
-        );
-        await lifecycle.onAdopted();
-        facts.adopted = true;
-        await dispatchGate.promise;
-        facts.dispatchRetainedRoot =
-          getActiveGatewayRootWorkCount({ excludeCurrent: true }) < getActiveGatewayRootWorkCount();
-        facts.dispatchAdmissionClosed = isGatewaySubordinateWorkAdmissionClosed();
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        lifecycle.abortSignal.addEventListener("abort", () => resolve(), { once: true });
-      });
-      await lifecycle.onCancelled?.();
-      cancelled.resolve();
-    },
-    (active) => activity.push(active),
-    (work) =>
-      runDetachedWebhookWork(async () => {
-        const signal = getAsyncWorkSignal();
-        expect(signal).toBeDefined();
-        if (signal) {
-          pumpSignals.push(signal);
+            }),
+          );
+          await lifecycle.onAdopted();
+          adopted = true;
+          await dispatchGate.promise;
+          dispatchRetainedRoot =
+            getActiveGatewayRootWorkCount({ excludeCurrent: true }) <
+            getActiveGatewayRootWorkCount();
+          dispatchAdmissionClosed = isGatewaySubordinateWorkAdmissionClosed();
+          return;
         }
-        await work();
-      }),
-  );
-  const replacement = createMonitor(queue, async (raw, lifecycle) => {
-    delivered.push(raw.id);
-    await lifecycle.onAdopted();
+        await new Promise<void>((resolve) => {
+          lifecycle.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        await lifecycle.onCancelled?.();
+        cancelled.resolve();
+      },
+      (active) => activity.push(active),
+      (work) =>
+        runDetachedWebhookWork(async () => {
+          const signal = getAsyncWorkSignal();
+          expect(signal).toBeDefined();
+          if (signal) {
+            pumpSignals.push(signal);
+          }
+          await work();
+        }),
+    );
+    const replacement = createMonitor(queue, async (raw, lifecycle) => {
+      delivered.push(raw.id);
+      await lifecycle.onAdopted();
+    });
+    let signal: ReturnType<typeof beginGatewayRestartSignalAdmission> = null;
+    try {
+      await monitor.admit(first);
+      monitor.start();
+      await monitor.waitForPumpIdle();
+      await vi.waitFor(() => expect(pumpSignals[0]?.aborted).toBe(true));
+      adoptGate.resolve();
+      await vi.waitFor(() => expect(adopted).toBe(true));
+      await expect(queue.listClaims()).resolves.toEqual([]);
+      await monitor.waitForPumpIdle();
+      await vi.waitFor(() =>
+        expect(getActiveGatewayRootWorkHolders()).toEqual(["webhook:detached"]),
+      );
+      expect(activity.at(-1)).toBe(true);
+
+      await monitor.admit(interrupted);
+      await monitor.admit(next);
+      await monitor.waitForPumpIdle();
+      expect(delivered).toEqual([first.id, interrupted.id]);
+      signal = beginGatewayRestartSignalAdmission();
+      expect(signal).not.toBeNull();
+      markGatewayRestartDraining();
+      const cleanup = instance.dispose().then((result) => {
+        disposalSettled = true;
+        return result;
+      });
+      await cleanupStarted.promise;
+      const stopping = monitor.stop().then(() => {
+        stoppingSettled = true;
+      });
+      await cancelled.promise;
+      expect(stoppingSettled).toBe(false);
+      expect(activity.at(-1)).toBe(true);
+      expect(getActiveGatewayRootWorkCount()).toBeGreaterThan(0);
+
+      dispatchGate.resolve();
+      await stopping;
+      expect(dispatchRetainedRoot).toBe(true);
+      expect(dispatchAdmissionClosed).toBe(true);
+      await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
+      expect(activity.at(-1)).toBe(false);
+      expect(cleanupSettled).toBe(false);
+      expect(disposalSettled).toBe(false);
+      expect(instance.disposing).toBe(true);
+      await expect(queue.listClaims()).resolves.toEqual([]);
+      await expect(queue.listPending()).resolves.toEqual([
+        expect.objectContaining({ id: interrupted.id, attempts: 0 }),
+        expect.objectContaining({ id: next.id, attempts: 0 }),
+      ]);
+
+      cleanupGate.resolve();
+      await expect(cleanup).resolves.toEqual({ errors: [] });
+      expect(cleanupSettled).toBe(true);
+      resetGatewayWorkAdmission();
+      replacement.start();
+      await replacement.waitForIdle();
+      await expect(replacement.admit(first)).resolves.toMatchObject({
+        kind: "durable",
+        queueResult: { kind: "completed", duplicate: true },
+      });
+      await replacement.waitForIdle();
+      expect(delivered).toEqual([first.id, interrupted.id, interrupted.id, next.id]);
+      await expect(queue.listPending()).resolves.toEqual([]);
+      await expect(queue.listClaims()).resolves.toEqual([]);
+    } finally {
+      adoptGate.resolve();
+      dispatchGate.resolve();
+      cleanupGate.resolve();
+      signal?.rollback();
+      await monitor.stop();
+      await replacement.stop();
+      await instance.dispose();
+    }
   });
-  let signal: ReturnType<typeof beginGatewayRestartSignalAdmission> = null;
-  try {
-    await monitor.admit(first);
-    monitor.start();
-    await monitor.waitForPumpIdle();
-    await vi.waitFor(() => expect(pumpSignals[0]?.aborted).toBe(true));
-    adoptGate.resolve();
-    await vi.waitFor(() => expect(facts.adopted).toBe(true));
-    await expect(queue.listClaims()).resolves.toEqual([]);
-    await monitor.waitForPumpIdle();
-    await vi.waitFor(() => expect(getActiveGatewayRootWorkHolders()).toEqual(["webhook:detached"]));
-    expect(activity.at(-1)).toBe(true);
-
-    await monitor.admit(interrupted);
-    await monitor.admit(next);
-    await monitor.waitForPumpIdle();
-    expect(delivered).toEqual([first.id, interrupted.id]);
-    signal = beginGatewayRestartSignalAdmission();
-    expect(signal).not.toBeNull();
-    markGatewayRestartDraining();
-    const cleanup = instance.dispose().then((result) => {
-      facts.disposalSettled = true;
-      return result;
-    });
-    await cleanupStarted.promise;
-    const stopping = monitor.stop().then(() => {
-      facts.stoppingSettled = true;
-    });
-    await cancelled.promise;
-    expect(facts.stoppingSettled).toBe(false);
-    expect(activity.at(-1)).toBe(true);
-    expect(getActiveGatewayRootWorkCount()).toBeGreaterThan(0);
-
-    dispatchGate.resolve();
-    await stopping;
-    expect(facts).toMatchObject({ dispatchRetainedRoot: true, dispatchAdmissionClosed: true });
-    await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
-    expect(activity.at(-1)).toBe(false);
-    expect(facts).toMatchObject({ cleanupSettled: false, disposalSettled: false });
-    expect(instance.disposing).toBe(true);
-    await expect(queue.listClaims()).resolves.toEqual([]);
-    await expect(queue.listPending()).resolves.toEqual([
-      expect.objectContaining({ id: interrupted.id, attempts: 0 }),
-      expect.objectContaining({ id: next.id, attempts: 0 }),
-    ]);
-
-    cleanupGate.resolve();
-    await expect(cleanup).resolves.toEqual({ errors: [] });
-    expect(facts.cleanupSettled).toBe(true);
-    resetGatewayWorkAdmission();
-    replacement.start();
-    await replacement.waitForIdle();
-    await expect(replacement.admit(first)).resolves.toMatchObject({
-      kind: "durable",
-      queueResult: { kind: "completed", duplicate: true },
-    });
-    await replacement.waitForIdle();
-    expect(delivered).toEqual([first.id, interrupted.id, interrupted.id, next.id]);
-    await expect(queue.listPending()).resolves.toEqual([]);
-    await expect(queue.listClaims()).resolves.toEqual([]);
-  } finally {
-    adoptGate.resolve();
-    dispatchGate.resolve();
-    cleanupGate.resolve();
-    signal?.rollback();
-    await monitor.stop();
-    await replacement.stop();
-    await instance.dispose();
-  }
 });
