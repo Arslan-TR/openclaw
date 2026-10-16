@@ -1,5 +1,8 @@
 import { expect, it, vi } from "vitest";
-import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement as awaitGate,
+  createDeferred,
+} from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { createTestAdmittedRunContext } from "../../agents/admitted-run-context.test-support.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
@@ -14,6 +17,36 @@ import {
 } from "./manager.cancel-session.worker.test-support.js";
 import { getAcpSessionResetControls } from "./manager.reset-controls.js";
 import { DEFAULT_DEPS } from "./manager.types.js";
+
+type Fixture = Parameters<Parameters<typeof withAcpCancellationFixture>[0]>[0];
+type TurnOptions = Partial<Parameters<Fixture["manager"]["runTurn"]>[0]>;
+
+function startTurn(f: Fixture, requestId: string, text: string, options: TurnOptions = {}) {
+  return f.manager.runTurn({
+    ...f.target,
+    admittedRunContext: options.admittedRunContext ?? createTestAdmittedRunContext(requestId),
+    provenance: "system",
+    mode: "prompt",
+    text,
+    requestId,
+    ...options,
+  });
+}
+
+function holdControlRead() {
+  const entered = createDeferred();
+  const release = createDeferred();
+  const prepare = DEFAULT_DEPS.prepareSessionControlRead;
+  const reader = vi
+    .spyOn(DEFAULT_DEPS, "prepareSessionControlRead")
+    .mockImplementationOnce(async (params) => {
+      const read = await prepare(params);
+      entered.resolve();
+      await release.promise;
+      return read;
+    });
+  return { entered, release, reader };
+}
 
 it("refuses inline-only idle ACP metadata without host data SQL", async () => {
   await withAcpCancellationFixture(
@@ -55,11 +88,7 @@ it("does not admit durable runtime cancellation from an inherited discovery snap
     );
     const result = Promise.allSettled([cancellation]);
     try {
-      await awaitGateBeforeSettlement(
-        entered.promise,
-        result,
-        "Cancellation ended before runtime preparation.",
-      );
+      await awaitGate(entered.promise, result, "Cancellation ended before runtime preparation.");
       runOpenClawStateWriteTransaction(
         ({ db }) =>
           applyAcpSessionMutation(db, {
@@ -111,13 +140,7 @@ it("joins a failing accepted sibling while another terminal signal remains activ
         return original(...args);
       });
     const turns = ["sibling-first", "sibling-second"].map((requestId) =>
-      f.manager.runTurn({
-        ...f.target,
-        admittedRunContext: createTestAdmittedRunContext(requestId),
-        provenance: "system",
-        mode: "prompt",
-        text: "queued",
-        requestId,
+      startTurn(f, requestId, "queued", {
         onEvent:
           requestId === "sibling-first"
             ? async () => {
@@ -138,11 +161,7 @@ it("joins a failing accepted sibling while another terminal signal remains activ
       return value;
     });
     try {
-      await awaitGateBeforeSettlement(
-        secondEntered.promise,
-        turnResults,
-        "Sibling signal was never admitted.",
-      );
+      await awaitGate(secondEntered.promise, turnResults, "Sibling signal was never admitted.");
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
@@ -185,7 +204,7 @@ it.each(["metadata", "lifecycle"] as const)(
         expectedOwnerKey: "agent:main:main",
       });
       const result = Promise.allSettled([cancellation]);
-      await awaitGateBeforeSettlement(entered.promise, result, "Cancellation ended before setup.");
+      await awaitGate(entered.promise, result, "Cancellation ended before setup.");
       try {
         if (replacement === "metadata") {
           await upsertAcpSessionMeta({ ...f.target, skipMaintenance: true, mutate: () => null });
@@ -253,11 +272,7 @@ it("joins only the superseded actor's late handle after post-ensure control read
     });
     let successor: Promise<void> | undefined;
     try {
-      await awaitGateBeforeSettlement(
-        readEntered.promise,
-        result,
-        "Cancellation ended before post-ensure read.",
-      );
+      await awaitGate(readEntered.promise, result, "Cancellation ended before post-ensure read.");
       await getAcpSessionResetControls(f.manager).forceDiscardSessionRuntime({
         ...f.target,
         reason: "fixture-actor-replacement",
@@ -269,11 +284,7 @@ it("joins only the superseded actor's late handle after post-ensure control read
       });
       await successor;
       releaseRead.resolve();
-      await awaitGateBeforeSettlement(
-        closeEntered.promise,
-        result,
-        "Superseded handle was not closed.",
-      );
+      await awaitGate(closeEntered.promise, result, "Superseded handle was not closed.");
       expect(settled).toBe(false);
       expect(close).toHaveBeenCalledExactlyOnceWith({
         handle: expect.objectContaining({ runtimeSessionName: "superseded-late-runtime" }),
@@ -315,32 +326,13 @@ it("refuses caller revocation while the registered cancellation read is pending"
       yield { type: "done", stopReason: "cancel" };
     });
     const context = createTestAdmittedRunContext("caller-worker");
-    const turn = f.manager.runTurn({
-      ...f.target,
+    const turn = startTurn(f, "caller-worker", "caller", {
       admittedRunContext: context,
-      provenance: "system",
-      mode: "prompt",
-      text: "caller",
-      requestId: "caller-worker",
       signal: stop.signal,
     });
     const turnResult = Promise.allSettled([turn]);
-    await awaitGateBeforeSettlement(
-      entered.promise,
-      turnResult,
-      "Turn ended before runtime entry.",
-    );
-    const readEntered = createDeferred();
-    const readRelease = createDeferred();
-    const prepare = DEFAULT_DEPS.prepareSessionControlRead;
-    const reader = vi
-      .spyOn(DEFAULT_DEPS, "prepareSessionControlRead")
-      .mockImplementationOnce(async (params) => {
-        const read = await prepare(params);
-        readEntered.resolve();
-        await readRelease.promise;
-        return read;
-      });
+    await awaitGate(entered.promise, turnResult, "Turn ended before runtime entry.");
+    const { entered: readEntered, release: readRelease, reader } = holdControlRead();
     let callerCurrent = true;
     const cancellation = f.manager.cancelSession({
       ...f.target,
@@ -355,11 +347,7 @@ it("refuses caller revocation while the registered cancellation read is pending"
     });
     const result = Promise.allSettled([cancellation]);
     try {
-      await awaitGateBeforeSettlement(
-        readEntered.promise,
-        result,
-        "Cancellation ended before read gate.",
-      );
+      await awaitGate(readEntered.promise, result, "Cancellation ended before read gate.");
       callerCurrent = false;
       readRelease.resolve();
       expect(await result).toMatchObject([
@@ -404,23 +392,14 @@ it.each(["acknowledged", "failed"] as const)(
       });
       const context = createTestAdmittedRunContext("late-worker");
       const events: unknown[] = [];
-      const turn = f.manager.runTurn({
-        ...f.target,
+      const turn = startTurn(f, "late-worker", "late", {
         admittedRunContext: context,
-        provenance: "system",
-        mode: "prompt",
-        text: "late",
-        requestId: "late-worker",
         onEvent: (event) => {
           events.push(event);
         },
       });
       const turnResult = Promise.allSettled([turn]);
-      await awaitGateBeforeSettlement(
-        ensureEntered.promise,
-        turnResult,
-        "Turn ended before setup gate.",
-      );
+      await awaitGate(ensureEntered.promise, turnResult, "Turn ended before setup gate.");
       let callerCurrent = true;
       let settled = false;
       const sql = observeHostDataSql();
@@ -452,14 +431,10 @@ it.each(["acknowledged", "failed"] as const)(
         return value;
       });
       try {
-        await awaitGateBeforeSettlement(
-          admitted.promise,
-          result,
-          "Cancellation ended before admission.",
-        );
+        await awaitGate(admitted.promise, result, "Cancellation ended before admission.");
         callerCurrent = false;
         ensureRelease.resolve();
-        await awaitGateBeforeSettlement(
+        await awaitGate(
           cancelEntered.promise,
           result,
           "Cancellation ended before runtime cleanup.",
@@ -519,31 +494,12 @@ it("does not adopt a same-request successor after actor replacement during cance
         yield { type: "done" };
       });
     const context = createTestAdmittedRunContext("actor-worker");
-    const first = f.manager.runTurn({
-      ...f.target,
+    const first = startTurn(f, "actor-worker", "first actor", {
       admittedRunContext: context,
-      provenance: "system",
-      mode: "prompt",
-      text: "first actor",
-      requestId: "actor-worker",
     });
     const firstResult = Promise.allSettled([first]);
-    await awaitGateBeforeSettlement(
-      firstEntered.promise,
-      firstResult,
-      "First actor ended before entry.",
-    );
-    const readEntered = createDeferred();
-    const readRelease = createDeferred();
-    const prepare = DEFAULT_DEPS.prepareSessionControlRead;
-    const reader = vi
-      .spyOn(DEFAULT_DEPS, "prepareSessionControlRead")
-      .mockImplementationOnce(async (params) => {
-        const read = await prepare(params);
-        readEntered.resolve();
-        await readRelease.promise;
-        return read;
-      });
+    await awaitGate(firstEntered.promise, firstResult, "First actor ended before entry.");
+    const { entered: readEntered, release: readRelease, reader } = holdControlRead();
     const cancellation = f.manager.cancelSession({
       ...f.target,
       reason: "pending-request",
@@ -554,29 +510,14 @@ it("does not adopt a same-request successor after actor replacement during cance
     const result = Promise.allSettled([cancellation]);
     let successor: Promise<void> | undefined;
     try {
-      await awaitGateBeforeSettlement(
-        readEntered.promise,
-        result,
-        "Cancellation ended before read gate.",
-      );
+      await awaitGate(readEntered.promise, result, "Cancellation ended before read gate.");
       await getAcpSessionResetControls(f.manager).forceDiscardSessionRuntime({
         ...f.target,
         reason: "fixture-actor-replacement",
       });
-      successor = f.manager.runTurn({
-        ...f.target,
-        admittedRunContext: createTestAdmittedRunContext("actor-worker"),
-        provenance: "system",
-        mode: "prompt",
-        text: "successor",
-        requestId: "actor-worker",
-      });
+      successor = startTurn(f, "actor-worker", "successor");
       const successorResult = Promise.allSettled([successor]);
-      await awaitGateBeforeSettlement(
-        nextEntered.promise,
-        successorResult,
-        "Successor ended before entry.",
-      );
+      await awaitGate(nextEntered.promise, successorResult, "Successor ended before entry.");
       readRelease.resolve();
       expect(await result).toMatchObject([{ status: "rejected" }]);
       expect(nextSignal?.aborted).toBe(false);
@@ -604,13 +545,8 @@ it("joins reentrant cancellation without issuing a second backend effect", async
       yield { type: "done", stopReason: "cancel" };
     });
     const context = createTestAdmittedRunContext("reentrant-cancel");
-    const turn = f.manager.runTurn({
-      ...f.target,
+    const turn = startTurn(f, "reentrant-cancel", "running", {
       admittedRunContext: context,
-      provenance: "system",
-      mode: "prompt",
-      text: "running",
-      requestId: "reentrant-cancel",
     });
     const turnResult = Promise.allSettled([turn]);
     await turnEntered.promise;
@@ -677,13 +613,8 @@ it.each(["metadata-read", "runtime-rpc"] as const)(
         yield { type: "done", stopReason: "cancel" };
       });
       const context = createTestAdmittedRunContext("retry-cancel");
-      const turn = f.manager.runTurn({
-        ...f.target,
+      const turn = startTurn(f, "retry-cancel", "running", {
         admittedRunContext: context,
-        provenance: "system",
-        mode: "prompt",
-        text: "running",
-        requestId: "retry-cancel",
       });
       const turnResult = Promise.allSettled([turn]).then((result) => {
         turnSettled = true;
@@ -774,7 +705,7 @@ it.each(["metadata-read", "runtime-rpc"] as const)(
           },
         });
         const secondResult = Promise.allSettled([second]);
-        await awaitGateBeforeSettlement(
+        await awaitGate(
           secondAdmission.promise,
           secondResult,
           "Second Stop ended before fresh control admission.",
