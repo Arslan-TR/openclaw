@@ -73,6 +73,7 @@ function fixture(prefix: string, filename = "shared.sqlite", brokerCount = 1) {
     brokers,
     open,
     run<Key extends keyof AdmissionOperations>(
+      this: void,
       store: SqliteWorkerStore<AdmissionOperations>,
       command: { type: Key; input: AdmissionOperations[Key]["input"] },
       admit = admitHost,
