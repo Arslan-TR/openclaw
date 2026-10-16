@@ -47,6 +47,7 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
   let clientRevision = -1;
   let requestRevision = 0;
   let displayedIdentityFingerprint: string | null = null;
+  let verificationRequested = false;
   let verificationQueued = false;
   let confirmationPending = false;
   let mutationOwner: RequestOwner | null = null;
@@ -132,6 +133,9 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
         (configurable && !nextConfigurable) ||
         (authorizable && !params.authorizable));
     const presentationChanged = clientChanged || ownerChanged || scopeChanged || accessLost;
+    if (presentationChanged) {
+      verificationRequested = false;
+    }
     if (contextChanged) {
       deviceAuthorization.retire(true);
       requestRevision += 1;
@@ -204,7 +208,10 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     if (clientChanged || ownerChanged) {
       return;
     }
-    if (becameConnected || (identityChanged && !mutationOwnsIdentityChange)) {
+    if (
+      (becameConnected && verificationRequested) ||
+      (identityChanged && !mutationOwnsIdentityChange)
+    ) {
       queueVerification();
     }
   }
@@ -362,6 +369,7 @@ export function createGitHubIdentity(deps: GitHubIdentityDependencies = {}) {
     if (!owner) {
       return;
     }
+    verificationRequested = true;
     loading = true;
     error = null;
     publish();

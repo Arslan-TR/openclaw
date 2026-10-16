@@ -506,7 +506,7 @@ export function ModelProviders(props: ModelProvidersViewProps) {
     <>
       <SettingsPage>
         <>
-          <Show when={!props.loading}>
+          <Show when={props.connected || !props.loading}>
             <ModelReadiness {...props} />
           </Show>
           <div id={MODEL_SETTINGS_TARGET_IDS.behavior}>

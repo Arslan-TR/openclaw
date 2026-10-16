@@ -168,7 +168,18 @@ describe("ModelProvidersPage agent scope", () => {
     expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.value).toBe(
       "Draft provider search",
     );
-    expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.disabled).toBe(true);
+    expect(search.disabled).toBe(false);
+    search.value = "anthropic";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await page.updateComplete;
+    const provider = page.querySelector<HTMLButtonElement>(
+      '[data-models-login-provider="anthropic"]',
+    )!;
+    expect(provider.disabled).toBe(true);
+    const reads = request.mock.calls.length;
+    provider.click();
+    await page.updateComplete;
+    expect(request.mock.calls).toHaveLength(reads);
     source.publish({ ...snapshot, phase: "connected" });
     await vi.waitFor(() => expect(requestCount(request, "models.authStatus")).toBe(2));
     expect(page.view.props.authStatus).toBe(previousData);
@@ -179,7 +190,7 @@ describe("ModelProvidersPage agent scope", () => {
     expect(page.view.props.addProviderOpen).toBe(true);
     expect(page.view.props.defaultModels.primary).toBe("openai/draft-model");
     expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.value).toBe(
-      "Draft provider search",
+      "anthropic",
     );
     expect(page.querySelector<HTMLInputElement>("[data-models-login-search]")?.disabled).toBe(
       false,

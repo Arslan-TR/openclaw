@@ -169,7 +169,11 @@ function contextWithMutableGateway(
   return {
     context,
     emitConnected(connected: boolean) {
-      currentSnapshot = { ...currentSnapshot, phase: connected ? "connected" : "stopped" };
+      currentSnapshot = {
+        ...currentSnapshot,
+        phase: connected ? "connected" : "stopped",
+        hello: connected ? gatewayHelloForMethods([]) : currentSnapshot.hello,
+      };
       for (const listener of listeners) {
         listener(currentSnapshot);
       }
@@ -314,7 +318,10 @@ describe("gateway source replacement across reconnect with a reused client", () 
     const context = contextWithClient(client, { connected: true });
     const staleResult = usageResult("stale");
     const page = await createUsagePage(client, false, context);
-    page.routeData = usageRouteData(context, staleResult, { ...context.gateway.snapshot });
+    page.routeData = usageRouteData(context, staleResult, {
+      ...context.gateway.snapshot,
+      hello: gatewayHelloForMethods([]),
+    });
 
     document.body.append(page.element);
     await page.updateComplete;
@@ -378,7 +385,9 @@ describe("gateway source replacement across reconnect with a reused client", () 
     const harness = contextWithMutableGateway(client);
     const result = usageResult();
     const page = await createUsagePage(client, false, harness.context);
-    page.routeData = usageRouteData(harness.context, result);
+    page.routeData = usageRouteData(harness.context, result, {
+      ...harness.context.gateway.snapshot,
+    });
 
     document.body.append(page.element);
     await page.updateComplete;
@@ -507,7 +516,7 @@ describe("gateway source replacement across reconnect with a reused client", () 
     const page = createModelProvidersPage(context);
     page.routeData = {
       gateway: context.gateway,
-      gatewaySnapshot: { ...context.gateway.snapshot },
+      gatewaySnapshot: { ...context.gateway.snapshot, hello: gatewayHelloForMethods([]) },
       data: staleData,
       client,
       agentId: "main",
@@ -546,7 +555,10 @@ describe("gateway source replacement across reconnect with a reused client", () 
       agentsList: { defaultId: "main", agents: [{ id: "main" }] },
       selectedAgentId: "main",
     });
-    const mounted = mountSkillsPage(context, skillsRouteData(context, linkedSkillReport()));
+    const mounted = mountSkillsPage(
+      context,
+      skillsRouteData(context, linkedSkillReport(), { ...context.gateway.snapshot }),
+    );
     await waitForSolid(() =>
       expect(mounted.page.querySelector(".plugins-item")?.textContent).toContain("Clean"),
     );
@@ -641,7 +653,10 @@ describe("gateway source replacement across reconnect with a reused client", () 
     });
     const mounted = mountSkillsPage(
       context,
-      skillsRouteData(context, skillReport("Stale skill"), { ...context.gateway.snapshot }),
+      skillsRouteData(context, skillReport("Stale skill"), {
+        ...context.gateway.snapshot,
+        hello: gatewayHelloForMethods([]),
+      }),
     );
     await waitForSolid(() => expect(mounted.page.textContent).toContain("Fresh skill"));
     expect(mounted.page.textContent).not.toContain("Stale skill");
@@ -795,7 +810,10 @@ describe("gateway source replacement across reconnect with a reused client", () 
     const context = contextWithClient(client, { connected: true, ensureList });
     const mounted = mountSkillsPage(
       context,
-      skillsRouteData(context, null, { ...context.gateway.snapshot }),
+      skillsRouteData(context, null, {
+        ...context.gateway.snapshot,
+        hello: gatewayHelloForMethods([]),
+      }),
     );
     await waitForSolid(() => expect(ensureList).toHaveBeenCalled());
     const replacementAgents = {
