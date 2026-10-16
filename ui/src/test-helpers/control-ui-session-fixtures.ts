@@ -84,10 +84,23 @@ export function createControlUiSessionFixtures(
   },
   isRecord: (value: unknown) => value is Record<string, unknown>,
 ) {
-  const records = new Map<
-    string,
-    { row: ControlUiSessionFixture; changed: Set<string>; lastRunEventSequence?: number }
-  >();
+  type FixtureRecord = {
+    row: ControlUiSessionFixture;
+    changed: Set<string>;
+    lastRunEventSequence?: number;
+  };
+  const records = new Map<string, FixtureRecord>();
+  const activeRuns = (row: ControlUiSessionFixture) =>
+    Array.isArray(row.activeRunIds)
+      ? row.activeRunIds.filter((id): id is string => typeof id === "string")
+      : [];
+  const commitRun = (value: FixtureRecord, sequence: number, fields: Record<string, unknown>) => {
+    value.lastRunEventSequence = sequence;
+    value.row = { ...value.row, ...fields };
+    for (const field of Object.keys(fields)) {
+      value.changed.add(field);
+    }
+  };
   const listed = new Set<string>();
   const materialized = new Set<string>();
   let materializedSequence = 0;
@@ -246,9 +259,7 @@ export function createControlUiSessionFixtures(
     const outcome = status === "running" ? (previous?.status ?? status) : status;
     const diagnostic = status === "running" ? previous?.errorMessage : errorMessage;
     const value = record(inputKey);
-    const activeRunIds = Array.isArray(value.row.activeRunIds)
-      ? value.row.activeRunIds.filter((id): id is string => typeof id === "string")
-      : [];
+    const activeRunIds = activeRuns(value.row);
     let sequence: number;
     if (status === "running") {
       // A send ACK consumes an earlier terminal outcome once; replay cannot revive it.
@@ -277,7 +288,7 @@ export function createControlUiSessionFixtures(
       outcome === "running"
         ? [...new Set([...activeRunIds, runId])]
         : activeRunIds.filter((id) => id !== runId);
-    const fields = {
+    commitRun(value, sequence, {
       // Like the Gateway projection, a newly started sole run has no execution
       // model until it publishes one; the previous fallback is not evidence.
       ...(outcome === "running" && activeRunIds.length === 0
@@ -289,12 +300,7 @@ export function createControlUiSessionFixtures(
       abortedLastRun: remaining.length === 0 && outcome === "killed",
       lastRunError: remaining.length === 0 && outcome === "failed" ? diagnostic : undefined,
       updatedAt: Date.now(),
-    };
-    value.lastRunEventSequence = sequence;
-    value.row = { ...value.row, ...fields };
-    for (const field of Object.keys(fields)) {
-      value.changed.add(field);
-    }
+    });
   };
   const abortRuns = (
     inputKey: string,
@@ -309,9 +315,7 @@ export function createControlUiSessionFixtures(
     if (!value) {
       return { ...response, aborted: false, runIds: [] as string[] };
     }
-    const activeRunIds = Array.isArray(value.row.activeRunIds)
-      ? value.row.activeRunIds.filter((id): id is string => typeof id === "string")
-      : [];
+    const activeRunIds = activeRuns(value.row);
     // Explicit abort receipts can precede the send ACK that lists the run locally.
     const candidates = confirmedRunIds ?? activeRunIds;
     const runIds = runId ? candidates.filter((id) => id === runId) : candidates;
@@ -324,20 +328,15 @@ export function createControlUiSessionFixtures(
       runsFor(key).set(id, { status: "killed", acknowledged: true, sequence });
     }
     const remaining = activeRunIds.filter((id) => !runIds.includes(id));
-    const fields = {
+    // Lifecycle writes override stale wire fixtures like other committed edits.
+    commitRun(value, sequence, {
       activeRunIds: remaining,
       hasActiveRun: remaining.length > 0,
       status: remaining.length > 0 ? "running" : "killed",
       abortedLastRun: remaining.length === 0,
       lastRunError: undefined,
       updatedAt: Date.now(),
-    };
-    value.lastRunEventSequence = sequence;
-    value.row = { ...value.row, ...fields };
-    // Lifecycle writes must override stale wire fixtures like other committed edits.
-    for (const field of Object.keys(fields)) {
-      value.changed.add(field);
-    }
+    });
     return { ...response, aborted, runIds };
   };
   // sessions.abort settles the session and its controlled descendants; the Gateway
@@ -348,9 +347,7 @@ export function createControlUiSessionFixtures(
     if (!value) {
       return;
     }
-    const activeRunIds = Array.isArray(value.row.activeRunIds)
-      ? value.row.activeRunIds.filter((id): id is string => typeof id === "string")
-      : [];
+    const activeRunIds = activeRuns(value.row);
     if (
       activeRunIds.length === 0 &&
       value.row.hasActiveRun !== true &&
@@ -362,19 +359,14 @@ export function createControlUiSessionFixtures(
     for (const id of activeRunIds) {
       runsFor(key).set(id, { status: "killed", acknowledged: true, sequence });
     }
-    const fields = {
+    commitRun(value, sequence, {
       activeRunIds: [],
       hasActiveRun: false,
       hasActiveSubagentRun: false,
       status: aborted ? "killed" : value.row.status === "running" ? "done" : value.row.status,
       ...(aborted ? { abortedLastRun: true, lastRunError: undefined } : {}),
       updatedAt: Math.max(Date.now(), (value.row.updatedAt ?? 0) + 1),
-    };
-    value.lastRunEventSequence = sequence;
-    value.row = { ...value.row, ...fields };
-    for (const field of Object.keys(fields)) {
-      value.changed.add(field);
-    }
+    });
   };
   // Abort receipts are lifecycle writes; a returned receipt replaces the chat.abort reply.
   const commitAbort = (method: string, params: unknown, response: unknown) => {

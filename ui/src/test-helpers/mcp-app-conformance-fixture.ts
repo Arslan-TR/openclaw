@@ -35,12 +35,11 @@ export function observeMcpAppNetwork(
   label: string,
   diagnostics: Array<Record<string, unknown>>,
 ) {
+  const record = (event: string, detail: Record<string, unknown>) =>
+    diagnostics.push({ host: label, atMs: Date.now(), event, ...detail });
   page.on("request", (request) => {
     if (request.url().includes("mcp-app")) {
-      diagnostics.push({
-        host: label,
-        atMs: Date.now(),
-        event: "request",
+      record("request", {
         method: request.method(),
         pathname: new URL(request.url()).pathname,
       });
@@ -48,30 +47,21 @@ export function observeMcpAppNetwork(
   });
   page.on("response", (response) => {
     if (response.url().includes("mcp-app")) {
-      diagnostics.push({
-        host: label,
-        atMs: Date.now(),
-        event: "response",
+      record("response", {
         status: response.status(),
         pathname: new URL(response.url()).pathname,
       });
     }
   });
   page.on("requestfailed", (request) =>
-    diagnostics.push({
-      host: label,
-      atMs: Date.now(),
-      event: "requestfailed",
+    record("requestfailed", {
       method: request.method(),
       pathname: new URL(request.url()).pathname,
       error: request.failure()?.errorText,
     }),
   );
   page.on("pageerror", (error) =>
-    diagnostics.push({
-      host: label,
-      atMs: Date.now(),
-      event: "pageerror",
+    record("pageerror", {
       message: error.message,
     }),
   );
@@ -654,20 +644,16 @@ await server.connect(new ObservedStdioTransport());
 }
 
 export async function findAppFrame(page: Page): Promise<Frame> {
+  const initializedFrame = async () => {
+    for (const frame of page.frames()) {
+      if ((await frame.locator("#initialized").count()) > 0) {
+        return frame;
+      }
+    }
+    return undefined;
+  };
   try {
-    await expect
-      .poll(
-        async () => {
-          for (const frame of page.frames()) {
-            if ((await frame.locator("#initialized").count()) > 0) {
-              return 1;
-            }
-          }
-          return 0;
-        },
-        { timeout: 20_000 },
-      )
-      .toBeGreaterThan(0);
+    await expect.poll(initializedFrame, { timeout: 20_000 }).toBeDefined();
   } catch (error) {
     const component = await page.evaluate(() => {
       const view = document.querySelector("mcp-app-view");
@@ -699,13 +685,7 @@ export async function findAppFrame(page: Page): Promise<Frame> {
       { cause: error },
     );
   }
-  let frame: Frame | undefined;
-  for (const candidate of page.frames()) {
-    if ((await candidate.locator("#initialized").count()) > 0) {
-      frame = candidate;
-      break;
-    }
-  }
+  const frame = await initializedFrame();
   if (!frame) {
     throw new Error("MCP App inner frame not found");
   }

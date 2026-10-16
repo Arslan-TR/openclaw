@@ -18,12 +18,6 @@ export function createControlUiMockResponses(
     match?: Record<string, unknown>;
     response?: unknown;
   };
-  type BrowserMethodResponseCases = {
-    cases?: BrowserMethodResponseCase[];
-  };
-  type BrowserMethodResponseSequence = {
-    sequence?: unknown[];
-  };
   const methodResponseSequenceIndexes = new Map<string, number>();
   const sessions = input.sessions;
 
@@ -71,21 +65,15 @@ export function createControlUiMockResponses(
     if (!input.agentModel || !isRecord(value)) {
       return value;
     }
-    const applyAgentsList = (agentsList: unknown): unknown => {
-      if (!isRecord(agentsList) || !Array.isArray(agentsList.agents)) {
-        return agentsList;
-      }
+    if (method === "agents.list" && Array.isArray(value.agents)) {
       return {
-        ...agentsList,
-        agents: agentsList.agents.map((agent) =>
+        ...value,
+        agents: value.agents.map((agent) =>
           isRecord(agent) && !Object.hasOwn(agent, "model")
             ? { ...agent, model: { primary: input.agentModel } }
             : agent,
         ),
       };
-    };
-    if (method === "agents.list") {
-      return applyAgentsList(value);
     }
     return value;
   }
@@ -115,14 +103,12 @@ export function createControlUiMockResponses(
       return true;
     }
     const entries = Object.entries(match);
-    if (entries.length === 0) {
-      return true;
-    }
-    if (!isRecord(params)) {
-      return false;
-    }
-    return entries.every(
-      ([key, expected]) => Object.hasOwn(params, key) && valuesEqual(params[key], expected),
+    return (
+      entries.length === 0 ||
+      (isRecord(params) &&
+        entries.every(
+          ([key, expected]) => Object.hasOwn(params, key) && valuesEqual(params[key], expected),
+        ))
     );
   }
 
@@ -130,16 +116,14 @@ export function createControlUiMockResponses(
     if (!isRecord(value)) {
       return null;
     }
-    const maybeCases = (value as BrowserMethodResponseCases).cases;
-    return Array.isArray(maybeCases) ? maybeCases : null;
+    return Array.isArray(value.cases) ? value.cases : null;
   }
 
   function responseSequence(value: unknown): unknown[] | null {
     if (!isRecord(value)) {
       return null;
     }
-    const maybeSequence = (value as BrowserMethodResponseSequence).sequence;
-    return Array.isArray(maybeSequence) ? maybeSequence : null;
+    return Array.isArray(value.sequence) ? value.sequence : null;
   }
 
   function configuredResponse(

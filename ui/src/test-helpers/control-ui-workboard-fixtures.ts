@@ -31,7 +31,6 @@ export function buildWorkboardMocks(
     priority: string,
     position: number,
     labels: string[],
-    notes = "",
     sessionKey?: string,
   ) => ({
     id,
@@ -39,7 +38,7 @@ export function buildWorkboardMocks(
     status,
     priority,
     labels,
-    notes,
+    notes: "",
     sessionKey,
     position,
     createdAt: baseTime - 86_400_000,
@@ -48,65 +47,49 @@ export function buildWorkboardMocks(
   });
   const cards = [
     card("card-inbox", "Capture customer feedback themes", "todo", "normal", 1, ["research"]),
-    card(
-      "card-brief",
-      "Draft weekly product brief",
-      "todo",
-      "low",
-      2,
-      ["writing"],
-      "",
-      briefSessionKey,
-    ),
-    card(
-      "card-ready",
-      "Prepare launch readiness checklist",
-      "ready",
-      "high",
-      1,
-      ["launch"],
-      "",
-      launchSessionKey,
-    ),
-    card(
-      "card-running",
-      "Validate onboarding flow",
-      "running",
-      "urgent",
-      1,
-      ["quality"],
-      "",
-      onboardingSessionKey,
-    ),
-    card(
-      "card-review",
-      "Review accessibility audit",
-      "review",
-      "high",
-      1,
-      ["frontend"],
-      "",
-      accessibilitySessionKey,
-    ),
-    card(
-      "card-blocked",
-      "Confirm staging environment access",
-      "blocked",
-      "normal",
-      1,
-      ["ops"],
-      "",
-      stagingSessionKey,
-    ),
-    card(
-      "card-done",
-      "Publish support handoff notes",
-      "done",
-      "low",
-      1,
-      ["docs"],
-      "",
-      handoffSessionKey,
+    ...(
+      [
+        ["brief", "Draft weekly product brief", "todo", "low", 2, "writing", briefSessionKey],
+        [
+          "ready",
+          "Prepare launch readiness checklist",
+          "ready",
+          "high",
+          1,
+          "launch",
+          launchSessionKey,
+        ],
+        [
+          "running",
+          "Validate onboarding flow",
+          "running",
+          "urgent",
+          1,
+          "quality",
+          onboardingSessionKey,
+        ],
+        [
+          "review",
+          "Review accessibility audit",
+          "review",
+          "high",
+          1,
+          "frontend",
+          accessibilitySessionKey,
+        ],
+        [
+          "blocked",
+          "Confirm staging environment access",
+          "blocked",
+          "normal",
+          1,
+          "ops",
+          stagingSessionKey,
+        ],
+        ["done", "Publish support handoff notes", "done", "low", 1, "docs", handoffSessionKey],
+      ] as const
+    ).map(([id, title, status, priority, position, label, key]) =>
+      card(`card-${id}`, title, status, priority, position, [label], key),
     ),
   ];
   const statuses = ["todo", "ready", "running", "review", "blocked", "done"];
@@ -130,7 +113,7 @@ export function buildWorkboardMocks(
     id: string,
     title: string,
     status: string,
-    position: number,
+    position = 1000,
     session = true,
   ) => ({
     ...card(
@@ -140,7 +123,6 @@ export function buildWorkboardMocks(
       "normal",
       position,
       ["synthetic"],
-      "",
       session ? `agent:main:card-states-${id}` : undefined,
     ),
     metadata: { automation: { boardId: "card-states" } },
@@ -151,7 +133,6 @@ export function buildWorkboardMocks(
         "rich",
         "Review the complete release handoff, including accessibility findings, localization notes, and the final owner checklist ✨",
         "review",
-        1000,
       ),
       priority: "high",
       labels: [
@@ -259,7 +240,7 @@ export function buildWorkboardMocks(
       },
     },
     {
-      ...stateCard("stale", "Investigate a run with no recent session activity", "running", 1000),
+      ...stateCard("stale", "Investigate a run with no recent session activity", "running"),
       labels: [],
       metadata: {
         automation: { boardId: "card-states" },
@@ -270,8 +251,8 @@ export function buildWorkboardMocks(
         },
       },
     },
-    stateCard("missing", "Reconnect a session that is absent from the directory", "todo", 1000),
-    stateCard("queued", "Wait for the task worker to accept the request", "ready", 1000),
+    stateCard("missing", "Reconnect a session that is absent from the directory", "todo"),
+    stateCard("queued", "Wait for the task worker to accept the request", "ready"),
     stateCard("running", "Collect the remaining release checklist findings", "running", 2000),
     stateCard("timeout", "Retry the environment check after its deadline", "blocked", 2000),
     stateCard("stopped", "Resume a task stopped by the operator", "blocked", 3000),
@@ -431,6 +412,16 @@ export function buildWorkboardMocks(
   const history = (...messages: Parameters<typeof chatHistoryMessage>[]) => ({
     messages: messages.map((message) => chatHistoryMessage(...message)),
   });
+  const conversation = (
+    user: string,
+    userMinutes: number,
+    assistant: string,
+    assistantMinutes: number,
+  ) =>
+    history(
+      ["user", user, baseTime - userMinutes * 60_000],
+      ["assistant", assistant, baseTime - assistantMinutes * 60_000],
+    );
   const cardSessionHistories = {
     ...Object.fromEntries(
       cardSessions
@@ -449,54 +440,30 @@ export function buildWorkboardMocks(
       "Draft this week's product brief from the latest feedback and delivery notes.",
       baseTime - 2 * 60_000,
     ]),
-    [launchSessionKey]: history(
-      [
-        "user",
-        "Prepare the launch readiness checklist. I will provide the release scope before we start.",
-        baseTime - 15 * 60_000,
-      ],
-      [
-        "assistant",
-        "The checklist outline is ready. Share the release scope when you are ready to continue.",
-        baseTime - 12 * 60_000,
-      ],
+    [launchSessionKey]: conversation(
+      "Prepare the launch readiness checklist. I will provide the release scope before we start.",
+      15,
+      "The checklist outline is ready. Share the release scope when you are ready to continue.",
+      12,
     ),
-    [stagingSessionKey]: history(
-      [
-        "user",
-        "Confirm that the staging environment is accessible for the release review.",
-        baseTime - 7 * 60_000,
-      ],
-      [
-        "assistant",
-        "The staging access check failed: the environment returned HTTP 403. An operator needs to restore access before I can retry.",
-        baseTime - 5 * 60_000,
-      ],
+    [stagingSessionKey]: conversation(
+      "Confirm that the staging environment is accessible for the release review.",
+      7,
+      "The staging access check failed: the environment returned HTTP 403. An operator needs to restore access before I can retry.",
+      5,
     ),
-    [handoffSessionKey]: history(
-      [
-        "user",
-        "Prepare the support handoff notes covering the launch checklist and known limitations.",
-        baseTime - 40 * 60_000,
-      ],
-      [
-        "assistant",
-        "The support handoff notes are complete, including escalation contacts and known limitations. The operator has reviewed and published them.",
-        baseTime - 30 * 60_000,
-      ],
+    [handoffSessionKey]: conversation(
+      "Prepare the support handoff notes covering the launch checklist and known limitations.",
+      40,
+      "The support handoff notes are complete, including escalation contacts and known limitations. The operator has reviewed and published them.",
+      30,
     ),
     [onboardingSessionKey]: {
-      ...history(
-        [
-          "user",
-          "Validate the onboarding flow, including account setup and the first successful task.",
-          baseTime - 8 * 60_000,
-        ],
-        [
-          "assistant",
-          "Account setup is working. I am checking the first-task flow and its empty and error states.",
-          baseTime - 60_000,
-        ],
+      ...conversation(
+        "Validate the onboarding flow, including account setup and the first successful task.",
+        8,
+        "Account setup is working. I am checking the first-task flow and its empty and error states.",
+        1,
       ),
       inFlightRun: {
         runId: "workboard-onboarding-run",
@@ -505,17 +472,11 @@ export function buildWorkboardMocks(
         events: [],
       },
     },
-    [accessibilitySessionKey]: history(
-      [
-        "user",
-        "Review keyboard navigation, focus visibility, and form labels in the onboarding flow.",
-        baseTime - 20 * 60_000,
-      ],
-      [
-        "assistant",
-        "The accessibility review is complete. Keyboard navigation, visible focus, and form labels are ready for operator review.",
-        baseTime - 3 * 60_000,
-      ],
+    [accessibilitySessionKey]: conversation(
+      "Review keyboard navigation, focus visibility, and form labels in the onboarding flow.",
+      20,
+      "The accessibility review is complete. Keyboard navigation, visible focus, and form labels are ready for operator review.",
+      3,
     ),
   };
   return {
