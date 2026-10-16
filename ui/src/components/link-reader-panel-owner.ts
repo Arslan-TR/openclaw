@@ -126,6 +126,8 @@ export class LinkReaderPanelOwner {
   activeId: string | null = null;
   private nextTabId = 0;
   private requestAbort: AbortController | null = null;
+  private recoveryScope: string | undefined;
+  private reloadPending = false;
   private returnFocus: HTMLElement | null = null;
   private scrollContent = false;
   private focusAddress = false;
@@ -204,16 +206,22 @@ export class LinkReaderPanelOwner {
       (!previousReaders ||
         previousReaders.length !== this.readers.length ||
         previousReaders.some((reader, index) => reader !== this.readers[index]));
-    if (
+    const identityChanged =
       changed.has("client") ||
-      changed.has("available") ||
       changed.has("agentId") ||
-      readersChanged
-    ) {
-      // Cached documents belong to this connection epoch, never a replacement gateway.
+      this.recoveryScope !== this.client?.recoveryScope;
+    this.recoveryScope = this.client?.recoveryScope;
+    if (identityChanged) {
       this.resetTabViews();
     }
+    if (changed.has("available") && !this.available) {
+      this.abortRequest();
+      this.reloadPending = true;
+    }
     if (readersChanged && this.available) {
+      this.abortRequest();
+      this.reloadPending = true;
+      const previousTarget = this.target;
       // Disabled or replaced contributions cannot retain old data or request authority.
       this.tabs = this.tabs.flatMap((tab) => {
         const current = tabTarget(tab);
@@ -221,6 +229,7 @@ export class LinkReaderPanelOwner {
           return this.readers.length > 0 ? [tab] : [];
         }
         if (!resolveLinkReaderTarget(current.href, this.readers)) {
+          this.setTabView(tab, { status: "idle" });
           return [];
         }
         tab.history = tab.history.flatMap((entry) => {
@@ -228,12 +237,17 @@ export class LinkReaderPanelOwner {
           return resolved ? [resolved] : [];
         });
         tab.index = tab.history.findIndex((entry) => entry.href === current.href);
+        if (tabTarget(tab)?.reader !== current.reader) {
+          this.setTabView(tab, { status: "idle" });
+        }
         return [tab];
       });
       if (!this.tabs.some((tab) => tab.id === this.activeId)) {
         this.activeId = this.tabs[0]?.id ?? null;
       }
-      this.urlDraft = this.target?.href ?? "";
+      if (this.target?.href !== previousTarget?.href) {
+        this.urlDraft = this.target?.href ?? "";
+      }
       if (this.tabs.length === 0 && previousReaders?.length) {
         this.closePanel();
       }
@@ -261,7 +275,14 @@ export class LinkReaderPanelOwner {
       this.createTab();
       this.focusAddress = false;
     }
-    if (this.isConnected && this.panelPresented && this.activeTab?.view.status === "idle") {
+    if (
+      this.isConnected &&
+      this.panelPresented &&
+      this.available &&
+      this.activeTab &&
+      (this.activeTab.view.status === "idle" || this.reloadPending)
+    ) {
+      this.reloadPending = false;
       void this.loadDetail();
     }
   }
@@ -504,6 +525,9 @@ export class LinkReaderPanelOwner {
   }
   commitUrl(event: Event): void {
     event.preventDefault();
+    if (!this.available) {
+      return;
+    }
     const draft = this.urlDraft.trim();
     const target = resolveLinkReaderTarget(
       /^[a-z][a-z0-9+.-]*:/iu.test(draft) ? draft : "https://" + draft,
@@ -529,7 +553,9 @@ export class LinkReaderPanelOwner {
     }
     const request = new AbortController();
     this.requestAbort = request;
-    tab.view = { status: "loading" };
+    if (tab.view.status !== "ready") {
+      tab.view = { status: "loading" };
+    }
     const isCurrent = () =>
       this.requestAbort === request &&
       !request.signal.aborted &&
@@ -584,7 +610,7 @@ export class LinkReaderPanelOwner {
         this.requestUpdate();
       }
     } catch (error) {
-      if (isCurrent()) {
+      if (isCurrent() && tab.view.status !== "ready") {
         tab.view = { status: "error", message: linkReaderErrorMessage(error) };
         this.requestUpdate();
       }

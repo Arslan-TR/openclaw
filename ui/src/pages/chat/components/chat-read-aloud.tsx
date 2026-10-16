@@ -29,7 +29,19 @@ export function ReadAloud(props: { text: string }) {
     setPlaying(false);
   };
   const playbackIdentity = createMemo(
-    () => [gateway.read().snapshot.client, gateway.read().snapshot.phase, props.text] as const,
+    () => {
+      const { snapshot, connectionRevision } = gateway.read();
+      return [
+        snapshot.client,
+        snapshot.client?.recoveryScope,
+        snapshot.client?.offlineRecoveryRetired,
+        connectionRevision,
+        props.text,
+        snapshot.phase === "connected" &&
+          snapshot.hello !== null &&
+          !canCallGatewayMethod(snapshot, "tts.speak", "operator.write"),
+      ] as const;
+    },
     { equals: (before, after) => before.every((value, index) => value === after[index]) },
   );
   createEffect(playbackIdentity, () => {
@@ -57,10 +69,8 @@ export function ReadAloud(props: { text: string }) {
       return;
     }
     const current = ++generation;
-    const isCurrent = () =>
-      current === generation &&
-      context.gateway.snapshot.client === client &&
-      context.gateway.snapshot.phase === "connected";
+    const connectionGeneration = client.connectionGeneration;
+    const isCurrent = () => current === generation && context.gateway.snapshot.client === client;
     setPlaying(true);
     setError("");
     try {
@@ -69,7 +79,7 @@ export function ReadAloud(props: { text: string }) {
         client,
         props.text,
         "tts.speak",
-        isCurrent,
+        () => isCurrent() && available() && client.connectionGeneration === connectionGeneration,
         resolveSpeechTextLimit(snapshot?.runtimeConfig ?? snapshot?.config),
       );
     } catch (cause) {
@@ -84,7 +94,7 @@ export function ReadAloud(props: { text: string }) {
   };
   const label = () => t(playing() ? "chat.messages.stopReading" : "chat.messages.readAloud");
   return (
-    <Show when={available()}>
+    <Show when={playing() || available()}>
       <openclaw-tooltip prop:content={error() || label()}>
         <button
           class="chat-read-aloud-btn"

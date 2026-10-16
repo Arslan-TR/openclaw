@@ -23,6 +23,7 @@ import { MarkdownHtml } from "../../../components/solid/markdown-html.tsx";
 import "../../../components/tooltip.ts";
 import { McpAppPanel } from "../../../components/solid/mcp-app-panel.tsx";
 import { registerFilePreviewEnglish } from "../../../i18n/locales/en-file-preview.ts";
+import { createCanvasFramePresentation } from "../../../lib/chat/canvas-frame-presentation.ts";
 import {
   resolveCanvasIframeUrl,
   resolveEmbedSandbox,
@@ -384,18 +385,26 @@ function CanvasPreview(props: {
       props.canvasPluginSurfaceUrl,
       props.allowExternalEmbedUrls ?? false,
     );
-  // A changed sandbox, URL, or height restarts the iframe, matching the original keyed preview.
+  let initialized = false;
+  const presentation = createCanvasFramePresentation(
+    () => `${sandbox()}\0${props.content.entryUrl ?? ""}\0${src() ? 1 : 0}`,
+    src,
+    () => initialized,
+  );
   return (
-    <Show
-      when={`${sandbox()}\u0000${src() ?? ""}\u0000${props.content.preferredHeight ?? ""}`}
-      keyed
-    >
+    <Show when={presentation.identity()} keyed>
       {(_identity) => (
         <iframe
+          ref={() => {
+            initialized = false;
+          }}
+          onLoad={() => {
+            initialized = true;
+          }}
           class="chat-tool-card__preview-frame"
           title={props.title}
           sandbox={sandbox()}
-          src={src() ?? undefined}
+          src={presentation.src()}
           style={{
             height: props.content.preferredHeight
               ? `${props.content.preferredHeight}px`

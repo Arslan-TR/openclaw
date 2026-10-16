@@ -59,7 +59,10 @@ export type TerminalPanelAction =
 
 export type TerminalPanelOpenAction = Extract<TerminalPanelAction, { kind: "catalog" | "open" }>;
 
-export type TerminalPanelError = { text: string; retryAction?: TerminalPanelOpenAction };
+export type TerminalPanelError = {
+  text: string;
+  retryAction?: TerminalPanelOpenAction | { kind: "resume" };
+};
 
 export type TerminalPanelSessionControllerState = {
   tabs: TerminalPanelSessionTab[];
@@ -74,6 +77,7 @@ export interface TerminalPanelSessionControllerHost {
   requestUpdate(): void;
   readonly isConnected: boolean;
   readonly client: TerminalGatewayClient | null;
+  readonly gatewayConnected: boolean;
   readonly agentId: string | null;
   readonly sessionKey: string | null;
   readonly available: boolean;

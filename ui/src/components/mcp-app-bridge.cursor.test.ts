@@ -27,6 +27,7 @@ it("round-trips opaque list cursors through the installed AppBridge transport", 
   bindMcpAppResourceHandlers({
     bridge,
     request,
+    releaseResourceSubscription: vi.fn(async () => ({})),
     sessionKey: "one",
     viewId: "app",
     iframe: document.createElement("iframe"),

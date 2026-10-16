@@ -366,6 +366,7 @@ export function renderPreview(
 }
 
 export type CacheEntry = {
+  generation: number | undefined;
   preview?: ControlUiLinkReaderPreview;
   expiresAt: number;
   promise: Promise<ControlUiLinkReaderPreview>;
@@ -374,7 +375,6 @@ export type CacheEntry = {
 };
 
 export type PreviewContext = {
-  generation: number;
   recoveryScope: string;
   succeeded: boolean;
 };
@@ -393,13 +393,8 @@ export function previewContextFor(
   }
   const key = agentId ?? "";
   let context = contexts.get(key);
-  if (
-    !context ||
-    context.generation !== client.connectionGeneration ||
-    context.recoveryScope !== client.recoveryScope
-  ) {
+  if (!context || context.recoveryScope !== client.recoveryScope) {
     context = {
-      generation: client.connectionGeneration,
       recoveryScope: client.recoveryScope,
       succeeded: false,
     };

@@ -1,4 +1,6 @@
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js";
+import { gatewayPresentationScope } from "../app/gateway-presentation-scope.ts";
+import { hasOperatorReadAccess } from "../app/operator-access.ts";
 import { formatUiError } from "../lib/format-error.ts";
 import { projectGateway } from "../lib/reactive/application.ts";
 import { useApplication } from "../lib/reactive/context.ts";
@@ -29,6 +31,13 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
       return controller;
     };
     controllers.set(host, controller);
+    let { client, phase, hello } = context.gateway.snapshot;
+    const stopConnection = context.gateway.subscribe((snapshot) => {
+      if (snapshot.client !== client || snapshot.phase !== phase || snapshot.hello !== hello) {
+        controller.connectionChanged();
+      }
+      ({ client, phase, hello } = snapshot);
+    });
     const binding = createMemo(
       () => {
         gateway?.read();
@@ -38,7 +47,10 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
           props.viewId,
           props.agentId,
           context?.gateway.connectionRevision,
-          context?.gateway.snapshot.hello,
+          context ? gatewayPresentationScope(context.gateway).key : undefined,
+          context?.gateway.snapshot.phase === "connected" &&
+            Boolean(context.gateway.snapshot.hello) &&
+            !hasOperatorReadAccess(context.gateway.snapshot.hello?.auth ?? null),
         ] as const;
       },
       { equals: (a, b) => a.every((value, index) => value === b[index]) },
@@ -62,6 +74,7 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
       () => controller.updateReservedHeight(),
     );
     onCleanup(() => {
+      stopConnection();
       controllers.delete(host);
       void controller.teardown();
     });
@@ -103,6 +116,13 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
               {t("mcpApp.unavailable", {
                 error: formatUiError(error(), t("mcpApp.errors.requestFailed")),
               })}
+              <button
+                type="button"
+                disabled={gateway?.read().snapshot.phase !== "connected"}
+                onClick={() => void controller.setup(controller.binding())}
+              >
+                {t("mcpApp.retry")}
+              </button>
             </div>
           )}
         </Show>

@@ -47,6 +47,9 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
   private connection: TerminalConnection | null = null;
   private activeClient: TerminalGatewayClient | null = null;
   private activeAvailable = false;
+  private activeConnected = true;
+  private activeRecoveryScope: string | undefined;
+  private recoveryRetired = false;
   private hadClient = false;
   private hadAvailable = false;
   private lifecycleGeneration = 0;
@@ -54,6 +57,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
   private lifecycleSyncToken = 0;
   private tabSequence = 0;
   private pendingRestore: TerminalRestoreBatch | null = null;
+  private readonly unresolvedSessionIds = new Set<string>();
   private intentQueue = terminalIntentQueue;
   private readonly bootQueue = new TerminalTaskQueue();
   private readonly intentHost: TerminalIntentHost;
@@ -68,6 +72,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
         this.host.client !== null &&
         this.host.client === this.activeClient &&
         this.host.available &&
+        this.host.gatewayConnected &&
         // Closed lazy shells must not consume work without a rendered viewport.
         this.host.terminalPanelOpen &&
         this.host.isConnected,
@@ -132,7 +137,10 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     this.host.requestUpdate();
   }
 
-  setError(text: string | null, retryAction?: TerminalPanelOpenAction): TerminalPanelError | null {
+  setError(
+    text: string | null,
+    retryAction?: TerminalPanelError["retryAction"],
+  ): TerminalPanelError | null {
     this.updateControllerState({ error: text ? { text, retryAction } : null });
     return this.error;
   }
@@ -143,6 +151,10 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       return;
     }
     this.setError(null);
+    if (action.kind === "resume") {
+      void this.resumeTransport();
+      return;
+    }
     void this.intentQueue.queue(action);
   }
 
@@ -151,7 +163,11 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       this.intentQueue = new TerminalIntentQueue(false);
     }
     this.activeClient = this.host.client;
+    this.activeRecoveryScope =
+      this.host.client?.recoveryScopeReady === false ? undefined : this.host.client?.recoveryScope;
+    this.recoveryRetired = this.host.client?.offlineRecoveryRetired === true;
     this.activeAvailable = this.host.available;
+    this.activeConnected = this.host.gatewayConnected;
     this.hadClient = this.host.client !== null;
     this.hadAvailable = this.host.available;
     // Latest mount executes: on a session route the side-panel terminal takes
@@ -207,15 +223,41 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
   }
 
   private synchronizeLifecycle(): void {
-    const clientChanged = this.host.client !== this.activeClient;
+    const recoveryScope = this.host.client?.recoveryScope;
+    const recoveryRetired = this.host.client?.offlineRecoveryRetired === true;
+    const identityChanged =
+      (this.host.client?.recoveryScopeReady !== false &&
+        this.activeRecoveryScope !== undefined &&
+        recoveryScope !== this.activeRecoveryScope) ||
+      (recoveryRetired && !this.recoveryRetired);
+    const clientChanged = this.host.client !== this.activeClient || identityChanged;
     const availabilityChanged = this.host.available !== this.activeAvailable;
-    if (!clientChanged && !availabilityChanged) {
+    const connectionChanged = this.host.gatewayConnected !== this.activeConnected;
+    if (!clientChanged && !availabilityChanged && !connectionChanged) {
+      return;
+    }
+    this.activeConnected = this.host.gatewayConnected;
+    this.recoveryRetired = recoveryRetired;
+    if (this.host.client?.recoveryScopeReady !== false) {
+      this.activeRecoveryScope = recoveryScope;
+    }
+    if (!clientChanged && !this.host.gatewayConnected) {
+      this.suspendTransport();
+      return;
+    }
+    if (!clientChanged && connectionChanged && this.host.available) {
+      void this.resumeTransport();
       return;
     }
     const becameAvailable = availabilityChanged && this.host.available && this.hadAvailable;
     const priorEpoch = (clientChanged && this.hadClient) || becameAvailable;
     const reconnecting = this.host.client !== null && priorEpoch;
     if (clientChanged) {
+      this.unresolvedSessionIds.clear();
+      if (identityChanged) {
+        persistTerminalSessionIds([], this.storageScope);
+        this.intentQueue.cancel(this.intentHost);
+      }
       this.activeClient = this.host.client;
       this.hadClient ||= this.host.client !== null;
     }
@@ -246,6 +288,60 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     }
   }
 
+  private suspendTransport(): void {
+    this.retireOperations();
+    this.connection?.suspend();
+    for (const tab of this.tabs) {
+      tab.pendingInput.drain();
+      const awaitFirstOutput = tab.awaitFirstOutput;
+      this.readiness.stop(tab);
+      tab.awaitFirstOutput = awaitFirstOutput;
+      if (!tab.gatewaySessionId) {
+        tab.cancelled = "lifecycle";
+        this.removeTab(tab);
+      } else {
+        tab.controller.setReadOnly(true);
+      }
+    }
+    this.host.terminalPanelUploadController.suspend();
+    this.updateControllerState({ booting: false });
+  }
+
+  private async resumeTransport(): Promise<void> {
+    const operation = this.captureTerminalOperation();
+    if (!operation) {
+      return;
+    }
+    try {
+      await this.connection?.resume();
+      if (!this.isTerminalOperationCurrent(operation)) {
+        return;
+      }
+      for (const tab of this.tabs) {
+        this.readiness.arm(tab);
+        tab.controller.setReadOnly(tab.status === "exited");
+        if (tab.status !== "exited") {
+          const { cols, rows } = tab.controller.terminal;
+          void this.connection?.resize(tab.gatewaySessionId, cols || 80, rows || 24).catch(() => {
+            if (this.isTerminalOperationCurrent(operation)) {
+              this.setError(t("terminal.deliveryFailed"));
+            }
+          });
+        }
+      }
+      if (this.host.terminalPanelOpen) {
+        await this.restoreSessions();
+      } else {
+        void this.intentQueue.drain();
+      }
+    } catch (error) {
+      if (this.isTerminalOperationCurrent(operation)) {
+        this.setError(`${t("terminal.attachFailed")}: ${formatUiError(error)}`, { kind: "resume" });
+      }
+    }
+    this.host.requestUpdate();
+  }
+
   restoreSessions(): Promise<void> {
     return this.intentQueue.queue({ kind: "restore", agentId: this.host.agentId?.trim() || null });
   }
@@ -260,12 +356,17 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
 
   private async reattachPersistedSessions(cancelIntent?: () => void): Promise<boolean> {
     const operation = this.captureTerminalOperation();
-    if (!operation || this.tabs.length > 0) {
+    if (!operation) {
       return false;
     }
-    const persisted = loadPersistedTerminalSessionIds(this.storageScope);
+    const persisted = loadPersistedTerminalSessionIds(this.storageScope).filter(
+      (sessionId) => !this.tabs.some((tab) => tab.gatewaySessionId === sessionId),
+    );
     if (persisted.length === 0) {
       return false;
+    }
+    for (const sessionId of persisted) {
+      this.unresolvedSessionIds.add(sessionId);
     }
     // Readiness can persist an adopted tab while later attaches are still pending.
     // Retain those ids until this generation resolves or deliberately removes them.
@@ -289,27 +390,33 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
         if (!session) {
           await this.restoreExitedSession(sessionId, restore);
         } else {
-          await this.attachSession(
+          const attached = await this.attachSession(
             sessionId,
             operation,
             session.owner?.startsWith("agent:") === true,
             restore,
           );
+          if (!attached && restore.pending.has(sessionId)) {
+            throw new Error(t("terminal.attachFailed"));
+          }
         }
         if (!this.isTerminalOperationCurrent(operation, restore)) {
           return false;
         }
         restore.pending.delete(sessionId);
+        this.unresolvedSessionIds.delete(sessionId);
         this.persistSessions();
       }
-    } catch {
-      // A failed restore falls through to a fresh session below.
+    } catch (error) {
+      if (this.isTerminalOperationCurrent(operation, restore)) {
+        this.setError(`${t("terminal.attachFailed")}: ${formatUiError(error)}`);
+        return true;
+      }
     } finally {
       restore.input.stop();
       if (this.isTerminalOperationCurrent(operation, restore)) {
         this.pendingRestore = null;
         this.updateControllerState({ booting: false });
-        // Completed failures keep the existing pruning policy, including list failure.
         this.persistSessions();
       }
     }
@@ -327,7 +434,12 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     }
     const sessions = await this.connectionFor(operation)
       .list()
-      .catch(() => []);
+      .catch((error) => {
+        if (this.isTerminalOperationCurrent(operation)) {
+          this.setError(`${t("terminal.attachFailed")}: ${formatUiError(error)}`);
+        }
+        return null;
+      });
     return this.isTerminalOperationCurrent(operation) ? sessions : null;
   }
 
@@ -382,6 +494,14 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       shouldFocusOnOpen: restore && (() => !restore.input.interacted),
       onReady: (tab) => this.readiness.markReady(tab),
       onExit: (tab, info) => this.handleExit(tab.id, info),
+      captureDeliveryError: () => {
+        const delivery = this.captureTerminalOperation();
+        return () => {
+          if (delivery && this.isTerminalOperationCurrent(delivery)) {
+            this.setError(t("terminal.deliveryFailed"));
+          }
+        };
+      },
     });
     if (!this.isTerminalOperationCurrent(operation, options.restore?.batch)) {
       disposeTerminalController(boot.tab.controller, boot.tab.host);
@@ -401,6 +521,12 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     result: TerminalOpenResult,
     agentOwned = false,
   ): void {
+    const generation = this.lifecycleGeneration;
+    const reportDeliveryError = () => {
+      if (generation === this.lifecycleGeneration && this.tabs.includes(tab)) {
+        this.setError(t("terminal.deliveryFailed"));
+      }
+    };
     this.retireRestoredTab(tab);
     delete tab.cancelPendingIntent;
     tab.gatewaySessionId = result.sessionId;
@@ -414,9 +540,11 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     const pendingInput = tab.pendingInput.drain();
     if (tab.status !== "exited") {
       const { cols, rows } = tab.controller.terminal;
-      void this.connection?.resize(result.sessionId, cols || 80, rows || 24);
+      void this.connection
+        ?.resize(result.sessionId, cols || 80, rows || 24)
+        .catch(reportDeliveryError);
       for (const data of pendingInput) {
-        void this.connection?.input(result.sessionId, data);
+        void this.connection?.input(result.sessionId, data).catch(reportDeliveryError);
       }
     }
     if (tab.status === "connecting") {
@@ -649,6 +777,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       return;
     }
     tab.cancelled = "close";
+    this.unresolvedSessionIds.delete(tab.gatewaySessionId);
     tab.cancelPendingIntent?.();
     this.retireRestoredTab(tab);
     this.host.terminalPanelUploadController.cancelForTab(tab);
@@ -680,6 +809,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     if (restore && this.isTerminalOperationCurrent(restore.operation, restore)) {
       for (const [sessionId, pendingTab] of restore.pending) {
         if (pendingTab === tab) {
+          this.unresolvedSessionIds.delete(sessionId);
           restore.userClosedTab ||= tab.cancelled === "close";
           restore.pending.delete(sessionId);
           if (tab.cancelled === "close" && restore.pending.size === 0) {
@@ -696,11 +826,12 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     if (restore && !this.isTerminalOperationCurrent(restore.operation, restore)) {
       return;
     }
-    const ids = new Set(
-      this.tabs
+    const ids = new Set([
+      ...this.tabs
         .filter((tab) => tab.status === "live" && tab.gatewaySessionId)
         .map((tab) => tab.gatewaySessionId),
-    );
+      ...this.unresolvedSessionIds,
+    ]);
     for (const sessionId of restore?.pending.keys() ?? []) {
       ids.add(sessionId);
     }
@@ -714,6 +845,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       !client ||
       client !== this.activeClient ||
       !this.host.available ||
+      !this.host.gatewayConnected ||
       !this.host.isConnected
     ) {
       return null;
@@ -734,6 +866,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     return (
       this.host.isConnected &&
       this.host.available &&
+      this.host.gatewayConnected &&
       this.host.client === operation.client &&
       this.activeClient === operation.client &&
       this.lifecycleGeneration === operation.generation &&
@@ -756,13 +889,17 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
     disposeTerminalController(tab.controller, tab.host);
   }
 
-  private disposeAllTabs(): void {
+  private retireOperations(): void {
     this.lifecycleGeneration += 1;
     this.pendingRestore = null;
     this.intentQueue.resetLifecycle(this.intentHost);
     this.lifecycleAbortController.abort();
     this.lifecycleAbortController = new AbortController();
     this.bootQueue.reset();
+  }
+
+  private disposeAllTabs(): void {
+    this.retireOperations();
     if (this.error?.retryAction) {
       this.setError(this.error.text);
     }

@@ -90,6 +90,46 @@ function appendElement(element: HTMLElement) {
 }
 
 describe("app launch catalog", () => {
+  it("retains expanded discoveries offline, refreshes on reconnect, and clears a changed Gateway", async () => {
+    const refreshed = createDeferred<McpAppDiscoverResult>();
+    const request = vi.fn().mockResolvedValueOnce(result).mockReturnValue(refreshed.promise);
+    const { gateway, publish } = createApplicationGateway();
+    const hello = gatewayHelloForMethods(["mcp.app.discover"]);
+    publish({
+      ...gateway.snapshot,
+      client: createTestGatewayClient(request),
+      phase: "connected",
+      hello,
+    });
+    const context = { ...discoveryContext(request).context, gateway };
+    const catalog = document.createElement("openclaw-mcp-app-catalog");
+    catalog.surface = "thread";
+    catalog.sessionKey = "agent:main:one";
+    provide(catalog, context);
+    appendElement(catalog);
+    await waitForSolid(() => expect(catalog.querySelector("button")).not.toBeNull());
+    catalog.querySelector<HTMLButtonElement>("button")!.click();
+    await waitForSolid(() => expect(catalog.textContent).toContain("Parts tray"));
+    const entry = catalog.querySelector<HTMLButtonElement>(".mcp-app-catalog__entry button")!;
+    publish({ ...gateway.snapshot, phase: "reconnecting", hello: null });
+    flush();
+    expect(catalog.querySelector(".mcp-app-catalog__entry button")).toBe(entry);
+    expect(entry.disabled).toBe(true);
+    publish({ ...gateway.snapshot, phase: "connected", hello });
+    flush();
+    expect(catalog.querySelector(".mcp-app-catalog__entry button")).toBe(entry);
+    expect(entry.disabled).toBe(false);
+    await waitForSolid(() => expect(request).toHaveBeenCalledTimes(2));
+    refreshed.resolve(result);
+    await refreshed.promise;
+    publish({
+      ...gateway.snapshot,
+      client: createTestGatewayClient(vi.fn(() => new Promise(() => {}))),
+    });
+    flush();
+    expect(catalog.textContent).not.toContain("Parts tray");
+  });
+
   it("waits for the new session's discovery before retaining an Apps page launch", async () => {
     // Observe the page-to-conversation contract without loading the conversation runtime.
     const lookup = customElements.get.bind(customElements);

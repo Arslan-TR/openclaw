@@ -42,6 +42,7 @@ export async function bootTerminalPanelSession(params: {
   shouldFocusOnOpen?: () => boolean;
   onReady: (tab: TerminalPanelSessionTab) => void;
   onExit: (tab: TerminalPanelSessionTab, info: Parameters<TerminalSink["onExit"]>[0]) => void;
+  captureDeliveryError: () => (error: unknown) => void;
 }) {
   const { panel, connection } = params;
   const host = document.createElement("div");
@@ -57,8 +58,14 @@ export async function bootTerminalPanelSession(params: {
   }
   viewport.append(host);
   const tabReference: { current?: TerminalPanelSessionTab } = {};
-  const startupInput = createTerminalStartupInput(connection, () =>
-    tabReference.current?.status === "exited" ? undefined : tabReference.current?.gatewaySessionId,
+  const startupInput = createTerminalStartupInput(
+    connection,
+    () =>
+      tabReference.current?.status === "exited"
+        ? undefined
+        : tabReference.current?.gatewaySessionId,
+    params.captureDeliveryError,
+    () => panel.gatewayConnected && panel.available && !tabReference.current?.controller.readOnly,
   );
   const { createTerminalDefaultColorQueryResponder } =
     await import("@openclaw/libterminal/browser");
@@ -135,6 +142,14 @@ export async function bootTerminalPanelSession(params: {
       // Suppress historical queries, then answer only the recovered suffix, including split queries.
       tab.defaultColorQueries.primeFromReplay(data.slice(0, newlyObservedFrom));
       tab.defaultColorQueries.observe(data.slice(newlyObservedFrom));
+      if (mode === "resume") {
+        const suffix = data.slice(newlyObservedFrom);
+        if (suffix) {
+          tab.controller.write(TERMINAL_OUTPUT_ENCODER.encode(suffix));
+          params.onReady(tab);
+        }
+        return undefined;
+      }
       if (mode === "recovery") {
         return replaceTerminalController(tab, createController, data, signal).then((replaced) => {
           if (replaced && !tab.cancelled && !signal.aborted) {

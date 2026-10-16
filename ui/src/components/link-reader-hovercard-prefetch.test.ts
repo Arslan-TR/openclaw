@@ -94,7 +94,6 @@ describe("GitHub hovercard prefetch subscriptions", () => {
   it.each([
     { phase: "pending", change: "connection" },
     { phase: "pending", change: "principal" },
-    { phase: "cached", change: "connection" },
     { phase: "cached", change: "principal" },
   ])("retires $phase inline state after $change changes", async ({ phase, change }) => {
     const { provider, anchor, request } = createIssueLink();

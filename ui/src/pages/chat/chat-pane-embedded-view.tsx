@@ -26,7 +26,8 @@ export function TerminalPanel(props: Props) {
       prop:embedded={true}
       prop:tabsInHeader={props.terminalTabsInHeader}
       prop:onClose={props.onCloseTerminal}
-      prop:client={props.state.connected ? props.state.client : null}
+      prop:client={props.state.client}
+      prop:gatewayConnected={props.state.connected}
       prop:available={props.state.terminalAvailable}
       prop:agentId={props.agentId}
       prop:sessionKey={props.state.sessionKey}
@@ -186,7 +187,7 @@ export function LinkReaderPanel(props: Props) {
       data-sidebar-panel-host
       prop:embedded={true}
       data-chat-autotype-exempt
-      prop:client={props.state.connected ? props.state.client : null}
+      prop:client={props.state.client}
       prop:available={props.state.connected}
       prop:readers={props.linkReaders ?? EMPTY_LINK_READERS}
       prop:agentId={props.agentId ?? undefined}

@@ -308,7 +308,7 @@ describe("generic preview portal lifecycle", () => {
     },
   );
 
-  it.each(["client", "agent", "agent round trip", "connection", "principal"])(
+  it.each(["client", "agent", "agent round trip", "principal"])(
     "retires cached details and requests current metadata after a %s change",
     async (change) => {
       const pending = createDeferred<ReturnType<typeof issuePreviewResponse>>();
@@ -330,8 +330,6 @@ describe("generic preview portal lifecycle", () => {
         if (change === "agent round trip") {
           provider.agentId = undefined;
         }
-      } else if (change === "connection") {
-        client.connectionGeneration += 1;
       } else {
         client.recoveryScope = "principal-b";
       }
@@ -354,6 +352,38 @@ describe("generic preview portal lifecycle", () => {
       expect(titleLinkInCard()?.textContent).toBe("Current identity details");
     },
   );
+
+  it("retains settled plugin previews offline and retries transport failures without negative caching", async () => {
+    const { anchor, provider } = createLink(ISSUE_HREF);
+    const request = vi.fn().mockResolvedValue(issuePreviewResponse());
+    const client = { request, connected: true, connectionGeneration: 1, recoveryScope: "account" };
+    provider.client = client as unknown as GatewayBrowserClient;
+    await hover(anchor);
+    const card = hovercard();
+    client.connected = false;
+    client.connectionGeneration++;
+    provider.readers = [...provider.readers];
+    await provider.updateComplete;
+    expect(hovercard()).toBe(card);
+    expect(titleLinkInCard()?.textContent).toContain("Keep hover previews reachable");
+    leave(anchor);
+    await vi.advanceTimersByTimeAsync(120);
+    await hover(anchor);
+    expect(request).toHaveBeenCalledOnce();
+    client.connected = true;
+    client.connectionGeneration++;
+    leave(anchor);
+    await vi.advanceTimersByTimeAsync(120);
+    client.recoveryScope = "another-account";
+    request.mockRejectedValueOnce(new Error("transport interrupted"));
+    await hover(anchor);
+    expect(titleLinkInCard()).toBeNull();
+    leave(anchor);
+    await vi.advanceTimersByTimeAsync(120);
+    await hover(anchor);
+    expect(titleLinkInCard()?.textContent).toContain("Keep hover previews reachable");
+    expect(request).toHaveBeenCalledTimes(3);
+  });
 
   it.each([
     ["agent", "agent-a"],

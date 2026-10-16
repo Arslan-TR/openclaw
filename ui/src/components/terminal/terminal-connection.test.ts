@@ -402,6 +402,23 @@ describe("TerminalConnection", () => {
     },
   );
 
+  it.each(["terminal.input", "terminal.resize"] as const)(
+    "reports rejected and unconfirmed %s delivery without retiring the session",
+    async (method) => {
+      const { client, conn } = makeHarness();
+      await openSession(conn);
+      const act = () =>
+        method === "terminal.input" ? conn.input("s1", "typed") : conn.resize("s1", 120, 40);
+      client.nextResponse = null;
+      await expect(act()).rejects.toThrow("delivery could not be confirmed");
+      const request = vi.spyOn(client, "request").mockRejectedValueOnce(new Error("offline"));
+      await expect(act()).rejects.toThrow("offline");
+      expect(conn.size).toBe(1);
+      request.mockRestore();
+      conn.dispose();
+    },
+  );
+
   it("buffers an instant exit that races ahead of registration", async () => {
     const { client, conn } = makeHarness();
     const data: string[] = [];

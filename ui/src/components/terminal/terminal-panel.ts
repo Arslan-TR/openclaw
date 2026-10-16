@@ -49,8 +49,9 @@ export class TerminalPanelController extends SolidPanelController {
       )
       .watchStore(() => this.context?.theme);
   }
-  /** Gateway client used for terminal.* RPCs; null until connected. */
+  /** Client identity is retained while its transport reconnects. */
   client: TerminalGatewayClient | null = null;
+  gatewayConnected = true;
   /** Agent whose workspace and sandbox policy own newly opened sessions. */
   agentId: string | null = null;
   /** Conversation that owns newly opened session-scoped terminals. */
@@ -86,7 +87,7 @@ export class TerminalPanelController extends SolidPanelController {
   private async loadSessionPicker(): Promise<void> {
     const generation = ++this.pickerGeneration;
     const client = this.client;
-    if (!client || !this.available) {
+    if (!client || !this.available || !this.gatewayConnected) {
       this.pickerLoading = false;
       this.invalidate();
       return;
@@ -94,7 +95,12 @@ export class TerminalPanelController extends SolidPanelController {
     this.pickerLoading = true;
     this.invalidate();
     const sessions = await this.terminalSessions.listSessions();
-    if (generation !== this.pickerGeneration || client !== this.client || !this.available) {
+    if (
+      generation !== this.pickerGeneration ||
+      client !== this.client ||
+      !this.available ||
+      !this.gatewayConnected
+    ) {
       return;
     }
     if (sessions !== null) {
@@ -111,7 +117,7 @@ export class TerminalPanelController extends SolidPanelController {
           tab.status === "live" &&
           tab.gatewaySessionId,
       ),
-    client: () => this.client,
+    client: () => (this.gatewayConnected && this.available ? this.client : null),
     config: () => this.context?.config,
     isCurrent: (tab) =>
       this.terminalSessions.tabs.includes(tab as TerminalPanelSessionTab) && tab.status === "live",
@@ -197,8 +203,9 @@ export class TerminalPanelController extends SolidPanelController {
       // without restoring them, so re-run the normal open path.
       void this.terminalSessions.restoreSessions();
     }
-    if (changed.has("client") || changed.has("available")) {
-      this.terminalSessions.scheduleLifecycleSync();
+    this.terminalSessions.scheduleLifecycleSync();
+    if (changed.has("gatewayConnected") && this.gatewayConnected && this.sessionPickerOpen) {
+      void this.loadSessionPicker();
     }
     for (const tab of this.terminalSessions.tabs) {
       updateTerminalFont(tab.controller, this.terminalFontFamily);
@@ -455,6 +462,7 @@ export class TerminalPanelController extends SolidPanelController {
   private get sessionPickerProps(): TerminalPanelViewState["picker"] {
     return {
       hosted: this.embedded && this.tabsInHeader,
+      connected: this.gatewayConnected,
       triggerRef: (element) => {
         this.sessionPickerTrigger.value = element;
       },
@@ -507,6 +515,7 @@ export class TerminalPanelController extends SolidPanelController {
               : undefined,
           }
         : null,
+      connected: this.gatewayConnected,
       dockDisabled:
         (this.embedded || this.sessionBottomOnly) && !this.terminalSessions.canHandoffSessions,
       picker: this.sessionPickerProps,
@@ -533,6 +542,7 @@ export type OpenClawTerminalPanel = HTMLElement &
   Pick<
     TerminalPanelController,
     | "client"
+    | "gatewayConnected"
     | "agentId"
     | "sessionKey"
     | "available"

@@ -732,13 +732,48 @@ describe("Plugin link reader panel", () => {
     await expectTitle(panel, "Item 1");
     panel.available = false;
     await panel.updateComplete;
-    expect(panel.querySelector("h1")).toBeNull();
-    expect(panel.querySelector('[role="alert"]')?.textContent).toContain("this connection");
-    expect(panel.querySelector<HTMLButtonElement>(".lr-retry")?.disabled).toBe(true);
+    expect(panel.querySelector("h1")?.textContent).toBe("Item 1");
+    expect(button(panel, "Refresh item").disabled).toBe(true);
     expect(request).toHaveBeenCalledTimes(2);
     panel.available = true;
     await expectTitle(panel, "Item 1");
     expect(request).toHaveBeenCalledTimes(3);
+  });
+  it("retains the loaded document, selected tab, and address draft through a transport blip", async () => {
+    const refreshed = deferredDetail();
+    const request = vi.fn().mockResolvedValueOnce(item()).mockReturnValueOnce(refreshed.promise);
+    const panel = await mount(request);
+    open(panel);
+    await expectTitle(panel, "Item 1");
+    const address = panel.querySelector<HTMLInputElement>(".lr-url")!;
+    address.value = "https://forge.example/items/42";
+    address.dispatchEvent(new Event("input", { bubbles: true }));
+    const selected = panel.activeHostedTabId;
+    const document = panel.querySelector("h1");
+
+    panel.available = false;
+    await panel.updateComplete;
+    expect(panel.querySelector("h1")).toBe(document);
+    expect(address.value).toBe("https://forge.example/items/42");
+    expect(panel.activeHostedTabId).toBe(selected);
+    expect(panel.querySelector<HTMLButtonElement>(".lr-go")?.disabled).toBe(true);
+    expect(request).toHaveBeenCalledTimes(1);
+
+    panel.available = true;
+    await waitForFast(() => expect(request).toHaveBeenCalledTimes(2));
+    expect(panel.querySelector("h1")).toBe(document);
+    expect(address.value).toBe("https://forge.example/items/42");
+    refreshed.resolve({ ...item(), title: "Refreshed item" });
+    await expectTitle(panel, "Refreshed item");
+
+    const replacement = deferredDetail();
+    panel.client = {
+      request: vi.fn().mockReturnValue(replacement.promise),
+    } as unknown as GatewayBrowserClient;
+    await panel.updateComplete;
+    expect(panel.querySelector("h1")).toBeNull();
+    replacement.resolve({ ...item(), title: "Replacement identity" });
+    await expectTitle(panel, "Replacement identity");
   });
   it("drops disabled plugin tabs and fences a response that resolves after removal", async () => {
     const pending = deferredDetail();

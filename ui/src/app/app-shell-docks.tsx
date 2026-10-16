@@ -53,7 +53,7 @@ export function ShellDocks(props: ShellDocksProps): SolidJSX.Element {
       <openclaw-link-reader-panel
         inert={props.navDrawerOpen}
         data-chat-autotype-exempt=""
-        prop:client={client()}
+        prop:client={gateway().client}
         prop:available={gateway().phase === "connected"}
         prop:readers={availableLinkReaders(gateway())}
         prop:agentId={props.selectedAgentId}

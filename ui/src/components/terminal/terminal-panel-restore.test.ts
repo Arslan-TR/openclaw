@@ -459,13 +459,25 @@ describe("terminal persisted restore", () => {
     },
   );
 
-  it("prunes a failed list before opening the existing fresh-session fallback", async () => {
-    const gateway = createGateway();
-    gateway.list.mockRejectedValueOnce(new Error("gateway temporarily unavailable"));
-    const { sessions } = mountPanel(gateway.client);
-    await waitForFast(() => expect(savedIds()).toEqual(["replacement"]));
-    expect(gateway.attaches).toHaveLength(0);
-    expect(sessions.tabs.map((tab) => tab.gatewaySessionId)).toEqual(["replacement"]);
-    expect(sessions.booting).toBe(false);
-  });
+  it.each(["list", "attach"] as const)(
+    "retains restoration ids after a failed %s without opening a replacement",
+    async (stage) => {
+      const gateway = createGateway();
+      const error = new Error("gateway temporarily unavailable");
+      if (stage === "list") {
+        gateway.list.mockRejectedValueOnce(error);
+      }
+      const { sessions } = mountPanel(gateway.client);
+      if (stage === "attach") {
+        const first = await waitForAttach(gateway, 0);
+        first.reject(error);
+      }
+      await waitForFast(() => expect(sessions.error?.text).toMatch(/attach/i));
+      expect(savedIds()).toEqual(["session-a", "session-b"]);
+      expect(gateway.attaches).toHaveLength(stage === "list" ? 0 : 1);
+      expect(sessions.tabs).toEqual([]);
+      expect(gateway.requests.some(({ method }) => method === "terminal.open")).toBe(false);
+      expect(sessions.booting).toBe(false);
+    },
+  );
 });

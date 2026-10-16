@@ -1,6 +1,7 @@
 /* @vitest-environment jsdom */
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../../test/helpers/promise.ts";
 import { refreshControlUiServiceWorker } from "../../app/sw-refresh.runtime.ts";
 import { i18n } from "../../i18n/index.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
@@ -94,6 +95,112 @@ describe("OpenClawTerminalPanel reconnect", () => {
         ({ params }) => typeof params === "object" && params !== null && "catalog" in params,
       ),
     ).toHaveLength(1);
+  });
+
+  it("retains the terminal, selected tab, and upload across a transport blip but retires them on identity change", async () => {
+    const terminal = createTerminalController();
+    createGhosttyTerminalMock.mockResolvedValue(terminal);
+    let listener: Parameters<TerminalGatewayClient["addEventListener"]>[0] | undefined;
+    let failedAttach = false;
+    const request = vi.fn(async (method: string) => {
+      if (method === "terminal.open") {
+        return terminalOpenResult("retained");
+      }
+      if (method === "terminal.attach") {
+        if (!failedAttach) {
+          failedAttach = true;
+          throw new Error("temporary attach failure");
+        }
+        return { ...terminalOpenResult("retained"), buffer: "beforeafter", seq: 11 };
+      }
+      if (method === "terminal.input") {
+        throw new Error("input delivery interrupted");
+      }
+      return { ok: true };
+    });
+    const client: TerminalGatewayClient = {
+      forceReconnect: vi.fn(),
+      recoveryScope: "account-a",
+      request: <T>(method: string) => request(method) as Promise<T>,
+      addEventListener: (next) => {
+        listener = next;
+        return () => {
+          listener = undefined;
+        };
+      },
+    };
+    const panel = createTestTerminalPanel(TERMINAL_PANEL_ELEMENT_NAME);
+    panel.client = client;
+    panel.available = true;
+    document.body.append(panel);
+    panel.toggle();
+    const sessions = terminalSessionsForTest(panel);
+    await waitForFast(() => expect(sessions.tabs[0]?.gatewaySessionId).toBe("retained"));
+    const tab = sessions.tabs[0]!;
+    const activeId = sessions.activeId;
+    listener?.({
+      event: "terminal.data",
+      payload: { sessionId: "retained", seq: 6, data: "before" },
+    });
+    const read = createDeferred<ArrayBuffer>();
+    const file = new File(["pending"], "pending.txt");
+    Object.defineProperty(file, "arrayBuffer", { value: () => read.promise });
+    const drop = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", { value: { types: ["Files"], files: [file] } });
+    panel.renderRoot.querySelector(".tp-viewport")?.dispatchEvent(drop);
+    expect(panel.terminalPanelUploadController.hasPendingBatch()).toBe(true);
+
+    panel.gatewayConnected = false;
+    await panel.updateComplete;
+    await waitForFast(() => expect(terminal.setReadOnly).toHaveBeenCalledWith(true));
+    expect(panel.terminalPanelOpen).toBe(true);
+    expect(sessions.tabs[0]).toBe(tab);
+    expect(sessions.activeId).toBe(activeId);
+    expect(terminal.dispose).not.toHaveBeenCalled();
+    expect(panel.terminalPanelUploadController.progress?.state).toBe("failed");
+    expect(panel.renderRoot.querySelector<HTMLButtonElement>(".tp-upload-retry")?.disabled).toBe(
+      true,
+    );
+    createGhosttyTerminalMock.mock.calls[0]![0].onData?.(new TextEncoder().encode("do not replay"));
+    read.resolve(new ArrayBuffer(1));
+    await read.promise;
+
+    panel.gatewayConnected = true;
+    await panel.updateComplete;
+    await waitForFast(() => expect(request).toHaveBeenCalledWith("terminal.attach"));
+    await waitForFast(() =>
+      expect(panel.renderRoot.querySelector(".tp-error .btn")).not.toBeNull(),
+    );
+    expect(sessions.tabs[0]).toBe(tab);
+    expect(terminal.setReadOnly).toHaveBeenLastCalledWith(true);
+    panel.renderRoot.querySelector<HTMLButtonElement>(".tp-error .btn")!.click();
+    await waitForFast(() => expect(terminal.setReadOnly).toHaveBeenLastCalledWith(false));
+    expect(sessions.tabs[0]).toBe(tab);
+    expect(sessions.activeId).toBe(activeId);
+    expect(createGhosttyTerminalMock).toHaveBeenCalledOnce();
+    expect(terminal.write.mock.calls.map(([bytes]) => new TextDecoder().decode(bytes))).toEqual([
+      "before",
+      "after",
+    ]);
+    expect(request.mock.calls.some(([method]) => method === "terminal.input")).toBe(false);
+    expect(request.mock.calls.some(([method]) => method === "terminal.upload")).toBe(false);
+    expect(panel.terminalPanelUploadController.hasPendingBatch()).toBe(true);
+
+    createGhosttyTerminalMock.mock.calls[0]![0].onData?.(
+      new TextEncoder().encode("after reconnect"),
+    );
+    await waitForFast(() =>
+      expect(panel.renderRoot.querySelector(".tp-error")?.textContent).toContain(
+        "Terminal delivery could not be confirmed",
+      ),
+    );
+
+    Object.assign(client, { recoveryScope: "account-b" });
+    panel.available = false;
+    await panel.updateComplete;
+    await waitForFast(() => expect(terminal.dispose).toHaveBeenCalledOnce());
+    expect(sessions.tabs).toEqual([]);
+    expect(panel.terminalPanelUploadController.hasPendingBatch()).toBe(false);
   });
 
   it.each(["agent:agent:main:background-task"] as const)(

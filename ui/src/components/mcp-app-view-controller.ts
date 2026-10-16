@@ -7,7 +7,9 @@ import { isMcpAppViewExpiredError } from "@openclaw/gateway-protocol";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { raceWithTimeout } from "@openclaw/retry";
 import type { ApplicationContext } from "../app/context.ts";
+import { gatewayPresentationScope } from "../app/gateway-presentation-scope.ts";
 import { navigateMcpAppLink } from "../app/mcp-app-routing.ts";
+import { hasOperatorReadAccess } from "../app/operator-access.ts";
 import { t as translate } from "../i18n/index.ts";
 import { registerMcpAppEnglish } from "../i18n/locales/en-mcp-app.ts";
 import { parseMcpAppLink } from "../lib/mcp-app-route.ts";
@@ -64,6 +66,7 @@ type McpAppResources = {
   transport: { close(): Promise<void> } | null;
   disposed: boolean;
   updateHostContext?: () => void;
+  reconnect?: () => Promise<void>;
 };
 type McpAppBinding = {
   client: NonNullable<ApplicationContext["gateway"]["snapshot"]["client"]>;
@@ -71,7 +74,7 @@ type McpAppBinding = {
   viewId: string;
   agentId?: string;
   connectionRevision: number | undefined;
-  hello: ApplicationContext["gateway"]["snapshot"]["hello"] | undefined;
+  scope: number;
 };
 
 const MCP_APP_TEARDOWN_TIMEOUT_MS = 250;
@@ -154,6 +157,7 @@ export class McpAppViewController {
   private resources: McpAppResources | null = null;
   private teardownPromise: Promise<void> | null = null;
   private setupAbort: AbortController | undefined;
+  private requestAbort = new AbortController();
 
   constructor(
     readonly host: McpAppViewElement,
@@ -166,6 +170,33 @@ export class McpAppViewController {
   set inactive(value: "ended" | "reconstructed" | null) {
     this.inactiveValue = value;
     this.notify();
+  }
+  connectionChanged() {
+    this.requestAbort.abort();
+    this.requestAbort = new AbortController();
+    this.confirmation.cancel();
+    if (this.context.gateway.snapshot.phase === "connected") {
+      const resources = this.resources;
+      if (!resources) {
+        void this.setup(this.binding());
+      } else if (resources?.reconnect) {
+        const signal = this.requestAbort.signal;
+        void resources.reconnect().then(
+          () => {
+            if (!signal.aborted && this.resources === resources && this.error) {
+              this.error = null;
+              this.notify();
+            }
+          },
+          (error) => {
+            if (!signal.aborted && this.resources === resources) {
+              this.error = error;
+              this.notify();
+            }
+          },
+        );
+      }
+    }
   }
   async setup(binding: McpAppBinding | null) {
     this.setupAbort?.abort();
@@ -236,7 +267,20 @@ export class McpAppViewController {
     params: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<T> {
+    const requestSignal = signal
+      ? AbortSignal.any([signal, this.requestAbort.signal])
+      : this.requestAbort.signal;
     try {
+      requestSignal.throwIfAborted();
+      const gateway = this.context.gateway;
+      if (
+        gateway.snapshot.phase !== "connected" ||
+        gateway.snapshot.client !== binding.client ||
+        !hasOperatorReadAccess(gateway.snapshot.hello?.auth ?? null) ||
+        gatewayPresentationScope(gateway).key !== binding.scope
+      ) {
+        throw new Error(translate("mcpApp.errors.gatewayUnavailable"));
+      }
       const { agentId: _untrustedAgent, ...operationParams } = params;
       const requestParams = {
         ...operationParams,
@@ -244,12 +288,15 @@ export class McpAppViewController {
         viewId: binding.viewId,
         ...(binding.agentId ? { agentId: binding.agentId } : {}),
       };
-      return await (signal
-        ? binding.client.request<T>(method, requestParams, { signal })
-        : binding.client.request<T>(method, requestParams));
+      const result = await binding.client.request<T>(method, requestParams, {
+        signal: requestSignal,
+      });
+      requestSignal.throwIfAborted();
+      return result;
     } catch (error) {
       if (
         isMcpAppViewExpiredError(error) &&
+        !requestSignal.aborted &&
         this.host.viewId === binding.viewId &&
         this.host.sessionKey === binding.sessionKey &&
         this.context?.gateway.snapshot.client === binding.client
@@ -318,20 +365,25 @@ export class McpAppViewController {
     if (!this.host.isConnected || this.resources || this.teardownPromise) {
       return;
     }
+    this.requestAbort = new AbortController();
     void this.setup(this.binding());
   }
 
   binding(): McpAppBinding | null {
     const gateway = this.context?.gateway;
     const client = gateway?.snapshot.client;
-    return client
+    const denied =
+      gateway.snapshot.phase === "connected" &&
+      gateway.snapshot.hello &&
+      !hasOperatorReadAccess(gateway.snapshot.hello.auth ?? null);
+    return client && !denied
       ? {
           client,
           sessionKey: this.host.sessionKey,
           viewId: this.host.viewId,
           agentId: this.host.agentId || undefined,
           connectionRevision: gateway.connectionRevision,
-          hello: gateway.snapshot.hello,
+          scope: gatewayPresentationScope(gateway).key,
         }
       : null;
   }
@@ -353,8 +405,9 @@ export class McpAppViewController {
       (this.host.agentId || undefined) === binding.agentId &&
       gateway?.snapshot.phase === "connected" &&
       gateway.snapshot.client === binding.client &&
+      hasOperatorReadAccess(gateway.snapshot.hello?.auth ?? null) &&
       gateway.connectionRevision === binding.connectionRevision &&
-      gateway.snapshot.hello === binding.hello
+      gatewayPresentationScope(gateway).key === binding.scope
     );
   }
 
@@ -510,7 +563,7 @@ export class McpAppViewController {
       );
       createdResources.bridge = bridge;
       const request = <T = unknown>(method: string, params: Record<string, unknown>) =>
-        this.request<T>(binding, method, params);
+        this.request<T>(binding, method, params, signal);
       const isCurrent = () => this.isCurrentBinding(binding, createdResources, signal);
       const confirm = (text: string, kind: "message" | "file") =>
         this.confirmation.request({
@@ -525,8 +578,13 @@ export class McpAppViewController {
           return undefined;
         }
         const generation = ++contextGeneration;
+        const requestSignal = this.requestAbort.signal;
         const publish = (nextContext: McpAppContextState) => {
-          if (createdResources.disposed || generation !== contextGeneration) {
+          if (
+            createdResources.disposed ||
+            requestSignal.aborted ||
+            generation !== contextGeneration
+          ) {
             return;
           }
           modelContext = nextContext;
@@ -573,9 +631,11 @@ export class McpAppViewController {
           return result;
         });
       }
-      const startNotifications = bindMcpAppResourceHandlers({
+      const notifications = bindMcpAppResourceHandlers({
         bridge,
         request,
+        releaseResourceSubscription: (uri) =>
+          this.request(binding, "mcp.app.unsubscribeResource", { uri }),
         sessionKey,
         viewId,
         iframe,
@@ -670,7 +730,13 @@ export class McpAppViewController {
       createdResources.updateHostContext = updateHostContext;
       updateHostContext();
       publishContext();
-      startNotifications();
+      notifications.start();
+      createdResources.reconnect = async () => {
+        await notifications.reconnect();
+        if (payload.updateModelContextSupported) {
+          await refreshModelContext();
+        }
+      };
       const hostContextCleanup = this.context?.theme.subscribe(updateHostContext);
       if (hostContextCleanup) {
         this.addResourceCleanup(createdResources, hostContextCleanup);

@@ -583,7 +583,7 @@ function OpenClawApp(props: { host: HTMLElement; runtime: ApplicationRuntime }):
   function Shell(): SolidJSX.Element {
     return (
       <openclaw-link-reader-hovercard-provider
-        prop:client={connected() ? snapshot().client : null}
+        prop:client={snapshot().client}
         prop:readers={availableLinkPreviewReaders(snapshot())}
         prop:claimedReaders={availableLinkReaders(snapshot())}
         prop:pagePreviewContext={context}
