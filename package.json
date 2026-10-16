@@ -9,8 +9,8 @@
     ],
     "postgresFamilies": ["state", "agent", "workboard", "logbook", "team-reports"],
     "schemaVersions": {
-      "state": 26,
-      "agent": 28
+      "state": 27,
+      "agent": 29
     }
   },
   "description": "Multi-channel AI gateway with extensible messaging integrations",

@@ -579,7 +579,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
     },
   );
   it.each([false, true])(
-    "keeps the real agent v27→v28 rollback exact (foreign write: %s)",
+    "keeps the real agent v27→current rollback exact (foreign write: %s)",
     async (foreignWrite) => {
       // The preceding foreign-write case deliberately retains the candidate state schema.
       closeOpenClawStateDatabaseForTest();
@@ -623,6 +623,12 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         CREATE INDEX idx_agent_transcript_event_parent
           ON "${agentNamespace}".transcript_event_identities
             (session_id NULLS FIRST, parent_id NULLS FIRST) WHERE parent_id IS NOT NULL;
+        CREATE INDEX idx_agent_session_nodes_last_interaction_at
+          ON "${agentNamespace}".session_nodes
+            (last_interaction_at DESC NULLS LAST, session_key ASC NULLS FIRST);
+        CREATE INDEX idx_agent_session_reactions_message
+          ON "${agentNamespace}".session_reactions
+            (session_key ASC NULLS FIRST, session_id ASC NULLS FIRST, message_id ASC NULLS FIRST);
         UPDATE "${agentNamespace}".openclaw_schema_meta
           SET version = 27, fingerprint = NULL, ddl_hash = NULL, server_major = NULL;
         UPDATE "${agentNamespace}".schema_meta SET schema_version = 27;
@@ -675,7 +681,8 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           await client.query<{ indexname: string; indexdef: string }>(
             `SELECT indexname, indexdef
           FROM pg_indexes WHERE schemaname = $1 AND indexname IN
-          ('idx_agent_transcript_event_parent', 'idx_agent_session_windows_conversation')
+          ('idx_agent_transcript_event_parent', 'idx_agent_session_windows_conversation',
+           'idx_agent_session_nodes_last_interaction_at', 'idx_agent_session_reactions_message')
           ORDER BY indexname`,
             [agentNamespace],
           )
@@ -685,6 +692,16 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         }));
       const beforeIndexes = await readIndexes();
       expect(beforeIndexes).toEqual([
+        {
+          indexname: "idx_agent_session_nodes_last_interaction_at",
+          indexdef:
+            "CREATE INDEX idx_agent_session_nodes_last_interaction_at ON fixture_namespace.session_nodes USING btree (last_interaction_at DESC NULLS LAST, session_key NULLS FIRST)",
+        },
+        {
+          indexname: "idx_agent_session_reactions_message",
+          indexdef:
+            "CREATE INDEX idx_agent_session_reactions_message ON fixture_namespace.session_reactions USING btree (session_key NULLS FIRST, session_id NULLS FIRST, message_id NULLS FIRST)",
+        },
         {
           indexname: "idx_agent_session_windows_conversation",
           indexdef:
