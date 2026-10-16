@@ -194,8 +194,13 @@ export function GitHubConnections() {
   const systemView = system.read;
   const active = () => (purpose() === "personal" ? personal : system);
   const openSetup = (next: "personal" | "system") => {
-    const { profileId, canRead, canAdmin } = access(context.gateway.snapshot);
-    if (view().locked || (next === "personal" ? !profileId || !canRead : !canAdmin)) {
+    const currentAccess = access(context.gateway.snapshot);
+    if (
+      view().locked ||
+      (next === "personal"
+        ? !currentAccess.profileId || !currentAccess.canRead
+        : !currentAccess.canAdmin)
+    ) {
       return;
     }
     setPurpose(next);

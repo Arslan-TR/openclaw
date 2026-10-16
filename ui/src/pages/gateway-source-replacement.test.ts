@@ -9,6 +9,7 @@ import type { AgentsListResult } from "../api/types.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../app/context.ts";
 import { createGatewayMetadataObserver } from "../app/gateway-observers.ts";
 import { sessionsResult } from "../lib/sessions/session-capability.test-support.ts";
+import { gatewayHelloForMethods } from "../test-helpers/gateway-methods.ts";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
 import { createSolidApplicationContextProvider } from "../test-helpers/solid-application-context.tsx";
 import { waitForSolid } from "../test-helpers/solid-settle.ts";
@@ -76,7 +77,7 @@ function gatewayWithClient(
     phase: connected ? "connected" : "stopped",
     offlineStable: false,
     canvasPluginSurfaceUrl: null,
-    hello: null,
+    hello: gatewayHelloForMethods([]),
     assistantAgentId: null,
     sessionKey: "main",
     lastError: null,
@@ -555,14 +556,31 @@ describe("gateway source replacement across reconnect with a reused client", () 
     expect(request).toHaveBeenCalledWith("skills.securityVerdicts", { agentId: "main" });
   });
 
-  it("discards pending route verdicts when the connected gateway lifecycle ends", async () => {
+  it("retains skills while retiring pending verdicts across disconnect and resets on source replacement", async () => {
     const pending = deferred<{ schema: string; items: unknown[] }>();
+    const verdicts = {
+      schema: "openclaw.skills.security-verdicts.v1",
+      items: [
+        {
+          registry: "https://clawhub.ai",
+          ok: true,
+          decision: "pass",
+          requestedSlug: "agentreceipt",
+          requestedVersion: "1.2.3",
+          securityStatus: "clean",
+        },
+      ],
+    };
+    let verdictRequests = 0;
     const request = vi.fn(async (method: string) => {
       if (method === "skills.library.list") {
         return emptySkillLibrary;
       }
+      if (method === "skills.status") {
+        return linkedSkillReport();
+      }
       if (method === "skills.securityVerdicts") {
-        return pending.promise;
+        return ++verdictRequests === 1 ? pending.promise : verdicts;
       }
       throw new Error(`Unexpected request: ${method}`);
     });
@@ -578,28 +596,30 @@ describe("gateway source replacement across reconnect with a reused client", () 
     await waitForSolid(() =>
       expect(mounted.page.querySelector(".plugins-item")?.textContent).toContain("Refreshing"),
     );
+    const row = mounted.page.querySelector(".plugins-item");
     harness.emitConnected(false);
-    pending.resolve({
-      schema: "openclaw.skills.security-verdicts.v1",
-      items: [
-        {
-          registry: "https://clawhub.ai",
-          ok: true,
-          decision: "pass",
-          requestedSlug: "agentreceipt",
-          requestedVersion: "1.2.3",
-          securityStatus: "clean",
-        },
-      ],
-    });
+    pending.resolve(verdicts);
     await pending.promise;
-    await waitForSolid(() => expect(mounted.page.querySelector(".plugins-item")).toBeNull());
+    await waitForSolid(() => expect(mounted.page.textContent).not.toContain("Refreshing"));
+    expect(mounted.page.querySelector(".plugins-item")).toBe(row);
+    expect(row?.textContent).toContain("Repo Skill");
     expect(mounted.page.textContent).not.toContain("Clean");
-    expect(mounted.page.textContent).not.toContain("Refreshing");
     expect(mounted.page.querySelector('[role="alert"]')).toBeNull();
     expect(request).toHaveBeenCalledTimes(2);
     expect(request).toHaveBeenCalledWith("skills.library.list", { scope: "all" });
     expect(request).toHaveBeenCalledWith("skills.securityVerdicts", { agentId: "main" });
+
+    harness.emitConnected(true);
+    await waitForSolid(() =>
+      expect(mounted.page.querySelector(".plugins-item")?.textContent).toContain("Clean"),
+    );
+    expect(mounted.page.textContent).toContain("Repo Skill");
+    expect(verdictRequests).toBe(2);
+
+    mounted.replaceContext(contextWithClient(client));
+    await waitForSolid(() => expect(mounted.page.querySelector(".plugins-item")).toBeNull());
+    expect(mounted.page.textContent).not.toContain("Repo Skill");
+    expect(mounted.page.textContent).not.toContain("Clean");
   });
 
   it("rejects skills route data from an earlier same-client gateway epoch", async () => {

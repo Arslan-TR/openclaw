@@ -134,6 +134,7 @@ describe("ModelProvidersPage agent scope", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
     const page = appendPage(context);
+    await waitForProviders(page);
     await waitForSolid(() => expect(page.view.props.supplementalLoading).toBe(false));
     const previousData = page.view.props.authStatus;
     const originalRequest = request.getMockImplementation()!;

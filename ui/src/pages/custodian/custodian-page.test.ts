@@ -552,6 +552,7 @@ describe("custodian page", () => {
     Object.assign(context, { channels });
     await channels.refresh();
     await channels.refresh();
+    const previousSnapshot = channels.state.channelsSnapshot;
     expect(channels.state.channelsSnapshot).not.toBeNull();
     expect(channels.state.channelsError).toBe("status unavailable");
     const { page } = await mountPage(context, { onboarding: true });
@@ -560,7 +561,7 @@ describe("custodian page", () => {
     setGatewaySnapshot({ phase: "connected" });
 
     await waitForFast(() => expect(statusRequestCount).toBe(3));
-    expect(channels.state.channelsSnapshot).toBeNull();
+    expect(channels.state.channelsSnapshot).toBe(previousSnapshot);
     expect(channels.state.channelsLoading).toBe(true);
     expect(page.querySelector(".custodian__nudge--channel-onboarding")).toBeNull();
 

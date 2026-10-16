@@ -2,6 +2,7 @@
 
 import { createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
+import type { MemorySearchResponse } from "../../../../src/gateway/server-methods/memory-search.ts";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
@@ -318,15 +319,16 @@ describe("MemoryMemoriesElement", () => {
   });
 
   it("keeps drafts and loaded memories through a reconnect but resets for another client", async () => {
-    const refreshed = deferred<unknown>();
+    const initialSearch: MemorySearchResponse = {
+      agentId: "main",
+      provider: "local",
+      searchMode: "hybrid",
+      results: [result],
+    };
+    const refreshed = deferred<MemorySearchResponse>();
     const request = vi.fn((method: string) =>
       method === "memory.search"
-        ? Promise.resolve({
-            agentId: "main",
-            provider: "local",
-            searchMode: "hybrid",
-            results: [result],
-          })
+        ? Promise.resolve(initialSearch)
         : Promise.resolve(memoryFileResponse("first\nRemember Ada\nthird")),
     );
     const element = createElement(request);

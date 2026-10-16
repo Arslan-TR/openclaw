@@ -8,6 +8,7 @@ import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import { projectGateway } from "../../lib/reactive/application.ts";
 import { useApplication } from "../../lib/reactive/context.ts";
 import { projectChannels } from "../../lib/reactive/domain-capabilities.ts";
+import { useGatewayPage } from "../../lib/reactive/gateway-page.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { projectSource } from "../../lib/reactive/projection.ts";
 import { defineSolidBridge, type SolidBridgeElement } from "../../lit/solid-bridge.ts";
@@ -99,6 +100,19 @@ function CustodianPageContent(props: Props) {
       }
     },
   );
+  useGatewayPage({
+    getGateway: () => context.gateway,
+    onSnapshot: ({ initial, becameConnected }) => {
+      if (
+        !initial &&
+        becameConnected &&
+        props.onboarding &&
+        !props.store.channelOnboardingNudgeClosed
+      ) {
+        void context.channels.refresh(false);
+      }
+    },
+  });
 
   async function loadHistory(reset: boolean) {
     const client = historyClient;
