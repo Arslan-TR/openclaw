@@ -21,6 +21,7 @@ import {
   resolveRuntimeWorkerArgv,
   resolveRuntimeWorkerUrl,
 } from "../../infra/runtime-worker-url.js";
+import { resolveSqliteDatabaseFilePath } from "../../infra/sqlite-database-admission.js";
 import * as temporaryState from "../../infra/tmp-openclaw-dir.js";
 import { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
 import {
@@ -552,12 +553,14 @@ it.each([
         if (settlement && argv.at(-1) !== "--check") {
           terminalFromCandidate = inspectTerminal();
           const open = nodeSqlite.openNodeSqliteDatabase;
+          const migratedStateLocation = nodeSqlite.resolveNodeSqliteLocation(database.path);
           vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementation((...args) => {
-            const openedPath = args[0];
-            if (
-              (openedPath.startsWith("file:") ? fileURLToPath(openedPath) : openedPath) ===
-              database.path
-            ) {
+            // SQLite encodes Windows filenames separately from file URLs. The
+            // observer must not turn the executor's lease writes into failed cleanup.
+            const openedPath = nodeSqlite.resolveNodeSqliteLocation(
+              resolveSqliteDatabaseFilePath(args[0]),
+            );
+            if (openedPath === migratedStateLocation) {
               oldRuntimeOpens.push(args[0]);
             }
             return open(...args);
