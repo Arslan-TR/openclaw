@@ -316,7 +316,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         expect(
           image.prepare("SELECT wr FROM pragma_table_list WHERE name = 'session_state_heads'").get()
             ?.wr,
-        ).toBe(0);
+        ).toBe(sourceVersion >= 26 ? 1 : 0);
         expect(
           image.prepare("SELECT last_sequence, pruned_max_sequence FROM session_state_heads").all(),
         ).toEqual([{ last_sequence: 81, pruned_max_sequence: 7 }]);
