@@ -46,7 +46,7 @@ const clientParams = { baseUrl: "https://chat.example.com/api/v4/", botToken };
 const jsonHeaders = { "content-type": "application/json" };
 const postParams = { channelId: "ch1", message: "hello" };
 
-function customClient(response: Response) {
+function customClient(response = Response.json({})) {
   const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response);
   return { client: createMattermostClient({ ...clientParams, fetchImpl }), fetchImpl };
 }
@@ -55,6 +55,25 @@ function guardedClient(response: Response) {
   const release = vi.fn(async () => {});
   fetchWithSsrFGuardMock.mockResolvedValueOnce({ response, release });
   return { client: createMattermostClient(clientParams), release };
+}
+
+function errorResponse(body: BodyInit | null, status: number, statusText?: string) {
+  return new Response(body, { status, statusText, headers: jsonHeaders });
+}
+
+function unreadableResponse(status = 200, message = "network error") {
+  return new Response(
+    new ReadableStream({
+      pull() {
+        throw new TypeError(message);
+      },
+    }),
+    { status, headers: jsonHeaders },
+  );
+}
+
+function requestHeaders(fetchImpl: ReturnType<typeof vi.fn<typeof fetch>>) {
+  return new Headers(fetchImpl.mock.calls[0]?.[1]?.headers);
 }
 
 function requestBody(fetchImpl: ReturnType<typeof vi.fn<typeof fetch>>): unknown {
@@ -158,11 +177,7 @@ describe("Mattermost request boundary", () => {
   });
 
   it("releases null-body errors without unbounded response readers", async () => {
-    const response = new Response(null, {
-      status: 503,
-      statusText: "Service Unavailable",
-      headers: jsonHeaders,
-    });
+    const response = errorResponse(null, 503, "Service Unavailable");
     const json = vi.spyOn(response, "json");
     const text = vi.spyOn(response, "text");
     const { client, release } = guardedClient(response);
@@ -175,7 +190,7 @@ describe("Mattermost request boundary", () => {
   });
 
   it("rejects raw, encoded, and URL-normalized traversal before fetch", async () => {
-    const { client, fetchImpl } = customClient(Response.json({}));
+    const { client, fetchImpl } = customClient();
     for (const path of [
       "/posts/../users/me",
       "/posts/%2e%2e/users/me",
@@ -228,16 +243,7 @@ describe("Mattermost request boundary", () => {
   });
 
   it("reports accepted typing as sent despite an unreadable body", async () => {
-    const { client, fetchImpl } = customClient(
-      new Response(
-        new ReadableStream({
-          pull() {
-            throw new TypeError("terminated");
-          },
-        }),
-        { headers: jsonHeaders },
-      ),
-    );
+    const { client, fetchImpl } = customClient(unreadableResponse(200, "terminated"));
     await expect(
       sendMattermostTyping(client, { channelId: "ch1", parentId: "root1" }),
     ).resolves.toBeUndefined();
@@ -272,31 +278,21 @@ describe("Mattermost request boundary", () => {
 
 describe("Mattermost credential diagnostics", () => {
   it("decodes JSON escapes before redacting the request credential", async () => {
-    const response = new Response(
+    const response = errorResponse(
       String.raw`{"message":"Bearer\u0020\u0061bcdefghijklmnopqrstuvwxyz"}`,
-      {
-        status: 401,
-        headers: jsonHeaders,
-      },
+      401,
     );
     const json = vi.spyOn(response, "json");
     const text = vi.spyOn(response, "text");
     const { client, fetchImpl } = customClient(response);
     await expect(client.request("/users/me")).rejects.toThrow("Mattermost API 401 : ***");
-    expect(new Headers(fetchImpl.mock.calls[0]?.[1]?.headers).get("Authorization")).toBe(
-      `Bearer ${botToken}`,
-    );
+    expect(requestHeaders(fetchImpl).get("Authorization")).toBe(`Bearer ${botToken}`);
     expect(json).not.toHaveBeenCalled();
     expect(text).not.toHaveBeenCalled();
   });
 
   it("redacts malformed JSON served with a JSON content type", async () => {
-    const { client } = customClient(
-      new Response(`upstream error: Bearer ${botToken}`, {
-        status: 502,
-        headers: jsonHeaders,
-      }),
-    );
+    const { client } = customClient(errorResponse(`upstream error: Bearer ${botToken}`, 502));
     await expect(client.request("/users/me")).rejects.toThrow(
       "Mattermost API 502 : upstream error: ***",
     );
@@ -314,9 +310,7 @@ describe("Mattermost credential diagnostics", () => {
         contentType: "text/plain",
       }),
     ).rejects.toThrow('Mattermost API 503 : {"message":{"context":"retry later","echoed":"***"}}');
-    expect(new Headers(fetchImpl.mock.calls[0]?.[1]?.headers).get("Authorization")).toBe(
-      `Bearer ${botToken}`,
-    );
+    expect(requestHeaders(fetchImpl).get("Authorization")).toBe(`Bearer ${botToken}`);
   });
 
   it("redacts a credential clipped by the error limit and releases unread data", async () => {
@@ -358,9 +352,7 @@ describe("Mattermost post receipts", () => {
       file_ids: ["file1", "file2"],
       props,
     });
-    expect(new Headers(fetchImpl.mock.calls[0]?.[1]?.headers).get("Content-Type")).toBe(
-      "application/json",
-    );
+    expect(requestHeaders(fetchImpl).get("Content-Type")).toBe("application/json");
   });
 });
 
@@ -412,7 +404,7 @@ describe("Mattermost post reads and edits", () => {
   );
 
   it("rejects invalid limits before provider access", async () => {
-    const { client, fetchImpl } = customClient(Response.json({}));
+    const { client, fetchImpl } = customClient();
     for (const limit of [0, 1.5]) {
       await expect(fetchMattermostChannelPosts(client, "ch1", { limit })).rejects.toThrow(
         "Mattermost read limit must be a positive integer",
@@ -422,7 +414,7 @@ describe("Mattermost post reads and edits", () => {
   });
 
   it("rejects mutually exclusive cursors before provider access", async () => {
-    const { client, fetchImpl } = customClient(Response.json({}));
+    const { client, fetchImpl } = customClient();
     await expect(
       fetchMattermostChannelPosts(client, "ch1", { before: "older", after: "newer" }),
     ).rejects.toThrow("Mattermost read accepts either before or after, not both");
@@ -485,14 +477,17 @@ describe("Mattermost DM retries", () => {
     expect(onRetry.mock.calls[1]?.[1]).toBeLessThanOrEqual(250);
   });
 
-  it.each([
-    { status: 400, message: "Invalid request; upstream Mattermost API 503 Service Unavailable" },
-  ])("does not retry $status with misleading details: $message", async ({ status, message }) => {
-    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json({ message }, { status }));
+  it("does not retry HTTP 400 with misleading transient details", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      Response.json(
+        { message: "Invalid request; upstream Mattermost API 503 Service Unavailable" },
+        { status: 400 },
+      ),
+    );
     const client = createMattermostClient({ ...clientParams, fetchImpl });
     const outcome = expect(
       createMattermostDirectChannelWithRetry(client, ["u1", "u2"]),
-    ).rejects.toThrow(`Mattermost API ${status}`);
+    ).rejects.toThrow("Mattermost API 400");
     await vi.runAllTimersAsync();
     await outcome;
     expect(fetchImpl).toHaveBeenCalledOnce();
@@ -516,17 +511,7 @@ describe("Mattermost DM retries", () => {
   it.each([400, 429, 503])(
     "preserves HTTP %s retry policy when the error response body fails",
     async (status) => {
-      const fetchImpl = vi.fn<typeof fetch>(
-        async () =>
-          new Response(
-            new ReadableStream({
-              pull() {
-                throw new TypeError("network error");
-              },
-            }),
-            { status, headers: jsonHeaders },
-          ),
-      );
+      const fetchImpl = vi.fn<typeof fetch>(async () => unreadableResponse(status));
       const client = createMattermostClient({ ...clientParams, fetchImpl });
       const outcome = rejection(createMattermostDirectChannelWithRetry(client, ["u1", "u2"]));
       await vi.runAllTimersAsync();
