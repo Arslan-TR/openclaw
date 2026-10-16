@@ -152,7 +152,7 @@ describe("Telegram durable ingress coalescing", () => {
   const originalStateDir = process.env.OPENCLAW_STATE_DIR;
   let stateDir: string;
   let activeResources: TelegramIngressResources[];
-  let cleanups: Array<() => unknown | Promise<unknown>>;
+  let cleanups: Array<() => unknown>;
 
   beforeEach(async () => {
     stateDir = sessionDirs.make();
@@ -195,7 +195,7 @@ describe("Telegram durable ingress coalescing", () => {
 
   const getQueue = () => openTelegramIngressQueue({ stateDir });
   const tombstones = (...updateIds: number[]) => assertSpoolTombstoned({ stateDir, updateIds });
-  const onCleanup = (cleanup: () => unknown | Promise<unknown>) => cleanups.push(cleanup);
+  const onCleanup = (cleanup: () => unknown) => cleanups.push(cleanup);
   const expectBodies = (...bodies: string[]) =>
     expect(downstreamTurns.mock.calls.map(([turn]) => turn.RawBody)).toEqual(bodies);
   function holdQuietWindow(delay: number) {
