@@ -350,7 +350,7 @@ describe("ModelProvidersPage agent scope", () => {
           },
         },
         note: "Update defaults from Control UI",
-        replacePaths: ["agents.defaults.model.fallbacks"],
+        replacePaths: ["agents.defaults.model.fallbacks", "agents.defaults.utilityModel.fallbacks"],
       });
     },
   );
@@ -377,7 +377,7 @@ describe("ModelProvidersPage agent scope", () => {
         },
       },
       note: "Update defaults from Control UI",
-      replacePaths: ["agents.defaults.model.fallbacks"],
+      replacePaths: ["agents.defaults.model.fallbacks", "agents.defaults.utilityModel.fallbacks"],
     });
   });
 
@@ -804,7 +804,7 @@ it("finishes loading with a system-only roster and keeps global defaults editabl
         },
       },
       note: "Update defaults from Control UI",
-      replacePaths: ["agents.defaults.model.fallbacks"],
+      replacePaths: ["agents.defaults.model.fallbacks", "agents.defaults.utilityModel.fallbacks"],
     });
     expect(request.mock.calls.some(([method]) => method.startsWith("models."))).toBe(false);
   } finally {
