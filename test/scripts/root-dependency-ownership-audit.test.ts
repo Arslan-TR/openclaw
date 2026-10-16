@@ -11,14 +11,14 @@ import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-function makeTempRepo(files: Record<string, string | object>) {
+function auditFixture(files: Record<string, string | object>, scanRoots = ["extensions"]) {
   const dir = tempDirs.make("openclaw-root-deps-audit-");
   for (const [file, value] of Object.entries(files)) {
     const target = path.join(dir, file);
     mkdirSync(path.dirname(target), { recursive: true });
     writeFileSync(target, typeof value === "string" ? value : JSON.stringify(value), "utf8");
   }
-  return dir;
+  return collectRootDependencyOwnershipAudit({ repoRoot: dir, scanRoots });
 }
 
 function runtimeRecord(depName: string, spec: string, file: string, overrides = {}) {
@@ -54,52 +54,36 @@ describe("collectModuleSpecifiers", () => {
 });
 
 describe("classifyRootDependencyOwnership", () => {
-  it("treats scripts and tests as dev-only candidates", () => {
-    expect(
-      classifyRootDependencyOwnership({
-        sections: ["scripts", "test"],
-      }),
-    ).toEqual({
+  it.each([
+    {
+      sections: ["scripts", "test"],
       category: "script_or_test_only",
       recommendation: "consider moving from dependencies to devDependencies",
-    });
-  });
-
-  it("treats extension-only deps as localizable", () => {
-    expect(
-      classifyRootDependencyOwnership({
-        depName: "vendor-sdk",
-        sections: ["extensions", "test"],
-      }),
-    ).toEqual({
+    },
+    {
+      sections: ["extensions", "test"],
       category: "extension_only_localizable",
       recommendation:
         "remove from root package.json and rely on owning extension manifests plus doctor --fix",
-    });
-  });
-
-  it("treats unreferenced deps as removal candidates", () => {
-    expect(
-      classifyRootDependencyOwnership({
-        sections: [],
-      }),
-    ).toEqual({
+    },
+    {
+      sections: [],
       category: "unreferenced",
       recommendation: "investigate removal; no direct source imports found in scanned files",
-    });
+    },
+  ])("classifies $sections as $category", ({ sections, ...expected }) => {
+    expect(classifyRootDependencyOwnership({ depName: "vendor-sdk", sections })).toEqual(expected);
   });
 });
 
 describe("collectRootDependencyOwnershipCheckErrors", () => {
   it("catches dependencies mirrored at root but only imported by one extension", () => {
     const manifest = { dependencies: { "vendor-sdk": "^1.0.0" } };
-    const repoRoot = makeTempRepo({
+    const records = auditFixture({
       "package.json": manifest,
       "extensions/demo-channel/package.json": manifest,
       "extensions/demo-channel/src/setup.ts": 'const sdk = await import("vendor-sdk");\n',
     });
-
-    const records = collectRootDependencyOwnershipAudit({ repoRoot, scanRoots: ["extensions"] });
 
     expect(collectRootDependencyOwnershipCheckErrors(records)).toEqual([
       "root dependency 'vendor-sdk' is extension-owned (remove from root package.json and rely on owning extension manifests plus doctor --fix); extension declarations: demo-channel:dependencies; sample imports: extensions/demo-channel/src/setup.ts",
@@ -107,26 +91,24 @@ describe("collectRootDependencyOwnershipCheckErrors", () => {
   });
 
   it("classifies root dependencies referenced through constant dynamic imports", () => {
-    const repoRoot = makeTempRepo({
-      "package.json": { dependencies: { clawpdf: "^0.2.0", "sqlite-vec": "0.1.9" } },
-      "src/media/pdf-extract.ts": `
+    const records = auditFixture(
+      {
+        "package.json": { dependencies: { clawpdf: "^0.2.0", "sqlite-vec": "0.1.9" } },
+        "src/media/pdf-extract.ts": `
         const CLAWPDF_MODULE = "clawpdf";
         export async function loadPdf() {
           return import(CLAWPDF_MODULE);
         }
       `,
-      "packages/memory-host-sdk/src/host/sqlite-vec.ts": `
+        "packages/memory-host-sdk/src/host/sqlite-vec.ts": `
         const SQLITE_VEC_MODULE_ID = "sqlite-vec";
         export async function loadSqliteVecModule() {
           return import(SQLITE_VEC_MODULE_ID);
         }
       `,
-    });
-
-    const records = collectRootDependencyOwnershipAudit({
-      repoRoot,
-      scanRoots: ["src", "packages"],
-    });
+      },
+      ["src", "packages"],
+    );
 
     expect(records).toEqual([
       runtimeRecord("clawpdf", "^0.2.0", "src/media/pdf-extract.ts"),
@@ -135,7 +117,7 @@ describe("collectRootDependencyOwnershipCheckErrors", () => {
   });
 
   it("does not fail explicitly root-owned internal extension runtime dependencies", () => {
-    const repoRoot = makeTempRepo({
+    const records = auditFixture({
       "package.json": {
         dependencies: { "@homebridge/ciao": "^1.3.7", "playwright-core": "1.59.1" },
       },
@@ -146,8 +128,6 @@ describe("collectRootDependencyOwnershipCheckErrors", () => {
       "extensions/browser/src/browser/playwright-core.runtime.ts":
         'const runtime = require("playwright-core");\n',
     });
-
-    const records = collectRootDependencyOwnershipAudit({ repoRoot, scanRoots: ["extensions"] });
 
     expect(records).toEqual([
       runtimeRecord("@homebridge/ciao", "^1.3.7", "extensions/bonjour/src/advertiser.ts", {
@@ -172,7 +152,7 @@ describe("collectRootDependencyOwnershipCheckErrors", () => {
   });
 
   it("allows runtime deps for bundled plugins that are still packaged in core", () => {
-    const repoRoot = makeTempRepo({
+    const records = auditFixture({
       "package.json": {
         dependencies: { "vendor-sdk": "^1.0.0" },
         files: ["dist/", "!dist/extensions/externalized/**"],
@@ -181,8 +161,6 @@ describe("collectRootDependencyOwnershipCheckErrors", () => {
       "extensions/internal/openclaw.plugin.json": {},
       "extensions/internal/src/setup.ts": 'const sdk = await import("vendor-sdk");\n',
     });
-
-    const records = collectRootDependencyOwnershipAudit({ repoRoot, scanRoots: ["extensions"] });
 
     expect(records).toEqual([
       runtimeRecord("vendor-sdk", "^1.0.0", "extensions/internal/src/setup.ts", {
