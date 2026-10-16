@@ -25,13 +25,13 @@ export function availableLinkReaders(
   if (!client || client.offlineRecoveryRetired) {
     return EMPTY_LINK_READERS;
   }
+  const catalog = readerCatalogs.get(client);
+  const previous = catalog && catalog.recoveryScope === client.recoveryScope ? catalog : undefined;
   if (snapshot.phase !== "connected") {
-    const catalog = readerCatalogs.get(client);
-    return catalog?.recoveryScope === client.recoveryScope ? catalog.readers : EMPTY_LINK_READERS;
+    return previous?.readers ?? EMPTY_LINK_READERS;
   }
-  const previous = readerCatalogs.get(client);
   if (
-    previous?.recoveryScope === client.recoveryScope &&
+    previous &&
     previous.hello === snapshot.hello &&
     previous.capabilities === snapshot.pluginCapabilities
   ) {
@@ -45,12 +45,9 @@ export function availableLinkReaders(
       }),
   );
   const retained = readers.map((reader) => {
-    const prior =
-      previous?.recoveryScope === client.recoveryScope
-        ? previous.readers.find(
-            (entry) => entry.pluginId === reader.pluginId && entry.id === reader.id,
-          )
-        : undefined;
+    const prior = previous?.readers.find(
+      (entry) => entry.pluginId === reader.pluginId && entry.id === reader.id,
+    );
     const metadata = reader.linkReader;
     const priorMetadata = prior?.linkReader;
     return prior &&
