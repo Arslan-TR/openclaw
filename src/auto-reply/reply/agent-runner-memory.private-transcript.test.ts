@@ -15,6 +15,7 @@ import { createSessionMaintenanceFollowup } from "../../agents/session-maintenan
 import { SessionManager } from "../../agents/sessions/session-manager.js";
 import { makeAssistantMessageFixture } from "../../agents/test-helpers/assistant-message-fixtures.js";
 import { ZERO_USAGE_FIXTURE } from "../../agents/test-helpers/usage-fixtures.js";
+import { withLoopbackTestServer } from "../../commands/loopback-server.test-support.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import { SESSION_TOTAL_TOKENS_VERSION } from "../../config/sessions.js";
 import {
@@ -22,7 +23,6 @@ import {
   loadTranscriptEvents,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
-import type { ModelDefinitionConfig } from "../../config/types.models.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   buildTimestampPrefix,
@@ -39,6 +39,7 @@ import { extractTextFromChatContent } from "../../shared/chat-content.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { runMemoryFlushIfNeeded } from "./agent-runner-memory.js";
+import { memoryModel } from "./agent-runner-memory.test-support.js";
 import { runReplyAgent } from "./agent-runner-run.js";
 import {
   createTestFollowupRun,
@@ -54,19 +55,6 @@ const isHumanMessage = (message: ModelRequest["messages"][number]) =>
   message.role === "user" && !isModelRuntimeContextCarrier(message);
 const lastHumanText = (request: ModelRequest) =>
   text(request.messages.findLast(isHumanMessage)?.content);
-
-function model(id: string, name: string, contextTokens: number): ModelDefinitionConfig {
-  return {
-    id,
-    name,
-    reasoning: false,
-    input: ["text"],
-    contextWindow: contextTokens,
-    contextTokens,
-    maxTokens: 8_192,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  };
-}
 
 function finishModelResponse(response: ServerResponse, content: string): void {
   for (const chunk of [
@@ -138,22 +126,21 @@ it.each(["completed", "interrupted"] as const)(
               method: string;
               params?: { protocolVersion?: string };
             };
-            let result;
-            if (message.method === "initialize") {
-              result = {
-                protocolVersion: message.params?.protocolVersion,
-                capabilities: { tools: {} },
-                serverInfo: { name: "memory-lifetime", version: "1" },
-              };
-            } else if (message.method === "tools/list") {
-              result = { tools: [] };
-            }
-            if (!result) {
-              response.writeHead(202).end();
-              return;
-            }
-            response.writeHead(200, { "content-type": "application/json" });
-            response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+            const result =
+              message.method === "initialize"
+                ? {
+                    protocolVersion: message.params?.protocolVersion,
+                    capabilities: { tools: {} },
+                    serverInfo: { name: "memory-lifetime", version: "1" },
+                  }
+                : message.method === "tools/list"
+                  ? { tools: [] }
+                  : undefined;
+            response.writeHead(
+              result ? 200 : 202,
+              result ? { "content-type": "application/json" } : {},
+            );
+            response.end(result && JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
             return;
           }
           const modelRequest = JSON.parse(body) as ModelRequest;
@@ -174,264 +161,253 @@ it.each(["completed", "interrupted"] as const)(
           response.destroy();
         }
       });
-      await new Promise<void>((resolve) => {
-        server.listen(0, "127.0.0.1", resolve);
-      });
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        throw new Error("Missing fixture address");
-      }
-      const scope = {
-        agentId: "main",
-        sessionId: "private-memory-source",
-        sessionKey: "agent:main:main",
-        storePath: path.join(state.sessionsDir(), "sessions.json"),
-      };
-      const modelRoute = { provider: "test-provider", model: "owner-model" };
-      const cfg: OpenClawConfig = {
-        agents: {
-          entries: { main: { workspace: state.workspaceDir } },
-          defaults: {
-            workspace: state.workspaceDir,
-            model: { primary: "test-provider/owner-model" },
+      await withLoopbackTestServer(server, async (port) => {
+        const scope = {
+          agentId: "main",
+          sessionId: "private-memory-source",
+          sessionKey: "agent:main:main",
+          storePath: path.join(state.sessionsDir(), "sessions.json"),
+        };
+        const modelRoute = { provider: "test-provider", model: "owner-model" };
+        const cfg: OpenClawConfig = {
+          agents: {
+            entries: { main: { workspace: state.workspaceDir } },
+            defaults: {
+              workspace: state.workspaceDir,
+              model: { primary: "test-provider/owner-model" },
+            },
           },
-        },
-        session: { store: scope.storePath },
-        tools: { profile: "coding" },
-        mcp: {
-          servers: {
-            fixture: { transport: "streamable-http", url: `http://127.0.0.1:${address.port}/mcp` },
+          session: { store: scope.storePath },
+          tools: { profile: "coding" },
+          mcp: {
+            servers: {
+              fixture: { transport: "streamable-http", url: `http://127.0.0.1:${port}/mcp` },
+            },
           },
-        },
-        models: {
-          providers: {
-            "test-provider": {
+          models: {
+            providers: {
+              "test-provider": {
+                api: "openai-completions",
+                apiKey: "synthetic-fixture-key",
+                baseUrl: `http://127.0.0.1:${port}/v1`,
+                models: [
+                  memoryModel("owner-model", 128_000, { name: "Owner fixture" }),
+                  memoryModel("test-model", 1_000_000, { name: "Fixture" }),
+                ],
+              },
+            },
+          },
+        };
+        let flush: ReturnType<typeof runMemoryFlushIfNeeded> | undefined;
+        let admission: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+        const scheduler = createTestGatewayScheduler();
+        try {
+          await setSessionMcpRuntimeScheduler(scheduler);
+          await state.writeConfig(cfg);
+          setRuntimeConfigSnapshot(cfg);
+          await replaceSessionEntry(scope, {
+            sessionId: scope.sessionId,
+            updatedAt: Date.now(),
+            totalTokens: 120_000,
+            totalTokensFresh: true,
+            totalTokensVersion: SESSION_TOTAL_TOKENS_VERSION,
+          });
+          const transcript = SessionManager.open(scope, state.workspaceDir);
+          transcript.appendMessage(makeUserMessage("Remember the Cedar project receipt.", 1));
+          transcript.appendMessage(
+            makeAssistantMessageFixture({
+              ...modelRoute,
               api: "openai-completions",
-              apiKey: "synthetic-fixture-key",
-              baseUrl: `http://127.0.0.1:${address.port}/v1`,
-              models: [
-                model("owner-model", "Owner fixture", 128_000),
-                model("test-model", "Fixture", 1_000_000),
-              ],
-            },
-          },
-        },
-      };
-      let flush: ReturnType<typeof runMemoryFlushIfNeeded> | undefined;
-      let admission: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
-      const scheduler = createTestGatewayScheduler();
-      try {
-        await setSessionMcpRuntimeScheduler(scheduler);
-        await state.writeConfig(cfg);
-        setRuntimeConfigSnapshot(cfg);
-        await replaceSessionEntry(scope, {
-          sessionId: scope.sessionId,
-          updatedAt: Date.now(),
-          totalTokens: 120_000,
-          totalTokensFresh: true,
-          totalTokensVersion: SESSION_TOTAL_TOKENS_VERSION,
-        });
-        const transcript = SessionManager.open(scope, state.workspaceDir);
-        transcript.appendMessage(makeUserMessage("Remember the Cedar project receipt.", 1));
-        transcript.appendMessage(
-          makeAssistantMessageFixture({
+              content: [{ type: "text", text: "Cedar receipt saved." }],
+              stopReason: "stop",
+              errorMessage: undefined,
+              usage: { ...ZERO_USAGE_FIXTURE, input: 120_000, output: 2, totalTokens: 120_002 },
+            }),
+          );
+          const original = await loadTranscriptEvents(scope);
+          const entry = loadSessionEntry(scope)!;
+          const foreground = createTestFollowupRun({
+            ...scope,
+            sessionFile: scope.sessionKey,
+            agentDir: state.agentDir(),
+            workspaceDir: state.workspaceDir,
+            config: cfg,
             ...modelRoute,
-            api: "openai-completions",
-            content: [{ type: "text", text: "Cedar receipt saved." }],
-            stopReason: "stop",
-            errorMessage: undefined,
-            usage: {
-              ...ZERO_USAGE_FIXTURE,
-              input: 120_000,
-              output: 2,
-              totalTokens: 120_002,
-            },
-          }),
-        );
-        const original = await loadTranscriptEvents(scope);
-        const entry = loadSessionEntry(scope)!;
-        const foreground = createTestFollowupRun({
-          ...scope,
-          sessionFile: scope.sessionKey,
-          agentDir: state.agentDir(),
-          workspaceDir: state.workspaceDir,
-          config: cfg,
-          ...modelRoute,
-          messageProvider: "webchat",
-          thinkLevel: "off",
-          timeoutMs: 30_000,
-          senderIsOwner: true,
-        });
-        const maintenance = createSessionMaintenanceFollowup({
-          run: foreground.run,
-          sessionEntry: entry,
-          cfg,
-          sessionKey: scope.sessionKey,
-          ...modelRoute,
-          auth: {},
-        });
-        installAgentRunnerMemoryFixture(() => ({
-          softThresholdTokens: 4_000,
-          reserveTokensFloor: 8_192,
-          forceFlushTranscriptBytes: 2 * 1024 * 1024,
-          prompt: "Checkpoint durable notes. Reply NO_REPLY.",
-          systemPrompt: "Write durable notes only.",
-          relativePath: "memory/checkpoint.md",
-          model: "test-provider/test-model",
-        }));
-        admission = await beginSessionWorkAdmission({
-          scope: scope.storePath,
-          identities: [scope.sessionKey, scope.sessionId],
-          signal: interrupted.signal,
-          assertAllowed: () => {
-            interrupted.signal.throwIfAborted();
-            expect(loadSessionEntry(scope)?.sessionId).toBe(scope.sessionId);
-          },
-        });
-        flush = admission.run(() =>
-          runMemoryFlushIfNeeded({
-            cfg,
-            followupRun: maintenance,
-            promptForEstimate: "",
-            defaultModel: "owner-model",
-            resolvedVerboseLevel: "off",
+            messageProvider: "webchat",
+            thinkLevel: "off",
+            timeoutMs: 30_000,
+            senderIsOwner: true,
+          });
+          const maintenance = createSessionMaintenanceFollowup({
+            run: foreground.run,
             sessionEntry: entry,
-            sessionStore: { [scope.sessionKey]: entry },
+            cfg,
+            sessionKey: scope.sessionKey,
+            ...modelRoute,
+            auth: {},
+          });
+          installAgentRunnerMemoryFixture(() => ({
+            softThresholdTokens: 4_000,
+            reserveTokensFloor: 8_192,
+            forceFlushTranscriptBytes: 2 * 1024 * 1024,
+            prompt: "Checkpoint durable notes. Reply NO_REPLY.",
+            systemPrompt: "Write durable notes only.",
+            relativePath: "memory/checkpoint.md",
+            model: "test-provider/test-model",
+          }));
+          admission = await beginSessionWorkAdmission({
+            scope: scope.storePath,
+            identities: [scope.sessionKey, scope.sessionId],
+            signal: interrupted.signal,
+            assertAllowed: () => {
+              interrupted.signal.throwIfAborted();
+              expect(loadSessionEntry(scope)?.sessionId).toBe(scope.sessionId);
+            },
+          });
+          flush = admission.run(() =>
+            runMemoryFlushIfNeeded({
+              cfg,
+              followupRun: maintenance,
+              promptForEstimate: "",
+              defaultModel: "owner-model",
+              resolvedVerboseLevel: "off",
+              sessionEntry: entry,
+              sessionStore: { [scope.sessionKey]: entry },
+              sessionKey: scope.sessionKey,
+              storePath: scope.storePath,
+              isHeartbeat: false,
+              abortSignal: interrupted.signal,
+            }),
+          );
+          await awaitGateBeforeSettlement(
+            entered.promise,
+            flush,
+            "Memory run ended before reaching inference",
+          );
+          await waitForDiagnosticEventsDrained();
+          expect(missingPrivateSessionId).toBe(false);
+          const firstPrivateSessionIds = [...privateSessionIds];
+          expect(firstPrivateSessionIds.length).toBeGreaterThan(0);
+          for (const sessionId of firstPrivateSessionIds) {
+            expect(peekSessionMcpRuntime({ sessionId })).toBeUndefined();
+            // Seed a run-owned resource without widening the memory model tool surface.
+            // Release its lease before settlement so active-lease protection is not exercised.
+            const lease = await acquireSessionMcpRuntime({
+              sessionId,
+              workspaceDir: state.workspaceDir,
+              cfg,
+              manifestRegistry: { plugins: [] },
+            });
+            try {
+              await lease.runtime.getCatalog();
+            } finally {
+              lease.releaseLease();
+            }
+            expect(peekSessionMcpRuntime({ sessionId })).toBeDefined();
+          }
+          if (outcome === "interrupted") {
+            interrupted.abort(new Error("next human turn"));
+          } else {
+            finishFirstResponse.resolve(true);
+          }
+          expect((await flush).outcome).toBe(outcome === "interrupted" ? "failed" : "completed");
+          admission.release();
+          admission = undefined;
+          expect(requests).toHaveLength(1);
+          expect(runtimeBudgets).toEqual([128_000]);
+          expectRetiredRuntimes(
+            firstPrivateSessionIds,
+            "completed private memory run must retire its acquired MCP runtime",
+          );
+          expect.soft(await loadTranscriptEvents(scope)).toEqual(original);
+          if (outcome === "interrupted") {
+            expect.soft(loadSessionEntry(scope)?.memoryFlush).toBeUndefined();
+          }
+          foreground.prompt = human;
+          foreground.currentInboundContext = { text: runtimeContext };
+          const current = loadSessionEntry(scope)!;
+          const result = await runReplyAgent({
+            commandBody: human,
+            transcriptCommandBody: human,
+            followupRun: foreground,
+            queueKey: scope.sessionKey,
+            resolvedQueue: { mode: "interrupt" },
+            shouldSteer: false,
+            shouldFollowup: false,
+            isActive: false,
+            opts: { runId: "next-human" },
+            typing: createTypingController({}),
+            sessionCtx: {
+              Provider: "webchat",
+              MessageSid: "next-human",
+              SessionKey: scope.sessionKey,
+            },
+            sessionEntry: current,
+            sessionStore: { [scope.sessionKey]: current },
             sessionKey: scope.sessionKey,
             storePath: scope.storePath,
-            isHeartbeat: false,
-            abortSignal: interrupted.signal,
-          }),
-        );
-        await awaitGateBeforeSettlement(
-          entered.promise,
-          flush,
-          "Memory run ended before reaching inference",
-        );
-        await waitForDiagnosticEventsDrained();
-        expect(missingPrivateSessionId).toBe(false);
-        const firstPrivateSessionIds = [...privateSessionIds];
-        expect(firstPrivateSessionIds.length).toBeGreaterThan(0);
-        for (const sessionId of firstPrivateSessionIds) {
-          expect(peekSessionMcpRuntime({ sessionId })).toBeUndefined();
-          // Seed a run-owned resource without widening the memory model tool surface.
-          // Release its lease before settlement so active-lease protection is not exercised.
-          const lease = await acquireSessionMcpRuntime({
-            sessionId,
-            workspaceDir: state.workspaceDir,
-            cfg,
-            manifestRegistry: { plugins: [] },
+            defaultModel: "owner-model",
+            resolvedVerboseLevel: "off",
+            isNewSession: false,
+            blockStreamingEnabled: false,
+            resolvedBlockStreamingBreak: "message_end",
+            shouldInjectGroupIntro: false,
+            typingMode: "never",
           });
-          try {
-            await lease.runtime.getCatalog();
-          } finally {
-            lease.releaseLease();
-          }
-          expect(peekSessionMcpRuntime({ sessionId })).toBeDefined();
-        }
-        if (outcome === "interrupted") {
-          interrupted.abort(new Error("next human turn"));
-        } else {
-          finishFirstResponse.resolve(true);
-        }
-        expect((await flush).outcome).toBe(outcome === "interrupted" ? "failed" : "completed");
-        admission.release();
-        admission = undefined;
-        expect(requests).toHaveLength(1);
-        expect(runtimeBudgets).toEqual([128_000]);
-        expectRetiredRuntimes(
-          firstPrivateSessionIds,
-          "completed private memory run must retire its acquired MCP runtime",
-        );
-        expect.soft(await loadTranscriptEvents(scope)).toEqual(original);
-        if (outcome === "interrupted") {
-          expect.soft(loadSessionEntry(scope)?.memoryFlush).toBeUndefined();
-        }
-        foreground.prompt = human;
-        foreground.currentInboundContext = { text: runtimeContext };
-        const current = loadSessionEntry(scope)!;
-        const result = await runReplyAgent({
-          commandBody: human,
-          transcriptCommandBody: human,
-          followupRun: foreground,
-          queueKey: scope.sessionKey,
-          resolvedQueue: { mode: "interrupt" },
-          shouldSteer: false,
-          shouldFollowup: false,
-          isActive: false,
-          opts: { runId: "next-human" },
-          typing: createTypingController({}),
-          sessionCtx: {
-            Provider: "webchat",
-            MessageSid: "next-human",
-            SessionKey: scope.sessionKey,
-          },
-          sessionEntry: current,
-          sessionStore: { [scope.sessionKey]: current },
-          sessionKey: scope.sessionKey,
-          storePath: scope.storePath,
-          defaultModel: "owner-model",
-          resolvedVerboseLevel: "off",
-          isNewSession: false,
-          blockStreamingEnabled: false,
-          resolvedBlockStreamingBreak: "message_end",
-          shouldInjectGroupIntro: false,
-          typingMode: "never",
-        });
-        expect(result).toMatchObject({ text: "FOREGROUND_READY" });
-        const humanRequests = requests.filter((request) => lastHumanText(request).endsWith(human));
-        expect(humanRequests).toHaveLength(1);
-        const humanMessages = humanRequests[0]!.messages;
-        const userIndex = humanMessages.findLastIndex(isHumanMessage);
-        const nextUser = text(humanMessages[userIndex]?.content);
-        expect(humanMessages.filter(isModelRuntimeContextCarrier)).toHaveLength(1);
-        expect(text(humanMessages.find(isModelRuntimeContextCarrier)?.content)).toContain(
-          runtimeContext,
-        );
-        expect(humanMessages.findIndex(isModelRuntimeContextCarrier)).toBeGreaterThan(userIndex);
-        const canonicalHuman = SessionManager.open(scope)
-          .buildSessionContext()
-          .messages.findLast(
-            (message) => message.role === "user" && text(message.content) === human,
+          expect(result).toMatchObject({ text: "FOREGROUND_READY" });
+          const humanRequests = requests.filter((request) =>
+            lastHumanText(request).endsWith(human),
           );
-        if (!canonicalHuman || typeof canonicalHuman.timestamp !== "number") {
-          throw new Error("Missing canonical human timestamp");
-        }
-        const prefix = buildTimestampPrefix(
-          new Date(canonicalHuman.timestamp),
-          timestampOptsFromConfig(cfg),
-        );
-        expect(prefix).toBeDefined();
-        expect(nextUser).toBe(`${prefix}${human}`);
-        await waitForDiagnosticEventsDrained();
-        expect.soft(missingPrivateSessionId).toBe(false);
-        expectRetiredRuntimes(
-          [...privateSessionIds].filter((sessionId) => !firstPrivateSessionIds.includes(sessionId)),
-          "later private memory run must retire before the human turn returns",
-        );
-      } finally {
-        finishFirstResponse.resolve(false);
-        interrupted.abort(createAbortError("fixture cleanup"));
-        await flush?.catch(() => undefined);
-        admission?.release();
-        await waitForSessionMaintenance(scope.sessionKey);
-        // Retire fixture-owned leftovers after work settles, including failed setup or assertions.
-        const mcpManager = getSessionMcpRuntimeManagerForTesting();
-        for (const sessionId of mcpManager.listSessionIds()) {
-          if (mcpManager.peekSession({ sessionId })?.workspaceDir === state.workspaceDir) {
-            await mcpManager.disposeSession(sessionId);
+          expect(humanRequests).toHaveLength(1);
+          const humanMessages = humanRequests[0]!.messages;
+          const userIndex = humanMessages.findLastIndex(isHumanMessage);
+          const nextUser = text(humanMessages[userIndex]?.content);
+          expect(humanMessages.filter(isModelRuntimeContextCarrier)).toHaveLength(1);
+          expect(text(humanMessages.find(isModelRuntimeContextCarrier)?.content)).toContain(
+            runtimeContext,
+          );
+          expect(humanMessages.findIndex(isModelRuntimeContextCarrier)).toBeGreaterThan(userIndex);
+          const canonicalHuman = SessionManager.open(scope)
+            .buildSessionContext()
+            .messages.findLast(
+              (message) => message.role === "user" && text(message.content) === human,
+            );
+          if (!canonicalHuman || typeof canonicalHuman.timestamp !== "number") {
+            throw new Error("Missing canonical human timestamp");
           }
+          const prefix = buildTimestampPrefix(
+            new Date(canonicalHuman.timestamp),
+            timestampOptsFromConfig(cfg),
+          );
+          expect(prefix).toBeDefined();
+          expect(nextUser).toBe(`${prefix}${human}`);
+          await waitForDiagnosticEventsDrained();
+          expect.soft(missingPrivateSessionId).toBe(false);
+          expectRetiredRuntimes(
+            [...privateSessionIds].filter(
+              (sessionId) => !firstPrivateSessionIds.includes(sessionId),
+            ),
+            "later private memory run must retire before the human turn returns",
+          );
+        } finally {
+          finishFirstResponse.resolve(false);
+          interrupted.abort(createAbortError("fixture cleanup"));
+          await flush?.catch(() => undefined);
+          admission?.release();
+          await waitForSessionMaintenance(scope.sessionKey);
+          // Retire fixture-owned leftovers after work settles, including failed setup or assertions.
+          const mcpManager = getSessionMcpRuntimeManagerForTesting();
+          for (const sessionId of mcpManager.listSessionIds()) {
+            if (mcpManager.peekSession({ sessionId })?.workspaceDir === state.workspaceDir) {
+              await mcpManager.disposeSession(sessionId);
+            }
+          }
+          await scheduler.stop();
+          clearMemoryPluginState();
+          clearRuntimeConfigSnapshot();
+          stopDiagnostics();
         }
-        await scheduler.stop();
-        clearMemoryPluginState();
-        clearRuntimeConfigSnapshot();
-        stopDiagnostics();
-        server.closeAllConnections();
-        await new Promise<void>((resolve, reject) => {
-          server.close((error) => (error ? reject(error) : resolve()));
-        });
-        expect(requestErrors).toEqual([]);
-      }
+      }).finally(() => expect(requestErrors).toEqual([]));
     });
   },
   60_000,
