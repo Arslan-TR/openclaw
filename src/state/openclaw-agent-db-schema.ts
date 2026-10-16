@@ -64,6 +64,7 @@ import {
 import { registerOpenClawAgentDatabaseIdentity } from "./openclaw-agent-db-identity.js";
 import * as maintenanceAuthority from "./openclaw-agent-db-lease.js";
 import { migrateOpenClawAgentSchema } from "./openclaw-agent-db-legacy-schema.js";
+import { assertAgentDatabaseMaintenanceAuthority } from "./openclaw-agent-db-maintenance-authority.js";
 import { persistAgentSchemaMetadata } from "./openclaw-agent-db-metadata-write.js";
 import { ensureOpenClawAgentDatabasePermissions } from "./openclaw-agent-db-permissions.js";
 import { registerOpenClawAgentDatabase } from "./openclaw-agent-db-registry.js";
@@ -321,7 +322,7 @@ function ensureAgentSchema(
           return;
         }
         if (identityMigration) {
-          maintenanceAuthority.assertAgentDatabaseMaintenanceAuthority();
+          assertAgentDatabaseMaintenanceAuthority();
         }
         getOpenClawDatabaseMaintenanceScope()?.assertAgentSchemaMigration({
           agentId,
