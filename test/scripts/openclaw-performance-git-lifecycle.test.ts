@@ -37,6 +37,19 @@ function performanceRun(
   });
 }
 
+function expectReport(
+  report: Awaited<ReturnType<typeof performanceRun>>,
+  code: number,
+  counts: Partial<Record<"pushes" | "fetches" | "checkouts" | "readyAttempts", number>>,
+) {
+  expect(report.code, report.output).toBe(code);
+  for (const key of ["pushes", "fetches", "checkouts", "readyAttempts"] as const) {
+    if (counts[key] !== undefined) {
+      expect(report[key]).toHaveLength(counts[key]);
+    }
+  }
+}
+
 // Real workflow bodies must drain writers while an unrelated sentinel stays alive.
 posixIt.for(Object.keys(steps) as PerformanceFixtureOptions["mode"][])(
   "Performance %s drains Git trees before every continuation",
@@ -79,14 +92,13 @@ posixIt.for(["absent", "invalid", "trailing-newline"] as const)(
     const report = await performanceRun(signal, "baseline", {
       performance: { mode: "baseline", baseline },
     });
-    expect(report.code, report.output).toBe(0);
+    expectReport(report, 0, { checkouts: 0 });
     expect(report.githubSummary).toContain(
       baseline === "absent"
         ? "No previous source performance baseline exists"
         : "Previous source performance baseline pointer is invalid.",
     );
     expect(report.githubEnv).toBe("");
-    expect(report.checkouts).toHaveLength(0);
   },
 );
 
@@ -182,10 +194,8 @@ posixIt.for(["hang", 23, 125] as const)(
     const report = await performanceRun(signal, "prepare", {
       fetchResults: [failure, failure, failure],
     });
-    expect(report.code, report.output).toBe(1);
-    expect(report.fetches).toHaveLength(3);
+    expectReport(report, 1, { fetches: 3, checkouts: 0 });
     expect(report.fetches.every(({ args }) => args.includes("--depth=1"))).toBe(true);
-    expect(report.checkouts).toHaveLength(0);
     expect(report.commands.at(-1)?.args[0]).toBe("fetch");
     expect(report.githubOutput).toBe("ready=false\n");
     expect(report.githubSummary).toBe("");
@@ -198,13 +208,11 @@ posixIt(
     const report = await performanceRun(signal, "prepare", {
       performance: { mode: "prepare", duplicate: true },
     });
-    expect(report.code, report.output).toBe(0);
-    expect(report.readyAttempts).toHaveLength(0);
+    expectReport(report, 0, { readyAttempts: 0, pushes: 0 });
     expect(report.githubOutput).toContain("already_published=true\n");
     expect(report.githubOutput).toContain("ready=true\n");
     expect(report.githubOutput).not.toContain("report_commit=");
     expect(report.githubSummary).toContain("### Clawgrit report already published");
-    expect(report.pushes).toHaveLength(0);
     expect(report.commands.some(({ args }) => args[0] === "commit")).toBe(false);
     expect(
       report.commands.every(
@@ -236,10 +244,7 @@ posixIt.for([125, "hang"] as const)(
   { timeout: 55_000 },
   async (code, { signal }) => {
     const report = await performanceRun(signal, "publish", { pushResults: [code] });
-    expect(report.code, report.output).toBe(0);
-    expect(report.pushes).toHaveLength(2);
-    expect(report.fetches).toHaveLength(1);
-    expect(report.checkouts).toHaveLength(1);
+    expectReport(report, 0, { pushes: 2, fetches: 1, checkouts: 1 });
     expect(report.output.match(/fixture backoff: \d+/gu)).toEqual(["fixture backoff: 2"]);
     expect(report.githubSummary).toContain("### Clawgrit report published");
     expect(report.performance?.config).not.toContain("AUTHORIZATION");
@@ -277,8 +282,7 @@ posixIt.for([false, true])(
       pushResults: [23, 23, 23, 23, 23],
       fetchResults: fetchFails ? [23, 23, 23, 23, 23] : [],
     });
-    expect(report.code, report.output).toBe(1);
-    expect(report.pushes).toHaveLength(5);
+    expectReport(report, 1, { pushes: 5, checkouts: fetchFails ? 0 : 4 });
     expect(report.boundaries.filter(({ name }) => name === "backoff")).toHaveLength(5);
     expect(report.fetches.map(({ args }) => args)).toEqual(
       Array.from({ length: 5 }, () => ["fetch", "--depth=1", "origin", "main"]),
@@ -286,7 +290,6 @@ posixIt.for([false, true])(
     expect(report.output.match(/fixture backoff: \d+/gu)).toEqual(
       [2, 4, 6, 8, 10].map((seconds) => `fixture backoff: ${seconds}`),
     );
-    expect(report.checkouts).toHaveLength(fetchFails ? 0 : 4);
     expect(report.commands.filter(({ args }) => args[0] === "cherry-pick")).toHaveLength(
       fetchFails ? 0 : 4,
     );
@@ -306,10 +309,7 @@ posixIt.for([1, 5])(
       performance: { mode: "publish", remoteDuplicateAttempt: attempt },
       pushResults: Array.from({ length: attempt }, () => 124),
     });
-    expect(report.code, report.output).toBe(0);
-    expect(report.pushes).toHaveLength(attempt);
-    expect(report.fetches).toHaveLength(attempt);
-    expect(report.checkouts).toHaveLength(attempt - 1);
+    expectReport(report, 0, { pushes: attempt, fetches: attempt, checkouts: attempt - 1 });
     expect(report.githubSummary).toContain("### Clawgrit report published");
   },
 );
@@ -325,9 +325,8 @@ posixIt.for([23, 125])(
         { match: "^cherry-pick --abort$", code },
       ],
     });
-    expect(report.code, report.output).toBe(1);
+    expectReport(report, 1, { pushes: 1 });
     expect(report.commands.at(-1)?.args).toEqual(["cherry-pick", "--abort"]);
-    expect(report.pushes).toHaveLength(1);
     expect(report.output).toContain(
       "::error::Unable to replay the clawgrit report after a concurrent publish.",
     );
@@ -354,10 +353,7 @@ posixIt.for([125, "hang"] as const)(
       pushResults: [23],
       fetchResults: [code],
     });
-    expect(report.code, report.output).toBe(0);
-    expect(report.pushes).toHaveLength(2);
-    expect(report.fetches).toHaveLength(1);
-    expect(report.checkouts).toHaveLength(0);
+    expectReport(report, 0, { pushes: 2, fetches: 1, checkouts: 0 });
     expect(report.output.match(/::warning::Unable to refresh/gu)).toHaveLength(1);
   },
 );
@@ -389,9 +385,7 @@ posixIt(
       cooperativeTrees: true,
       cancelDuringBackoff: true,
     });
-    expect(report.code, report.output).toBe(143);
-    expect(report.pushes).toHaveLength(1);
-    expect(report.fetches).toHaveLength(0);
+    expectReport(report, 143, { pushes: 1, fetches: 0 });
     expect(report.githubSummary).toBe("");
     expect(report.boundaries.some(({ name }) => name === "backoff-cancel")).toBe(true);
   },

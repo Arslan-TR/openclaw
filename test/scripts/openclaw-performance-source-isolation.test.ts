@@ -1,4 +1,3 @@
-// OpenClaw source performance isolation executes the workflow's real shared-shell path.
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -17,30 +16,18 @@ type WorkflowStep = {
   with?: Record<string, string>;
 };
 
-type WorkflowJob = {
-  env?: Record<string, string>;
-  steps?: WorkflowStep[];
-};
-
 type Workflow = {
   env?: Record<string, string>;
-  jobs?: Record<string, WorkflowJob>;
+  jobs?: Record<string, { env?: Record<string, string>; steps?: WorkflowStep[] }>;
 };
 
-function readWorkflow(): Workflow {
-  return parse(readFileSync(WORKFLOW, "utf8")) as Workflow;
-}
-
 it("isolates the source performance gateway from network and scheduled work", () => {
-  const workflow = readWorkflow();
+  const workflow = parse(readFileSync(WORKFLOW, "utf8")) as Workflow;
   const job = workflow.jobs?.source_performance;
   const targetStepName = "Run OpenClaw source performance probes";
   const jobSteps = job?.steps ?? [];
-  const step = expectDefined(
-    jobSteps.find((candidate) => candidate.name === targetStepName),
-    targetStepName,
-  );
-  const targetStepIndex = jobSteps.findIndex((candidate) => candidate.name === targetStepName);
+  const targetStepIndex = jobSteps.findIndex((item) => item.name === targetStepName);
+  const step = expectDefined(jobSteps[targetStepIndex], targetStepName);
   const run = step.run ?? "";
   const sliceStartMarker = 'gateway_home="$(mktemp -d)"';
   const sliceEndMarker = "cleanup_gateway\ntrap - EXIT";
@@ -57,12 +44,12 @@ it("isolates the source performance gateway from network and scheduled work", ()
   const binDir = join(fixtureRoot, "bin");
   mkdirSync(binDir);
   const writeCommand = (name: string, source: string) =>
-    writeFileSync(join(binDir, name), source, { mode: 0o755 });
+    writeFileSync(join(binDir, name), `#!/bin/sh\nset -eu\n${source}`, { mode: 0o755 });
   writeCommand(
     "node",
-    `#!/bin/sh
-set -eu
-record_env() {
+    `capture() {
+  name="$1"
+  shift
   {
     printf 'OPENCLAW_HOME=%s\\n' "\${OPENCLAW_HOME-<unset>}"
     printf 'OPENCLAW_STATE_DIR=%s\\n' "\${OPENCLAW_STATE_DIR-<unset>}"
@@ -71,61 +58,37 @@ record_env() {
     printf 'OPENCLAW_GATEWAY_TOKEN=%s\\n' "\${OPENCLAW_GATEWAY_TOKEN-<unset>}"
     printf 'OPENCLAW_SKIP_CHANNELS=%s\\n' "\${OPENCLAW_SKIP_CHANNELS-<unset>}"
     printf 'OPENCLAW_SKIP_CRON=%s\\n' "\${OPENCLAW_SKIP_CRON-<unset>}"
-  } > "$CAPTURE_DIR/$1.env"
-}
-record_argv() {
-  name="$1"
-  shift
+  } > "$CAPTURE_DIR/$name.env"
   printf '%s\\n' "$@" > "$CAPTURE_DIR/$name.argv"
+  /bin/cp "$OPENCLAW_CONFIG_PATH" "$CAPTURE_DIR/$name.config"
 }
 if [ "\${1-}" = "-e" ]; then
   [ -n "\${REAL_NODE-}" ] || { printf 'REAL_NODE is required\\n' >&2; exit 64; }
   exec "$REAL_NODE" "$@"
 fi
-if [ "\${1-}" = "dist/entry.js" ] && [ "\${2-}" = "gateway" ] && [ "\${3-}" = "run" ]; then
-  record_env gateway
-  record_argv gateway "$@"
-  /bin/cp "$OPENCLAW_CONFIG_PATH" "$CAPTURE_DIR/gateway.config"
+case "\${1-}:\${2-}:\${3-}" in
+  dist/entry.js:gateway:run) name=gateway; event=gateway-run ;;
+  dist/entry.js:gateway:health) name=health; event=gateway-health ;;
+  --import:tsx:*bench-cli-startup.ts) name=benchmark; event=benchmark ;;
+  *) printf 'unexpected node argv: %s\\n' "$*" >&2; exit 64 ;;
+esac
+capture "$name" "$@"
+if [ "$name" = gateway ]; then
   printf '%s\\n' "$OPENCLAW_GATEWAY_PORT" > "$CAPTURE_DIR/gateway.port"
   trap 'printf "terminated\\n" > "$CAPTURE_DIR/gateway.terminated"; exit 0' TERM INT
-  printf 'gateway-run\\n' >> "$EVENTS_FILE"
-  : > "$CAPTURE_DIR/gateway.ready"
-  remaining=8
-  while [ "$remaining" -gt 0 ]; do
-    /bin/sleep 1
-    remaining=$((remaining - 1))
-  done
-  exit 64
 fi
-if [ "\${1-}" = "dist/entry.js" ] && [ "\${2-}" = "gateway" ] && [ "\${3-}" = "health" ]; then
-  record_env health
-  record_argv health "$@"
-  /bin/cp "$OPENCLAW_CONFIG_PATH" "$CAPTURE_DIR/health.config"
-  printf 'gateway-health\\n' >> "$EVENTS_FILE"
-  exit 0
-fi
-if [ "\${1-}" = "--import" ] && [ "\${2-}" = "tsx" ]; then
-  case "\${3-}" in
-    *bench-cli-startup.ts) ;;
-    *) exit 64 ;;
-  esac
-  record_env benchmark
-  record_argv benchmark "$@"
-  /bin/cp "$OPENCLAW_CONFIG_PATH" "$CAPTURE_DIR/benchmark.config"
-  printf 'benchmark\\n' >> "$EVENTS_FILE"
-  exit 0
-fi
-printf 'unexpected node argv:' >&2
-printf ' %s' "$@" >&2
-printf '\\n' >&2
+printf '%s\\n' "$event" >> "$EVENTS_FILE"
+[ "$name" = gateway ] || exit 0
+: > "$CAPTURE_DIR/gateway.ready"
+for _ in 1 2 3 4 5 6 7 8; do
+  /bin/sleep 1
+done
 exit 64
 `,
   );
   writeCommand(
     "cp",
-    `#!/bin/sh
-set -eu
-[ "$#" -eq 2 ] || exit 64
+    `[ "$#" -eq 2 ] || exit 64
 [ ! -e "$CAPTURE_DIR/readiness-copy.config" ] || exit 64
 /bin/cp "$1" "$CAPTURE_DIR/readiness-copy.config"
 /bin/cp "$1" "$2"
@@ -133,9 +96,7 @@ set -eu
   );
   writeCommand(
     "curl",
-    `#!/bin/sh
-set -eu
-[ -s "$CAPTURE_DIR/gateway.port" ] || exit 1
+    `[ -s "$CAPTURE_DIR/gateway.port" ] || exit 1
 port="$(cat "$CAPTURE_DIR/gateway.port")"
 expected="http://127.0.0.1:$port/healthz"
 found=false
@@ -149,9 +110,7 @@ printf 'http-health\\n' >> "$EVENTS_FILE"
   );
   writeCommand(
     "rg",
-    `#!/bin/sh
-set -eu
-[ "$#" -eq 3 ] && [ "$1" = '-q' ] && [ "$2" = 'catalogRefresh:' ] && [ "$3" = 'src/config/zod-schema.core.ts' ] || {
+    `[ "$#" -eq 3 ] && [ "$1" = '-q' ] && [ "$2" = 'catalogRefresh:' ] && [ "$3" = 'src/config/zod-schema.core.ts' ] || {
   printf 'unexpected rg argv\\n' >&2
   exit 64
 }
@@ -172,19 +131,11 @@ exit "$RG_STATUS"
     mkdirSync(captureDir, { recursive: true });
     mkdirSync(sourcePerfDir);
     const isolatedEnv = { ...process.env };
-    for (const name of [
-      "OPENCLAW_SKIP_CRON",
-      "OPENCLAW_SKIP_CHANNELS",
-      "OPENCLAW_GATEWAY_TOKEN",
-      "BASH_ENV",
-      "ENV",
-      "BASHOPTS",
-      "SHELLOPTS",
-      "CDPATH",
-      "GLOBIGNORE",
-      "PROMPT_COMMAND",
-      "ZDOTDIR",
-    ]) {
+    const ambientKeys = (
+      "OPENCLAW_SKIP_CRON OPENCLAW_SKIP_CHANNELS OPENCLAW_GATEWAY_TOKEN " +
+      "BASH_ENV ENV BASHOPTS SHELLOPTS CDPATH GLOBIGNORE PROMPT_COMMAND ZDOTDIR"
+    ).split(" ");
+    for (const name of ambientKeys) {
       delete isolatedEnv[name];
     }
     Object.assign(isolatedEnv, {
@@ -239,7 +190,6 @@ exit "$RG_STATUS"
         mode: "local",
         port: Number(gatewayPort),
         bind: "loopback",
-        auth: { mode: "token" },
         controlUi: { enabled: false },
         tailscale: { mode: "off" },
       },
@@ -316,12 +266,7 @@ exit "$RG_STATUS"
     ["job env", job?.env],
     ["current step env", step.env],
     ["current step before harness", run.slice(0, sliceStart)],
-    ...jobSteps
-      .slice(0, targetStepIndex)
-      .map(
-        (candidate, index) =>
-          [`preceding step ${index + 1} (${candidate.name ?? "unnamed"})`, candidate] as const,
-      ),
+    ["preceding steps", jobSteps.slice(0, targetStepIndex)],
     [
       "current step GITHUB_ENV writes",
       run

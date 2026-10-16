@@ -23,10 +23,12 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const scriptSource = readFileSync(SCRIPT, "utf8");
 const definitions = scriptSource.slice(0, scriptSource.lastIndexOf('\ncase "${1:-}" in'));
 
-function shell(code: string, env: NodeJS.ProcessEnv, args: string[] = []) {
+function shell(code: string, env: NodeJS.ProcessEnv, args: string[] = [], timeout?: number) {
   return spawnSync("/bin/bash", ["-euo", "pipefail", "-c", `${definitions}\n${code}`, ...args], {
     env,
     encoding: "utf8",
+    timeout,
+    maxBuffer: timeout === undefined ? undefined : 256 * 1024,
   });
 }
 
@@ -35,7 +37,12 @@ function readJson(file: string) {
 }
 
 function writeJson(file: string, value: unknown) {
+  mkdirSync(join(file, ".."), { recursive: true });
   writeFileSync(file, JSON.stringify(value));
+}
+
+function readText(root: string, path: string) {
+  return readFileSync(join(root, path), "utf8");
 }
 
 function linesIfPresent(file: string) {
@@ -71,13 +78,7 @@ function fixture() {
     },
     command: {
       name: "mock-provider",
-      argv: [
-        "profile=diagnostic",
-        "repeat=1",
-        "contract=canonical",
-        "include=scenario:fresh-install",
-        "failOnRegression=false",
-      ],
+      argv: ["fixture"],
       exitCode: 0,
       startedAt: "2026-08-21T00:00:00Z",
       finishedAt: "2026-08-21T00:01:00Z",
@@ -102,11 +103,7 @@ function fixture() {
     exitCode: 0,
   });
   const expected = join(root, "expected.json");
-  writeJson(expected, {
-    ...JSON.parse(readFileSync(evidence, "utf8")),
-    timing: JSON.parse(readFileSync(timing, "utf8")),
-    stopped: true,
-  });
+  writeJson(expected, { ...readJson(evidence), timing: readJson(timing), stopped: true });
   return { artifact, evidence, output, payload, root, timing, expected };
 }
 
@@ -148,8 +145,7 @@ const root = ${JSON.stringify(root)}, options = ${JSON.stringify(options)};
 const args = process.argv.slice(2);
 fs.appendFileSync(root + "/curl-calls", JSON.stringify({args, env:process.env}) + "\\n");
 if (args.includes("--version")) {
-  if (options.fault === "version") process.exit(2);
-  console.log("curl fixture\\nProtocols: " + (options.fault === "http" ? "https" : "http https"));
+  console.log("curl fixture\\nProtocols: http https");
   console.log("Features: " + (options.fault === "ipv6" ? "SSL" : "IPv6 SSL"));
   process.exit(0);
 }
@@ -176,11 +172,8 @@ process.exit(code);
   expect(systemdStart).toBeGreaterThan(prepareStart);
   // Execute the real preparation gates; systemd startup is outside this fixture.
   const preparation = scriptSource.slice(prepareStart, systemdStart);
-  const result = spawnSync(
-    "/bin/bash",
-    [
-      "-c",
-      `${definitions}
+  const result = shell(
+    `
 id() {
   [[ "\${1:-}" == -u ]] || return 1
   if [[ "$2" == openclaw-bench ]]; then printf '12346\\n'; else printf '12345\\n'; fi
@@ -193,12 +186,7 @@ runuser() {
   [[ "$1:$2:$3:$4:$5:$6:$7" == "-u:$ROLE:--:/usr/bin/env:-C:/home/$ROLE:-i" ]] || exit 90
   [[ "\${*: -3}" != "sudo -n true" ]] || return 1
   shift 7
-  local arg args=()
-  for arg in "$@"; do
-    [[ "$arg" != curl ]] || arg="$ROOT/bin/curl"
-    args+=("$arg")
-  done
-  /usr/bin/env -i "\${args[@]}"
+  /usr/bin/env -i "$@"
 }
 command() {
   [[ "$1:$2" != "-v:$MISSING_TOOL" ]] || return 1
@@ -215,25 +203,21 @@ ${preparation}
 ${prepareName}
 printf handoff > "$ROOT/handoff"
 `,
-    ],
     {
-      env: {
-        HOME: root,
-        PATH: `${bin}:/usr/bin:/bin`,
-        ROOT: root,
-        ROLE: options.runner ? "openclaw-bench" : "openclaw-sut",
-        FAULT: options.fault ?? "",
-        MISSING_TOOL: options.fault?.startsWith("missing:")
-          ? options.fault.slice("missing:".length)
-          : "",
-        HTTP_PROXY: "http://proxy.invalid",
-        HTTPS_PROXY: "http://proxy.invalid",
-        ALL_PROXY: "http://proxy.invalid",
-      },
-      encoding: "utf8",
-      timeout: 5000,
-      maxBuffer: 256 * 1024,
+      HOME: root,
+      PATH: `${bin}:/usr/bin:/bin`,
+      ROOT: root,
+      ROLE: options.runner ? "openclaw-bench" : "openclaw-sut",
+      FAULT: options.fault ?? "",
+      MISSING_TOOL: options.fault?.startsWith("missing:")
+        ? options.fault.slice("missing:".length)
+        : "",
+      HTTP_PROXY: "http://proxy.invalid",
+      HTTPS_PROXY: "http://proxy.invalid",
+      ALL_PROXY: "http://proxy.invalid",
     },
+    [],
+    5000,
   );
   return {
     result,
@@ -276,7 +260,7 @@ describe("OpenClaw performance Crabbox boundary", () => {
             " ",
           ),
         );
-        expect(probe.env.HOME).toBe(runner ? "/home/openclaw-bench" : "/home/openclaw-sut");
+        expect(probe.env).toMatchObject({ HOME: `/home/openclaw-${runner ? "bench" : "sut"}` });
         expect(Object.keys(probe.env).some((key) => /proxy/i.test(key))).toBe(false);
       }
     },
@@ -404,9 +388,8 @@ as_sut() {
       fi
       return 0 ;;
     __prepare) return "$SETUP_EXIT" ;;
-    __build) return "$BUILD_EXIT" ;;
+    __build) return 0 ;;
   esac
-  if [[ "$1" == test ]]; then command test "\${@:2}"; return; fi
   printf '%s\\n' "$SHA"
 }
 as_runner() {
@@ -482,7 +465,6 @@ finish
         SHA: "a".repeat(40),
         LANE: entry.lane ?? "mock-provider",
         SETUP_EXIT: String(entry.setupExit ?? 0),
-        BUILD_EXIT: "0",
         MATRIX_EXIT: String(entry.matrixExit ?? 0),
         BUNDLE_EXIT: String(entry.bundleExit ?? 0),
         SUMMARY_EXIT: String(entry.summaryExit ?? 0),
@@ -496,19 +478,16 @@ finish
     );
     expect(result.status, result.stderr).toBe(entry.expected);
     expect(existsSync(join(root, "quiesced"))).toBe(true);
-    expect(readFileSync(join(root, "exported"), "utf8")).toBe(`${entry.expected}\n`);
-    expect(
-      readJson(
-        join(
-          root,
-          `.artifacts/performance-crabbox/${entry.lane ?? "mock-provider"}/workload-result.json`,
-        ),
-      ),
-    ).toMatchObject({ exitCode: entry.expected, exportExitCode: entry.collectionExit ? 43 : 0 });
+    expect(readText(root, "exported")).toBe(`${entry.expected}\n`);
+    const receipt = `.artifacts/performance-crabbox/${entry.lane ?? "mock-provider"}/workload-result.json`;
+    expect(readJson(join(root, receipt))).toMatchObject({
+      exitCode: entry.expected,
+      exportExitCode: entry.collectionExit ? 43 : 0,
+    });
     if (entry.lane === "source") {
       expect(existsSync(join(root, "runner-cli"))).toBe(!entry.setupExit);
       if (!entry.setupExit) {
-        expect(readFileSync(join(root, "runner-cli"), "utf8")).toBe("runner-measurement");
+        expect(readText(root, "runner-cli")).toBe("runner-measurement");
       }
     } else if (entry.admitted === false) {
       const summaryPath = join(root, ".artifacts/kova/summaries/mock-provider.md");
@@ -521,9 +500,7 @@ finish
         expect(summary).toContain("candidate-produced diagnostics only; not gate evidence");
       }
     } else if (!entry.setupExit && !entry.bundleExit) {
-      expect(readFileSync(join(root, "validated-matrix-exit"), "utf8")).toBe(
-        `${entry.matrixExit ?? 0}\n`,
-      );
+      expect(readText(root, "validated-matrix-exit")).toBe(`${entry.matrixExit ?? 0}\n`);
     }
   });
 
@@ -637,26 +614,20 @@ finish
         const root = tempDirs.make("openclaw-performance-kova-contract-");
         const openclaw = join(root, "openclaw");
         const artifact = (path: string) => join(openclaw, ".artifacts/kova", path);
-        for (const path of [
-          "reports/mock-provider",
-          "plans",
-          "bundles/mock-provider",
-          "summaries",
-        ]) {
-          mkdirSync(artifact(path), { recursive: true });
-        }
+        mkdirSync(artifact("summaries"), { recursive: true });
         const common = { profile: { id: "diagnostic" }, target: `local-build:${openclaw}` };
+        const controls = { include: ["scenario:probe"], repeat: 1 };
         writeJson(artifact("plans/mock-provider.json"), {
           ...common,
           schemaVersion: "kova.matrix.plan.v1",
-          controls: { include: [planFilter], repeat: 1 },
+          controls: { ...controls, include: [planFilter] },
           entries: [{ scenario: { id: "probe" }, state: { id: "fresh" }, status: "SELECTED" }],
         });
         writeJson(artifact("reports/mock-provider/report.json"), {
           ...common,
           schemaVersion: "kova.report.v1",
           mode: "execution",
-          controls: { include: ["scenario:probe"], repeat: 1 },
+          controls,
           auth: { requestedMode: "mock" },
           summary: { statuses: { BLOCKED: 1 } },
           records: records

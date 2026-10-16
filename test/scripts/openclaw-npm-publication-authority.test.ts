@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
@@ -21,53 +21,31 @@ const packageNames = [
 ];
 
 // Execute the real workflow and admission owner; replace only GitHub/npm transport.
-async function fixture(candidateTrap = false) {
+async function fixture() {
   const f = candidatePublicationFixture();
   const root = tempDirs.make("npm-publication-authority-");
   const bin = join(root, "bin");
   const statePath = join(root, "state.json");
-  for (const directory of [
-    "bin",
-    "preflight-tarball",
-    "full-release-validation",
-    "package",
-    "scripts",
-  ]) {
-    mkdirSync(join(root, directory));
-  }
-  const write = (path: string, content: string, executable = false) =>
-    writeFileSync(join(root, path), content, executable ? { mode: 0o755 } : undefined);
+  const write = (path: string, content: string, executable = false) => {
+    const target = join(root, path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content, executable ? { mode: 0o755 } : undefined);
+  };
   const json = (path: string, value: unknown) => write(path, JSON.stringify(value));
   const version = "2026.8.28-beta.1";
   json("package.json", { name: "openclaw", version });
+  mkdirSync(join(root, "preflight-tarball"));
   const tarballs = packageNames.map((name, i) => {
     const tarballName = "package-" + i + ".tgz";
     json("package/package.json", { name, version });
-    execFileSync("tar", [
-      "-czf",
-      join(root, "preflight-tarball", tarballName),
-      "-C",
-      root,
-      "package",
-    ]);
+    const target = join(root, "preflight-tarball", tarballName);
+    execFileSync("tar", ["-czf", target, "-C", root, "package"]);
     return { packageName: name, tarballName };
   });
   json("preflight-tarball/preflight-manifest.json", { corePackageTarballs: tarballs.slice(0, 3) });
   json("full-release-validation/full-release-validation-manifest.json", f.manifest);
-  // Retain the mutation path for red-before proof; the trap verifies frozen candidates.
-  for (const file of [
-    "scripts/openclaw-npm-publish.sh",
-    "scripts/openclaw-npm-extended-stable-release.mjs",
-    "scripts/plugin-sdk-api-release-evidence.mjs",
-    "scripts/lib/npm-publish-plan.mjs",
-    "scripts/lib/release-version.mjs",
-  ]) {
-    mkdirSync(join(root, file, ".."), { recursive: true });
-    copyFileSync(file, join(root, file));
-  }
-  if (candidateTrap) {
-    write("scripts/openclaw-npm-publish.sh", "echo CANDIDATE_PUBLISHER_EXECUTED >&2; exit 99\n");
-  }
+  // Candidate code must never run, including during historical/manual recovery.
+  write("scripts/openclaw-npm-publish.sh", "echo CANDIDATE_PUBLISHER_EXECUTED >&2; exit 99\n");
   write(
     "scripts/npm-preflight-tooling-identity.mjs",
     "throw new Error('CANDIDATE_GUARD_EXECUTED');\n",
@@ -75,9 +53,9 @@ async function fixture(candidateTrap = false) {
   symlinkSync(resolve("."), join(root, "trusted-workflow"), "dir");
 
   const api: Record<string, unknown> = {};
-  const archives: Record<string, string> = {};
-  const logs: Record<string, string> = {};
-  const views: Record<string, unknown> = {};
+  const binary: Record<string, string> = {};
+  const respondBytes = (key: string, value: string | Uint8Array) =>
+    (binary[key] = Buffer.from(value).toString("base64"));
   for (const id of new Set([f.runId, ...f.plan.children.map((child) => child.runId)])) {
     api["actions/runs/" + id] = await f.client.getRun(id);
     api["actions/runs/" + id + "/attempts/1"] = f.client.getRunAttempt(id, 1);
@@ -85,18 +63,18 @@ async function fixture(candidateTrap = false) {
     api["actions/runs/" + id + "/jobs"] = { total_count: parentJobs.length, jobs: parentJobs };
     const jobs = await f.client.getRunAttemptJobs(id);
     api["actions/runs/" + id + "/attempts/1/jobs"] = { total_count: jobs.length, jobs };
-    views[id] = f.client.getRunView(id);
+    api["view/" + id] = f.client.getRunView(id);
     if (id === f.runId) {
       for (const job of parentJobs) {
-        logs["actions/jobs/" + job.id + "/logs"] = await f.client.getJobLog(job.id);
+        respondBytes("actions/jobs/" + job.id + "/logs", await f.client.getJobLog(job.id));
       }
     }
   }
-  logs["actions/jobs/902/logs"] = await f.client.getJobLog(902);
+  respondBytes("actions/jobs/902/logs", await f.client.getJobLog(902));
   api["actions/runs/40/attempts/1"] = f.admission.run;
   api["actions/runs/40/attempts/1/jobs"] = f.admission.jobs;
   api["actions/artifacts/70"] = f.admission.metadata;
-  archives["actions/artifacts/70/zip"] = f.admission.archive().toString("base64");
+  respondBytes("actions/artifacts/70/zip", f.admission.archive());
   api["collaborators/" + f.admission.actor.login + "/permission"] = {
     permission: "write",
     user: f.admission.actor,
@@ -138,10 +116,10 @@ async function fixture(candidateTrap = false) {
   const archive = (name: string, value: unknown) =>
     makeStoredZip({ [name]: JSON.stringify(value) });
   const artifact = <T extends { id: number }>(metadata: T, name: string, value: unknown) => {
-    const bytes = archive(name, value);
-    const result = { ...metadata, digest: "sha256:" + hash(bytes), size_in_bytes: bytes.length };
+    const zip = archive(name, value);
+    const result = { ...metadata, digest: "sha256:" + hash(zip), size_in_bytes: zip.length };
     api["actions/artifacts/" + metadata.id] = result;
-    archives["actions/artifacts/" + metadata.id + "/zip"] = bytes.toString("base64");
+    respondBytes("actions/artifacts/" + metadata.id + "/zip", zip);
     return result;
   };
   const manifestArtifact = artifact(
@@ -164,7 +142,7 @@ async function fixture(candidateTrap = false) {
     total_count: 2,
     artifacts: [manifestArtifact, planArtifact],
   };
-  json("transport.json", { api, archives, logs, views });
+  json("transport.json", { api, binary });
   json("state.json", { writes: [], calls: [], revoked: false });
 
   const preload = join(root, "transport.mjs");
@@ -176,12 +154,25 @@ import { EventEmitter } from 'node:events';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
-import { promisify } from 'node:util';
 const root = process.env.NPM_AUTHORITY_FIXTURE;
 const isGh = command => command === 'gh' || command === root + '/bin/gh';
 const statePath = root + '/state.json';
 const readState = () => JSON.parse(readFileSync(statePath, 'utf8'));
 const save = state => writeFileSync(statePath, JSON.stringify(state));
+if (process.argv[1] === root + '/bin/npm') {
+  const state = readState();
+  const args = process.argv.slice(2);
+  if (args[0] === 'view') {
+    state.calls.push('registry:' + args[1]);
+    save(state);
+    process.exit(state.reuseFirst && args[1].startsWith('@openclaw/ai@') ? 0 : 1);
+  }
+  if (args[0] !== 'publish') throw new Error('Unexpected npm command');
+  state.writes.push(args);
+  if (state.writes.length === state.revokeAfter) state.revoked = true;
+  save(state);
+  process.exit(0);
+}
 if (process.argv[1]?.endsWith('/openclaw-npm-extended-stable-release.mjs') && process.argv[2] === 'publish-plan') {
   const state = readState();
   state.calls.push('prepare');
@@ -198,15 +189,15 @@ function response(args) {
   state.calls.push(key);
   if (state.revokeAtParent && key === 'actions/runs/99') state.revoked = true;
   save(state);
-  if (data.archives[key]) return Buffer.from(data.archives[key], 'base64');
-  if (data.logs[key]) return Buffer.from(data.logs[key]);
-  let result = key.startsWith('view/') ? data.views[key.slice(5)] : data.api[key];
+  if (data.binary[key]) return Buffer.from(data.binary[key], 'base64');
+  let result = data.api[key];
   if (!result) throw new Error('Unexpected GitHub endpoint: ' + key);
   result = structuredClone(result);
   if (state.revoked && key.startsWith('collaborators/')) result.permission = 'read';
   if (state.movedRef && key.startsWith('git/ref/tags/')) result.object.sha = 'd'.repeat(40);
-  if (state.parentCompleted && key === 'actions/runs/99') { result.status = 'completed'; result.conclusion = 'failure'; }
-  if (state.recovery && key === 'actions/runs/99') { result.status = 'completed'; result.conclusion = 'failure'; }
+  if ((state.parentCompleted || state.recovery) && key === 'actions/runs/99') {
+    Object.assign(result, { status: 'completed', conclusion: 'failure' });
+  }
   return Buffer.from(JSON.stringify(result));
 }
 const originalSync = cp.execFileSync;
@@ -215,16 +206,6 @@ cp.execFileSync = (command, args, options = {}) => {
   const bytes = response(args);
   if (Number.isInteger(options.stdio?.[1])) writeFileSync(options.stdio[1], bytes);
   return options.encoding ? bytes.toString(options.encoding) : bytes;
-};
-const originalAsync = cp.execFile;
-cp.execFile = (command, args, options, callback) => {
-  if (!isGh(command)) return originalAsync(command, args, options, callback);
-  try { callback(null, response(args).toString('utf8'), ''); }
-  catch (error) { callback(error, '', ''); }
-};
-cp.execFile[promisify.custom] = async (command, args, options) => {
-  if (!isGh(command)) throw new Error('Unexpected async transport: ' + command);
-  return { stdout: response(args).toString('utf8'), stderr: '' };
 };
 const originalSpawn = cp.spawn;
 cp.spawn = (command, args, options) => {
@@ -246,25 +227,7 @@ syncBuiltinESMExports();
 `,
   );
   write("bin/gh", "#!/bin/sh\necho 'GitHub transport escaped the fixture' >&2; exit 90\n", true);
-  write(
-    "bin/npm",
-    `#!/usr/bin/env node
-const fs = require('node:fs');
-const path = process.env.NPM_AUTHORITY_FIXTURE + '/state.json';
-const state = JSON.parse(fs.readFileSync(path, 'utf8'));
-const args = process.argv.slice(2);
-if (args[0] === 'view') {
-  state.calls.push('registry:' + args[1]);
-  fs.writeFileSync(path, JSON.stringify(state));
-  process.exit(state.reuseFirst && args[1].startsWith('@openclaw/ai@') ? 0 : 1);
-}
-if (args[0] !== 'publish') throw new Error('Unexpected npm command');
-state.writes.push(args);
-if (state.writes.length === state.revokeAfter) state.revoked = true;
-fs.writeFileSync(path, JSON.stringify(state));
-`,
-    true,
-  );
+  write("bin/npm", "#!/usr/bin/env node\n", true);
   write(
     "bin/git",
     "#!/bin/sh\n[ \"$*\" = 'rev-parse HEAD' ] || exit 90\nprintf '%s\\n' '" + f.q + "'\n",
@@ -330,31 +293,30 @@ fs.writeFileSync(path, JSON.stringify(state));
 }
 
 describe("npm final publication authority", () => {
-  it("publishes all companions and core through trusted tooling after fresh admission", async () => {
-    const f = await fixture(true);
-    const result = f.publish();
-    expect(result.status, result.stderr).toBe(0);
-    expect(f.state().writes.map((args) => args[1])).toEqual(
-      [0, 1, 2, 3].map((i) => "./preflight-tarball/package-" + i + ".tgz"),
-    );
-    for (const args of f.state().writes) {
-      expect(args.slice(2)).toEqual(["--access", "public", "--tag", "beta", "--provenance"]);
-    }
-    expect(result.stderr).not.toContain("CANDIDATE_");
-    expect(f.state().calls.filter((key) => key === "actions/runs/99")).toHaveLength(4);
-  });
-
-  it("retains the historical publisher-lineage route without candidate admission", async () => {
-    const f = await fixture();
-    f.env.FULL_RELEASE_VALIDATION_RUN_ID = "";
-    f.env.FULL_RELEASE_VALIDATION_RUN_ATTEMPT = "";
-    f.env.PREFLIGHT_WORKFLOW_SHA = f.env.WORKFLOW_SHA;
-    const result = f.publish();
-    expect(result.status, result.stderr).toBe(0);
-    expect(f.state().writes).toHaveLength(4);
-    expect(f.state().calls).not.toContain("actions/artifacts/70/zip");
-    expect(f.state().calls.filter((key) => key === "actions/runs/99")).toHaveLength(4);
-  });
+  it.each([true, false])(
+    "publishes through trusted tooling with candidate admission: %s",
+    async (candidate) => {
+      const f = await fixture();
+      if (!candidate) {
+        f.env.FULL_RELEASE_VALIDATION_RUN_ID = "";
+        f.env.FULL_RELEASE_VALIDATION_RUN_ATTEMPT = "";
+        f.env.PREFLIGHT_WORKFLOW_SHA = f.env.WORKFLOW_SHA;
+      }
+      const result = f.publish();
+      expect(result.status, result.stderr).toBe(0);
+      expect(f.state().writes.map((args) => args[1])).toEqual(
+        [0, 1, 2, 3].map((i) => "./preflight-tarball/package-" + i + ".tgz"),
+      );
+      for (const args of f.state().writes) {
+        expect(args.slice(2)).toEqual(["--access", "public", "--tag", "beta", "--provenance"]);
+      }
+      expect(result.stderr).not.toContain("CANDIDATE_");
+      expect(f.state().calls.filter((key) => key === "actions/runs/99")).toHaveLength(4);
+      if (!candidate) {
+        expect(f.state().calls).not.toContain("actions/artifacts/70/zip");
+      }
+    },
+  );
 
   const authorityError = "qualification authority";
   it.each<[string, Record<string, unknown>, number[], string, string?]>([
