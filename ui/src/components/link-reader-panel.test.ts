@@ -836,7 +836,9 @@ describe("Plugin link reader panel", () => {
     panel.selectHostedTab(firstTab);
     await expectTitle(panel, "Fresh Item 1");
     await waitForFast(() =>
-      expect(panel.querySelector(".lr-content:not([hidden]) img")?.src).toBe(freshImage),
+      expect(panel.querySelector<HTMLImageElement>(".lr-content:not([hidden]) img")?.src).toBe(
+        freshImage,
+      ),
     );
   });
   it("retires loaded documents and images when offline recovery is revoked on the same client", async () => {

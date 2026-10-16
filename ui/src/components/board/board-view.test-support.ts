@@ -7,7 +7,10 @@ import {
   createApplicationContextProvider,
   createApplicationGateway,
 } from "../../test-helpers/application-context.ts";
-import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
+import {
+  createTestGatewayClient,
+  type GatewayRequestHandler,
+} from "../../test-helpers/gateway-client.ts";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
 import { waitForSolid } from "../../test-helpers/solid-settle.ts";
 
@@ -75,10 +78,7 @@ export function callbacks(overrides: Partial<BoardViewCallbacks> = {}): BoardVie
   };
 }
 
-export function gatewayContext(
-  client: { request: ReturnType<typeof vi.fn> } | null,
-  basePath = "",
-) {
+export function gatewayContext(client: { request: GatewayRequestHandler } | null, basePath = "") {
   const { gateway } = createApplicationGateway();
   gateway.connection.gatewayUrl = "";
   gateway.snapshot.client = client ? createTestGatewayClient(client.request) : null;
