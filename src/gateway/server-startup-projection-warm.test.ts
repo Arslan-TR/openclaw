@@ -22,6 +22,24 @@ import type { GatewayServer } from "./server-public.js";
 import * as rowReads from "./session-row-database-facts.js";
 import * as projections from "./session-row-projection.js";
 
+function observeProjectionDisposal(afterCreate?: () => Promise<void>) {
+  const createProjection = projections.createSessionRowProjection;
+  const disposed = vi.fn();
+  vi.spyOn(projections, "createSessionRowProjection").mockImplementation(async (params) => {
+    const projection = await createProjection(params);
+    const dispose = projection.dispose;
+    vi.spyOn(projection, "dispose").mockImplementation(() => {
+      dispose();
+      disposed();
+    });
+    if (afterCreate) {
+      await afterCreate();
+    }
+    return projection;
+  });
+  return disposed;
+}
+
 function createStartupState(label: string) {
   return createOpenClawTestState({
     label,
@@ -63,6 +81,8 @@ it("overlaps startup orphan marking with projection preparation and joins both b
   const requests = new AbortController();
   const earlyRequest = new AbortController();
   const requestSignal = AbortSignal.any([signal, requests.signal]);
+  const waitFor = <T>(gate: PromiseLike<T>, operation: PromiseLike<unknown>, message: string) =>
+    withinTest(awaitGateBeforeSettlement(gate, operation, message), signal);
   const entryPath = `${buildControlUiSessionEntryUrl(`${basePath}/chat/main/topic`, basePath)}&probe=1`;
   let startup: Promise<GatewayServer> | undefined;
   let projection: Awaited<ReturnType<typeof projections.createSessionRowProjection>> | undefined;
@@ -151,22 +171,16 @@ it("overlaps startup orphan marking with projection preparation and joins both b
       startupFinished = true;
       return server;
     });
-    await withinTest(
-      awaitGateBeforeSettlement(
-        projectionEntered.promise,
-        startup,
-        "Gateway did not warm its projection while transport creation was pending",
-      ),
-      signal,
+    await waitFor(
+      projectionEntered.promise,
+      startup,
+      "Gateway did not warm its projection while transport creation was pending",
     );
     releaseTransport.resolve();
-    await withinTest(
-      awaitGateBeforeSettlement(
-        listenerBound.promise,
-        startup,
-        "Gateway startup completed before its listener was available",
-      ),
-      signal,
+    await waitFor(
+      listenerBound.promise,
+      startup,
+      "Gateway startup completed before its listener was available",
     );
     const read = (path: string, fetchSignal = requestSignal) =>
       fetch(`http://127.0.0.1:${port}${path}`, {
@@ -175,21 +189,15 @@ it("overlaps startup orphan marking with projection preparation and joins both b
       });
     earlyEntryRequest = read(entryPath, AbortSignal.any([requestSignal, earlyRequest.signal]));
     void earlyEntryRequest.catch(() => {});
-    const entryResponse = await withinTest(
-      awaitGateBeforeSettlement(
-        entryReceived.promise,
-        earlyEntryRequest,
-        "Session entry request did not reach the Gateway listener",
-      ),
-      signal,
+    const entryResponse = await waitFor(
+      entryReceived.promise,
+      earlyEntryRequest,
+      "Session entry request did not reach the Gateway listener",
     );
-    await withinTest(
-      awaitGateBeforeSettlement(
-        projectionEntered.promise,
-        earlyEntryRequest,
-        "Session entry request completed without preparing its session projection",
-      ),
-      signal,
+    await waitFor(
+      projectionEntered.promise,
+      earlyEntryRequest,
+      "Session entry request completed without preparing its session projection",
     );
     for (const [path, expectedStatus, expectedBody] of [
       ["/health", 200, { ok: true, status: "live" }],
@@ -207,23 +215,17 @@ it("overlaps startup orphan marking with projection preparation and joins both b
     earlyRequest.abort();
     await withinTest(entryClosed.promise, signal);
     entryRequest = read(entryPath);
-    const secondEntryResponse = await withinTest(
-      awaitGateBeforeSettlement(
-        secondEntryReceived.promise,
-        entryRequest,
-        "Second session entry request did not reach the Gateway listener",
-      ),
-      signal,
+    const secondEntryResponse = await waitFor(
+      secondEntryReceived.promise,
+      entryRequest,
+      "Second session entry request did not reach the Gateway listener",
     );
     expect(secondEntryResponse.writableEnded).toBe(false);
     releaseListening.resolve();
-    await withinTest(
-      awaitGateBeforeSettlement(
-        Promise.all([earlyRuntimeEntered.promise, markingEntered.promise]),
-        startup,
-        "Gateway did not mark startup orphans while its projection was pending",
-      ),
-      signal,
+    await waitFor(
+      Promise.all([earlyRuntimeEntered.promise, markingEntered.promise]),
+      startup,
+      "Gateway did not mark startup orphans while its projection was pending",
     );
     expect(secondEntryResponse.writableEnded).toBe(false);
     releaseProjection.resolve();
@@ -276,7 +278,6 @@ it("joins and disposes a warming projection when transport creation fails", asyn
   const releaseProjection = createDeferred();
   const transportFailed = createDeferred();
   const failure = new Error("Synthetic transport failure");
-  const disposed = vi.fn();
   let startup: Promise<GatewayServer> | undefined;
   let settled = false;
   try {
@@ -287,17 +288,9 @@ it("joins and disposes a warming projection when transport creation fails", asyn
       cron: { enabled: false },
     });
     state.applyEnv();
-    const createProjection = projections.createSessionRowProjection;
-    vi.spyOn(projections, "createSessionRowProjection").mockImplementation(async (params) => {
-      const projection = await createProjection(params);
-      const dispose = projection.dispose;
-      vi.spyOn(projection, "dispose").mockImplementation(() => {
-        dispose();
-        disposed();
-      });
+    const disposed = observeProjectionDisposal(async () => {
       projectionEntered.resolve();
       await releaseProjection.promise;
-      return projection;
     });
     const transportModule = await import("./server-runtime-state.js");
     vi.spyOn(transportModule, "createGatewayHttpTransport").mockImplementation(async () => {
@@ -344,7 +337,6 @@ it("refuses startup and disposes its projection when initial rows fail after the
   const token = "startup-projection-synthetic-token";
   const state = await createStartupState("startup-projection-warm");
   let kernel: Awaited<ReturnType<typeof createGatewayKernel>> | undefined;
-  const disposed = vi.fn();
   try {
     await state.writeConfig({
       gateway: { auth: { mode: "token", token }, controlUi: { enabled: false }, port },
@@ -374,16 +366,7 @@ it("refuses startup and disposes its projection when initial rows fail after the
       }
       return readFacts(...args);
     });
-    const createProjection = projections.createSessionRowProjection;
-    vi.spyOn(projections, "createSessionRowProjection").mockImplementation(async (params) => {
-      const projection = await createProjection(params);
-      const dispose = projection.dispose;
-      vi.spyOn(projection, "dispose").mockImplementation(() => {
-        dispose();
-        disposed();
-      });
-      return projection;
-    });
+    const disposed = observeProjectionDisposal();
     const startup = createGatewayKernel(port, {
       auth: { mode: "token", token },
       bind: "loopback",
