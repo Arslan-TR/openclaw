@@ -123,6 +123,11 @@ describe("OpenClawTerminalPanel reconnect", () => {
       if (method === "terminal.input") {
         return Promise.reject(new Error("input delivery interrupted"));
       }
+      if (method === "terminal.list") {
+        return Promise.resolve({
+          sessions: [{ ...terminalOpenResult("retained"), attached: true, createdAtMs: 1 }],
+        });
+      }
       return Promise.resolve({ ok: true });
     });
     const client: TerminalGatewayClient = {

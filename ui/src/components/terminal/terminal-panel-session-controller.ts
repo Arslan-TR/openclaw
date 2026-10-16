@@ -322,11 +322,7 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
       return;
     }
     try {
-      await this.connection?.resume();
-      if (!this.isTerminalOperationCurrent(operation)) {
-        return;
-      }
-      for (const tab of this.tabs) {
+      await this.recovery.resume(operation, (tab) => {
         this.readiness.arm(tab);
         tab.controller.setReadOnly(tab.status === "exited");
         if (tab.status !== "exited") {
@@ -335,6 +331,9 @@ export class TerminalPanelSessionController implements TerminalPanelSessionContr
             ?.resize(tab.gatewaySessionId, cols || 80, rows || 24)
             .catch(this.captureDeliveryError(tab));
         }
+      });
+      if (!this.isTerminalOperationCurrent(operation)) {
+        return;
       }
       if (this.host.terminalPanelOpen) {
         await this.restoreSessions();

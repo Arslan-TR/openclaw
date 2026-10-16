@@ -61,8 +61,9 @@ export class TerminalPanelSessionRecovery {
     this.unresolvedSessionIds.delete(sessionId);
   }
 
-  async listSessions(): Promise<TerminalSessionInfo[] | null> {
-    const operation = this.host.captureOperation();
+  async listSessions(
+    operation = this.host.captureOperation(),
+  ): Promise<TerminalSessionInfo[] | null> {
     if (!operation) {
       return null;
     }
@@ -76,6 +77,44 @@ export class TerminalPanelSessionRecovery {
         return null;
       });
     return this.host.isCurrent(operation) ? sessions : null;
+  }
+
+  async resume(
+    operation: TerminalOperation,
+    onResumed: (tab: TerminalPanelSessionTab) => void,
+  ): Promise<void> {
+    const connection = this.host.connectionFor(operation);
+    const failures = await connection.resume();
+    if (!this.host.isCurrent(operation)) {
+      return;
+    }
+    for (const tab of this.host.tabs()) {
+      if (!failures.has(tab.gatewaySessionId)) {
+        onResumed(tab);
+      }
+    }
+    if (failures.size === 0) {
+      return;
+    }
+    const listed = await this.listSessions(operation);
+    if (!this.host.isCurrent(operation)) {
+      return;
+    }
+    for (const tab of this.host.tabs()) {
+      const sessionId = tab.gatewaySessionId;
+      if (
+        failures.has(sessionId) &&
+        listed &&
+        !listed.some((session) => session.sessionId === sessionId)
+      ) {
+        connection.release(sessionId);
+        this.markExited(tab, sessionId);
+        failures.delete(sessionId);
+      }
+    }
+    if (failures.size > 0) {
+      throw failures.values().next().value;
+    }
   }
 
   async reattach(cancelIntent?: () => void): Promise<boolean> {

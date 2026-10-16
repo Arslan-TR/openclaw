@@ -1,6 +1,7 @@
 /* @vitest-environment jsdom */
 
 import type { TerminalAttachResult } from "@openclaw/gateway-protocol";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.ts";
 import { refreshControlUiServiceWorker } from "../../app/sw-refresh.runtime.ts";
@@ -100,5 +101,58 @@ it("holds retained PTYs and queued actions behind the same-client reconnect refr
   expect(sessions.tabs[0]).toBe(tab);
   expect(tab.controller).toBe(terminal);
   expect(terminal.dispose).not.toHaveBeenCalled();
+  expect(panel.renderRoot.querySelector(".tp-error")).toBeNull();
+});
+
+it("exits a confirmed missing retained PTY without leaving its surviving tab read-only", async () => {
+  vi.mocked(refreshControlUiServiceWorker).mockResolvedValue(false);
+  createGhosttyTerminalMock.mockImplementation(async () => createTerminalController());
+  let opened = 0;
+  const request = createGatewayRequestMock((method, params) => {
+    if (method === "terminal.open") {
+      return terminalOpenResult(++opened === 1 ? "expired" : "survivor");
+    }
+    if (method === "terminal.attach") {
+      return isRecord(params) && params.sessionId === "expired"
+        ? Promise.reject(new Error('unknown terminal session "expired"'))
+        : { ...terminalOpenResult("survivor"), buffer: "", seq: 0 };
+    }
+    if (method === "terminal.list") {
+      return { sessions: [{ ...terminalOpenResult("survivor"), attached: true, createdAtMs: 1 }] };
+    }
+    return { ok: true };
+  });
+  const panel = createTestTerminalPanel(elementName);
+  panel.client = createTestGatewayClient(request);
+  panel.available = true;
+  document.body.append(panel);
+  panel.toggle();
+  const sessions = terminalSessionsForTest(panel);
+  await waitForFast(() => expect(sessions.tabs[0]?.status).toBe("live"));
+  await sessions.openSession();
+  await waitForFast(() => expect(sessions.tabs[1]?.status).toBe("live"));
+  const [expired, survivor] = sessions.tabs;
+  expect(expired?.gatewaySessionId).toBe("expired");
+  expect(survivor?.gatewaySessionId).toBe("survivor");
+
+  panel.gatewayConnected = false;
+  await panel.updateComplete;
+  await waitForFast(() => {
+    expect(expired!.controller.setReadOnly).toHaveBeenLastCalledWith(true);
+    expect(survivor!.controller.setReadOnly).toHaveBeenLastCalledWith(true);
+  });
+  panel.gatewayConnected = true;
+  await panel.updateComplete;
+  await waitForFast(() => {
+    expect(expired!.status).toBe("exited");
+    expect(survivor!.status).toBe("live");
+    expect(survivor!.controller.setReadOnly).toHaveBeenLastCalledWith(false);
+    expect(panel.hostedTabs.map((tab) => tab.className)).toEqual(["is-exited", "is-live"]);
+  });
+  expect(expired!.controller.setReadOnly).toHaveBeenLastCalledWith(true);
+  expect(sessions.tabs).toEqual([expired, survivor]);
+  expect(expired!.controller.dispose).not.toHaveBeenCalled();
+  expect(survivor!.controller.dispose).not.toHaveBeenCalled();
+  expect(sessionStorage.getItem("openclaw.terminal.sessions.v1")).toBe('["survivor"]');
   expect(panel.renderRoot.querySelector(".tp-error")).toBeNull();
 });

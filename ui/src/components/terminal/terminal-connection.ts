@@ -444,16 +444,20 @@ export class TerminalConnection {
     this.dropSubscriptions();
   }
 
-  async resume(): Promise<void> {
+  async resume(): Promise<Map<string, unknown>> {
     this.suspended = false;
+    const failures = new Map<string, unknown>();
     await Promise.all(
       [...this.streams].map(([sessionId, stream]) => {
         stream.abort.abort();
         stream.abort = new AbortController();
-        return this.reattachStream(sessionId, stream);
+        return this.reattachStream(sessionId, stream).catch((error: unknown) => {
+          failures.set(sessionId, error);
+        });
       }),
     );
     this.scheduleLivenessCheck();
+    return failures;
   }
 
   private flushPending(sessionId: string, stream: StreamState, coveredThroughSeq?: number): void {
@@ -649,6 +653,12 @@ export class TerminalConnection {
       reason: "disconnected",
       error: "Terminal session is no longer available. Open a new terminal session.",
     });
+  }
+
+  release(sessionId: string): void {
+    this.removeStream(sessionId);
+    this.pending.delete(sessionId);
+    this.maybeUnsubscribe();
   }
 
   async close(sessionId: string): Promise<void> {
