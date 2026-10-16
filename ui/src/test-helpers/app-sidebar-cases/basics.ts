@@ -344,7 +344,8 @@ describe("AppSidebar agent chip", () => {
     expect(card?.getAttribute("aria-label")).toBe("Identity and app menu for Owner: Reconnecting…");
     const announcement = sidebar.querySelector('.sidebar-footer-bar > [role="status"]');
     expect(announcement?.getAttribute("aria-live")).toBe("polite");
-    expect(announcement?.textContent).toBe("Reconnecting…");
+    // The bottom-left chip owns unhealthy announcements; the footer only reports recovery.
+    expect(announcement?.textContent).toBe("");
     expect(sidebar.querySelector(".sidebar-agent-card__subtitle-row")).toBeNull();
 
     card?.click();

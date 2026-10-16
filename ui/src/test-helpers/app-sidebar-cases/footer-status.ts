@@ -176,7 +176,7 @@ describe("AppSidebar gateway footer subtitle", () => {
     ).not.toContain("git@e8cbc62");
   });
 
-  it("shows nonhealthy state as the avatar dot and announces it once", async () => {
+  it("shows nonhealthy state as the avatar dot and leaves announcing to the chip", async () => {
     const label = "Suspended";
     setNativeGatewayTestState(twoGateways);
     const gateway = createGateway({} as GatewayBrowserClient);
@@ -192,7 +192,7 @@ describe("AppSidebar gateway footer subtitle", () => {
     expect(card?.querySelector(".sidebar-identity-card__status")).not.toBeNull();
     expect(card?.getAttribute("aria-label")).toBe(`Identity and app menu for Owner: ${label}`);
     expect(footer?.querySelectorAll("[role=status]")).toHaveLength(1);
-    expect(footer?.querySelector("[role=status]")?.textContent).toBe(label);
+    expect(footer?.querySelector("[role=status]")?.textContent).toBe("");
     expect(footer?.querySelector(".sidebar-identity-card__name")?.textContent).toBe("Owner");
     expect(footer?.querySelector(".sidebar-identity-card__gateway")?.textContent).toContain(
       "Local Gateway",

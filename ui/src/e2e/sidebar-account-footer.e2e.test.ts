@@ -69,7 +69,7 @@ async function expectRailConnectionStatus(footer: Locator, kind: string, label: 
   ).toBe(`Identity and app menu for Riley: ${label}`);
   const lifecycle = footer.locator(":scope > [role=status]");
   expect(await lifecycle.count()).toBe(1);
-  expect(await lifecycle.textContent()).toBe(label);
+  expect(await lifecycle.textContent()).toBe("");
   expect(await identity.getByRole("status").count()).toBe(0);
 }
 

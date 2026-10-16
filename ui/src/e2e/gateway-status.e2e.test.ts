@@ -256,8 +256,8 @@ suite.define(() => {
         expect(await identityStatus.locator("[role=status]").count()).toBe(0);
         const announcement = footer.locator(":scope > [role=status]");
         expect(await announcement.count()).toBe(1);
-        expect(await announcement.textContent()).toContain("Reconnecting…");
-        expect(await announcement.textContent()).not.toContain("in outbox");
+        expect(await announcement.textContent()).toBe("");
+        expect(await chip.locator("[role=status]").textContent()).toContain("Reconnecting…");
         expect(await footer.textContent()).not.toContain("in outbox");
         expect(await gateway.getRequests("chat.send")).toHaveLength(0);
 
