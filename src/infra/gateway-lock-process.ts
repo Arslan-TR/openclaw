@@ -1,4 +1,3 @@
-// Native identity inspection shared by Gateway lock admission and observation.
 import fsSync from "node:fs";
 import { readDarwinProcessCommand } from "../process/supervisor/darwin-process-command.js";
 import { getFileLockProcessStartTime } from "../shared/pid-alive.js";
