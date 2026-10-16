@@ -19,9 +19,9 @@ describe("session goals", () => {
   const scope = () => ({ storePath: fixture.storePath(), sessionKey });
   const readEntry = () => loadSessionEntry(scope());
   const writeEntry = (entry: SessionEntry) => upsertSessionEntryCore(scope(), entry);
-  const createGoal = (
-    options: Omit<Parameters<typeof createSessionGoal>[0], "storePath" | "sessionKey">,
-  ) => createSessionGoal({ ...scope(), ...options });
+  type GoalOptions = Omit<Parameters<typeof createSessionGoal>[0], "storePath" | "sessionKey">;
+  const createGoal = (options: GoalOptions) =>
+    createSessionGoal({ ...scope(), now: 10, ...options });
   const setStatus = (
     status: Parameters<typeof updateSessionGoalStatus>[0]["status"],
     now: number,
@@ -29,14 +29,17 @@ describe("session goals", () => {
   ) =>
     updateSessionGoalStatus({ ...scope(), status, now, ...(note === undefined ? {} : { note }) });
 
-  async function writeSession(totalTokens = 0) {
-    await writeEntry({
-      sessionId: "sess-1",
-      updatedAt: 1,
-      totalTokens,
-      totalTokensFresh: true,
-      totalTokensVersion: 1,
-    });
+  const sessionEntry = (totalTokens = 0): SessionEntry => ({
+    sessionId: "sess-1",
+    updatedAt: 1,
+    totalTokens,
+    totalTokensFresh: true,
+    totalTokensVersion: 1,
+  });
+  const writeSession = (totalTokens = 0) => writeEntry(sessionEntry(totalTokens));
+  async function startGoal(totalTokens = 0, options: Partial<GoalOptions> = {}) {
+    await writeSession(totalTokens);
+    return createGoal({ objective: "ship", ...options });
   }
 
   it("creates core-owned goal state on the session entry", async () => {
@@ -47,31 +50,22 @@ describe("session goals", () => {
       totalTokensVersion: 1,
     });
 
-    const goal = await createGoal({
-      objective: "  land the PR \n",
-      tokenBudget: 50,
-      now: 10,
-    });
+    const goal = await createGoal({ objective: "  land the PR \n", tokenBudget: 50 });
 
-    expect(goal.objective).toBe("land the PR");
-    expect(goal.status).toBe("active");
-    expect(goal.tokenStart).toBe(100);
-    expect(goal.tokenStartFresh).toBe(true);
-    expect(goal.tokenBudget).toBe(50);
+    expect(goal).toMatchObject({
+      objective: "land the PR",
+      status: "active",
+      tokenStart: 100,
+      tokenStartFresh: true,
+      tokenBudget: 50,
+    });
     expect(readEntry()?.goal?.id).toBe(goal.id);
   });
 
   it("can create a goal from a fallback session entry", async () => {
     const goal = await createGoal({
       objective: "native slash start",
-      fallbackEntry: {
-        sessionId: "sess-1",
-        updatedAt: 1,
-        totalTokens: 10,
-        totalTokensFresh: true,
-        totalTokensVersion: 1,
-      },
-      now: 10,
+      fallbackEntry: sessionEntry(10),
     });
 
     expect(goal.tokenStart).toBe(10);
@@ -79,26 +73,15 @@ describe("session goals", () => {
   });
 
   it("resumes budget-limited goals with a fresh budget window", async () => {
-    await writeSession(100);
-    await createGoal({
-      objective: "finish task",
-      tokenBudget: 20,
-      now: 10,
-    });
-    await writeEntry({
-      ...readEntry()!,
-      totalTokens: 125,
-    });
+    await startGoal(100, { objective: "finish task", tokenBudget: 20 });
+    await writeEntry({ ...readEntry()!, totalTokens: 125 });
     await getSessionGoal({ ...scope(), now: 20 });
 
     const resumed = await setStatus("active", 30);
     const snapshot = await getSessionGoal({ ...scope(), now: 40 });
 
-    expect(resumed.status).toBe("active");
-    expect(resumed.tokenStart).toBe(125);
-    expect(resumed.tokensUsed).toBe(0);
-    expect(snapshot.goal?.status).toBe("active");
-    expect(snapshot.goal?.tokensUsed).toBe(0);
+    expect(resumed).toMatchObject({ status: "active", tokenStart: 125, tokensUsed: 0 });
+    expect(snapshot.goal).toMatchObject({ status: "active", tokensUsed: 0 });
   });
 
   it("adopts the first fresh token snapshot as the baseline after stale goal creation", async () => {
@@ -108,11 +91,7 @@ describe("session goals", () => {
       totalTokens: 100,
       totalTokensFresh: false,
     });
-    await createGoal({
-      objective: "finish task",
-      tokenBudget: 20,
-      now: 10,
-    });
+    await createGoal({ objective: "finish task", tokenBudget: 20 });
     await writeEntry({
       ...readEntry()!,
       totalTokens: 125,
@@ -122,26 +101,25 @@ describe("session goals", () => {
 
     const snapshot = await getSessionGoal({ ...scope(), now: 20 });
 
-    expect(snapshot.goal?.tokenStart).toBe(125);
-    expect(snapshot.goal?.tokenStartFresh).toBe(true);
-    expect(snapshot.goal?.tokensUsed).toBe(0);
-    expect(snapshot.goal?.status).toBe("active");
+    expect(snapshot.goal).toMatchObject({
+      tokenStart: 125,
+      tokenStartFresh: true,
+      tokensUsed: 0,
+      status: "active",
+    });
   });
 
   it("lets model tools complete or block but keeps existing terminal state", async () => {
-    await writeSession(0);
-    await createGoal({
-      objective: "ship",
-      now: 10,
-    });
+    await startGoal();
 
     const completed = await setStatus("complete", 20, "done");
 
-    expect(completed.status).toBe("complete");
-    expect(completed.lastStatusNote).toBe("done");
+    expect(completed).toMatchObject({ status: "complete", lastStatusNote: "done" });
     const repeated = await setStatus("complete", 30, "verified");
-    expect(repeated.completedAt).toBe(completed.completedAt);
-    expect(repeated.lastStatusNote).toBe("verified");
+    expect(repeated).toMatchObject({
+      completedAt: completed.completedAt,
+      lastStatusNote: "verified",
+    });
     expect(readEntry()?.goal?.completedAt).toBe(completed.completedAt);
     await expect(setStatus("blocked", 30)).rejects.toThrow(/already complete/);
   });
@@ -152,12 +130,7 @@ describe("session goals", () => {
   ])(
     "resumes completed goals with appropriate accounting at $totalTokens tokens",
     async ({ totalTokens, tokenStart, tokensUsed }) => {
-      await writeSession(100);
-      const created = await createGoal({
-        objective: "ship",
-        tokenBudget: 20,
-        now: 10,
-      });
+      const created = await startGoal(100, { tokenBudget: 20 });
       await writeEntry({ ...readEntry()!, totalTokens });
       const completed = await setStatus("complete", 20, "verified");
       expect(formatSessionGoalStatus(completed)).toContain("Commands: /goal resume, /goal clear");
@@ -182,34 +155,22 @@ describe("session goals", () => {
   );
 
   it("lets users resume blocked goals", async () => {
-    await writeSession(0);
-    await createGoal({
-      objective: "ship",
-      now: 10,
-    });
+    await startGoal();
 
     await setStatus("blocked", 20, "waiting on CI");
     const resumed = await setStatus("active", 30);
 
-    expect(resumed.status).toBe("active");
-    expect(resumed.lastStatusNote).toBe("waiting on CI");
+    expect(resumed).toMatchObject({ status: "active", lastStatusNote: "waiting on CI" });
   });
 
   it("resumes paused goals with a fresh budget window after usage passes the budget", async () => {
-    await writeSession(0);
-    await createGoal({
-      objective: "ship",
-      tokenBudget: 20,
-      now: 10,
-    });
+    await startGoal(0, { tokenBudget: 20 });
     await setStatus("paused", 20);
     await writeEntry({ ...readEntry()!, totalTokens: 100 });
 
     const resumed = await setStatus("active", 30);
 
-    expect(resumed.status).toBe("active");
-    expect(resumed.tokenStart).toBe(100);
-    expect(resumed.tokensUsed).toBe(0);
+    expect(resumed).toMatchObject({ status: "active", tokenStart: 100, tokensUsed: 0 });
     expect(resumed.budgetLimitedAt).toBeUndefined();
   });
 
@@ -234,12 +195,7 @@ describe("session goals", () => {
   });
 
   it("rewords the objective without touching status or token accounting", async () => {
-    await writeSession(100);
-    await createGoal({
-      objective: "ship the fix",
-      tokenBudget: 50,
-      now: 10,
-    });
+    await startGoal(100, { objective: "ship the fix", tokenBudget: 50 });
 
     const updated = await updateSessionGoalObjective({
       ...scope(),
@@ -247,11 +203,13 @@ describe("session goals", () => {
       now: 20,
     });
 
-    expect(updated.objective).toBe("ship the fix and update docs");
-    expect(updated.status).toBe("active");
-    expect(updated.tokenStart).toBe(100);
-    expect(updated.tokenBudget).toBe(50);
-    expect(updated.updatedAt).toBe(20);
+    expect(updated).toMatchObject({
+      objective: "ship the fix and update docs",
+      status: "active",
+      tokenStart: 100,
+      tokenBudget: 50,
+      updatedAt: 20,
+    });
     expect(readEntry()?.goal?.objective).toBe("ship the fix and update docs");
   });
 
@@ -265,10 +223,7 @@ describe("session goals", () => {
       }),
     ).rejects.toThrow(/goal not found/);
 
-    await createGoal({
-      objective: "ship",
-      now: 10,
-    });
+    await createGoal({ objective: "ship" });
     await setStatus("complete", 20);
 
     await expect(
@@ -304,18 +259,16 @@ describe("session goals", () => {
       { adoptFreshBaseline: false },
     );
 
-    expect(goal?.tokenStart).toBe(0);
-    expect(goal?.tokenStartFresh).toBe(false);
-    expect(goal?.tokensUsed).toBe(0);
-    expect(goal?.status).toBe("active");
+    expect(goal).toMatchObject({
+      tokenStart: 0,
+      tokenStartFresh: false,
+      tokensUsed: 0,
+      status: "active",
+    });
   });
 
   it("clears goal state", async () => {
-    await writeSession(0);
-    await createGoal({
-      objective: "ship",
-      now: 10,
-    });
+    await startGoal();
 
     await expect(clearSessionGoal({ ...scope() })).resolves.toBe(true);
     expect(readEntry()?.goal).toBeUndefined();

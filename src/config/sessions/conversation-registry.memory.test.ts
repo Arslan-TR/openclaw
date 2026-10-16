@@ -26,11 +26,9 @@ function mutate<Key extends keyof SessionActorStorageWrites>(
   return actor.storage!.mutate({ type, input }, authority);
 }
 async function commit<Key extends keyof SessionActorStorageWrites>(
-  actor: SessionActor,
-  type: Key,
-  input: SessionActorStorageWrites[Key]["input"],
+  ...args: Parameters<typeof mutate<Key>>
 ) {
-  return readSessionActorStorageResult(await mutate(actor, type, input));
+  return readSessionActorStorageResult(await mutate(...args));
 }
 
 vi.mock("node:sqlite", async (importOriginal) => ({
@@ -56,6 +54,8 @@ const scope = {
 };
 const sessionKey = "agent:main:dashboard:incognito-conversation-registry";
 const read = (ref: string) => readConversation(scope, ref);
+const ownerTarget = { agentId: scope.agentId, path: scope.storePath };
+const readOwner = () => memorySessionActorOwners.read(ownerTarget)!;
 afterEach(() => memorySessionActorOwners.reset());
 const primary = (sessionId: string) =>
   resolveCurrentSessionPrimaryConversation({ ...scope, sessionKey, sessionId });
@@ -92,7 +92,7 @@ async function fixture() {
     routeContext: { peerId: "canonical-ops", guildId: "guild-a" },
   });
   return {
-    owner: memorySessionActorOwners.read({ agentId: scope.agentId, path: scope.storePath })!,
+    owner: readOwner(),
     actor,
     created,
     acquire,
@@ -104,11 +104,7 @@ describe("memory conversation registry", () => {
     const identity = address("catalogue");
     await registerConversationAddresses(scope, [identity], 1);
     expect(await read(identity.conversationRef)).toHaveProperty("target", "reef:catalogue");
-    expect(
-      memorySessionActorOwners
-        .read({ agentId: scope.agentId, path: scope.storePath })!
-        .listSessions(authority),
-    ).toEqual([]);
+    expect(readOwner().listSessions(authority)).toEqual([]);
   });
   it("retains observed identity through generic writes and changes current bindings at rebind/reset", async () => {
     const { actor, acquire, created } = await fixture();
@@ -248,7 +244,7 @@ describe("memory conversation registry", () => {
     await commit(actor, "session.lifecycle.delete", {});
     expect(await read(eligible.conversationRef)).toHaveProperty("target", "reef:yes");
     expect(resolveCurrentConversationSession(scope, eligible.conversationRef)).toBeUndefined();
-    memorySessionActorOwners.closeDatabase({ agentId: scope.agentId, path: scope.storePath });
+    memorySessionActorOwners.closeDatabase(ownerTarget);
     expect(await listConversations(scope)).toEqual([]);
   });
 });
