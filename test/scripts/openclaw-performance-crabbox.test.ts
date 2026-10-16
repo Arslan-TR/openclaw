@@ -21,6 +21,10 @@ const CONFIG = ".github/crabbox/openclaw-performance-untrusted.yaml";
 const SCHEMA = ".github/crabbox/openclaw-performance-evidence.schema.json";
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
+function writeJson(file: string, value: unknown) {
+  writeFileSync(file, JSON.stringify(value));
+}
+
 function sha256(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -37,64 +41,55 @@ function fixture() {
   mkdirSync(join(root, ".artifacts/kova/reports/mock-provider"), { recursive: true });
   writeFileSync(artifactPath, contents);
   execFileSync("tar", ["-czf", payload, "-C", root, artifact]);
-  writeFileSync(
-    evidence,
-    JSON.stringify({
-      schemaVersion: 1,
-      lane: "mock-provider",
-      testedRef: "refs/pull/1/head",
-      openclawSha: "a".repeat(40),
-      kovaSha: "b".repeat(40),
-      workflow: { sha: "c".repeat(40), runId: "123", runAttempt: "1" },
-      crabbox: {
-        commit: "8ba71f913bbe57285ae29af45ef0d8ec6712477d",
-        version: "0.46.0+8ba71f913bbe",
-      },
-      command: {
-        name: "mock-provider",
-        argv: [
-          "profile=diagnostic",
-          "repeat=1",
-          "contract=canonical",
-          "include=scenario:fresh-install",
-          "failOnRegression=false",
-        ],
-        exitCode: 0,
-        startedAt: "2026-08-21T00:00:00Z",
-        finishedAt: "2026-08-21T00:01:00Z",
-      },
-      isolation: {
-        sutUser: "openclaw-sut",
-        trustedHarnessRootOwned: true,
-        noSudo: true,
-        imdsBlocked: true,
-        environmentClean: true,
-        cachesEmptyBefore: true,
-        tailscaleRequested: false,
-        tailscaleMetadataAbsent: true,
-      },
-      artifacts: [{ path: artifact, size: contents.length, sha256: sha256(contents) }],
-      lease: { provider: "aws", market: "on-demand", cleanupPolicy: "always" },
-    }),
-  );
-  writeFileSync(
-    timing,
-    JSON.stringify({
-      provider: "aws",
-      leaseId: "cbx_0123456789ab",
-      runId: "run_0123456789ab",
+  writeJson(evidence, {
+    schemaVersion: 1,
+    lane: "mock-provider",
+    testedRef: "refs/pull/1/head",
+    openclawSha: "a".repeat(40),
+    kovaSha: "b".repeat(40),
+    workflow: { sha: "c".repeat(40), runId: "123", runAttempt: "1" },
+    crabbox: {
+      commit: "8ba71f913bbe57285ae29af45ef0d8ec6712477d",
+      version: "0.46.0+8ba71f913bbe",
+    },
+    command: {
+      name: "mock-provider",
+      argv: [
+        "profile=diagnostic",
+        "repeat=1",
+        "contract=canonical",
+        "include=scenario:fresh-install",
+        "failOnRegression=false",
+      ],
       exitCode: 0,
-    }),
-  );
+      startedAt: "2026-08-21T00:00:00Z",
+      finishedAt: "2026-08-21T00:01:00Z",
+    },
+    isolation: {
+      sutUser: "openclaw-sut",
+      trustedHarnessRootOwned: true,
+      noSudo: true,
+      imdsBlocked: true,
+      environmentClean: true,
+      cachesEmptyBefore: true,
+      tailscaleRequested: false,
+      tailscaleMetadataAbsent: true,
+    },
+    artifacts: [{ path: artifact, size: contents.length, sha256: sha256(contents) }],
+    lease: { provider: "aws", market: "on-demand", cleanupPolicy: "always" },
+  });
+  writeJson(timing, {
+    provider: "aws",
+    leaseId: "cbx_0123456789ab",
+    runId: "run_0123456789ab",
+    exitCode: 0,
+  });
   const expected = join(root, "expected.json");
-  writeFileSync(
-    expected,
-    JSON.stringify({
-      ...JSON.parse(readFileSync(evidence, "utf8")),
-      timing: JSON.parse(readFileSync(timing, "utf8")),
-      stopped: true,
-    }),
-  );
+  writeJson(expected, {
+    ...JSON.parse(readFileSync(evidence, "utf8")),
+    timing: JSON.parse(readFileSync(timing, "utf8")),
+    stopped: true,
+  });
   return { artifact, evidence, output, payload, root, timing, expected };
 }
 
@@ -690,38 +685,32 @@ finish
         mkdirSync(join(openclaw, ".artifacts/kova/bundles/mock-provider"), { recursive: true });
         mkdirSync(join(openclaw, ".artifacts/kova/summaries"), { recursive: true });
         const common = { profile: { id: "diagnostic" }, target: `local-build:${openclaw}` };
-        writeFileSync(
-          join(openclaw, ".artifacts/kova/plans/mock-provider.json"),
-          JSON.stringify({
-            ...common,
-            schemaVersion: "kova.matrix.plan.v1",
-            controls: { include: [planFilter], repeat: 1 },
-            entries: [{ scenario: { id: "probe" }, state: { id: "fresh" }, status: "SELECTED" }],
-          }),
-        );
-        writeFileSync(
-          join(openclaw, ".artifacts/kova/reports/mock-provider/report.json"),
-          JSON.stringify({
-            ...common,
-            schemaVersion: "kova.report.v1",
-            mode: "execution",
-            controls: { include: ["scenario:probe"], repeat: 1 },
-            auth: { requestedMode: "mock" },
-            summary: { statuses: { BLOCKED: 1 } },
-            records: records
-              ? [
-                  {
-                    scenario: "probe",
-                    state: { id: "fresh" },
-                    status: "BLOCKED",
-                    repeat: { total: 1, index: 1 },
-                    auth: { mode: "mock" },
-                    failureReason: "fixture blocked prerequisite",
-                  },
-                ]
-              : [],
-          }),
-        );
+        writeJson(join(openclaw, ".artifacts/kova/plans/mock-provider.json"), {
+          ...common,
+          schemaVersion: "kova.matrix.plan.v1",
+          controls: { include: [planFilter], repeat: 1 },
+          entries: [{ scenario: { id: "probe" }, state: { id: "fresh" }, status: "SELECTED" }],
+        });
+        writeJson(join(openclaw, ".artifacts/kova/reports/mock-provider/report.json"), {
+          ...common,
+          schemaVersion: "kova.report.v1",
+          mode: "execution",
+          controls: { include: ["scenario:probe"], repeat: 1 },
+          auth: { requestedMode: "mock" },
+          summary: { statuses: { BLOCKED: 1 } },
+          records: records
+            ? [
+                {
+                  scenario: "probe",
+                  state: { id: "fresh" },
+                  status: "BLOCKED",
+                  repeat: { total: 1, index: 1 },
+                  auth: { mode: "mock" },
+                  failureReason: "fixture blocked prerequisite",
+                },
+              ]
+            : [],
+        });
         writeFileSync(
           join(openclaw, ".artifacts/kova/bundles/mock-provider/bundle.json"),
           '{"files":[]}',
@@ -846,7 +835,7 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
       artifacts: Array<{ sha256: string }>;
     };
     expectDefined(evidence.artifacts[0], "artifact evidence").sha256 = "0".repeat(64);
-    writeFileSync(files.evidence, JSON.stringify(evidence));
+    writeJson(files.evidence, evidence);
 
     const result = verify(files);
     expect(result.status).toBe(1);
@@ -867,7 +856,7 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
       } else {
         evidence[field] = field === "testedRef" ? "different-ref" : "d".repeat(40);
       }
-      writeFileSync(files.evidence, JSON.stringify(evidence));
+      writeJson(files.evidence, evidence);
       const result = verify(files);
       expect(result.status).not.toBe(0);
       expect(existsSync(files.output)).toBe(false);
@@ -876,14 +865,11 @@ validate_kova mock-provider "$ROOT" diagnostic 1 scenario:probe - "$GATED" "$HEL
 
   it("rejects timing for a different lease", () => {
     const files = fixture();
-    writeFileSync(
-      files.timing,
-      JSON.stringify({
-        leaseId: "cbx_abcdef123456",
-        leaseStopped: false,
-        leaseStopError: "release failed",
-      }),
-    );
+    writeJson(files.timing, {
+      leaseId: "cbx_abcdef123456",
+      leaseStopped: false,
+      leaseStopError: "release failed",
+    });
 
     const result = verify(files);
     expect(result.status).toBe(1);

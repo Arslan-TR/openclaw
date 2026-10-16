@@ -27,6 +27,10 @@ const step = (name: string) => {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const posixIt = it.skipIf(process.platform === "win32");
 
+function runShell(script: string, env: Record<string, string>) {
+  return spawnSync("bash", ["-c", script], { encoding: "utf8", env: { ...process.env, ...env } });
+}
+
 describe("Gateway concurrency workflow", () => {
   it("keeps manual mock/live load isolated from scheduled Kova and report publication", () => {
     expect(job.if).toBe(
@@ -71,14 +75,10 @@ describe("Gateway concurrency workflow", () => {
     { requested: "true", eligible: "true", status: 0 },
   ])("admits requested=$requested eligible=$eligible without secrets", (fixture) => {
     const root = tempDirs.make("gateway-concurrency-admission-");
-    const result = spawnSync("bash", ["-c", step("Admit Gateway concurrency request").run!], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        CONCURRENCY_OUTPUT: root,
-        LIVE_REQUESTED: fixture.requested,
-        SECRET_ELIGIBLE: fixture.eligible,
-      },
+    const result = runShell(step("Admit Gateway concurrency request").run!, {
+      CONCURRENCY_OUTPUT: root,
+      LIVE_REQUESTED: fixture.requested,
+      SECRET_ELIGIBLE: fixture.eligible,
     });
     expect(result.status, result.stderr).toBe(fixture.status);
     if (fixture.status !== 0) {
@@ -95,24 +95,16 @@ describe("Gateway concurrency workflow", () => {
     const resolver = workflow.jobs.resolve_target!.steps.find(
       (candidate) => candidate.name === "Resolve OpenClaw target ref",
     )!;
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'python3() { printf "%s\\n" "$FIXTURE_SHA"; }\nnode() { return 91; }\n' + resolver.run,
-      ],
+    const result = runShell(
+      'python3() { printf "%s\\n" "$FIXTURE_SHA"; }\nnode() { return 91; }\n' + resolver.run,
       {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          FIXTURE_SHA: sha,
-          CI_GIT_OWNER: "fixture-git-owner",
-          TARGET_CHECKOUT_DIR: root,
-          TARGET_REF_INPUT: sha,
-          GITHUB_REF_NAME: "main",
-          GITHUB_OUTPUT: output,
-          PERFORMANCE_MODE: "gateway-concurrency",
-        },
+        FIXTURE_SHA: sha,
+        CI_GIT_OWNER: "fixture-git-owner",
+        TARGET_CHECKOUT_DIR: root,
+        TARGET_REF_INPUT: sha,
+        GITHUB_REF_NAME: "main",
+        GITHUB_OUTPUT: output,
+        PERFORMANCE_MODE: "gateway-concurrency",
       },
     );
     expect(result.status, result.stderr).toBe(0);
@@ -135,23 +127,15 @@ describe("Gateway concurrency workflow", () => {
       fixture.provider === "mock" ? "Run mock Gateway concurrency" : "Run live Gateway concurrency",
     );
     // Replace only the process boundary; execute the actual workflow's auth and pipefail logic.
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'node() { printf "%s\\n" "$@" > "$ARGS_PATH"; return "$CHILD_STATUS"; }\n' + selected.run,
-      ],
+    const result = runShell(
+      'node() { printf "%s\\n" "$@" > "$ARGS_PATH"; return "$CHILD_STATUS"; }\n' + selected.run,
       {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          ARGS_PATH: argsPath,
-          CHILD_STATUS: fixture.childStatus,
-          CONCURRENCY_OUTPUT: output,
-          PERFORMANCE_HELPER_DIR: join(root, "trusted helpers"),
-          BENCH_PROVIDER: fixture.provider,
-          OPENAI_API_KEY: fixture.key,
-        },
+        ARGS_PATH: argsPath,
+        CHILD_STATUS: fixture.childStatus,
+        CONCURRENCY_OUTPUT: output,
+        PERFORMANCE_HELPER_DIR: join(root, "trusted helpers"),
+        BENCH_PROVIDER: fixture.provider,
+        OPENAI_API_KEY: fixture.key,
       },
     );
     expect(result.status, result.stderr).toBe(fixture.status);
@@ -169,41 +153,13 @@ describe("Gateway concurrency workflow", () => {
       fixture.provider,
       "--entry",
       "dist/entry.js",
-      "--runs",
-      "1",
-      "--warmup",
-      "0",
-      "--agent-warmup-turns",
-      "0",
-      "--session-count",
-      "1000",
-      "--agent-count",
-      "32",
-      "--concurrency",
-      "32",
-      "--turns-per-session",
-      "3",
-      "--history-messages",
-      "20",
-      "--history-message-chars",
-      "1024",
-      "--probe-rounds",
-      "64",
-      "--cadence-ms",
-      "100",
-      "--session-updates",
-      "100",
-      "--session-update-clients",
-      "2",
-      "--history-clients",
-      "2",
-      "--history-burst",
-      "2",
-      "--subscribers",
-      "4",
-      "--control-plane",
-      "--timeout-ms",
-      "120000",
+      ...(
+        "--runs 1 --warmup 0 --agent-warmup-turns 0 --session-count 1000 " +
+        "--agent-count 32 --concurrency 32 --turns-per-session 3 --history-messages 20 " +
+        "--history-message-chars 1024 --probe-rounds 64 --cadence-ms 100 --session-updates 100 " +
+        "--session-update-clients 2 --history-clients 2 --history-burst 2 --subscribers 4 " +
+        "--control-plane --timeout-ms 120000"
+      ).split(" "),
       "--load-cpu-prof-dir",
       join(output, `${fixture.provider}-profiles`),
       "--output",

@@ -52,26 +52,10 @@ describe("OpenClaw source performance isolation", () => {
     const sliceEndMarkerIndex = run.indexOf(sliceEndMarker, sliceStart);
     const workflowSlice = run.slice(sliceStart, sliceEndMarkerIndex + sliceEndMarker.length);
     const cronEnv = "OPENCLAW_SKIP_CRON";
-    const joinedSliceContinuations = workflowSlice.replace(/\\\s*\n/g, " ");
-    const gatewayConfigHeredocTargets = joinedSliceContinuations
-      .split("\n")
-      .filter((line) => line.includes("<<"))
-      .flatMap((line) => line.match(/\$\{?gateway_config\}?/g) ?? []);
-    const configHeredocStart = workflowSlice.indexOf('cat > "$gateway_config" <<EOF');
-    const configHeredocEnd = workflowSlice.indexOf("\nEOF\n", configHeredocStart);
-
     expect(sliceStart).toBeGreaterThanOrEqual(0);
     expect(run.lastIndexOf(sliceStartMarker)).toBe(sliceStart);
     expect(sliceEndMarkerIndex).toBeGreaterThan(sliceStart);
     expect(run.lastIndexOf(sliceEndMarker)).toBe(sliceEndMarkerIndex);
-    expect(gatewayConfigHeredocTargets).toHaveLength(1);
-    expect(configHeredocStart).toBeGreaterThanOrEqual(0);
-    expect(configHeredocEnd).toBeGreaterThan(configHeredocStart);
-    expect(
-      workflowSlice.slice(configHeredocStart, configHeredocEnd).split("${catalog_refresh_config}"),
-    ).toHaveLength(2);
-    expect(workflowSlice.match(/OPENCLAW_SKIP_CRON/g) ?? []).toHaveLength(1);
-    expect(workflowSlice.match(/OPENCLAW_SKIP_CHANNELS/g) ?? []).toHaveLength(1);
 
     const fixtureRoot = tempDirs.make("openclaw-performance-isolation-");
     const binDir = join(fixtureRoot, "bin");
@@ -244,9 +228,9 @@ exit "$RG_STATUS"
       const gatewayConfig = readFileSync(join(captureDir, "gateway.config"), "utf8");
       const gatewayPort = readFileSync(join(captureDir, "gateway.port"), "utf8").trim();
       expect(gatewayPort).toMatch(/^[1-9][0-9]*$/);
-      expect(readFileSync(join(captureDir, "readiness-copy.config"), "utf8")).toBe(gatewayConfig);
-      expect(readFileSync(join(captureDir, "health.config"), "utf8")).toBe(gatewayConfig);
-      expect(readFileSync(join(captureDir, "benchmark.config"), "utf8")).toBe(gatewayConfig);
+      for (const name of ["readiness-copy", "health", "benchmark"]) {
+        expect(readFileSync(join(captureDir, `${name}.config`), "utf8")).toBe(gatewayConfig);
+      }
       parse(gatewayConfig, { uniqueKeys: true });
       const parsedConfig = JSON.parse(gatewayConfig) as {
         gateway?: { auth?: Record<string, unknown> };

@@ -1,11 +1,25 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildMarkdown, parseArgs } from "../../scripts/openclaw-performance-source-summary.mts";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
-const tmpRoots: string[] = [];
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const mkTmpRoot = () => tempDirs.make("openclaw-source-summary-");
+
+const mockHello = {
+  counts: { failed: 0, passed: 1, total: 1 },
+  metrics: {
+    gatewayCpuCoreRatio: 0.15,
+    gatewayProcessRssDeltaBytes: 1024 * 1024,
+    gatewayProcessRssEndBytes: 91 * 1024 * 1024,
+    gatewayProcessRssStartBytes: 90 * 1024 * 1024,
+    wallMs: 250,
+  },
+  run: { primaryModel: "mock-openai/perf" },
+  scenarios: [{ id: "mock-hello", status: "pass" }],
+};
 
 const sqliteRun = {
   integrity: { agent: ["ok"], state: "ok" },
@@ -23,12 +37,6 @@ const sqliteRun = {
   timingsMs: { checkpoint: 1, seed: 100, total: 150 },
   walBytes: { agentAfter: [0], agentBefore: [1024], stateAfter: 0, stateBefore: 4096 },
 };
-
-function mkTmpRoot() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-source-summary-"));
-  tmpRoots.push(root);
-  return root;
-}
 
 function writeJson(filePath: string, value: unknown) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -51,7 +59,7 @@ function expectNoNodeStack(stderr: string) {
   expect(stderr).not.toContain("\n    at ");
 }
 
-function writeSourceFixture(sourceDir: string) {
+function writeSourceFixture(sourceDir = mkTmpRoot()) {
   writeJson(path.join(sourceDir, "gateway-cpu", "gateway-startup-bench.json"), {
     results: [
       {
@@ -105,25 +113,13 @@ function writeSourceFixture(sourceDir: string) {
     ...sqliteRun,
     queries: [{ p50Ms: 0.1, p95Ms: 0.2, query: "SELECT 1", rows: 1 }],
   });
-  writeJson(path.join(sourceDir, "mock-hello", "run-001", "qa-suite-summary.json"), {
-    counts: { failed: 0, passed: 1, total: 1 },
-    metrics: {
-      gatewayCpuCoreRatio: 0.15,
-      gatewayProcessRssDeltaBytes: 1024 * 1024,
-      gatewayProcessRssEndBytes: 91 * 1024 * 1024,
-      gatewayProcessRssStartBytes: 90 * 1024 * 1024,
-      wallMs: 250,
-    },
-    run: { primaryModel: "mock-openai/perf" },
-    scenarios: [{ id: "mock-hello", status: "pass" }],
-  });
+  writeJson(path.join(sourceDir, "mock-hello/run-001/qa-suite-summary.json"), mockHello);
+  return sourceDir;
 }
 
 it("labels CLI RSS semantics and rejects mixed-metric memory trends", () => {
-  const sourceDir = mkTmpRoot();
-  const baselineDir = mkTmpRoot();
-  writeSourceFixture(sourceDir);
-  writeSourceFixture(baselineDir);
+  const sourceDir = writeSourceFixture();
+  const baselineDir = writeSourceFixture();
   expect(buildMarkdown(sourceDir, baselineDir)).toContain("RSS metric: legacy-last-marker");
   const cliPath = path.join(sourceDir, "cli-startup.json");
   const cli = JSON.parse(fs.readFileSync(cliPath, "utf8"));
@@ -193,12 +189,6 @@ function writeSqliteV2Fixture(
   });
 }
 
-afterEach(() => {
-  for (const root of tmpRoots.splice(0)) {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
 describe("parseArgs", () => {
   it("parses source summary paths", () => {
     expect(
@@ -245,10 +235,8 @@ describe("parseArgs", () => {
 
 describe("buildMarkdown", () => {
   it("compares reordered v2 SQLite scenarios only by shared scenario ID", () => {
-    const sourceDir = mkTmpRoot();
-    const baselineDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeSourceFixture(baselineDir);
+    const sourceDir = writeSourceFixture();
+    const baselineDir = writeSourceFixture();
     const agentQuery = sqliteQuery({
       database: "agent",
       id: "agent-cache.plugin-model-catalog.list",
@@ -286,32 +274,16 @@ describe("buildMarkdown", () => {
   });
 
   it("does not compare v2 SQLite scenarios with different workloads", () => {
-    for (const baselineQuery of [
-      {
-        database: "state",
-        rows: 999,
-        runs: 20,
-        sql: "SELECT id FROM delivery_queue_entries WHERE queue_name = ? AND status = ?",
-      },
-      {
-        database: "agent",
-        rows: 1000,
-        runs: 12,
-        sql: "SELECT id FROM delivery_queue_entries WHERE queue_name = ? AND status = ?",
-      },
-      {
-        database: "state",
-        rows: 1000,
-        runs: 12,
-        sql: "SELECT id FROM delivery_queue_entries WHERE status = ?",
-      },
+    for (const overrides of [
+      { rows: 999, runs: 20 },
+      { database: "agent" },
+      { sql: "SELECT id FROM delivery_queue_entries WHERE status = ?" },
     ]) {
-      const sourceDir = mkTmpRoot();
-      const baselineDir = mkTmpRoot();
-      writeSourceFixture(sourceDir);
-      writeSourceFixture(baselineDir);
+      const sourceDir = writeSourceFixture();
+      const baselineDir = writeSourceFixture();
       writeSqliteV2Fixture(sourceDir);
-      writeSqliteV2Fixture(baselineDir, [sqliteQuery({ ...baselineQuery, p50Ms: 18, p95Ms: 20 })]);
+      const baselineQuery = sqliteQuery({ ...overrides, p50Ms: 18, p95Ms: 20 });
+      writeSqliteV2Fixture(baselineDir, [baselineQuery]);
 
       expect(buildMarkdown(sourceDir, baselineDir)).toContain(
         `| delivery.pending.load | state | 1000 | 12 | 10.0ms | 12.0ms | ${baselineQuery.rows} | ${baselineQuery.runs} | 20.0ms | n/a (workload differs) |`,
@@ -334,8 +306,7 @@ describe("buildMarkdown", () => {
     ];
 
     for (const invalidQuery of invalidQueries) {
-      const sourceDir = mkTmpRoot();
-      writeSourceFixture(sourceDir);
+      const sourceDir = writeSourceFixture();
       writeSqliteV2Fixture(sourceDir, [invalidQuery]);
 
       expect(() => buildMarkdown(sourceDir, null)).toThrow(
@@ -345,8 +316,7 @@ describe("buildMarkdown", () => {
   });
 
   it("rejects control characters in v2 SQLite display fields", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
+    const sourceDir = writeSourceFixture();
     writeSqliteV2Fixture(sourceDir, [
       sqliteQuery({
         id: "delivery.pending\nload",
@@ -373,101 +343,73 @@ describe("buildMarkdown", () => {
     );
   });
 
-  it("rejects malformed mock hello summaries", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeJson(path.join(sourceDir, "mock-hello", "run-001", "qa-suite-summary.json"), {});
-
-    expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] invalid mock hello summary counts:",
-    );
-  });
-
-  it("rejects mock hello summaries without matching scenario evidence", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeJson(path.join(sourceDir, "mock-hello", "run-001", "qa-suite-summary.json"), {
-      counts: { failed: 0, passed: 1, total: 1 },
-      metrics: {
-        gatewayCpuCoreRatio: 0.15,
-        gatewayProcessRssDeltaBytes: 1024 * 1024,
-        gatewayProcessRssEndBytes: 91 * 1024 * 1024,
-        gatewayProcessRssStartBytes: 90 * 1024 * 1024,
-        wallMs: 250,
+  it.each<[string, string, unknown, string]>([
+    [
+      "rejects malformed mock hello summaries",
+      "mock-hello/run-001/qa-suite-summary.json",
+      {},
+      "invalid mock hello summary counts",
+    ],
+    [
+      "rejects mock hello summaries without matching scenario evidence",
+      "mock-hello/run-001/qa-suite-summary.json",
+      {
+        ...mockHello,
+        scenarios: [{ id: "mock-hello", status: "fail" }],
       },
-      run: { primaryModel: "mock-openai/perf" },
-      scenarios: [{ id: "mock-hello", status: "fail" }],
-    });
-
-    expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] invalid mock hello scenario evidence:",
-    );
-  });
-
-  it("rejects gateway startup artifacts without resource metrics", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeJson(path.join(sourceDir, "gateway-cpu", "gateway-startup-bench.json"), {
-      results: [{ id: "default", summary: { readyzMs: { p50: 12 } } }],
-    });
-
-    expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] incomplete gateway startup metrics for default:",
-    );
-  });
-
-  it("rejects extension memory artifacts without combined-process context", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeJson(path.join(sourceDir, "extension-memory.json"), {
-      topByDeltaMb: [
-        { dir: "extensions/browser", maxRssMb: 80, deltaFromBaselineMb: 12, status: "ok" },
-      ],
-    });
-
-    expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] incomplete extension memory context:",
-    );
+      "invalid mock hello scenario evidence",
+    ],
+    [
+      "rejects gateway startup artifacts without resource metrics",
+      "gateway-cpu/gateway-startup-bench.json",
+      { results: [{ id: "default", summary: { readyzMs: { p50: 12 } } }] },
+      "incomplete gateway startup metrics for default",
+    ],
+    [
+      "rejects extension memory artifacts without combined-process context",
+      "extension-memory.json",
+      {
+        topByDeltaMb: [
+          { dir: "extensions/browser", maxRssMb: 80, deltaFromBaselineMb: 12, status: "ok" },
+        ],
+      },
+      "incomplete extension memory context",
+    ],
+    [
+      "rejects malformed SQLite perf smoke artifacts",
+      "sqlite-perf-smoke.json",
+      {
+        integrity: { agent: ["ok"], state: "ok" },
+        profile: "smoke",
+        rows: { stateRows: 4100 },
+        walBytes: { stateAfter: 1 },
+      },
+      "incomplete SQLite perf metrics",
+    ],
+    [
+      "rejects SQLite perf smoke artifacts with failing agent integrity",
+      "sqlite-perf-smoke.json",
+      {
+        integrity: { agent: ["ok", "database disk image is malformed"], state: "ok" },
+        profile: "smoke",
+        queries: [{ p50Ms: 0.1, p95Ms: 0.2, query: "SELECT 1", rows: 1 }],
+        rows: { agentCacheEntries: 1000, stateRows: 4100 },
+        timingsMs: { total: 150 },
+        walBytes: { stateAfter: 0, stateBefore: 4096 },
+      },
+      "SQLite agent integrity check did not pass",
+    ],
+  ])("%s", (_name, relative, artifact, message) => {
+    const sourceDir = writeSourceFixture();
+    writeJson(path.join(sourceDir, relative), artifact);
+    expect(() => buildMarkdown(sourceDir, null)).toThrow(`[source-performance] ${message}:`);
   });
 
   it("allows source performance fixtures without older-ref SQLite smoke artifacts", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
+    const sourceDir = writeSourceFixture();
     fs.rmSync(path.join(sourceDir, "sqlite-perf-smoke.json"));
 
     expect(buildMarkdown(sourceDir, null)).toContain("## SQLite State Smoke");
     expect(buildMarkdown(sourceDir, null)).toContain("No data.");
-  });
-
-  it("rejects malformed SQLite perf smoke artifacts", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeJson(path.join(sourceDir, "sqlite-perf-smoke.json"), {
-      integrity: { agent: ["ok"], state: "ok" },
-      profile: "smoke",
-      rows: { stateRows: 4100 },
-      walBytes: { stateAfter: 1 },
-    });
-
-    expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] incomplete SQLite perf metrics:",
-    );
-  });
-
-  it("rejects SQLite perf smoke artifacts with failing agent integrity", () => {
-    const sourceDir = mkTmpRoot();
-    writeSourceFixture(sourceDir);
-    writeJson(path.join(sourceDir, "sqlite-perf-smoke.json"), {
-      integrity: { agent: ["ok", "database disk image is malformed"], state: "ok" },
-      profile: "smoke",
-      queries: [{ p50Ms: 0.1, p95Ms: 0.2, query: "SELECT 1", rows: 1 }],
-      rows: { agentCacheEntries: 1000, stateRows: 4100 },
-      timingsMs: { total: 150 },
-      walBytes: { stateAfter: 0, stateBefore: 4096 },
-    });
-
-    expect(() => buildMarkdown(sourceDir, null)).toThrow(
-      "[source-performance] SQLite agent integrity check did not pass:",
-    );
   });
 });
