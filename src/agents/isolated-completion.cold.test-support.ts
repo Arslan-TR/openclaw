@@ -134,6 +134,7 @@ export function traceIsolatedCompletionColdStart(
         "provider-model-metadata",
         "provider-model-shared",
         "provider-tools",
+        "secret-input",
         "secret-input-runtime",
       ].find((candidate) => candidate === entry);
       return measure(surface ? `native-${surface}` : "native-other", () => loadNative(...args));
