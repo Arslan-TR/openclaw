@@ -450,13 +450,13 @@ describe("SidebarUpdateCard", () => {
     await settle();
     expect(action?.disabled).toBe(true);
     expect(element.element.textContent).not.toContain(
-      "Actions are unavailable while the Gateway reconnects.",
+      "Could not refresh. Check your connection and try again.",
     );
 
     completeSecond?.(false);
     await vi.waitFor(() => expect(action?.disabled).toBe(false));
     expect(element.element.textContent).toContain(
-      "Actions are unavailable while the Gateway reconnects.",
+      "Could not refresh. Check your connection and try again.",
     );
     action?.click();
     expect(onRefresh).toHaveBeenCalledTimes(3);

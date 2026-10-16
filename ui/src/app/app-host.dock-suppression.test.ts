@@ -306,11 +306,15 @@ describe("OpenClaw shell dock suppression", () => {
     expect(container.querySelector(".shell-chrome-controls__home")).toBeNull();
     expect(container.querySelector(".shell--navigation-rail openclaw-app-sidebar")).not.toBeNull();
     expect(homeAvailable()).toBe(true);
+    const acceptedHello = context.gateway.snapshot.hello!;
     context.gateway.connection.gatewayUrl = "ws://another-gateway.test";
+    // The Gateway owner clears the previous identity's hello on connection replacement.
+    context.gateway.snapshot.hello = null;
     refreshShellView(shell);
     expect(container.querySelector(".shell-chrome-controls__home")).toBeNull();
     expect(homeAvailable()).toBe(false);
     context.gateway.snapshot.phase = "connected";
+    context.gateway.snapshot.hello = { ...acceptedHello };
     refreshShellView(shell);
     expect(container.querySelector(".shell-chrome-controls__home")).toBeNull();
     expect(container.querySelector(".shell--navigation-rail openclaw-app-sidebar")).not.toBeNull();
