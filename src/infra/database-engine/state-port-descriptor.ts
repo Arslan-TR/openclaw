@@ -141,7 +141,7 @@ export async function loadStatePortDescriptor(
           ) +
           legacyIndexes.skill_usage +
           legacyIndexes.acp_replay_events,
-        expectedCatalog: catalog.map((fact) =>
+        expectedCatalog: descriptor.expectedCatalog.map((fact) =>
           fact.kind === "indexes" &&
           (fact.table === "skill_usage" || fact.table === "acp_replay_events")
             ? { table: fact.table, kind: fact.kind, value: Number(fact.value) + 1 }
