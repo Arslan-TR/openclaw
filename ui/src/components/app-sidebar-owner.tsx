@@ -50,7 +50,6 @@ import {
 import { SessionOrganizerController } from "./session-organizer-controller.ts";
 import { SidebarAgentRoster, renderSidebarPinnedSession } from "./sidebar-agent-roster.tsx";
 import type { createSidebarScroll } from "./sidebar-context-controller.ts";
-import { equalSidebarContext, selectSidebarContext } from "./sidebar-context-state.ts";
 import { SidebarMenusController } from "./sidebar-menus-controller.tsx";
 import type { SidebarNavigationCatalog } from "./sidebar-navigation-catalog.ts";
 import { createSidebarPeople, SidebarPeoplePreferences } from "./sidebar-people.ts";
@@ -184,23 +183,6 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
   ) {
     super(...args);
     new SubscriptionsController(this)
-      .watch(
-        () => this.router,
-        (router, notify) => {
-          const stop = router.subscribeSelector(selectSidebarContext, notify, equalSidebarContext);
-          return () => {
-            stop();
-            this.contextualSidebar = undefined;
-          };
-        },
-        (router) => {
-          this.contextualSidebar = selectSidebarContext(router.getState());
-        },
-      )
-      .effect(
-        () => this.context?.chatSubmissions,
-        (submissions) => submissions.subscribeCreate(() => this.requestUpdate()),
-      )
       .effect(
         () => this.sidebarSnapshotController,
         (snapshot) => {
@@ -231,16 +213,6 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
       .effect(
         () => this.context?.gateway,
         (gateway) => gateway.subscribeEvents((event) => this.narration?.handleEvent(event)),
-      )
-      .effect(
-        () => this.context?.agentIdentity,
-        (identity) => identity.subscribe(this.sessionData.requestSessionDataUpdate),
-      )
-      .watchStore(() => this.context?.theme)
-      .watchStore(() => this.context?.config)
-      .effect(
-        () => this.context?.plugins,
-        (plugins) => plugins.subscribe(this.sessionData.requestSessionDataUpdate),
       );
   }
   get nativeGatewaySnapshot(): NativeGatewaysSnapshot | null {

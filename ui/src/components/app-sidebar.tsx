@@ -22,6 +22,7 @@ import { createSessionPullRequestIndicators } from "./app-sidebar-session-pr-ind
 import { createSessionAttention } from "./session-attention.ts";
 import { createSessionOwnerFilterQuery } from "./session-owner-filter.ts";
 import { createSidebarScroll } from "./sidebar-context-controller.ts";
+import { equalSidebarContext, selectSidebarContext } from "./sidebar-context-state.ts";
 import { createSidebarNavigationCatalog } from "./sidebar-navigation-catalog.ts";
 import { createSidebarPeople } from "./sidebar-people.ts";
 
@@ -66,9 +67,33 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     () => props.navigationVisible,
   );
   const scroll = createSidebarScroll(owner);
+  const contextual = createMemo(() => {
+    const router = props.router;
+    return router
+      ? projectSource(router, {
+          read: (current) => selectSidebarContext(current.getState()),
+          subscribe: (current, notify) =>
+            current.subscribeSelector(selectSidebarContext, notify, equalSidebarContext),
+          equality: equalSidebarContext,
+        })
+      : undefined;
+  });
+  owner.readContextualSidebar = createMemo(() => contextual()?.read(), {
+    equals: equalSidebarContext,
+  });
   const projection = projectSource(owner, {
     read: (current) => current,
-    subscribe: (current, notify) => current.subscribe(notify),
+    subscribe: (current, notify) => {
+      const cleanups = [
+        current.subscribe(notify),
+        context.chatSubmissions.subscribeCreate(notify),
+        context.theme.subscribe(notify),
+        context.config.subscribe(notify),
+        context.agentIdentity.subscribe(current.sessionData.requestSessionDataUpdate),
+        context.plugins.subscribe(current.sessionData.requestSessionDataUpdate),
+      ];
+      return () => cleanups.forEach((cleanup) => cleanup());
+    },
     equality: "revision",
   });
   const people = (owner.peopleView = createSidebarPeople(owner, owner.people, () => {
@@ -79,6 +104,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     () => {
       projection.revision();
       Object.values(props);
+      void owner.contextualSidebar;
       // Snapshot capture keeps observing Pages after its navigation view closes.
       void catalog.dashboards;
       // Synchronous owners release boot snapshots and restore query state before row consumers read.
@@ -91,19 +117,13 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
   createSessionOwnerFilterQuery(owner.sessionOwnerFilter, prepared, () =>
     context.sessions.listSnapshot(owner.sessionData.sessionListQuery(owner.expandedAgentId())),
   );
-  const presentationRevision = createParkedProjection(
-    () => {
-      Object.values(props);
-      return projection.revision();
-    },
-    () => props.navigationVisible,
-  );
+  const presentation = createParkedProjection(prepared, () => props.navigationVisible);
   const observed = new WeakMap<object, object>();
   const observe = <T extends object>(target: T): T => {
     const proxy = new Proxy(target, {
       get(current, key, receiver) {
         if (getObserver()) {
-          presentationRevision();
+          presentation();
         }
         const value = Reflect.get(current, key, receiver);
         return value && typeof value === "object" ? (observed.get(value) ?? value) : value;

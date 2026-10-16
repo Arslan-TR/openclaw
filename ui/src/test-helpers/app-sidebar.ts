@@ -10,6 +10,7 @@ import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { AgentsListResult, GatewaySessionRow, SessionsListResult } from "../api/types.ts";
 import type { RouteId } from "../app-route-paths.ts";
 import { createApplicationNavigationPreferences } from "../app/bootstrap-navigation-preferences.ts";
+import { createChatSubmissions } from "../app/chat-submissions.ts";
 import { createApplicationConfigCapability } from "../app/config.ts";
 import type {
   ApplicationContext,
@@ -515,6 +516,7 @@ export function createContext(
   const lifecycle = createSidebarContextLifecycle(gateway, agents, selectedAgentId);
   sidebarSessionGatewayBindings.get(sessions)?.(gateway, lifecycle.agentSelection);
   return {
+    chatSubmissions: createChatSubmissions(),
     config: createApplicationConfigCapability({ resourceBasePath: "" }),
     gateway,
     ...lifecycle,
