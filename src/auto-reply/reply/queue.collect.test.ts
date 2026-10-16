@@ -35,11 +35,7 @@ import {
 } from "./queue.test-helpers.js";
 import { resolveFollowupDeliveryStorageKey } from "./queue/delivery-context.js";
 import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
-import {
-  isFollowupRunAborted,
-  type InternalFollowupRun,
-  type QueuedFollowupReplyBatch,
-} from "./queue/types.js";
+import { isFollowupRunAborted, type InternalFollowupRun } from "./queue/types.js";
 import type { ReplyOperationRunState } from "./reply-operation-run-state.js";
 const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-overflow-session-");
 installQueueRuntimeErrorSilencer();

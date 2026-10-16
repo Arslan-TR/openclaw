@@ -96,8 +96,7 @@ it.each([
         }
         const before = await fs.readFile(configPath, "utf8");
         expect(
-          (await readConfigFileSnapshot()).sourceConfig.messages?.queue
-            ?.allowCollaborativeSteering,
+          (await readConfigFileSnapshot()).sourceConfig.messages?.queue?.allowCollaborativeSteering,
         ).toBeUndefined();
         await using ctx = await prepareDoctorContext(configPath);
         expect(await fs.readFile(configPath, "utf8")).toBe(before);

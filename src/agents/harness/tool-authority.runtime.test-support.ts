@@ -84,18 +84,16 @@ export async function published<T>(
     queue: ReturnType<typeof vi.fn<ReturnType<typeof createEmbeddedRunHandle>["queueMessage"]>>;
     close: () => void;
   }) => Promise<T>,
-  params: Partial<typeof attempt> & { toolAuthorityFingerprint?: string } &
-    Pick<
+  params: Partial<typeof attempt> & { toolAuthorityFingerprint?: string } & Pick<
       ReplyToolAuthorityOverlay,
       "toolsAllow" | "senderId" | "senderName" | "clientCaps" | "gatewayUiCommandTarget"
     > = {},
   operatorAuthority?: Parameters<typeof prepareAgentRunAdmission>[0]["operatorAuthority"],
   replyOperation?: Parameters<typeof withPreparedEmbeddedRunToolAuthority>[0]["replyOperation"],
 ) {
-  return admitted(
-    async ({ admittedRunContext, close }) => {
-      try {
-        return await withPreparedEmbeddedRunToolAuthority(
+  return admitted(async ({ admittedRunContext, close }) => {
+    try {
+      return await withPreparedEmbeddedRunToolAuthority(
         { admittedRunContext, replyOperation },
         { ...attempt, ...params },
         undefined,
@@ -111,12 +109,10 @@ export async function published<T>(
           }
         },
       );
-      } finally {
-        replyOperation?.complete();
-      }
-    },
-    operatorAuthority,
-  );
+    } finally {
+      replyOperation?.complete();
+    }
+  }, operatorAuthority);
 }
 
 export function steer(overlay: ReplyToolAuthorityOverlay, hash?: string) {

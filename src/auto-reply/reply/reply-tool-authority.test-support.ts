@@ -3,8 +3,8 @@ import type {
   ReplyToolAuthorityOverlay,
   ReplyToolAuthorityRoute,
 } from "./reply-run-registry.contracts.js";
-import type { ReplyToolAuthorityInput } from "./reply-tool-authority.types.js";
 import { prepareFollowupRunToolAuthorityFingerprint } from "./reply-tool-authority.js";
+import type { ReplyToolAuthorityInput } from "./reply-tool-authority.types.js";
 
 export async function resolveFollowupRunToolAuthorityFingerprintAsync(
   snapshot: ReplyToolAuthorityInput,

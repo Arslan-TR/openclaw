@@ -10,6 +10,7 @@ import { stringifyRouteThreadId } from "../../plugin-sdk/channel-route.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { internalSessionConversationId } from "../../utils/message-channel-constants.js";
 import { normalizeMessageChannel } from "../../utils/message-channel-core.js";
+import { shouldUseFromAsSenderFallback } from "../sender-identity.js";
 import type { RuntimeMsgContext } from "../templating.js";
 import { resolveOriginMessageProvider } from "./origin-routing.js";
 import type { ReplyToolAuthorityOverlay } from "./reply-run-registry.contracts.js";
@@ -27,6 +28,8 @@ export function resolveInboundReplyToolAuthorityOverlay(params: {
   forceCodeModeTools?: boolean;
 }): ReplyToolAuthorityOverlay {
   const { ctx } = params;
+  const senderId = normalizeOptionalString(ctx.SenderId);
+  const senderE164 = normalizeOptionalString(ctx.SenderE164);
   return {
     sessionKey: normalizeOptionalString(ctx.SessionKey),
     operatorAuthority: params.operatorAuthority,
@@ -48,10 +51,14 @@ export function resolveInboundReplyToolAuthorityOverlay(params: {
     groupSpace: normalizeOptionalString(ctx.GroupSpace),
     memberRoleIds: normalizeArrayBackedTrimmedStringList(ctx.MemberRoleIds),
     spawnedBy: normalizeOptionalString(params.sessionEntry?.spawnedBy),
-    senderId: normalizeOptionalString(ctx.SenderId),
+    senderId:
+      senderId ??
+      (!senderE164 && shouldUseFromAsSenderFallback({ from: ctx.From, chatType: ctx.ChatType })
+        ? normalizeOptionalString(ctx.From)
+        : undefined),
     senderName: normalizeOptionalString(ctx.SenderName),
     senderUsername: normalizeOptionalString(ctx.SenderUsername),
-    senderE164: normalizeOptionalString(ctx.SenderE164),
+    senderE164,
     senderIsOwner: params.senderIsOwner,
     inputProvenance: ctx.InputProvenance,
     trustedInternalHandoff: undefined,

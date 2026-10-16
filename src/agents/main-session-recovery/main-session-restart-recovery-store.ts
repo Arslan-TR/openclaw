@@ -15,7 +15,6 @@ import { canPrepareAgentSessionWorktree } from "../../gateway/agent-turn/agent-h
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
 import { readSessionMessagesAsync } from "../../gateway/session-transcript-readers.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
-import { findDeliveryIntentOwners } from "../../infra/outbound/delivery-queue-storage.js";
 import {
   getOwedHarnessCompletionTask,
   createHarnessCompletionSourceAssertion,
@@ -42,6 +41,7 @@ import {
 } from "./main-session-restart-recovery-checkpoint.js";
 import {
   hasRestartRecoveryMessageActionAuthority,
+  resolvePendingFinalRecoveryAction,
   requiresRestartRecoveryMessageActionAuthority,
 } from "./main-session-restart-recovery-delivery.js";
 import {
@@ -67,40 +67,6 @@ import {
   resolveRestartRecoveryTerminalClientRunId,
 } from "./main-session-restart-recovery-shared.js";
 import { resolveRestartRecoveryDispatchTarget } from "./main-session-restart-recovery-target.js";
-
-async function pendingFinalRecoveryAction(
-  pending: NonNullable<SessionEntry["pendingFinalDelivery"]>,
-  stateDir?: string,
-): Promise<"complete" | "defer" | "fail" | "notice" | "retry"> {
-  const deliveries = pending.deliveries;
-  if (!deliveries?.length) {
-    return "fail";
-  }
-  if (deliveries.every(({ state }) => state === "delivered" || state === "suppressed")) {
-    return "complete";
-  }
-  const owners = await findDeliveryIntentOwners(
-    deliveries.map(({ id }) => id),
-    stateDir,
-  );
-  if (owners.some((owner) => owner?.status === "pending" || owner?.settlementPending)) {
-    return "defer";
-  }
-  if (
-    pending.kind === "replayable" &&
-    deliveries.every(({ state }) => state === "prepared") &&
-    owners.every((owner) => owner === null)
-  ) {
-    return "retry";
-  }
-  // Residual ambiguity (unknown custody, settled owners, unreplayable mixes):
-  // complete the session and record durable notice debt instead of failing it.
-  // A fire-and-forget failure notice is lost during the very outage that made
-  // the outcome ambiguous; the debt survives until the next same-route turn.
-  // Records without notice identity cannot carry debt, so they keep the
-  // visible fail path instead of completing silently.
-  return pending.context && pending.intentId ? "notice" : "fail";
-}
 
 async function completePendingFinalRecoveryWithNotice(
   entry: SessionEntry,
@@ -363,7 +329,7 @@ export async function recoverStore(params: {
       );
 
       const pendingAction = entry.pendingFinalDelivery
-        ? await pendingFinalRecoveryAction(entry.pendingFinalDelivery, params.stateDir)
+        ? await resolvePendingFinalRecoveryAction(entry.pendingFinalDelivery, params.stateDir)
         : undefined;
       if (stopped()) {
         return result;
