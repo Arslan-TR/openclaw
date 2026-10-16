@@ -226,6 +226,22 @@ their feature's activation, evidence selection, and permission to send that
 evidence. Having credentials alone must not activate background collection or
 spending.
 
+The host applies the registered consumer plugin's `allowedCompletionModels`
+policy from `plugins.entries.<consumer-id>.llm` before provider dispatch. An empty
+or invalid-only list denies all models; `["*"]` permits any model at this policy
+layer. Pass the operation's owning `agentId` as before; omitting it selects the
+global decision role, even inside an agent operation. Unlike the agent-bound LLM
+runtime, Decision calls select their owner explicitly and do not require
+`allowAgentIdOverride`.
+
+A configured decision role is not a caller model override, so `allowModelOverride`
+and the override-only `allowedModels` do not gate it. The agent's conversational
+`modelPolicy.allow` is not an all-completion restriction. Current Gateway operator
+model policy remains independently enforced, including revocation and cancellation.
+Request fields cannot substitute consumer identity or another plugin's policy.
+Authorization failures throw rather than return an `unavailable` fallback outcome.
+The built-in decision tool uses its host-bound agent rather than a public override.
+
 Call from a live plugin tool, hook, or other owned operation, carrying its
 cancellation signal:
 
@@ -288,9 +304,11 @@ same prepared-secret path whether the caller is built-in or third-party.
 
 The host admits at most four requests, with no queue and a 30-second maximum.
 Consumers can request shorter deadlines and choose their own fallback policy.
-Three unhealthy responses open a ten-second circuit; recovery admits one trial.
-Retry-After is bounded to one minute. Auth errors latch until the prepared-secret
-or configuration generation changes. There are no host retries or health checks.
+Three transport, rate-limit, or invalid-response failures open a ten-second circuit;
+recovery admits one trial. Retry-After is bounded to one minute. Authentication
+failures return to the caller without opening the shared provider circuit: another
+agent or a later evaluation may use a different credential. There are no host retries
+or health checks.
 
 Caller cancellation and closed consumer authority reject: do not start fallback.
 Provider retirement returns unavailable while a live consumer can fall back.
@@ -310,8 +328,12 @@ previous value across reload. Refresh with `secrets.reload`; capability failure
 does not retain an old key.
 
 `plugins.inspect` reports configuration, credential readiness, current callability,
-last success, usage, latency, and bounded unavailable counts. Counts are
-instance-local diagnostics, not durable audit records or write authority.
+last success, usage, latency, and bounded unavailable counts. `credentialReady: true`
+means the provider's local `isReady()` confirmed prepared credentials. `false`
+means readiness is unconfirmed or unavailable, not necessarily that credentials
+are missing. Omitting `isReady()` leaves evaluation eligible; returning `false`
+blocks it. `callable` separately reports current admission, not guaranteed success.
+Counts are instance-local diagnostics, not durable audit records or write authority.
 
 For discovery, declare static `decisionModels` entries in the provider manifest
 with `provider`, `id`, and `name`. Each provider must be owned by

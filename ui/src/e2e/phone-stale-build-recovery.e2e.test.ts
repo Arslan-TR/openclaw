@@ -513,7 +513,7 @@ suite.define(() => {
         ).toEqual(
           Array.from({ length: 4 }, () => ({
             cacheControl: "no-cache",
-            fromWorker: false,
+            fromWorker: serviceWorker === "normal",
             status: 200,
           })),
         );
