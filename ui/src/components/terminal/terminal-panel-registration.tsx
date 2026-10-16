@@ -1,7 +1,11 @@
+import { createMemo, untrack } from "solid-js";
 import { useOptionalApplication } from "../../lib/reactive/context.ts";
 import { nativePanelTabStripCss as tabStyles } from "../panel-tab-strip-styles.ts";
+import "../dock-panel-solid.css";
+import "./terminal-panel.css";
 import { definePanelBridge } from "../solid-panel-bridge.tsx";
-import { TerminalPanel } from "./terminal-panel-component.tsx";
+import { usePanelController } from "../solid-panel-controller.ts";
+import { TerminalPanelHostedActions, TerminalPanelView } from "./terminal-panel-view.tsx";
 import { CATALOG_TERMINAL_READY_TIMEOUT_MS, TerminalPanelController } from "./terminal-panel.ts";
 import { createIsolatedGhosttyTerminal } from "./terminal-runtime.ts";
 import dockStyles from "../dock-panel-solid.css?inline";
@@ -25,6 +29,21 @@ export type TerminalInputs = Pick<
   | "createTerminalController"
   | "catalogReadyTimeoutMs"
 >;
+
+function TerminalPanel(props: { controller: TerminalPanelController }) {
+  // A bridge mount owns one controller until its host disconnects.
+  const controller = untrack(() => props.controller);
+  usePanelController(controller);
+  const view = createMemo(() => controller.read().viewState);
+  // The side-panel header moves this Solid-owned node outside the panel's host.
+  <TerminalPanelHostedActions
+    view={view}
+    ref={(element) => {
+      controller.hostedActionsContent = element;
+    }}
+  />;
+  return <TerminalPanelView view={view} />;
+}
 
 export function defineTerminalPanelElement(
   tag = "openclaw-terminal-panel",
