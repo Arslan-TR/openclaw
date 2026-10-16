@@ -33,6 +33,10 @@ const env = {
   OPENCLAW_VERSION: "2026.4.25",
   VITEST: "true",
 };
+const disablePlugin = (id: string) => ({
+  config: { plugins: { entries: { [id]: { enabled: false } } } },
+  policyPluginIds: [id],
+});
 
 function makeFixture(owner?: string) {
   const stateDir = makeTempDir();
@@ -42,12 +46,15 @@ function makeFixture(owner?: string) {
   const candidates = [candidate];
   const refresh = (params: Parameters<typeof refreshPersistedInstalledPluginIndex>[0]) =>
     refreshPersistedInstalledPluginIndex({ stateDir, candidates, env, ...params });
-  return { stateDir, pluginDir, candidate, candidates, refresh };
+  const read = () => readPersistedInstalledPluginIndex({ stateDir });
+  const write = (index: InstalledPluginIndex) =>
+    writePersistedInstalledPluginIndex(index, { stateDir });
+  return { stateDir, pluginDir, candidate, candidates, refresh, read, write };
 }
 
 describe("installed plugin index policy refresh", () => {
   it("preserves admitted source during policy refresh and refuses publication under its lease", async () => {
-    const { stateDir, pluginDir, candidate, refresh } = makeFixture("package");
+    const { stateDir, pluginDir, candidate, refresh, read, write } = makeFixture("package");
     const installRecords = {
       package: { source: "git", installPath: pluginDir },
       orphaned: { source: "path", installPath: path.join(stateDir, "missing") },
@@ -72,27 +79,16 @@ describe("installed plugin index policy refresh", () => {
     };
     const publish = (receipt: typeof admission) =>
       createPluginSourceAdmissionPublisher({ stateDir })!({ ...publication, receipt });
-    await writePersistedInstalledPluginIndex(
-      {
-        ...initial,
-        plugins: initial.plugins.map((plugin) => ({ ...plugin, sourceAdmissions })),
-      },
-      { stateDir },
-    );
-    expect(
-      Object.keys((await readPersistedInstalledPluginIndex({ stateDir }))!.installRecords),
-    ).toEqual(["orphaned", "package"]);
+    await write({
+      ...initial,
+      plugins: initial.plugins.map((plugin) => ({ ...plugin, sourceAdmissions })),
+    });
+    expect(Object.keys((await read())!.installRecords)).toEqual(["orphaned", "package"]);
     expect(await publish(latestAdmission)).toBe(true);
-    fs.writeFileSync(
-      path.join(pluginDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id: "demo",
-        name: "Demo",
-        configSchema: { type: "object" },
-        providers: ["demo", "changed"],
-      }),
-      "utf8",
-    );
+    const manifestPath = path.join(pluginDir, "openclaw.plugin.json");
+    const manifest: { providers: string[] } = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    manifest.providers = ["demo", "changed"];
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
 
     const refreshed = await withPluginLifecycleLease(
       resolveInstalledPluginIndexStateDatabaseOptions({ stateDir, env }),
@@ -101,8 +97,7 @@ describe("installed plugin index policy refresh", () => {
           lease,
           reason: "policy-changed",
           installRecords,
-          config: { plugins: { entries: { demo: { enabled: false } } } },
-          policyPluginIds: ["demo"],
+          ...disablePlugin("demo"),
         });
         expect(await publish(newerAdmission)).toBe(false);
         return current;
@@ -116,20 +111,16 @@ describe("installed plugin index policy refresh", () => {
       manifestHash: initial.plugins[0]?.manifestHash,
       sourceAdmissions: { [admissionKey]: latestAdmission },
     });
-    expect(
-      (await readPersistedInstalledPluginIndex({ stateDir }))?.plugins[0]?.sourceAdmissions,
-    ).toEqual({ [admissionKey]: latestAdmission });
+    expect((await read())?.plugins[0]?.sourceAdmissions).toEqual({
+      [admissionKey]: latestAdmission,
+    });
     expect(refreshed.policyHash).not.toBe(initial.policyHash);
 
-    const changedInstallRecords = {
-      ...installRecords,
-      package: { ...installRecords.package, source: "npm" },
-    } satisfies InstalledPluginIndex["installRecords"];
     const rebuilt = await refresh({
       reason: "policy-changed",
       candidates: undefined,
       discovery: { candidates: [candidate], diagnostics: [] },
-      installRecords: changedInstallRecords,
+      installRecords: { ...installRecords, package: { ...installRecords.package, source: "npm" } },
     });
     expect(rebuilt.plugins[0]).toMatchObject({ pluginId: "demo", installOwner: "package" });
     expect(rebuilt.plugins[0]?.manifestHash).not.toBe(initial.plugins[0]?.manifestHash);
@@ -139,14 +130,14 @@ describe("installed plugin index policy refresh", () => {
   it.each(["policy target", "installed projection"] as const)(
     "rebuilds source when the %s is missing",
     async (missing) => {
-      const { stateDir, pluginDir, candidates, refresh } = makeFixture();
+      const { stateDir, pluginDir, candidates, refresh, read, write } = makeFixture();
       const installRecords: InstalledPluginIndex["installRecords"] | undefined =
         missing === "installed projection"
           ? { demo: { source: "path", installPath: pluginDir } }
           : undefined;
       const initial = await refresh({ reason: "manual", installRecords });
       if (missing === "installed projection") {
-        await writePersistedInstalledPluginIndex({ ...initial, plugins: [] }, { stateDir });
+        await write({ ...initial, plugins: [] });
       } else {
         const nextPluginDir = path.join(stateDir, "plugins", "next-demo");
         fs.mkdirSync(nextPluginDir, { recursive: true });
@@ -155,22 +146,13 @@ describe("installed plugin index policy refresh", () => {
       const refreshed = await refresh({
         reason: "policy-changed",
         installRecords,
-        ...(missing === "policy target"
-          ? {
-              config: { plugins: { entries: { "next-demo": { enabled: false } } } },
-              policyPluginIds: ["next-demo"],
-            }
-          : {}),
+        ...(missing === "policy target" ? disablePlugin("next-demo") : {}),
       });
       if (missing === "policy target") {
         expect(refreshed.plugins.map((plugin) => plugin.pluginId)).toContain("next-demo");
       } else {
         expect(refreshed.plugins.map((plugin) => plugin.pluginId)).toEqual(["demo"]);
-        expect(
-          (await readPersistedInstalledPluginIndex({ stateDir }))?.plugins.map(
-            (plugin) => plugin.pluginId,
-          ),
-        ).toEqual(["demo"]);
+        expect((await read())?.plugins.map((plugin) => plugin.pluginId)).toEqual(["demo"]);
       }
     },
   );

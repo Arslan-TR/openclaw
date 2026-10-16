@@ -30,6 +30,10 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   }),
 );
 
+function packagePath(projectRoot: string) {
+  return path.join(projectRoot, "node_modules", ...PACKAGE_NAME.split("/"));
+}
+
 function writeManaged(stateDir: string, version: string, generationKey?: string): string {
   const npmDir = path.join(stateDir, "npm");
   const packageDir = writeManagedNpmPlugin({ stateDir, version, ...managedPlugin });
@@ -43,7 +47,28 @@ function writeManaged(stateDir: string, version: string, generationKey?: string)
     generationKey,
   });
   fs.renameSync(flatProjectRoot, generationProjectRoot);
-  return path.join(generationProjectRoot, "node_modules", ...PACKAGE_NAME.split("/"));
+  return packagePath(generationProjectRoot);
+}
+
+function seedAuthority(stateDir: string, installPath: string, dangling = false) {
+  return seedInstalledPluginIndex(
+    {
+      discord: {
+        source: "npm",
+        installPath,
+        resolvedName: PACKAGE_NAME,
+        spec: `${PACKAGE_NAME}@${dangling ? "latest" : "1.0.0"}`,
+        resolvedVersion: dangling ? "2.0.0" : "1.0.0",
+        ...(!dangling ? { version: "1.0.0", resolvedSpec: `${PACKAGE_NAME}@1.0.0` } : {}),
+      },
+    },
+    { stateDir, candidates: [] },
+  );
+}
+
+function orderInstalls(older: string, newer: string) {
+  setInstallTimestamp(older, Date.UTC(2026, 0, 1));
+  setInstallTimestamp(newer, Date.UTC(2026, 0, 2));
 }
 
 async function expectRecovered(stateDir: string, installPath: string, resolvedVersion = "1.0.0") {
@@ -69,27 +94,13 @@ describe("managed npm generation-dir loader precedence", () => {
     const stateDir = tempDirs.make("openclaw-plugin-generation-precedence-");
     const newerPackageDir = writeManaged(stateDir, "3.0.0", "discord-newer-on-windows");
     const downgradedPackageDir = writeManaged(stateDir, "1.0.0");
-    setInstallTimestamp(downgradedPackageDir, Date.UTC(2026, 0, 1));
-    setInstallTimestamp(newerPackageDir, Date.UTC(2026, 0, 2));
+    orderInstalls(downgradedPackageDir, newerPackageDir);
     const differentlyCasedActivePath = downgradedPackageDir.replace(
       stateDir,
       stateDir.toUpperCase(),
     );
 
-    await seedInstalledPluginIndex(
-      {
-        discord: {
-          source: "npm",
-          spec: `${PACKAGE_NAME}@1.0.0`,
-          installPath: differentlyCasedActivePath,
-          version: "1.0.0",
-          resolvedName: PACKAGE_NAME,
-          resolvedVersion: "1.0.0",
-          resolvedSpec: `${PACKAGE_NAME}@1.0.0`,
-        },
-      },
-      { stateDir, candidates: [] },
-    );
+    await seedAuthority(stateDir, differentlyCasedActivePath);
     const emitWarning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
 
     const loaded = await loadInstalledPluginIndexInstallRecords({ stateDir });
@@ -105,29 +116,15 @@ describe("managed npm generation-dir loader precedence", () => {
     const npmDir = path.join(stateDir, "npm");
     const recentPackageDir = writeManaged(stateDir, "1.0.0", "discord-recent-after-dangling");
     const olderPackageDir = writeManaged(stateDir, "9.0.0");
-    setInstallTimestamp(olderPackageDir, Date.UTC(2026, 0, 1));
-    setInstallTimestamp(recentPackageDir, Date.UTC(2026, 0, 2));
-    const missingPackageDir = path.join(
+    orderInstalls(olderPackageDir, recentPackageDir);
+    const missingPackageDir = packagePath(
       resolvePluginNpmGenerationProjectDir({
         npmDir,
         packageName: PACKAGE_NAME,
         generationKey: "discord-missing",
       }),
-      "node_modules",
-      ...PACKAGE_NAME.split("/"),
     );
-    await seedInstalledPluginIndex(
-      {
-        discord: {
-          source: "npm",
-          spec: `${PACKAGE_NAME}@latest`,
-          installPath: missingPackageDir,
-          resolvedName: PACKAGE_NAME,
-          resolvedVersion: "2.0.0",
-        },
-      },
-      { stateDir, candidates: [] },
-    );
+    await seedAuthority(stateDir, missingPackageDir, true);
     const emitWarning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
 
     await expectRecovered(stateDir, recentPackageDir);
@@ -146,8 +143,7 @@ describe("managed npm generation-dir loader precedence", () => {
       version: "9.0.0",
       layout: "legacy",
     });
-    setInstallTimestamp(olderPackageDir, Date.UTC(2026, 0, 1));
-    setInstallTimestamp(recentPackageDir, Date.UTC(2026, 0, 2));
+    orderInstalls(olderPackageDir, recentPackageDir);
     writeManagedNpmPlugin({
       stateDir,
       packageName: "@openclaw/unrelated",

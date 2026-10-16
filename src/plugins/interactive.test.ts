@@ -1,4 +1,3 @@
-// Covers interactive plugin registry entries and lifecycle behavior.
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import * as conversationBinding from "./conversation-binding.js";
 import type {
@@ -51,86 +50,50 @@ type InteractiveDispatchParams =
   | (Parameters<typeof discordInteractiveDispatcher>[0] & { channel: "discord" })
   | (Parameters<typeof slackInteractiveDispatcher>[0] & { channel: "slack" });
 
-function createTelegramDispatchParams(params: {
-  data: string;
-  callbackId: string;
-}): Extract<InteractiveDispatchParams, { channel: "telegram" }> {
+const conversations = {
+  telegram: { conversationId: "-10099:topic:77", parentConversationId: "-10099", threadId: 77 },
+  discord: { conversationId: "channel-1", parentConversationId: "parent-1" },
+  slack: { conversationId: "C123", parentConversationId: "C123", threadId: "1710000000.000100" },
+};
+
+function baseDispatchParams<TChannel extends keyof typeof conversations>(
+  channel: TChannel,
+  data: string,
+  id: string,
+) {
   return {
-    channel: "telegram",
-    data: params.data,
-    dedupeId: params.callbackId,
-    ctx: {
-      accountId: "default",
-      callbackId: params.callbackId,
-      conversationId: "-10099:topic:77",
-      parentConversationId: "-10099",
-      senderId: "user-1",
-      threadId: 77,
-      auth: { isAuthorizedSender: true },
-      callbackMessage: {
-        messageId: 55,
-        chatId: "-10099",
-      },
-    },
+    channel,
+    data,
+    dedupeId: id,
     respond: {},
+    ctx: {
+      ...conversations[channel],
+      accountId: "default",
+      senderId: "user-1",
+      auth: { isAuthorizedSender: true },
+    },
   };
 }
 
-function createDiscordDispatchParams(params: {
-  data: string;
-  interactionId: string;
-  interaction?: Partial<
-    Extract<InteractiveDispatchParams, { channel: "discord" }>["ctx"]["interaction"]
-  >;
-}): Extract<InteractiveDispatchParams, { channel: "discord" }> {
+function telegramParams(
+  data: string,
+  callbackId: string,
+): Extract<InteractiveDispatchParams, { channel: "telegram" }> {
+  const base = baseDispatchParams("telegram", data, callbackId);
   return {
-    channel: "discord",
-    data: params.data,
-    dedupeId: params.interactionId,
-    ctx: {
-      accountId: "default",
-      interactionId: params.interactionId,
-      conversationId: "channel-1",
-      parentConversationId: "parent-1",
-      senderId: "user-1",
-      auth: { isAuthorizedSender: true },
-      interaction: {
-        kind: "button",
-        messageId: "message-1",
-        values: ["allow"],
-        ...params.interaction,
-      },
-    },
-    respond: {},
+    ...base,
+    ctx: { ...base.ctx, callbackId, callbackMessage: { messageId: 55, chatId: "-10099" } },
   };
 }
 
-function createSlackDispatchParams(params: {
-  data: string;
-  interactionId: string;
-  interaction?: Partial<
-    Extract<InteractiveDispatchParams, { channel: "slack" }>["ctx"]["interaction"]
-  >;
-}): Extract<InteractiveDispatchParams, { channel: "slack" }> {
-  return {
-    channel: "slack",
-    data: params.data,
-    dedupeId: params.interactionId,
-    ctx: {
-      accountId: "default",
-      interactionId: params.interactionId,
-      conversationId: "C123",
-      parentConversationId: "C123",
-      threadId: "1710000000.000100",
-      senderId: "user-1",
-      auth: { isAuthorizedSender: true },
-      interaction: {
-        kind: "button",
-        ...params.interaction,
-      },
-    },
-    respond: {},
-  };
+function interactionParams<TChannel extends "discord" | "slack">(
+  channel: TChannel,
+  data: string,
+  interactionId: string,
+  interaction: Record<string, unknown>,
+) {
+  const base = baseDispatchParams(channel, data, interactionId);
+  return { ...base, ctx: { ...base.ctx, interactionId, interaction } };
 }
 
 async function dispatchInteractive(params: InteractiveDispatchParams) {
@@ -182,7 +145,7 @@ function register(
 }
 
 function dispatchTelegram(data: string, callbackId: string) {
-  return dispatchInteractive(createTelegramDispatchParams({ data, callbackId }));
+  return dispatchInteractive(telegramParams(data, callbackId));
 }
 
 describe("plugin interactive handlers", () => {
@@ -344,10 +307,9 @@ describe("plugin interactive handlers", () => {
 
     await expect(
       dispatchInteractive({
-        ...createDiscordDispatchParams({
-          data: "codex:approve:thread-1",
-          interactionId: "ix-ack-1",
-          interaction: { kind: "button", values: undefined },
+        ...interactionParams("discord", "codex:approve:thread-1", "ix-ack-1", {
+          kind: "button",
+          values: undefined,
         }),
         onMatched: async () => {
           callOrder.push("ack");
@@ -359,7 +321,7 @@ describe("plugin interactive handlers", () => {
   it.each([
     {
       channel: "telegram" as const,
-      dispatchParams: createTelegramDispatchParams({ data: "codex:bind", callbackId: "cb-bind" }),
+      dispatchParams: telegramParams("codex:bind", "cb-bind"),
       conversation: {
         channel: "telegram",
         accountId: "default",
@@ -370,10 +332,9 @@ describe("plugin interactive handlers", () => {
     },
     {
       channel: "discord" as const,
-      dispatchParams: createDiscordDispatchParams({
-        data: "codex:bind",
-        interactionId: "ix-bind",
-        interaction: { kind: "button", values: ["allow"] },
+      dispatchParams: interactionParams("discord", "codex:bind", "ix-bind", {
+        kind: "button",
+        values: ["allow"],
       }),
       conversation: {
         channel: "discord",
@@ -384,15 +345,11 @@ describe("plugin interactive handlers", () => {
     },
     {
       channel: "slack" as const,
-      dispatchParams: createSlackDispatchParams({
-        data: "codex:bind",
-        interactionId: "slack-bind",
-        interaction: {
-          kind: "button",
-          value: "bind",
-          selectedValues: ["bind"],
-          selectedLabels: ["Bind"],
-        },
+      dispatchParams: interactionParams("slack", "codex:bind", "slack-bind", {
+        kind: "button",
+        value: "bind",
+        selectedValues: ["bind"],
+        selectedLabels: ["Bind"],
       }),
       conversation: {
         channel: "slack",
@@ -492,16 +449,13 @@ describe("plugin interactive handlers", () => {
       pluginName: "Codex",
       pluginRoot: "/plugins/codex",
     });
-    const dispatchParams = createTelegramDispatchParams({
-      data: "codex:bind",
-      callbackId: `auth-${name}`,
-    });
+    const params = telegramParams("codex:bind", `auth-${name}`);
 
     await dispatchInteractive({
-      ...dispatchParams,
+      ...params,
       conversation: testCase.conversation,
       ctx: {
-        ...dispatchParams.ctx,
+        ...params.ctx,
         auth: { isAuthorizedSender: testCase.auth },
         senderId: testCase.senderId,
         accountId: testCase.accountId,
@@ -524,10 +478,7 @@ describe("plugin interactive handlers", () => {
     register(handler);
 
     const baseParams = {
-      ...createTelegramDispatchParams({
-        data: "codex:resume:thread-1",
-        callbackId: "cb-post-handler-failure",
-      }),
+      ...telegramParams("codex:resume:thread-1", "cb-post-handler-failure"),
       afterInvoke,
     };
 
@@ -539,23 +490,14 @@ describe("plugin interactive handlers", () => {
   });
 
   it("dedupes concurrent interactive dispatches while a handler is still running", async () => {
-    let releaseHandler: (() => void) | undefined;
-    const handlerGate = new Promise<void>((resolve) => {
-      releaseHandler = resolve;
-    });
-    if (!releaseHandler) {
-      throw new Error("Expected handler release callback to be initialized");
-    }
+    const { promise: handlerGate, resolve: releaseHandler } = Promise.withResolvers<void>();
     const handler = vi.fn(async () => {
       await handlerGate;
       return { handled: true };
     });
     register(handler);
 
-    const baseParams = createTelegramDispatchParams({
-      data: "codex:resume:thread-1",
-      callbackId: "cb-concurrent",
-    });
+    const baseParams = telegramParams("codex:resume:thread-1", "cb-concurrent");
 
     const firstDispatch = dispatchInteractive(baseParams);
     await vi.waitFor(() => {
@@ -572,23 +514,14 @@ describe("plugin interactive handlers", () => {
   });
 
   it("releases inflight interactive dedupe keys after a handler failure", async () => {
-    let rejectHandler: ((error: Error) => void) | undefined;
-    const handlerGate = new Promise<never>((_, reject) => {
-      rejectHandler = reject;
-    });
-    if (!rejectHandler) {
-      throw new Error("Expected handler reject callback to be initialized");
-    }
+    const { promise: handlerGate, reject: rejectHandler } = Promise.withResolvers<never>();
     const handler = vi
       .fn(async () => ({ handled: true }))
       .mockImplementationOnce(async () => await handlerGate)
       .mockResolvedValueOnce({ handled: true });
     register(handler);
 
-    const baseParams = createTelegramDispatchParams({
-      data: "codex:resume:thread-1",
-      callbackId: "cb-retry-after-failure",
-    });
+    const baseParams = telegramParams("codex:resume:thread-1", "cb-retry-after-failure");
 
     const firstDispatch = dispatchInteractive(baseParams);
     await vi.waitFor(() => {
