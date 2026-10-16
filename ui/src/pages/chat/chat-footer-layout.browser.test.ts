@@ -42,6 +42,79 @@ describeBrowserLayout.concurrent("chat footer browser layout", () => {
   beforeAll(() => layoutBrowser.start());
   afterAll(() => layoutBrowser.close());
 
+  it("keeps connection status above the visible bottom-left composer across split layouts", async () => {
+    await withBrowserPage(openBrowserPage(1200, 800), async (page) => {
+      const pane = (id: string, height: number, visible = true) => `
+        <openclaw-chat-pane class="chat-pane-cache__pane ${visible ? "chat-pane-cache__pane--visible" : ""}">
+          <div style="flex: 1">Transcript</div>
+          <div class="chat-footer" id="${id}" style="height: ${height}px">Composer</div>
+        </openclaw-chat-pane>`;
+      await page.setContent(`<style>${readUiCss()}${readStyleSheet("ui/src/styles/chat/split-view.css")}</style>
+        <div class="shell shell--chat" style="--shell-content-height: 800px">
+          <main class="content content--chat" style="padding: 0">
+            <div class="chat-split-view" style="height: 100%">
+              <div class="chat-split-view__column" id="left-column" style="flex: 1">
+                <div class="chat-split-view__cell" id="top-cell" style="flex: 1">
+                  <div class="chat-pane-cache">${pane("top-composer", 80)}</div>
+                </div>
+                <resizable-divider></resizable-divider>
+                <div class="chat-split-view__cell" id="bottom-cell" style="flex: 1">
+                  <div class="chat-pane-cache">
+                    ${pane("left-composer", 240)}${pane("left-retained", 60, false)}
+                  </div>
+                </div>
+              </div>
+              <resizable-divider></resizable-divider>
+              <div class="chat-split-view__column" id="right-column" style="flex: 1">
+                <div class="chat-split-view__cell" id="right-cell" style="flex: 1">
+                  <div class="chat-pane-cache">
+                    ${pane("right-composer", 100)}${pane("right-retained", 40, false)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </main>
+          <div class="shell-connection-status">Reconnecting</div>
+        </div>`);
+      const expectAbove = async (selector: string) => {
+        await waitForLayoutSettled(page, `${selector}, .shell-connection-status`);
+        const composer = await getRect(page, selector);
+        const chip = await getRect(page, ".shell-connection-status");
+        expect(chip.left).toBeGreaterThanOrEqual(composer.left);
+        expect(chip.right).toBeLessThanOrEqual(composer.right);
+        expect(chip.bottom).toBeCloseTo(composer.top - 12, 0);
+      };
+      await expectAbove("#left-composer");
+      await page.setViewportSize({ width: 390, height: 800 });
+      await page.evaluate(() => {
+        document.querySelector(".shell")!.classList.add("shell--mobile-nav");
+        document.querySelector(".chat-split-view")!.classList.add("chat-split-view--narrow");
+        document
+          .querySelector("#left-column")!
+          .classList.add("chat-split-view__column--narrow-hidden");
+        for (const id of ["top-cell", "bottom-cell"]) {
+          document.getElementById(id)!.classList.add("chat-split-view__cell--narrow-hidden");
+        }
+      });
+      await expectAbove("#right-composer");
+      await page.evaluate(() => {
+        document
+          .querySelector("#left-column")!
+          .classList.remove("chat-split-view__column--narrow-hidden");
+        document
+          .querySelector("#right-column")!
+          .classList.add("chat-split-view__column--narrow-hidden");
+        document
+          .querySelector("#top-cell")!
+          .classList.remove("chat-split-view__cell--narrow-hidden");
+        document
+          .querySelector("#right-cell")!
+          .classList.add("chat-split-view__cell--narrow-hidden");
+      });
+      await expectAbove("#top-composer");
+    });
+  });
+
   it("does not rebuild the footer layout tree while autosizing the editor", async () => {
     await withBrowserPage(openBrowserPage(1200, 800), async (page) => {
       // Keep the grid/flex chain: a directly sized conversation cannot reproduce

@@ -3596,9 +3596,18 @@ button.gateway-status:focus-visible {
   color: var(--danger);
 }
 
-/* The connection chip follows the visible writing surface or sticky save bar so it never
-   covers a composer or primary action. */
-.shell :is(.chat-footer, .creation-composer, .new-session-page__composer, .cron-editor-actions) {
+/* Only the visible bottom-left chat cell owns the chip anchor; cached sessions
+   remain in layout, and narrow layouts hide every cell except the active one. */
+.shell
+  .chat-split-view__column:nth-child(
+    1 of .chat-split-view__column:not(.chat-split-view__column--narrow-hidden)
+  )
+  > .chat-split-view__cell:nth-last-child(
+    1 of .chat-split-view__cell:not(.chat-split-view__cell--narrow-hidden)
+  )
+  .chat-pane-cache__pane--visible
+  .chat-footer,
+.shell :is(.creation-composer, .new-session-page__composer, .cron-editor-actions) {
   anchor-name: --shell-composer;
 }
 
