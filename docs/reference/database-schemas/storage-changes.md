@@ -2083,6 +2083,11 @@ without a separate planning read or archive worker. Cron run alias cleanup uses
 that path and keeps the stable session's transcript. Native-session participants,
 pending-delivery protection, and lease-loss refusal remain in the lifecycle owner.
 The transaction passes its validated rows to deletion instead of reading them again.
+Deletion planning uses a read snapshot on the admitted agent worker, including
+historical-generation planning and rechecks. Empty transcript plans use that
+writer for removal without starting a reclamation worker. Nonempty transcripts
+retain archive extraction and reclamation before publication; pending-archive
+recovery, retention, and final authority checks are unchanged.
 
 Prepared session-store updates, entry replacements, and lifecycle upserts use
 the same admission for cold snapshot reads and actual commits, retaining their

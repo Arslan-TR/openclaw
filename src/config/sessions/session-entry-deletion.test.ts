@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import * as admission from "../../infra/sqlite-worker-operation-admission.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import * as archive from "./session-accessor.sqlite-archive.js";
 import { replaceSessionEntry, replaceSessionEntrySync } from "./session-accessor.sqlite-entry.js";
 import { deleteSessionEntryLifecycle } from "./session-accessor.sqlite-lifecycle.js";
 import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.test-support.js";
@@ -128,5 +129,30 @@ it("rolls back entry deletion when cleanup authority is lost at native commit", 
       sessionId: "original",
       label: "initial",
     });
+  });
+});
+
+it("deletes empty transcripts through the admitted writer without starting an archive worker", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const f = createSessionCompoundWorkerFixture();
+    const createArchiveWorker = vi.spyOn(archive, "createSqliteTranscriptArchiveWorker");
+    for (const suffix of ["first", "second", "third"]) {
+      const scope = { ...f.scope, sessionKey: `agent:main:empty-${suffix}`, sessionId: suffix };
+      const entry = { sessionId: suffix, updatedAt: 1 };
+      await replaceSessionEntry(scope, entry);
+      const expectedEntry = await readSessionEntryInWorker(scope);
+      expect(expectedEntry).toMatchObject(entry);
+      await expect(
+        deleteSessionEntryLifecycle({
+          ...scope,
+          target: { canonicalKey: scope.sessionKey, storeKeys: [scope.sessionKey] },
+          archiveTranscript: true,
+          expectedEntry,
+        }),
+      ).resolves.toMatchObject({ deleted: true, archivedTranscripts: [] });
+      await expect(readSessionEntryInWorker(scope)).resolves.toBeUndefined();
+      await expect(loadSessionTranscriptEvents(scope)).resolves.toEqual([]);
+    }
+    expect(createArchiveWorker).not.toHaveBeenCalled();
   });
 });
