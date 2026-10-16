@@ -761,7 +761,7 @@ describe("openrouter provider hooks", () => {
   });
 
   it("uses OpenRouter reasoning for DeepSeek V4 replay turns", async () => {
-    const capturedPayload = await captureOpenRouterWrappedPayload({
+    const capturedPayload = await capturePayload({
       modelId: "deepseek/deepseek-v4-flash",
       thinkingLevel: "xhigh",
       baseUrl: "https://openrouter.ai/api/v1",
@@ -836,7 +836,7 @@ describe("openrouter provider hooks", () => {
   });
 
   it("strips disabled OpenRouter DeepSeek V4 reasoning replay fields", async () => {
-    const capturedPayload = await captureOpenRouterWrappedPayload({
+    const capturedPayload = await capturePayload({
       modelId: "openrouter/deepseek/deepseek-v4-pro",
       thinkingLevel: "off",
       baseUrl: "https://openrouter.ai/api/v1",
@@ -893,7 +893,7 @@ describe("openrouter provider hooks", () => {
         content: [{ type: "tool_use", id: "toolu_1", name: "lookup", input: {} }],
       },
     ];
-    const capturedPayload = await captureOpenRouterWrappedPayload({
+    const capturedPayload = await capturePayload({
       modelId: "anthropic/claude-opus-4.6",
       thinkingLevel: "high",
       baseUrl: "https://openrouter.ai/api/v1",

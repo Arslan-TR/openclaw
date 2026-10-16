@@ -145,7 +145,8 @@ const root = ${JSON.stringify(root)}, options = ${JSON.stringify(options)};
 const args = process.argv.slice(2);
 fs.appendFileSync(root + "/curl-calls", JSON.stringify({args, env:process.env}) + "\\n");
 if (args.includes("--version")) {
-  console.log("curl fixture\\nProtocols: http https");
+  if (options.fault === "version") process.exit(2);
+  console.log("curl fixture\\nProtocols: " + (options.fault === "http" ? "https" : "http https"));
   console.log("Features: " + (options.fault === "ipv6" ? "SSL" : "IPv6 SSL"));
   process.exit(0);
 }
@@ -186,7 +187,12 @@ runuser() {
   [[ "$1:$2:$3:$4:$5:$6:$7" == "-u:$ROLE:--:/usr/bin/env:-C:/home/$ROLE:-i" ]] || exit 90
   [[ "\${*: -3}" != "sudo -n true" ]] || return 1
   shift 7
-  /usr/bin/env -i "$@"
+  local arg args=()
+  for arg in "$@"; do
+    [[ "$arg" != curl ]] || arg="$ROOT/bin/curl"
+    args+=("$arg")
+  done
+  /usr/bin/env -i "\${args[@]}"
 }
 command() {
   [[ "$1:$2" != "-v:$MISSING_TOOL" ]] || return 1

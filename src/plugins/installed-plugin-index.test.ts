@@ -3,6 +3,7 @@ import path from "node:path";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { expectObjectFields } from "../test-utils/mock-call-assertions.js";
 import { recordPluginCandidateInstallOwner } from "./candidate-install-owner.js";
 import type { PluginCandidate } from "./discovery.js";
 import { resolveInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
@@ -258,7 +259,7 @@ describe("installed plugin index", () => {
       installRecords: {},
     });
 
-    expect(records[0]).toMatchObject({
+    expectObjectFields(records[0], {
       pluginId: id,
       compat: [],
       startup: { sidecar: false },

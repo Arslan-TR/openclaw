@@ -35,6 +35,11 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   }),
 );
 const stateKey = "plugins.installedIndex";
+const priorJson = `{ "revision": 41, "index": {
+  "version": 1, "hostContractVersion": "2026.4.25", "compatRegistryVersion": "compat-v1",
+  "migrationVersion": 1, "policyHash": "prior", "generatedAtMs": 123,
+  "installRecords": {}, "plugins": [], "diagnostics": []
+} }`;
 
 function makeEnv() {
   return {

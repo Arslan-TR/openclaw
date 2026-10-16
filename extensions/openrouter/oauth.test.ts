@@ -315,7 +315,7 @@ describe("OpenRouter OAuth", () => {
   });
 
   it("bounds successful OpenRouter OAuth responses", async () => {
-    const oversized = oversizedJsonResponse({ chunkCount: 1, chunkSize: 16 * 1024 * 1024 + 10 });
+    const oversized = oversizedJsonResponse({ chunkCount: 2, chunkSize: 16 * 1024 * 1024 + 10 });
     const { ctx } = oauthContext({ isRemote: true });
 
     await expect(

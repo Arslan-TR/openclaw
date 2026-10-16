@@ -84,7 +84,10 @@ async function writeArtifact(filePath: string, content: string, stale = false) {
 async function evictionFixture(dir: string) {
   const storePath = path.join(dir, "sessions.json");
   const oldKey = "agent:main:subagent:old-worker";
-  const store = { [oldKey]: archivedEntry("old", 1), "agent:main:main": makeEntry("active", 2) };
+  const store: Record<string, SessionEntry> = {
+    [oldKey]: archivedEntry("old", 1),
+    "agent:main:main": makeEntry("active", 2),
+  };
   await writeStore(storePath, store);
   const oldTranscript = await writeArtifact(path.join(dir, "old.jsonl"), "t".repeat(10 * 1024));
   return { storePath, oldKey, store, oldTranscript };

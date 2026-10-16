@@ -88,7 +88,8 @@ describe("client voice session store persisted records", () => {
   });
 
   it("filters open lookup candidates in SQL before decoding payloads", async () => {
-    const rows = [
+    const rows = [];
+    for (const patch of [
       { voiceSessionId: "selected" },
       { voiceSessionId: "closed", status: "closed" },
       { voiceSessionId: "other", sessionKey: "agent:main:other" },
@@ -97,7 +98,9 @@ describe("client voice session store persisted records", () => {
       { voiceSessionId: "recent", sessionKey: "agent:main:recent", updatedAt: 10 },
       { voiceSessionId: "excluded", sessionKey: "agent:main:excluded" },
       { voiceSessionId: "invalid", version: 2 },
-    ].map((patch) => Object.assign({}, original, patch));
+    ]) {
+      rows.push({ ...original, ...patch });
+    }
     const insert = database.db.prepare(
       "INSERT INTO cache_entries(scope, key, value_json, updated_at) VALUES (?, ?, ?, ?)",
     );

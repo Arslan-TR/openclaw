@@ -119,7 +119,7 @@ it.each([
   [
     "unknown bot",
     textEvent("@_alice hi", [mention("@_alice", "Alice", "ou_alice")], "p2p"),
-    { mentionedBot: false, mentionTargets: undefined },
+    { mentionedBot: false },
     "  ",
   ],
   [
@@ -137,7 +137,11 @@ it.each([
 ] satisfies Array<
   [string, Partial<EventInput>, Partial<ReturnType<typeof parseFeishuMessageEvent>>, string]
 >)("handles mention metadata: %s", (_name, input, expected, botId) => {
-  expect(parseEvent(input, botId)).toMatchObject(expected);
+  const actual = parseEvent(input, botId);
+  expect(actual).toMatchObject(expected);
+  if (_name === "unknown bot") {
+    expect(actual.mentionTargets).toBeUndefined();
+  }
 });
 
 it("preserves post code while ignoring broadcast-only addressing", () => {

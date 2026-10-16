@@ -90,11 +90,11 @@ export function useClientVoiceDigestHarness() {
   return {
     sendDurableMessageBatch,
     settleDigestAttempts,
-    async seedDigest(to = "channel:voice-updates") {
+    async seedDigest(this: void, to = "channel:voice-updates") {
       await seedSession("agent:main:main", { channel: "discord", to });
       return createCompletedMutationSession();
     },
-    holdSend() {
+    holdSend(this: void) {
       const sending = createDeferred();
       const finishSend = createDeferred();
       sendDurableMessageBatch.mockImplementationOnce(async () => {
@@ -118,14 +118,14 @@ export function useClientVoiceDigestHarness() {
       }),
     recoverStale: (params: Partial<Parameters<typeof closeStaleClientVoiceSessions>[0]> = {}) =>
       closeStaleClientVoiceSessions({ agentId: "main", config: {}, ...params }),
-    expectRetained(pending?: 0) {
+    expectRetained(this: void, pending?: 0) {
       expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
         active: 0,
         retained: 1,
         ...(pending === undefined ? {} : { pending }),
       });
     },
-    recordEffect(runId: string, toolCallId: string) {
+    recordEffect(this: void, runId: string, toolCallId: string) {
       emitTrustedDiagnosticEvent({
         type: "tool.execution.started",
         runId,

@@ -328,6 +328,7 @@ describe("buildMarkdown", () => {
     [
       "sqlite-perf-smoke.json",
       {
+        ...sqliteRun,
         integrity: { agent: ["ok", "database disk image is malformed"], state: "ok" },
         profile: "smoke",
       },

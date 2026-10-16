@@ -410,7 +410,7 @@ describe("markdown sidebar", () => {
     const presentation = panel.querySelector('[role="status"]');
     const header = panel.querySelector(".chat-assistant-attachment-card__header");
     pending = false;
-    panel.content = { ...panel.content };
+    panel.content = { ...content };
     const image = await vi.waitFor(() =>
       expectDefined(panel.querySelector(".sidebar-attachment-preview__image"), "Preview image"),
     );
@@ -419,7 +419,7 @@ describe("markdown sidebar", () => {
     image.dispatchEvent(new Event("error"));
     expect(image.getAttribute("data-preview")).toBe("error");
     src = "/next.png";
-    panel.content = { ...panel.content };
+    panel.content = { ...content };
     const next = await vi.waitFor(() => {
       const current = expectDefined(
         panel.querySelector(".sidebar-attachment-preview__image"),

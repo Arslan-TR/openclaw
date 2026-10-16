@@ -73,6 +73,7 @@ async function expectUnavailable(state: SessionWorkspaceHost, message: string) {
 function createHost<T extends object>(overrides: T) {
   return {
     connected: true,
+    agentsList: { defaultId: "main", mainKey: "main", scope: "global", agents: [] },
     handleOpenSidebar: vi.fn(),
     hello: null,
     sessionKey: "agent:main:current",

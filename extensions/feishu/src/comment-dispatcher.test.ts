@@ -146,7 +146,7 @@ describe("createFeishuCommentReplyDispatcher", () => {
     });
     expect(cleanup).not.toHaveBeenCalled();
 
-    void created.dispatcherOptions.onCleanup?.();
+    created.dispatcherOptions.onCleanup?.();
     expect(cleanup).toHaveBeenCalledTimes(1);
 
     resolveCleanup();

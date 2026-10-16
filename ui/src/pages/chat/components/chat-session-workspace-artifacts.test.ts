@@ -49,7 +49,7 @@ describe("session workspace artifacts", () => {
       type: mimeType.startsWith("image/") ? "image" : "file",
       mimeType,
       title,
-      download: { mode: http ? "url" : "bytes" },
+      download: { mode: http ? ("url" as const) : ("bytes" as const) },
     };
     const request = vi.fn(async (_method: string, query: { transport?: string }) => ({
       artifact,

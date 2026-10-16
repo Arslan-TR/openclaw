@@ -15,6 +15,7 @@ import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
 } from "../state/openclaw-state-db.js";
+import { expectObjectFields } from "../test-utils/mock-call-assertions.js";
 import { withMockedWindowsPlatform } from "../test-utils/vitest-spies.js";
 import { recordPluginCandidateInstallOwner } from "./candidate-install-owner.js";
 import type { PluginCandidate } from "./discovery.js";
@@ -246,7 +247,7 @@ describe("plugin index install records store", () => {
       },
     });
 
-    expect((await loadInstalledPluginIndexInstallRecords({ stateDir })).discord).toMatchObject({
+    expectObjectFields((await loadInstalledPluginIndexInstallRecords({ stateDir })).discord, {
       ...npmRecord(packageName, recoveredVersion, activePackageDir),
       integrity: undefined,
     });
@@ -300,7 +301,7 @@ describe("plugin index install records store", () => {
       [createPluginCandidate(stateDir, "codex")],
     );
 
-    expect((await loadInstalledPluginIndexInstallRecords({ stateDir })).codex).toMatchObject({
+    expectObjectFields((await loadInstalledPluginIndexInstallRecords({ stateDir })).codex, {
       ...npmRecord("@openclaw/codex", "2026.5.18-beta.1", codexDir),
       integrity: undefined,
       shasum: undefined,
