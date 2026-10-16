@@ -11,8 +11,14 @@ import type * as KillTreeModule from "../process/kill-tree.js";
 let shellEnv: typeof import("./shell-env.js");
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+afterEach(() => {
+  vi.doUnmock("node:child_process");
+  vi.doUnmock("../process/kill-tree.js");
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
-function readShellPath(
+function readPath(
   env: NodeJS.ProcessEnv,
   exec: ReturnType<typeof vi.fn>,
   timeoutMs?: number,
@@ -32,14 +38,10 @@ beforeEach(async () => {
 });
 
 describe("async login-shell PATH preparation", () => {
-  afterEach(() => {
-    vi.doUnmock("node:child_process");
-    vi.doUnmock("../process/kill-tree.js");
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
-  async function holdProbe() {
+  async function holdProbe(
+    overrides: Partial<Parameters<typeof shellEnv.prepareShellPathFromLoginShell>[0]> = {},
+  ) {
+    const options = { env: {}, platform: "linux" as const, ...overrides };
     type ShellProcess = childProcess.ChildProcessByStdio<null, PassThrough, PassThrough>;
     type ShellSpawnOptions = childProcess.SpawnOptionsWithStdioTuple<"ignore", "pipe", "pipe">;
     let child: ShellProcess;
@@ -63,6 +65,8 @@ describe("async login-shell PATH preparation", () => {
       exec,
       sync,
       kill,
+      start: () => shellEnv.prepareShellPathFromLoginShell(options),
+      path: () => shellEnv.getShellPathFromLoginShell(options),
       get child() {
         return child;
       },
@@ -82,41 +86,33 @@ describe("async login-shell PATH preparation", () => {
     expect(probe.child.stderr?.destroyed).toBe(true);
   }
 
-  async function expectRetry(
-    probe: Awaited<ReturnType<typeof holdProbe>>,
-    options: Parameters<typeof shellEnv.prepareShellPathFromLoginShell>[0],
-  ) {
-    const retry = shellEnv.prepareShellPathFromLoginShell(options);
+  async function expectRetry(probe: Awaited<ReturnType<typeof holdProbe>>) {
+    const retry = probe.start();
     expect(probe.exec).toHaveBeenCalledTimes(2);
     probe.finish(null);
     await expect(retry).resolves.toBe("/shell/bin");
   }
 
   it("shares an in-flight probe and makes later synchronous resolution immediate", async () => {
-    const probe = await holdProbe();
-    const options = {
-      env: { PATH: "/daemon/bin", SHELL: "relative-shell" },
-      platform: "linux" as const,
-    };
-    const first = shellEnv.prepareShellPathFromLoginShell(options);
-    const second = shellEnv.prepareShellPathFromLoginShell(options);
+    const probe = await holdProbe({ env: { PATH: "/daemon/bin", SHELL: "relative-shell" } });
+    const first = probe.start();
+    const second = probe.start();
     expect(second).toBe(first);
     expect(probe.exec).toHaveBeenCalledOnce();
     expect(probe.exec.mock.calls[0]?.[0]).toBe("/bin/sh");
     probe.finish(null, "startup banner\n\0PATH= /shell/bin \0BAD\0");
     await expect(first).resolves.toBe("/shell/bin");
-    expect(shellEnv.getShellPathFromLoginShell(options)).toBe("/shell/bin");
-    await expect(shellEnv.prepareShellPathFromLoginShell(options)).resolves.toBe("/shell/bin");
+    expect(probe.path()).toBe("/shell/bin");
+    await expect(probe.start()).resolves.toBe("/shell/bin");
     expect(probe.sync).not.toHaveBeenCalled();
     expect(probe.exec).toHaveBeenCalledOnce();
   });
 
   it("preserves a synchronous result published during preparation", async () => {
     const probe = await holdProbe();
-    const options = { env: {}, platform: "linux" as const };
-    const pending = shellEnv.prepareShellPathFromLoginShell(options);
+    const pending = probe.start();
     probe.sync.mockReturnValue(Buffer.from("\0PATH=/sync/bin\0"));
-    expect(shellEnv.getShellPathFromLoginShell(options)).toBe("/sync/bin");
+    expect(probe.path()).toBe("/sync/bin");
     expect(probe.exec.mock.calls[0]).toEqual(probe.sync.mock.calls[0]);
     expect(probe.exec.mock.calls[0]?.[2]).toMatchObject({
       detached: true,
@@ -124,15 +120,14 @@ describe("async login-shell PATH preparation", () => {
     });
     probe.finish(null);
     await expect(pending).resolves.toBe("/sync/bin");
-    expect(shellEnv.getShellPathFromLoginShell(options)).toBe("/sync/bin");
+    expect(probe.path()).toBe("/sync/bin");
   });
 
   it.each(["spawn error", "timeout", "stdout overflow", "combined output overflow"])(
     "retries %s without caching the failed preparation",
     async (failure) => {
       const probe = await holdProbe();
-      const options = { env: {}, platform: "linux" as const };
-      const pending = shellEnv.prepareShellPathFromLoginShell(options);
+      const pending = probe.start();
       let error: Error | null = null;
       if (failure === "spawn error") {
         error = new Error("ENOENT");
@@ -150,8 +145,8 @@ describe("async login-shell PATH preparation", () => {
       probe.finish(error);
       expectReleased(probe);
       await expect(pending).resolves.toBeNull();
-      await expectRetry(probe, options);
-      expect(shellEnv.getShellPathFromLoginShell(options)).toBe("/shell/bin");
+      await expectRetry(probe);
+      expect(probe.path()).toBe("/shell/bin");
       expect(probe.sync).not.toHaveBeenCalled();
     },
   );
@@ -164,59 +159,54 @@ describe("async login-shell PATH preparation", () => {
     ["sync", "win32", "\0PATH=/usr/local/bin:/usr/bin\0HOME=/tmp\0", 0],
   ] as const)("caches a null %s PATH on %s for %j", async (mode, platform, output, calls) => {
     if (mode === "async") {
-      const probe = await holdProbe();
-      const options = { env: {}, platform };
-      const pending = shellEnv.prepareShellPathFromLoginShell(options);
+      const probe = await holdProbe({ platform });
+      const pending = probe.start();
       if (calls > 0) {
         probe.finish(null, output);
       }
       await expect(pending).resolves.toBeNull();
-      expect(shellEnv.getShellPathFromLoginShell(options)).toBeNull();
+      expect(probe.path()).toBeNull();
       expect(probe.exec).toHaveBeenCalledTimes(calls);
       expect(probe.sync).not.toHaveBeenCalled();
     } else {
       const exec = vi.fn(() => Buffer.from(output));
-      expect(readShellPath({}, exec, undefined, platform)).toBeNull();
-      expect(readShellPath({}, exec, undefined, platform)).toBeNull();
+      expect(readPath({}, exec, undefined, platform)).toBeNull();
+      expect(readPath({}, exec, undefined, platform)).toBeNull();
       expect(exec).toHaveBeenCalledTimes(calls);
     }
   });
 
-  it("settles a live shell at its deadline and releases the probe for retry", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
-    const killProcessTree = vi.fn();
-    vi.doMock("../process/kill-tree.js", async (importOriginal) => ({
-      ...(await importOriginal<typeof KillTreeModule>()),
-      killProcessTree,
-    }));
-    const probe = await holdProbe();
-    const options = { env: {}, timeoutMs: 10, platform: "linux" as const };
-    const settled = vi.fn();
-    const pending = shellEnv.prepareShellPathFromLoginShell(options).then(settled);
-    Object.defineProperty(probe.child, "pid", { value: 12345 });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(settled).toHaveBeenCalledWith(null);
-    expect(killProcessTree).toHaveBeenCalledWith(12345, { detached: true, force: true });
-    expectReleased(probe);
-    await pending;
-    await expectRetry(probe, options);
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("keeps the deadline through descendant-held output pipes after shell exit", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
-    const probe = await holdProbe();
-    const options = { env: {}, timeoutMs: 10, platform: "linux" as const };
-    const pending = shellEnv.prepareShellPathFromLoginShell(options);
-    await vi.advanceTimersByTimeAsync(4);
-    probe.child.stdout?.emit("data", Buffer.from("\0PATH=/expired/bin\0"));
-    probe.child.emit("exit", 0, null);
-    await vi.advanceTimersByTimeAsync(6);
-    expectReleased(probe);
-    await expect(pending).resolves.toBeNull();
-    await expectRetry(probe, options);
-    expect(vi.getTimerCount()).toBe(0);
-  });
+  it.each([false, true])(
+    "releases the deadline probe for retry after shell exit=%s",
+    async (afterExit) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      const killProcessTree = vi.fn();
+      vi.doMock("../process/kill-tree.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof KillTreeModule>()),
+        killProcessTree,
+      }));
+      const probe = await holdProbe({ timeoutMs: 10 });
+      const settled = vi.fn();
+      const pending = probe.start().then(settled);
+      Object.defineProperty(probe.child, "pid", { value: 12345 });
+      if (afterExit) {
+        await vi.advanceTimersByTimeAsync(4);
+        probe.child.stdout?.emit("data", Buffer.from("\0PATH=/expired/bin\0"));
+        probe.child.emit("exit", 0, null);
+      }
+      await vi.advanceTimersByTimeAsync(afterExit ? 6 : 10);
+      expect(settled).toHaveBeenCalledWith(null);
+      if (afterExit) {
+        expect(killProcessTree).not.toHaveBeenCalled();
+      } else {
+        expect(killProcessTree).toHaveBeenCalledWith(12345, { detached: true, force: true });
+      }
+      expectReleased(probe);
+      await pending;
+      await expectRetry(probe);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 
   it("keeps timeout and startup environment semantics and separates in-flight keys", async () => {
     const probe = await holdProbe();
@@ -243,13 +233,13 @@ describe("async login-shell PATH preparation", () => {
         windowsHide: true,
       }),
     );
-    const options = probe.exec.mock.calls[0]?.[2];
-    expect(options?.env?.HOME).toBe(os.homedir());
-    expect(options?.env?.ZDOTDIR).toBeUndefined();
-    expect(options?.env?.BASH_ENV).toBeUndefined();
-    const finishFirst = probe.finish;
-    // Settle the first child before checking a different key; its promise remains in flight.
-    finishFirst(null);
+    expect(probe.exec.mock.calls[0]?.[2]?.env).toMatchObject({
+      HOME: os.homedir(),
+      ZDOTDIR: undefined,
+      BASH_ENV: undefined,
+    });
+    // The first child's promise is still in flight until the next microtask.
+    probe.finish(null);
     const second = shellEnv.prepareShellPathFromLoginShell({
       env,
       timeoutMs: Number.MAX_SAFE_INTEGER,
@@ -267,27 +257,29 @@ describe("shell env fallback", () => {
     return Buffer.from(`\0${output}`);
   }
 
-  function runShellEnvFallback(params: {
-    enabled?: boolean;
-    env?: NodeJS.ProcessEnv;
-    expectedKeys?: string[];
+  function fallback({
+    exec,
+    enabled = true,
+    env = {},
+    expectedKeys = ["OPENAI_API_KEY"],
+    ...options
+  }: Omit<Partial<Parameters<typeof shellEnv.loadShellEnvFallback>[0]>, "exec"> & {
     exec: ReturnType<typeof vi.fn>;
-    logger?: Pick<typeof console, "warn">;
-    platform?: NodeJS.Platform;
-    timeoutMs?: number;
   }) {
     return shellEnv.loadShellEnvFallback({
-      enabled: params.enabled ?? true,
-      env: params.env ?? {},
-      expectedKeys: params.expectedKeys ?? ["OPENAI_API_KEY"],
-      exec: params.exec as unknown as Parameters<typeof shellEnv.loadShellEnvFallback>[0]["exec"],
-      logger: params.logger,
-      platform: params.platform,
-      timeoutMs: params.timeoutMs,
+      ...options,
+      enabled,
+      env,
+      expectedKeys,
+      exec: exec as unknown as Parameters<typeof shellEnv.loadShellEnvFallback>[0]["exec"],
     });
   }
 
-  function makeUnsafeStartupEnv(): NodeJS.ProcessEnv {
+  function mockShell(output = "OPENAI_API_KEY=from-shell\0PATH=/usr/local/bin:/usr/bin\0") {
+    return vi.fn((_shell: string, _args: readonly string[]) => framedShellEnv(output));
+  }
+
+  function unsafeStartupEnv(): NodeJS.ProcessEnv {
     return {
       SHELL: "/bin/bash",
       HOME: "/tmp/evil-home",
@@ -298,31 +290,37 @@ describe("shell env fallback", () => {
   }
 
   function expectSanitizedStartupEnv(receivedEnv: NodeJS.ProcessEnv | undefined) {
-    if (receivedEnv === undefined) {
-      throw new Error("expected sanitized startup env");
-    }
-    expect(receivedEnv.BASH_ENV).toBeUndefined();
-    expect(receivedEnv.PS4).toBeUndefined();
-    expect(receivedEnv.ZDOTDIR).toBeUndefined();
-    expect(receivedEnv.SHELL).toBeUndefined();
-    expect(receivedEnv.HOME).toBe(os.homedir());
+    expect(receivedEnv).toMatchObject({
+      BASH_ENV: undefined,
+      PS4: undefined,
+      ZDOTDIR: undefined,
+      SHELL: undefined,
+      HOME: os.homedir(),
+    });
   }
 
-  function withEtcShells(shells: string[], fn: () => void) {
+  function registerShells(shells: string[]) {
     const etcShellsContent = `${shells.join("\n")}\n`;
-    const readFileSyncSpy = vi
-      .spyOn(fs, "readFileSync")
-      .mockImplementation((filePath, encoding?: BufferEncoding | fs.ReadFileSyncOptions | null) => {
+    vi.spyOn(fs, "readFileSync").mockImplementation(
+      (filePath, encoding?: BufferEncoding | fs.ReadFileSyncOptions | null) => {
         if (filePath === "/etc/shells" && encoding === "utf8") {
           return etcShellsContent;
         }
         throw new Error(`Unexpected readFileSync(${String(filePath)}) in test`);
-      });
-    try {
-      fn();
-    } finally {
-      readFileSyncSpy.mockRestore();
-    }
+      },
+    );
+  }
+
+  function bashProbe(command: string, expectedKeys = ["PATH"]) {
+    const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash" };
+    const exec = vi.fn(
+      (file: string, args: string[], options: Parameters<typeof execFileSync>[2]) => {
+        expect(args).toStrictEqual(["-lic", "printf '\\0'; env -0"]);
+        return execFileSync(file, ["-lic", command], options);
+      },
+    );
+    registerShells(["/bin/bash"]);
+    return { env, exec, result: fallback({ env, exec, expectedKeys }) };
   }
 
   it.each([
@@ -356,13 +354,11 @@ describe("shell env fallback", () => {
 
   it("imports missing expected keys even when another expected key already exists", () => {
     const env: NodeJS.ProcessEnv = { OPENCLAW_GATEWAY_TOKEN: "set" };
-    const exec = vi.fn(() =>
-      framedShellEnv(
-        "OPENCLAW_GATEWAY_TOKEN=from-shell\0TWILIO_ACCOUNT_SID=AC123\0TWILIO_AUTH_TOKEN=secret\0TWILIO_FROM_NUMBER=+15550001234\0",
-      ),
+    const exec = mockShell(
+      "OPENCLAW_GATEWAY_TOKEN=from-shell\0TWILIO_ACCOUNT_SID=AC123\0TWILIO_AUTH_TOKEN=secret\0TWILIO_FROM_NUMBER=+15550001234\0",
     );
 
-    const res = runShellEnvFallback({
+    const res = fallback({
       env,
       expectedKeys: [
         "OPENCLAW_GATEWAY_TOKEN",
@@ -377,37 +373,33 @@ describe("shell env fallback", () => {
       ok: true,
       applied: ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER"],
     });
-    expect(env.OPENCLAW_GATEWAY_TOKEN).toBe("set");
-    expect(env.TWILIO_ACCOUNT_SID).toBe("AC123");
-    expect(env.TWILIO_AUTH_TOKEN).toBe("secret");
-    expect(env.TWILIO_FROM_NUMBER).toBe("+15550001234");
+    expect(env).toEqual({
+      OPENCLAW_GATEWAY_TOKEN: "set",
+      TWILIO_ACCOUNT_SID: "AC123",
+      TWILIO_AUTH_TOKEN: "secret",
+      TWILIO_FROM_NUMBER: "+15550001234",
+    });
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
   it("treats explicitly empty env vars as intentional overrides", () => {
     const env: NodeJS.ProcessEnv = { OPENAI_API_KEY: "" };
-    const exec = vi.fn(() => framedShellEnv("OPENAI_API_KEY=from-shell\0"));
+    const exec = mockShell("OPENAI_API_KEY=from-shell\0");
 
-    const res = runShellEnvFallback({ env, exec });
+    const res = fallback({ env, exec });
 
-    expect(res.ok).toBe(true);
-    expect(res.applied).toStrictEqual([]);
-    expect(res.ok && res.skippedReason).toBe("already-has-keys");
+    expect(res).toEqual({ ok: true, applied: [], skippedReason: "already-has-keys" });
     expect(env.OPENAI_API_KEY).toBe("");
     expect(exec).not.toHaveBeenCalled();
   });
 
   it.each(["environment", "PATH"])("retries failed %s probes and caches recovery", (mode) => {
     const logger = { warn: vi.fn() };
-    const exec = vi
-      .fn(() => framedShellEnv("OPENAI_API_KEY=from-shell\0PATH=/usr/local/bin:/usr/bin\0"))
-      .mockImplementationOnce(() => {
-        throw new Error(mode === "environment" ? "shell unavailable" : "exec failed");
-      });
+    const exec = mockShell().mockImplementationOnce(() => {
+      throw new Error(mode === "environment" ? "shell unavailable" : "exec failed");
+    });
     const read = (env: NodeJS.ProcessEnv) =>
-      mode === "environment"
-        ? runShellEnvFallback({ env, exec, logger })
-        : readShellPath(env, exec);
+      mode === "environment" ? fallback({ env, exec, logger }) : readPath(env, exec);
     expect(read({})).toEqual(
       mode === "environment" ? { ok: false, applied: [], error: "shell unavailable" } : null,
     );
@@ -430,11 +422,9 @@ describe("shell env fallback", () => {
 
   it("tracks last applied keys across success, skip, and failure paths", () => {
     const successEnv: NodeJS.ProcessEnv = {};
-    const successExec = vi.fn(() =>
-      framedShellEnv("OPENAI_API_KEY=from-shell\0DISCORD_BOT_TOKEN=\0EXTRA=ignored\0"),
-    );
+    const successExec = mockShell("OPENAI_API_KEY=from-shell\0DISCORD_BOT_TOKEN=\0EXTRA=ignored\0");
     expect(
-      runShellEnvFallback({
+      fallback({
         env: successEnv,
         expectedKeys: ["OPENAI_API_KEY", "DISCORD_BOT_TOKEN"],
         exec: successExec,
@@ -445,7 +435,7 @@ describe("shell env fallback", () => {
     });
     expect(shellEnv.getShellEnvAppliedKeys()).toEqual(["OPENAI_API_KEY"]);
 
-    expect(runShellEnvFallback({ enabled: false, exec: successExec })).toEqual({
+    expect(fallback({ enabled: false, exec: successExec })).toEqual({
       ok: true,
       applied: [],
       skippedReason: "disabled",
@@ -456,7 +446,7 @@ describe("shell env fallback", () => {
       throw new Error("boom");
     });
     expect(
-      runShellEnvFallback({
+      fallback({
         exec: failureExec,
         logger: { warn: vi.fn() },
       }),
@@ -469,11 +459,9 @@ describe("shell env fallback", () => {
   });
 
   it("clears only discarded shell-applied keys", () => {
-    runShellEnvFallback({
+    fallback({
       expectedKeys: ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
-      exec: vi.fn(() =>
-        framedShellEnv("OPENAI_API_KEY=openai-shell\0ANTHROPIC_API_KEY=anthropic-shell\0"),
-      ),
+      exec: mockShell("OPENAI_API_KEY=openai-shell\0ANTHROPIC_API_KEY=anthropic-shell\0"),
     });
 
     shellEnv.clearShellEnvAppliedKeys(["OPENAI_API_KEY"]);
@@ -494,17 +482,16 @@ describe("shell env fallback", () => {
           : kind === "unregistered"
             ? "/opt/homebrew/bin/evil-shell"
             : trustedShell;
-      const exec = vi.fn(() => framedShellEnv("OPENAI_API_KEY=from-shell\0"));
-      withEtcShells(["/bin/sh", "/bin/bash", "/bin/zsh", trustedShell], () => {
-        const res = runShellEnvFallback({ env: { SHELL: requested }, exec });
-        expect(res.ok).toBe(true);
-        expect(exec).toHaveBeenCalledTimes(1);
-        expect(exec).toHaveBeenCalledWith(
-          kind === "registered" ? trustedShell : "/bin/sh",
-          ["-l", "-c", "printf '\\0'; env -0"],
-          expect.objectContaining({ windowsHide: true }),
-        );
-      });
+      const exec = mockShell("OPENAI_API_KEY=from-shell\0");
+      registerShells(["/bin/sh", "/bin/bash", "/bin/zsh", trustedShell]);
+      const res = fallback({ env: { SHELL: requested }, exec });
+      expect(res.ok).toBe(true);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith(
+        kind === "registered" ? trustedShell : "/bin/sh",
+        ["-l", "-c", "printf '\\0'; env -0"],
+        expect.objectContaining({ windowsHide: true }),
+      );
     },
   );
 
@@ -515,7 +502,7 @@ describe("shell env fallback", () => {
     });
     const logger = { warn: vi.fn() };
 
-    const res = runShellEnvFallback({ env, exec, logger, platform: "win32" });
+    const res = fallback({ env, exec, logger, platform: "win32" });
 
     expect(res).toEqual({ ok: true, applied: [] });
     expect(env.OPENAI_API_KEY).toBeUndefined();
@@ -524,7 +511,7 @@ describe("shell env fallback", () => {
   });
 
   it.each(["environment", "PATH"])("sanitizes %s startup and caps its exec timeout", (mode) => {
-    const env = makeUnsafeStartupEnv();
+    const env = unsafeStartupEnv();
     let receivedEnv: NodeJS.ProcessEnv | undefined;
     let receivedTimeout: number | undefined;
     const exec = vi.fn(
@@ -538,9 +525,9 @@ describe("shell env fallback", () => {
     );
     const timeoutMs = Number.MAX_SAFE_INTEGER;
     if (mode === "environment") {
-      expect(runShellEnvFallback({ env, exec, timeoutMs }).ok).toBe(true);
+      expect(fallback({ env, exec, timeoutMs }).ok).toBe(true);
     } else {
-      expect(readShellPath(env, exec, timeoutMs)).toBe("/usr/local/bin:/usr/bin");
+      expect(readPath(env, exec, timeoutMs)).toBe("/usr/local/bin:/usr/bin");
     }
     expect(exec).toHaveBeenCalledTimes(1);
     expectSanitizedStartupEnv(receivedEnv);
@@ -551,71 +538,31 @@ describe("shell env fallback", () => {
     if (process.platform === "win32" || !fs.existsSync("/bin/bash")) {
       return;
     }
-    const shell = "/bin/bash";
-    const env: NodeJS.ProcessEnv = { SHELL: shell };
-    const exec = vi.fn(
-      (file: string, args: string[], options: Parameters<typeof execFileSync>[2]) => {
-        expect(args).toStrictEqual(["-lic", "printf '\\0'; env -0"]);
-        return execFileSync(file, ["-lic", "set -u; : \"$PS1\"; printf '\\0'; env -0"], options);
-      },
-    );
-
-    withEtcShells([shell], () => {
-      expect(runShellEnvFallback({ env, expectedKeys: ["PATH"], exec })).toMatchObject({
-        ok: true,
-      });
-    });
+    const { exec, result } = bashProbe("set -u; : \"$PS1\"; printf '\\0'; env -0");
+    expect(result).toMatchObject({ ok: true });
     expect(exec).toHaveBeenCalledOnce();
   });
 
   it.skipIf(process.platform !== "linux" || !fs.existsSync("/bin/bash"))(
     "runs the login-shell probe in its own session",
     () => {
-      const shell = "/bin/bash";
-      const env: NodeJS.ProcessEnv = { SHELL: shell };
-      const realExec = execFileSync;
-      const probe = vi
-        .spyOn(childProcess, "execFileSync")
-        .mockImplementation((file, args, options) => {
-          expect(args).toStrictEqual(["-lic", "printf '\\0'; env -0"]);
-          return realExec(
-            file,
-            [
-              "-lic",
-              'printf \'\\0OPENCLAW_PROBE_PID=%s\\0OPENCLAW_PROBE_SID=%s\\0\' "$$" "$(ps -o sid= -p $$)"; env -0',
-            ],
-            options,
-          );
-        });
-      try {
-        withEtcShells([shell], () => {
-          expect(
-            shellEnv.loadShellEnvFallback({
-              enabled: true,
-              env,
-              expectedKeys: ["OPENCLAW_PROBE_PID", "OPENCLAW_PROBE_SID"],
-              exec: childProcess.execFileSync,
-            }),
-          ).toEqual({ ok: true, applied: ["OPENCLAW_PROBE_PID", "OPENCLAW_PROBE_SID"] });
-        });
-        expect(env.OPENCLAW_PROBE_SID?.trim()).toBe(env.OPENCLAW_PROBE_PID);
-      } finally {
-        probe.mockRestore();
-      }
+      const { env, result } = bashProbe(
+        'printf \'\\0OPENCLAW_PROBE_PID=%s\\0OPENCLAW_PROBE_SID=%s\\0\' "$$" "$(ps -o sid= -p $$)"; env -0',
+        ["OPENCLAW_PROBE_PID", "OPENCLAW_PROBE_SID"],
+      );
+      expect(result).toEqual({ ok: true, applied: ["OPENCLAW_PROBE_PID", "OPENCLAW_PROBE_SID"] });
+      expect(env.OPENCLAW_PROBE_SID?.trim()).toBe(env.OPENCLAW_PROBE_PID);
     },
   );
 
   it("keeps Bash PATH discovery noninteractive and cached separately from env imports", () => {
     const shell = "/bin/bash";
     const env: NodeJS.ProcessEnv = { SHELL: shell };
-    const exec = vi.fn((_shell: string, _args: string[]) =>
-      framedShellEnv("OPENAI_API_KEY=from-shell\0PATH=/usr/local/bin:/usr/bin\0"),
-    );
+    const exec = mockShell();
 
-    withEtcShells([shell], () => {
-      expect(runShellEnvFallback({ env, exec })).toEqual({ ok: true, applied: ["OPENAI_API_KEY"] });
-      expect(readShellPath(env, exec)).toBe("/usr/local/bin:/usr/bin");
-    });
+    registerShells([shell]);
+    expect(fallback({ env, exec })).toEqual({ ok: true, applied: ["OPENAI_API_KEY"] });
+    expect(readPath(env, exec)).toBe("/usr/local/bin:/usr/bin");
 
     expect(exec).toHaveBeenCalledTimes(2);
     expect(exec.mock.calls[0]?.[1]).toStrictEqual(["-lic", "printf '\\0'; env -0"]);
@@ -645,7 +592,7 @@ describe("shell env fallback", () => {
       expectedExecutable = path.join(shellBin, executable);
       fs.writeFileSync(expectedExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     }
-    const exec = vi.fn(() => framedShellEnv(`PATH=${shellBin}\0`));
+    const exec = mockShell(`PATH=${shellBin}\0`);
     const result = shellEnv.resolveExecutableFromUserShellPath(executable, {
       env: { PATH: daemonBin, SHELL: "/bin/sh" },
       strategy,
