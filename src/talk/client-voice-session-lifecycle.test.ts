@@ -28,19 +28,18 @@ const envSnapshot = captureEnv(["OPENCLAW_STATE_DIR"]);
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let tempDir: string;
 
-async function registerRun(
-  agentId: string,
-  voiceSessionId: string,
-  sessionKey: string,
-  runId: string,
-): Promise<() => void> {
-  return await registerClientVoiceConsultRun({
-    agentId,
-    sessionKey,
-    voiceSessionId,
-    runId,
-  });
+async function open(name: string, agentId = "main") {
+  const target = { agentId, sessionKey: `agent:${agentId}:${name}` };
+  return {
+    ...target,
+    voiceSessionId: await createOrResumeClientVoiceSession({
+      ...target,
+      origin: "client",
+      voiceSessionId: `voice-${name}`,
+    }),
+  };
 }
+const registerRun = registerClientVoiceConsultRun;
 
 describe("client voice run lifecycle", () => {
   beforeEach(() => {
@@ -55,23 +54,25 @@ describe("client voice run lifecycle", () => {
     envSnapshot.restore();
   });
 
-  it("keeps a live run after close and releases it on completion", async () => {
-    const sessionKey = "agent:main:active";
-    const voiceSessionId = await createVoiceSession({ sessionKey });
-    await registerRun("main", voiceSessionId, sessionKey, "run-active");
-
-    await closeClientVoiceSession({
-      agentId: "main",
-      sessionKey,
-      voiceSessionId,
-      config: {},
-    });
-
-    expect(resolveClientVoiceRunBinding("run-active")).toMatchObject({ voiceSessionId });
-
-    await completeRun("run-active");
-    expect(resolveClientVoiceRunBinding("run-active")).toBeUndefined();
-  });
+  it.each(["before", "after"])(
+    "keeps completion ownership when a run registers %s transport close",
+    async (when) => {
+      const session = await open("active");
+      const register = () => registerRun({ ...session, runId: "run-active" });
+      if (when === "before") {
+        await register();
+      }
+      await closeClientVoiceSession({ ...session, config: {} });
+      if (when === "after") {
+        await register();
+      }
+      expect(resolveClientVoiceRunBinding("run-active")).toMatchObject({
+        voiceSessionId: session.voiceSessionId,
+      });
+      await completeRun("run-active");
+      expect(resolveClientVoiceRunBinding("run-active")).toBeUndefined();
+    },
+  );
 
   it("keeps shared-state close pending after a live consult loses read admission", async () => {
     const database = openOpenClawStateDatabase();
@@ -81,7 +82,7 @@ describe("client voice run lifecycle", () => {
     const voiceSessionId = await createVoiceSession({ sessionKey });
     const voiceClose = prepareClientVoiceSessionClose();
     const root = tryBeginGatewayRootWorkAdmission()!;
-    await root.run(async () => registerRun("main", voiceSessionId, sessionKey, runId));
+    await root.run(() => registerRun({ agentId: "main", voiceSessionId, sessionKey, runId }));
     let voiceDrained = false;
     let stateClosed = false;
     const voiceDrain = voiceClose.drain().then(() => {
@@ -101,11 +102,11 @@ describe("client voice run lifecycle", () => {
       });
       await nextEventLoopTurn();
       expect(resolveClientVoiceRunBinding(runId)).toMatchObject({ voiceSessionId });
-      expect(voiceDrained, "failed entry cannot release the live run's persistence custody").toBe(
-        false,
-      );
-      expect(stateClosed).toBe(false);
-      expect(database.db.isOpen).toBe(true);
+      expect({ voiceDrained, stateClosed, databaseOpen: database.db.isOpen }).toEqual({
+        voiceDrained: false,
+        stateClosed: false,
+        databaseOpen: true,
+      });
       root.release();
       await Promise.all([voiceDrain, stateClose]);
       expect(database.db.isOpen).toBe(false);
@@ -125,7 +126,7 @@ describe("client voice run lifecycle", () => {
       const close = prepareClientVoiceSessionClose();
       const root = tryBeginGatewayRootWorkAdmission()!;
       const retained = await root.run(async () => {
-        await registerRun("main", voiceSessionId, sessionKey, runId);
+        await registerRun({ agentId: "main", voiceSessionId, sessionKey, runId });
         return failure === "after ACK" ? retainGatewayRootWorkAdmissionContinuationScope() : null;
       });
       try {
@@ -160,45 +161,16 @@ describe("client voice run lifecycle", () => {
     },
   );
 
-  it("keeps completion ownership for a run registered after transport close", async () => {
-    const sessionKey = "agent:main:stale-bind";
-    const voiceSessionId = await createVoiceSession({ sessionKey });
-
-    await closeClientVoiceSession({
-      agentId: "main",
-      sessionKey,
-      voiceSessionId,
-      config: {},
-    });
-    await registerRun("main", voiceSessionId, sessionKey, "run-stale-bind");
-
-    expect(resolveClientVoiceRunBinding("run-stale-bind")).toMatchObject({ voiceSessionId });
-
-    await completeRun("run-stale-bind");
-    expect(resolveClientVoiceRunBinding("run-stale-bind")).toBeUndefined();
-  });
-
   it("releases only the prior scope when a run binding is replaced", async () => {
-    const open = async (agentId: string, name: string) => {
-      const target = { agentId, sessionKey: `agent:${agentId}:${name}` };
-      return {
-        ...target,
-        voiceSessionId: await createOrResumeClientVoiceSession({
-          ...target,
-          origin: "client",
-          voiceSessionId: `voice-${name}`,
-        }),
-      };
-    };
-    const first = await open("agent-a", "first");
+    const first = await open("first", "agent-a");
     const firstRoot = tryBeginGatewayRootWorkAdmission()!;
     const releaseFirst = await firstRoot.run(() =>
       registerClientVoiceConsultRun({ ...first, runId: "run-shared" }),
     );
     await closeClientVoiceSession({ ...first, config: {} });
-    const unrelated = await open("agent-b", "unrelated");
+    const unrelated = await open("unrelated", "agent-b");
     await registerClientVoiceConsultRun({ ...unrelated, runId: "run-unrelated" });
-    const replacement = await open("agent-b", "replacement");
+    const replacement = await open("replacement", "agent-b");
     const replacementRoot = tryBeginGatewayRootWorkAdmission()!;
     await replacementRoot.run(() =>
       registerClientVoiceConsultRun({ ...replacement, runId: "run-shared" }),

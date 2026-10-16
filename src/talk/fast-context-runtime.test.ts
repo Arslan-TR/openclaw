@@ -12,8 +12,35 @@ vi.mock("../plugins/memory-runtime.js", () => mocks);
 import { resolveRealtimeVoiceFastContextConsult } from "./fast-context-runtime.js";
 
 const liveness = { assertCurrent() {} };
+const caller = "agent:main:voice:15550001234";
+const nativeHit = (id: string, excerpt: string, source?: string) => ({
+  reference: { providerId: "records", id },
+  excerpt,
+  source,
+});
+const legacyHit = (path: string, snippet: string, source: "memory" | "sessions" = "memory") => ({
+  path,
+  snippet,
+  source,
+  startLine: 1,
+  endLine: 1,
+  score: 1,
+});
 function nativeSearch(search: () => unknown, close: () => unknown = vi.fn()) {
   mocks.getActiveMemoryProviderCore.mockResolvedValue({ provider: { search, close } });
+}
+function revocableLiveness() {
+  let active = true;
+  return {
+    revoke() {
+      active = false;
+    },
+    assertCurrent() {
+      if (!active) {
+        throw new Error("revoked");
+      }
+    },
+  };
 }
 type ConsultParams = Parameters<typeof resolveRealtimeVoiceFastContextConsult>[0];
 function consult(
@@ -73,18 +100,7 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
 
   it("does not split a surrogate pair at the fast-context snippet limit", async () => {
     const safePrefix = "x".repeat(698);
-    nativeSearch(
-      vi.fn().mockResolvedValue({
-        hits: [
-          {
-            reference: { providerId: "records", id: "test" },
-            excerpt: `${safePrefix}🚀tail`,
-            source: "memory",
-            score: 1,
-          },
-        ],
-      }),
-    );
+    nativeSearch(async () => ({ hits: [nativeHit("test", `${safePrefix}🚀tail`, "memory")] }));
 
     const result = await consult({ maxResults: 1 });
 
@@ -97,11 +113,8 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
   });
 
   it("passes genuine request identity without inventing owner privileges and revokes after return", async () => {
-    const search = vi.fn().mockResolvedValue({
-      hits: [{ reference: { providerId: "records", id: "visible" }, excerpt: "Visible memory" }],
-    });
     const close = vi.fn();
-    nativeSearch(search, close);
+    nativeSearch(async () => ({ hits: [nativeHit("visible", "Visible memory")] }), close);
     const result = await consult(
       { sources: ["memory", "sessions"], fallbackToConsult: false },
       { sessionKey: "agent:main:voice:caller" },
@@ -123,20 +136,18 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
   it.each(["search", "close"])(
     "does not publish hits after caller authority expires during %s",
     async (during) => {
-      let active = true;
+      const live = revocableLiveness();
       const close = vi.fn(async () => {
         if (during === "close") {
-          active = false;
+          live.revoke();
         }
       });
       nativeSearch(
         vi.fn(async () => {
           if (during === "search") {
-            active = false;
+            live.revoke();
           }
-          return {
-            hits: [{ reference: { providerId: "records", id: "secret" }, excerpt: "Secret" }],
-          };
+          return { hits: [nativeHit("secret", "Secret")] };
         }),
         close,
       );
@@ -144,13 +155,7 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
         {},
         {
           sessionKey: "voice:caller",
-          liveness: {
-            assertCurrent() {
-              if (!active) {
-                throw new Error("revoked");
-              }
-            },
-          },
+          liveness: live,
         },
       );
       expect(result).toEqual({ handled: false });
@@ -158,82 +163,56 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
     },
   );
 
-  describe("with a legacy memory runtime", () => {
-    const legacyConsult = (sources: Array<"memory" | "sessions">, liveCheck = liveness) =>
-      consult({ sources }, { sessionKey: "agent:main:voice:15550001234", liveness: liveCheck });
+  const legacyConsult = (sources: Array<"memory" | "sessions">, liveCheck = liveness) => {
+    mocks.isActiveMemoryProviderNative.mockReturnValue(false);
+    return consult({ sources }, { sessionKey: caller, liveness: liveCheck });
+  };
 
-    beforeEach(() => {
-      mocks.isActiveMemoryProviderNative.mockReturnValue(false);
+  it("removes unauthorized session hits before building caller context", async () => {
+    const hits = [
+      legacyHit("memory/allowed.md", "Visible memory"),
+      legacyHit("sessions/private.jsonl", "Private session secret", "sessions"),
+    ];
+    mocks.getActiveMemorySearchManagerCore.mockResolvedValue({
+      manager: { search: vi.fn().mockResolvedValue(hits) },
+    });
+    mocks.authorizeActiveMemorySearchHits.mockResolvedValue([hits[0]]);
+
+    const result = await legacyConsult(["memory", "sessions"]);
+
+    expect(mocks.authorizeActiveMemorySearchHits).toHaveBeenCalledWith({
+      cfg: {},
+      agentId: "main",
+      requesterSessionKey: caller,
+      sandboxed: false,
+      hits,
+    });
+    expect(result.handled && result.result.text).toContain("Visible memory");
+    expect(result.handled && result.result.text).not.toContain("Private session secret");
+  });
+
+  it("does not publish hits after the call ends during search", async () => {
+    const live = revocableLiveness();
+    mocks.getActiveMemorySearchManagerCore.mockResolvedValue({
+      manager: {
+        search: vi.fn(async () => {
+          live.revoke();
+          return [legacyHit("MEMORY.md", "Secret")];
+        }),
+      },
     });
 
-    it("removes unauthorized session hits before building caller context", async () => {
-      const hits = [
-        {
-          path: "memory/allowed.md",
-          startLine: 1,
-          endLine: 1,
-          snippet: "Visible memory",
-          source: "memory" as const,
-          score: 1,
-        },
-        {
-          path: "sessions/private.jsonl",
-          startLine: 1,
-          endLine: 1,
-          snippet: "Private session secret",
-          source: "sessions" as const,
-          score: 1,
-        },
-      ];
-      mocks.getActiveMemorySearchManagerCore.mockResolvedValue({
-        manager: { search: vi.fn().mockResolvedValue(hits) },
-      });
-      mocks.authorizeActiveMemorySearchHits.mockResolvedValue([hits[0]]);
+    const result = await legacyConsult(["memory"], live);
 
-      const result = await legacyConsult(["memory", "sessions"]);
-
-      expect(mocks.authorizeActiveMemorySearchHits).toHaveBeenCalledWith({
-        cfg: {},
-        agentId: "main",
-        requesterSessionKey: "agent:main:voice:15550001234",
-        sandboxed: false,
-        hits,
-      });
-      expect(result.handled && result.result.text).toContain("Visible memory");
-      expect(result.handled && result.result.text).not.toContain("Private session secret");
-    });
-
-    it("does not publish hits after the call ends during search", async () => {
-      let active = true;
-      mocks.getActiveMemorySearchManagerCore.mockResolvedValue({
-        manager: {
-          search: vi.fn(async () => {
-            active = false;
-            return [
-              { path: "MEMORY.md", startLine: 1, endLine: 1, snippet: "Secret", source: "memory" },
-            ];
-          }),
-        },
-      });
-
-      const result = await legacyConsult(["memory"], {
-        assertCurrent() {
-          if (!active) {
-            throw new Error("revoked");
-          }
-        },
-      });
-
-      expect(result).toEqual({ handled: false });
-    });
+    expect(result).toEqual({ handled: false });
   });
   // The voice-call plugin released in v2026.9.7 calls the host helper without `liveness`.
-  describe("released callers without liveness", () => {
+  it("never reads native providers for released callers without liveness and respects fallback", async () => {
     const releasedVoiceCallConsult = (fallbackToConsult: boolean) =>
       consult(
         { fallbackToConsult },
         {
-          sessionKey: "agent:main:voice:15550001234",
+          sessionKey: caller,
           liveness: undefined,
           labels: {
             audienceLabel: "caller",
@@ -242,13 +221,11 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
         },
       );
 
-    it("never reads a native provider and follows the caller's fallback policy", async () => {
-      await expect(releasedVoiceCallConsult(true)).resolves.toEqual({ handled: false });
-      await expect(releasedVoiceCallConsult(false)).resolves.toEqual({
-        handled: true,
-        result: { text: expect.stringContaining("No relevant OpenClaw memory or session context") },
-      });
-      expect(mocks.getActiveMemoryProviderCore).not.toHaveBeenCalled();
+    await expect(releasedVoiceCallConsult(true)).resolves.toEqual({ handled: false });
+    await expect(releasedVoiceCallConsult(false)).resolves.toEqual({
+      handled: true,
+      result: { text: expect.stringContaining("No relevant OpenClaw memory or session context") },
     });
+    expect(mocks.getActiveMemoryProviderCore).not.toHaveBeenCalled();
   });
 });
