@@ -59,6 +59,39 @@ describe("client voice session lifecycle", () => {
   const harness = useClientVoiceDigestHarness();
   const { sendDurableMessageBatch, settleDigestAttempts } = harness;
 
+  function recordEffect(runId: string, toolCallId: string) {
+    emitTrustedDiagnosticEvent({
+      type: "tool.execution.started",
+      runId,
+      toolCallId,
+      toolName: "message",
+      mutatingAction: true,
+    });
+    emitTrustedDiagnosticEvent({
+      type: "tool.execution.completed",
+      runId,
+      toolCallId,
+      toolName: "message",
+      durationMs: 5,
+    });
+  }
+
+  const readRecord = (id: string) => clientVoiceSessionTesting.readRecord("main", id);
+  const closeVoice = (
+    voiceSessionId: string,
+    params: Partial<Parameters<typeof closeClientVoiceSession>[0]> = {},
+  ) =>
+    closeClientVoiceSession({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      config: {},
+      ...params,
+      voiceSessionId,
+    });
+  const recoverStale = (
+    params: Partial<Parameters<typeof closeStaleClientVoiceSessions>[0]> = {},
+  ) => closeStaleClientVoiceSessions({ agentId: "main", config: {}, ...params });
+
   beforeEach(({ onTestFinished }) => {
     setRuntimeConfigSnapshot({});
     onTestFinished(clearRuntimeConfigSnapshot);
@@ -78,18 +111,16 @@ describe("client voice session lifecycle", () => {
       }));
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settle();
         await vi.advanceTimersByTimeAsync(
           clientVoiceSessionTesting.digestDeliveryPolicy.failureRetentionMs + 1,
         );
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
-        await closeStaleClientVoiceSessions({ agentId: "main", config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
+        await recoverStale();
         await settle();
         expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toBeUndefined();
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toBeUndefined();
         expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
           active: 0,
           retained: 1,
@@ -136,12 +167,7 @@ describe("client voice session lifecycle", () => {
       await request.run("closing-request", () =>
         caller.track(async () => {
           for (const voiceSessionId of ids) {
-            await closeClientVoiceSession({
-              agentId: "main",
-              sessionKey: "agent:main:main",
-              voiceSessionId,
-              config: {},
-            });
+            await closeVoice(voiceSessionId);
           }
         }),
       );
@@ -210,7 +236,7 @@ describe("client voice session lifecycle", () => {
         return { status: "sent" };
       });
       try {
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settleDigestAttempts();
         expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
           active: 0,
@@ -251,9 +277,7 @@ describe("client voice session lifecycle", () => {
         expect(sendDurableMessageBatch).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining({ to: "channel:original-voice" }),
         );
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toEqual(expect.any(Number));
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
       } finally {
         releaseSend.resolve();
         setTestEnvValue("OPENCLAW_STATE_DIR", harness.stateDir);
@@ -294,34 +318,16 @@ describe("client voice session lifecycle", () => {
           });
         }
 
-        await closeClientVoiceSession({
-          agentId: "main",
-          sessionKey,
-          voiceSessionId,
-          config: {},
-        });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settle();
         expect(sendDurableMessageBatch).not.toHaveBeenCalled();
         expect(resolveClientVoiceRunBinding("run-1")).toMatchObject({ voiceSessionId });
 
         for (const runId of ["run-1", "run-2"]) {
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.started",
-            runId,
-            toolCallId: "call-1",
-            toolName: "message",
-            mutatingAction: true,
-          });
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.completed",
-            runId,
-            toolCallId: "call-1",
-            toolName: "message",
-            durationMs: 5,
-          });
+          recordEffect(runId, "call-1");
         }
         await flushClientVoiceSessionWrites({ agentId: "main", voiceSessionId });
-        expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.effects).toEqual([
+        expect(readRecord(voiceSessionId)?.effects).toEqual([
           expect.objectContaining({ runId: "run-1", status: "succeeded" }),
           expect.objectContaining({ runId: "run-2", status: "succeeded" }),
         ]);
@@ -338,16 +344,9 @@ describe("client voice session lifecycle", () => {
             payloads: [{ text: "Voice call changes\n- message: succeeded\n- message: succeeded" }],
           }),
         );
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toEqual(expect.any(Number));
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
 
-        await closeClientVoiceSession({
-          agentId: "main",
-          sessionKey,
-          voiceSessionId,
-          config: {},
-        });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settle();
         expect(sendDurableMessageBatch).toHaveBeenCalledTimes(1);
         if (incognito) {
@@ -371,7 +370,7 @@ describe("client voice session lifecycle", () => {
       });
       const binding = { ...target, voiceSessionId, runId: "queued-consult" };
       const releaseOriginal = await registerClientVoiceConsultRun(binding);
-      await closeClientVoiceSession({ ...target, voiceSessionId, config: {} });
+      await closeVoice(voiceSessionId, target);
       await settleDigestAttempts();
       expect(sendDurableMessageBatch).not.toHaveBeenCalled();
 
@@ -397,20 +396,7 @@ describe("client voice session lifecycle", () => {
         voiceSessionId: "successor-voice",
       };
       try {
-        emitTrustedDiagnosticEvent({
-          type: "tool.execution.started",
-          runId: binding.runId,
-          toolCallId: "queued-effect",
-          toolName: "message",
-          mutatingAction: true,
-        });
-        emitTrustedDiagnosticEvent({
-          type: "tool.execution.completed",
-          runId: binding.runId,
-          toolCallId: "queued-effect",
-          toolName: "message",
-          durationMs: 5,
-        });
+        recordEffect(binding.runId, "queued-effect");
         await completeRun(binding.runId);
         expect(settled).toBe(false);
         expect(resolveClientVoiceRunBinding(binding.runId)).toBeUndefined();
@@ -441,7 +427,7 @@ describe("client voice session lifecycle", () => {
         expect(resolveClientVoiceRunBinding(binding.runId)).toEqual(
           replacement ? successor : undefined,
         );
-        await closeClientVoiceSession({ ...target, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, target);
         await settleDigestAttempts();
         expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
       } finally {
@@ -463,25 +449,16 @@ describe("client voice session lifecycle", () => {
       const voiceSessionId = await createVoiceSession();
       await recordMutation(voiceSessionId, "run-live");
       // Call ends while the consult still runs, so the digest is deferred.
-      await closeClientVoiceSession({
-        agentId: "main",
-        sessionKey: "agent:main:main",
-        voiceSessionId,
-        config: {},
-      });
+      await closeVoice(voiceSessionId);
       sendDurableMessageBatch.mockRejectedValueOnce(new Error("channel offline"));
       await completeRun("run-live");
       await settle();
       expect(clientVoiceSessionTesting.digestDeliverySnapshot().active).toBe(0);
-      expect(
-        clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-      ).toBeUndefined();
+      expect(readRecord(voiceSessionId)?.digestDeliveredAt).toBeUndefined();
 
-      await closeStaleClientVoiceSessions({ agentId: "main", config: {} });
+      await recoverStale();
       await settle();
-      expect(
-        clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-      ).toEqual(expect.any(Number));
+      expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
       expect(sendDurableMessageBatch).toHaveBeenCalledTimes(2);
     });
   });
@@ -497,12 +474,7 @@ describe("client voice session lifecycle", () => {
 
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
-        await closeClientVoiceSession({
-          agentId: "main",
-          sessionKey: "agent:main:main",
-          voiceSessionId,
-          config: {},
-        });
+        await closeVoice(voiceSessionId);
         await settle();
         expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
           active: 0,
@@ -534,9 +506,7 @@ describe("client voice session lifecycle", () => {
         await recordMutation(voiceSessionId, "late-run");
         await completeRun("late-run");
         await settle();
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toEqual(expect.any(Number));
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
         expect(sendDurableMessageBatch).toHaveBeenCalledTimes(2);
       } finally {
         vi.useRealTimers();
@@ -551,18 +521,8 @@ describe("client voice session lifecycle", () => {
         to: "channel:voice-updates",
       });
       const delivered = await createCompletedMutationSession();
-      await closeClientVoiceSession({
-        agentId: "main",
-        sessionKey: "agent:main:main",
-        voiceSessionId: delivered,
-        config: {},
-      });
-      await closeClientVoiceSession({
-        agentId: "main",
-        sessionKey: "agent:main:main",
-        voiceSessionId: delivered,
-        config: {},
-      });
+      await closeVoice(delivered);
+      await closeVoice(delivered);
       await settle();
       expect(sendDurableMessageBatch).toHaveBeenCalledTimes(1);
       expect(sendDurableMessageBatch).toHaveBeenCalledWith(
@@ -594,12 +554,7 @@ describe("client voice session lifecycle", () => {
           mutatingAction: true,
         });
         await completeRun(`run-${voiceSessionId}`);
-        await closeClientVoiceSession({
-          agentId: "main",
-          sessionKey,
-          voiceSessionId,
-          config: {},
-        });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settle();
       }
       expect(sendDurableMessageBatch).toHaveBeenCalledTimes(1);
@@ -633,13 +588,11 @@ describe("client voice session lifecycle", () => {
           });
         try {
           const warn = vi.fn();
-          expect(
-            await closeStaleClientVoiceSessions({ agentId: "main", config: {}, now, warn }),
-          ).toBe(closed === "original" ? 0 : 1);
+          expect(await recoverStale({ now, warn })).toBe(closed === "original" ? 0 : 1);
           expect(warn).toHaveBeenCalledTimes(closed === "original" ? 1 : 0);
-          expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.status).toBe("open");
+          expect(readRecord(voiceSessionId)?.status).toBe("open");
           env.restore();
-          expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.status).toBe(
+          expect(readRecord(voiceSessionId)?.status).toBe(
             closed === "original" ? "open" : "closed",
           );
         } finally {
@@ -657,15 +610,9 @@ describe("client voice session lifecycle", () => {
         now: 6 * 60 * 60_000,
       });
 
-      expect(
-        await closeStaleClientVoiceSessions({
-          agentId: "main",
-          config: {},
-          now: 6 * 60 * 60_000 + 2,
-        }),
-      ).toBe(1);
-      expect(clientVoiceSessionTesting.readRecord("main", stale)?.status).toBe("closed");
-      expect(clientVoiceSessionTesting.readRecord("main", recent)?.status).toBe("open");
+      expect(await recoverStale({ now: 6 * 60 * 60_000 + 2 })).toBe(1);
+      expect(readRecord(stale)?.status).toBe("closed");
+      expect(readRecord(recent)?.status).toBe("open");
     });
 
     it("does not close a call resumed after the stale candidate read", async () => {
@@ -681,8 +628,8 @@ describe("client voice session lifecycle", () => {
           return candidates;
         });
       try {
-        expect(await closeStaleClientVoiceSessions({ agentId: "main", config: {}, now })).toBe(0);
-        expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.status).toBe("open");
+        expect(await recoverStale({ now })).toBe(0);
+        expect(readRecord(voiceSessionId)?.status).toBe("open");
       } finally {
         read.mockRestore();
       }
@@ -705,14 +652,14 @@ describe("client voice session lifecycle", () => {
             await operation();
           });
         });
-      const stale = closeStaleClientVoiceSessions({ agentId: "main", config: {}, now });
+      const stale = recoverStale({ now });
       try {
         await entered.promise;
         await createOrResumeClientVoiceSession({ ...target, voiceSessionId, now });
         const explicit = closeClientVoiceSession({ ...target, voiceSessionId, config: {}, now });
         release.resolve();
         await Promise.all([stale, explicit]);
-        expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.status).toBe("closed");
+        expect(readRecord(voiceSessionId)?.status).toBe("closed");
       } finally {
         release.resolve();
         await stale;
@@ -794,7 +741,7 @@ describe("client voice session lifecycle", () => {
             }),
           }),
         ]);
-        expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)).toMatchObject({
+        expect(readRecord(voiceSessionId)).toMatchObject({
           sessionKey: "main",
           origin,
           hasUserTranscript: true,
@@ -821,7 +768,7 @@ describe("client voice session lifecycle", () => {
           config: {},
           now: firstClosedAt + 1,
         });
-        expect(clientVoiceSessionTesting.readRecord("main", voiceSessionId)).toMatchObject({
+        expect(readRecord(voiceSessionId)).toMatchObject({
           status: "closed",
           closedAt: firstClosedAt,
         });

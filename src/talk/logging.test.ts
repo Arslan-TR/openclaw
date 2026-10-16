@@ -1,4 +1,3 @@
-// Talk logging tests cover voice session log output and redaction.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +27,7 @@ function flushDiagnosticEvents() {
   });
 }
 
+type LogRecord = Extract<DiagnosticEventPayload, { type: "log.record" }>;
 type ObservedDiagnostic = { event: DiagnosticEventPayload; trusted: boolean };
 
 function stableDiagnosticPayload<TEvent extends DiagnosticEventPayload>(
@@ -40,7 +40,7 @@ function stableDiagnosticPayload<TEvent extends DiagnosticEventPayload>(
   return stable;
 }
 
-function stableLogRecordPayload(event: Extract<DiagnosticEventPayload, { type: "log.record" }>) {
+function stableLogRecordPayload(event: LogRecord) {
   const { code, loggerParents, ...stable } = stableDiagnosticPayload(event);
   expect(loggerParents).toStrictEqual(["openclaw"]);
   expect(code?.functionName).toMatch(/^[A-Za-z0-9_.:-]+$/u);
@@ -67,6 +67,33 @@ function requireObservedDiagnostic<TType extends DiagnosticEventPayload["type"]>
 describe("talk logging", () => {
   let tmpDir: string;
   let logFile: string;
+  let observed: ObservedDiagnostic[];
+  let unsubscribe: () => void;
+  const logs = () => observed.flatMap(({ event }) => (event.type === "log.record" ? [event] : []));
+
+  function expectLog(event: LogRecord, type: string, level: string, extra = {}) {
+    expect(stableLogRecordPayload(event)).toStrictEqual({
+      type: "log.record",
+      level,
+      message: `talk event ${type}`,
+      attributes: {
+        subsystem: "talk",
+        sessionId: "talk-session",
+        talkEventType: type,
+        talkMode: "realtime",
+        talkTransport: "gateway-relay",
+        talkBrain: "agent-consult",
+        talkProvider: "openai",
+        talkFinal: true,
+        ...extra,
+      },
+    });
+  }
+  function expectPrivateFieldsAbsent(serialized: string) {
+    for (const text of ["private transcript", "turn-1", "call-1", "item-1"]) {
+      expect(serialized).not.toContain(text);
+    }
+  }
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-talk-logs-"));
@@ -74,10 +101,15 @@ describe("talk logging", () => {
     resetDiagnosticEventsForTest();
     resetLogger();
     setLoggerOverride({ level: "info", file: logFile });
+    observed = [];
+    unsubscribe = onInternalDiagnosticEvent((event, metadata) => {
+      observed.push({ event, trusted: metadata.trusted });
+    });
   });
 
   afterEach(async () => {
     await flushLogger();
+    unsubscribe();
     resetDiagnosticEventsForTest();
     setLoggerOverride(null);
     resetLogger();
@@ -85,12 +117,6 @@ describe("talk logging", () => {
   });
 
   it("emits bounded lifecycle log records without transcript text or scoped ids", async () => {
-    const logs: Array<Extract<DiagnosticEventPayload, { type: "log.record" }>> = [];
-    const unsubscribe = onInternalDiagnosticEvent((event) => {
-      if (event.type === "log.record") {
-        logs.push(event);
-      }
-    });
     const events = createTalkEventSequencer(TALK_CONTEXT);
     const talkEvent = events.next({
       type: "output.text.done",
@@ -108,28 +134,11 @@ describe("talk logging", () => {
     await flushDiagnosticEvents();
     unsubscribe();
 
-    expect(logs).toHaveLength(1);
-    expect(stableLogRecordPayload(expectDefined(logs[0], "logs[0] test invariant"))).toStrictEqual({
-      type: "log.record",
-      level: "INFO",
-      message: "talk event output.text.done",
-      attributes: {
-        subsystem: "talk",
-        sessionId: "talk-session",
-        talkEventType: "output.text.done",
-        talkMode: "realtime",
-        talkTransport: "gateway-relay",
-        talkBrain: "agent-consult",
-        talkProvider: "openai",
-        talkFinal: true,
-        talkDurationMs: 42,
-      },
+    expect(logs()).toHaveLength(1);
+    expectLog(expectDefined(logs()[0], "Talk diagnostic log"), "output.text.done", "INFO", {
+      talkDurationMs: 42,
     });
-    const serialized = JSON.stringify(logs[0]);
-    expect(serialized).not.toContain("private transcript");
-    expect(serialized).not.toContain("turn-1");
-    expect(serialized).not.toContain("call-1");
-    expect(serialized).not.toContain("item-1");
+    expectPrivateFieldsAbsent(JSON.stringify(logs()[0]));
 
     // Other subsystems share the file sink and can log after diagnostic collection ends.
     getChildLogger({ subsystem: "sibling" }).info("unrelated lifecycle event");
@@ -144,24 +153,17 @@ describe("talk logging", () => {
     const talkRecords = fileLogRecords.filter((record) => record["0"] === '{"subsystem":"talk"}');
     expect(talkRecords).toHaveLength(1);
     const fileLogRecord = expectDefined(talkRecords[0], "Talk file log record");
-    expect(fileLogRecord.message).toBe("talk event output.text.done");
-    expect(fileLogRecord.session_id).toBe("talk-session");
+    expect(fileLogRecord).toMatchObject({
+      message: "talk event output.text.done",
+      session_id: "talk-session",
+    });
     expect(fileLogRecords).toContainEqual(
       expect.objectContaining({ message: "unrelated lifecycle event" }),
     );
-    expect(fileLog).not.toContain("private transcript");
-    expect(fileLog).not.toContain("turn-1");
-    expect(fileLog).not.toContain("call-1");
-    expect(fileLog).not.toContain("item-1");
+    expectPrivateFieldsAbsent(fileLog);
   });
 
   it("drops high-volume delta records from file and OTLP logs", async () => {
-    const logs: Array<Extract<DiagnosticEventPayload, { type: "log.record" }>> = [];
-    const unsubscribe = onInternalDiagnosticEvent((event) => {
-      if (event.type === "log.record") {
-        logs.push(event);
-      }
-    });
     const events = createTalkEventSequencer(TALK_CONTEXT);
 
     recordTalkLogEvent(
@@ -181,14 +183,10 @@ describe("talk logging", () => {
     await flushDiagnosticEvents();
     unsubscribe();
 
-    expect(logs).toHaveLength(0);
+    expect(logs()).toHaveLength(0);
   });
 
   it("records diagnostics and logs through the combined observability hook", async () => {
-    const observed: ObservedDiagnostic[] = [];
-    const unsubscribe = onInternalDiagnosticEvent((event, metadata) => {
-      observed.push({ event, trusted: metadata.trusted });
-    });
     const events = createTalkEventSequencer(TALK_CONTEXT);
 
     recordTalkObservabilityEvent(
@@ -220,21 +218,7 @@ describe("talk logging", () => {
       byteLength: undefined,
     });
     expect(logRecord.trusted).toBe(false);
-    expect(stableLogRecordPayload(logRecord.event)).toStrictEqual({
-      type: "log.record",
-      level: "WARN",
-      message: "talk event session.error",
-      attributes: {
-        subsystem: "talk",
-        sessionId: "talk-session",
-        talkEventType: "session.error",
-        talkMode: "realtime",
-        talkTransport: "gateway-relay",
-        talkBrain: "agent-consult",
-        talkProvider: "openai",
-        talkFinal: true,
-      },
-    });
+    expectLog(logRecord.event, "session.error", "WARN");
     expect(JSON.stringify(observed)).not.toContain("private detail");
   });
 });

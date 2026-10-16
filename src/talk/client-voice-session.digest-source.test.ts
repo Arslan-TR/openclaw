@@ -59,6 +59,22 @@ describe("client voice digest physical sources", () => {
   const harness = useClientVoiceDigestHarness();
   const { sendDurableMessageBatch, settleDigestAttempts } = harness;
 
+  const readRecord = (id: string) => clientVoiceSessionTesting.readRecord("main", id);
+  const closeVoice = (
+    voiceSessionId: string,
+    params: Partial<Parameters<typeof closeClientVoiceSession>[0]> = {},
+  ) =>
+    closeClientVoiceSession({
+      agentId: "main",
+      sessionKey: "agent:main:main",
+      config: {},
+      ...params,
+      voiceSessionId,
+    });
+  const recoverStale = (
+    params: Partial<Parameters<typeof closeStaleClientVoiceSessions>[0]> = {},
+  ) => closeStaleClientVoiceSessions({ agentId: "main", config: {}, ...params });
+
   beforeEach(({ onTestFinished }) => {
     setRuntimeConfigSnapshot({});
     onTestFinished(clearRuntimeConfigSnapshot);
@@ -71,7 +87,7 @@ describe("client voice digest physical sources", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       const closing = prepareClientVoiceSessionClose();
-      await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+      await closeVoice(voiceSessionId, { sessionKey });
       await closing.drain();
       expect(warning).toHaveBeenCalledWith(expect.stringContaining("conversation not found"));
       expect(sendDurableMessageBatch).not.toHaveBeenCalled();
@@ -112,9 +128,9 @@ describe("client voice digest physical sources", () => {
       });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      await closeClientVoiceSession({ ...target, voiceSessionId, config: {} });
+      await closeVoice(voiceSessionId, target);
       await settleDigestAttempts();
-      await closeClientVoiceSession({ ...target, voiceSessionId, config: {} });
+      await closeVoice(voiceSessionId, target);
       await settleDigestAttempts();
       expect(attempts).toBe(1);
       expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
@@ -170,7 +186,7 @@ describe("client voice digest physical sources", () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
         const firstClose = prepareClientVoiceSessionClose();
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config });
+        await closeVoice(voiceSessionId, { sessionKey, config });
         await firstClose.drain();
         expect(sendDurableMessageBatch).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining({ to: "channel:custom-recipient" }),
@@ -178,17 +194,13 @@ describe("client voice digest physical sources", () => {
         expect(warning).toHaveBeenCalledWith(
           expect.stringContaining("synthetic delivery marker failure"),
         );
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toBeUndefined();
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toBeUndefined();
 
         const retryClose = prepareClientVoiceSessionClose();
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
         await retryClose.drain();
         expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toEqual(expect.any(Number));
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
         expect(readVoiceSessionRecord("main", voiceSessionId, { path: storePath })).toBeUndefined();
       } finally {
         marker.mockRestore();
@@ -404,7 +416,7 @@ describe("client voice digest physical sources", () => {
     await seedSession(target.sessionKey, { channel: "discord", to: "channel:original-store" });
     await createOrResumeClientVoiceSession({ ...target, voiceSessionId, origin: "client" });
     await recordMutation(voiceSessionId, runA);
-    await closeClientVoiceSession({ ...target, voiceSessionId, config: {} });
+    await closeVoice(voiceSessionId, target);
     await settleDigestAttempts();
     expect(sendDurableMessageBatch).not.toHaveBeenCalled();
     try {
@@ -453,10 +465,10 @@ describe("client voice digest physical sources", () => {
       });
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
         await withinTest(sending.promise, signal);
         // Context replacement while send is active must share its later committed delivery fact.
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
         await closeOpenClawAgentDatabasesAsync(harness.stateDir);
         await fs.rename(metadataPath, savedPath);
         if (replacement) {
@@ -472,15 +484,13 @@ describe("client voice digest physical sources", () => {
         await closeOpenClawAgentDatabasesAsync(harness.stateDir);
         await fs.rm(metadataPath, { force: true });
         await fs.rename(savedPath, metadataPath);
-        await closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settleDigestAttempts();
         expect({ untouched, sends: sendDurableMessageBatch.mock.calls.length }).toEqual({
           untouched: true,
           sends: 1,
         });
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toEqual(expect.any(Number));
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
       } finally {
         finishSend.resolve();
         await settleDigestAttempts();
@@ -520,16 +530,14 @@ describe("client voice digest physical sources", () => {
       });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      await closeClientVoiceSession({ ...target, voiceSessionId, config: {} });
+      await closeVoice(voiceSessionId, target);
       await withinTest(readStarted.promise, signal);
-      expect(await closeStaleClientVoiceSessions({ agentId: "main", config: {} })).toBe(0);
+      expect(await recoverStale()).toBe(0);
       releaseRead.resolve();
       await settleDigestAttempts();
       expect(warning).toHaveBeenCalledWith(expect.stringContaining(markerFailure.message));
       expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
-      expect(
-        clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-      ).toEqual(expect.any(Number));
+      expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
     } finally {
       releaseRead.resolve();
       await settleDigestAttempts();
@@ -554,12 +562,7 @@ describe("client voice digest physical sources", () => {
       sendDurableMessageBatch.mockRejectedValueOnce(new Error("original channel offline"));
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       try {
-        await closeClientVoiceSession({
-          agentId: "main",
-          sessionKey,
-          voiceSessionId,
-          config: {},
-        });
+        await closeVoice(voiceSessionId, { sessionKey });
         await settleDigestAttempts();
         expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
           active: 0,
@@ -573,15 +576,9 @@ describe("client voice digest physical sources", () => {
         }
         await seedSession(sessionKey);
         const stale = await createVoiceSession({ sessionKey, now: 1 });
-        expect(
-          await closeStaleClientVoiceSessions({
-            agentId: "main",
-            config: {},
-            now: 6 * 60 * 60_000 + 2,
-          }),
-        ).toBe(1);
+        expect(await recoverStale({ now: 6 * 60 * 60_000 + 2 })).toBe(1);
         await settleDigestAttempts();
-        expect(clientVoiceSessionTesting.readRecord("main", stale)?.status).toBe("closed");
+        expect(readRecord(stale)?.status).toBe("closed");
         expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
           active: 0,
           retained: 1,
@@ -589,9 +586,7 @@ describe("client voice digest physical sources", () => {
         expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
 
         await createVoiceSession({ sessionKey, voiceSessionId });
-        await expect(
-          closeClientVoiceSession({ agentId: "main", sessionKey, voiceSessionId, config: {} }),
-        ).rejects.toThrow("physical source");
+        await expect(closeVoice(voiceSessionId, { sessionKey })).rejects.toThrow("physical source");
         expect(sendDurableMessageBatch).toHaveBeenCalledOnce();
 
         if (replacement === "same path replacement") {
@@ -600,15 +595,13 @@ describe("client voice digest physical sources", () => {
           await fs.rename(archivedPath, originalPath);
         }
         env.restore();
-        await closeStaleClientVoiceSessions({ agentId: "main", config: {} });
+        await recoverStale();
         await settleDigestAttempts();
         expect(sendDurableMessageBatch).toHaveBeenCalledTimes(2);
         expect(sendDurableMessageBatch).toHaveBeenLastCalledWith(
           expect.objectContaining({ to: "channel:original-store" }),
         );
-        expect(
-          clientVoiceSessionTesting.readRecord("main", voiceSessionId)?.digestDeliveredAt,
-        ).toEqual(expect.any(Number));
+        expect(readRecord(voiceSessionId)?.digestDeliveredAt).toEqual(expect.any(Number));
       } finally {
         vi.useRealTimers();
         env.restore();
@@ -636,7 +629,7 @@ describe("client voice digest physical sources", () => {
     });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      await closeClientVoiceSession({ ...target, voiceSessionId: retired, config: {} });
+      await closeVoice(retired, target);
       await withinTest(failed.promise, signal);
       await settleDigestAttempts();
       expect(clientVoiceSessionTesting.digestDeliverySnapshot()).toMatchObject({
@@ -726,14 +719,7 @@ describe("client voice digest physical sources", () => {
       try {
         if (phase === "recovery") {
           const warn = vi.fn();
-          expect(
-            await closeStaleClientVoiceSessions({
-              agentId: "main",
-              config: {},
-              now: 6 * 60 * 60_000 + 2,
-              warn,
-            }),
-          ).toBe(0);
+          expect(await recoverStale({ now: 6 * 60 * 60_000 + 2, warn })).toBe(0);
           expect(warn).toHaveBeenCalledOnce();
         } else {
           // Transcript and voice confirmation commit together before publication.

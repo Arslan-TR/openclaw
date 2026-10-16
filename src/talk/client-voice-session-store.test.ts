@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { trackSqliteStatementExecutions } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import type { AdmissionOperations } from "../infra/sqlite-database-admission.worker.test-support.js";
 import { SqliteWorkerBroker } from "../infra/sqlite-worker-broker.js";
 import {
   closeOpenClawAgentDatabasesForTest,
+  type OpenClawAgentDatabase,
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
 } from "../state/openclaw-agent-db.js";
@@ -37,11 +38,22 @@ function storedRecord(transcriptFailureKeys: unknown): string {
 }
 
 describe("client voice session store", () => {
-  it("preserves cache custody columns across rejected updates and a successful retry", async () => {
-    const home = await createTempHomeEnv("openclaw-voice-store-");
-    const scope = "talk-client-voice-sessions";
-    try {
-      const database = openOpenClawAgentDatabase({ agentId: "main" });
+  describe("persisted records", () => {
+    const options = { agentId: "main" };
+    let home: Awaited<ReturnType<typeof createTempHomeEnv>>;
+    let database: OpenClawAgentDatabase;
+    beforeEach(async () => {
+      home = await createTempHomeEnv("openclaw-voice-store-");
+      database = openOpenClawAgentDatabase(options);
+    });
+    afterEach(async () => {
+      closeOpenClawAgentDatabasesForTest();
+      closeOpenClawStateDatabaseForTest();
+      await home.restore();
+    });
+
+    it("preserves cache custody columns across rejected updates and a successful retry", async () => {
+      const scope = "talk-client-voice-sessions";
       const original = parseStoredVoiceSessionRecord(storedRecord([]));
       if (!original) {
         throw new Error("expected a valid voice record");
@@ -79,18 +91,9 @@ describe("client voice session store", () => {
         ...original,
         updatedAt: 3,
       });
-    } finally {
-      closeOpenClawAgentDatabasesForTest();
-      closeOpenClawStateDatabaseForTest();
-      await home.restore();
-    }
-  });
+    });
 
-  it("filters open lookup candidates in SQL before decoding payloads", async () => {
-    const home = await createTempHomeEnv("openclaw-voice-lookups-");
-    try {
-      const options = { agentId: "main" };
-      const database = openOpenClawAgentDatabase(options);
+    it("filters open lookup candidates in SQL before decoding payloads", async () => {
       const base = JSON.parse(storedRecord([]));
       const rows = [
         { voiceSessionId: "selected" },
@@ -150,18 +153,9 @@ describe("client voice session store", () => {
       } finally {
         parse.mockRestore();
       }
-    } finally {
-      closeOpenClawAgentDatabasesForTest();
-      closeOpenClawStateDatabaseForTest();
-      await home.restore();
-    }
-  });
+    });
 
-  it("refreshes tool facts after local writes, rollback, and worker commits without freshness probes", async () => {
-    const home = await createTempHomeEnv("openclaw-voice-facts-");
-    try {
-      const options = { agentId: "main" };
-      const database = openOpenClawAgentDatabase(options);
+    it("refreshes tool facts after local writes, rollback, and worker commits without freshness probes", async () => {
       const original = parseStoredVoiceSessionRecord(storedRecord([]))!;
       const write = (patch: Partial<typeof original>) =>
         runOpenClawAgentWriteTransaction(
@@ -215,30 +209,13 @@ describe("client voice session store", () => {
       });
       expect(probes.counts).toEqual({ freshness: 0 });
       probes.restore();
-    } finally {
-      closeOpenClawAgentDatabasesForTest();
-      closeOpenClawStateDatabaseForTest();
-      await home.restore();
-    }
+    });
   });
 
   it("defaults unresolved transcript failures for existing records", () => {
-    expect(
-      parseStoredVoiceSessionRecord(
-        JSON.stringify({
-          version: VOICE_SESSION_RECORD_VERSION,
-          voiceSessionId: "voice-1",
-          agentId: "main",
-          sessionKey: "agent:main:main",
-          origin: "client",
-          status: "open",
-          createdAt: 1,
-          updatedAt: 1,
-          consultRunIds: [],
-          effects: [],
-        }),
-      )?.transcriptFailureKeys,
-    ).toEqual([]);
+    expect(parseStoredVoiceSessionRecord(storedRecord(undefined))?.transcriptFailureKeys).toEqual(
+      [],
+    );
   });
 
   it("rejects malformed, duplicate, or over-cap unresolved transcript failures", () => {
@@ -256,11 +233,10 @@ describe("client voice session store", () => {
     ).toBeUndefined();
   });
 
-  it.each([{ name: "provider", patch: { provider: "   " } }])(
-    "rejects an invalid $name",
-    ({ patch }) => {
-      const value = JSON.parse(storedRecord([])) as Record<string, unknown>;
-      expect(parseStoredVoiceSessionRecord(JSON.stringify({ ...value, ...patch }))).toBeUndefined();
-    },
-  );
+  it("rejects an invalid provider", () => {
+    const value = JSON.parse(storedRecord([])) as Record<string, unknown>;
+    expect(
+      parseStoredVoiceSessionRecord(JSON.stringify({ ...value, provider: "   " })),
+    ).toBeUndefined();
+  });
 });

@@ -1,4 +1,3 @@
-// Fast context runtime tests cover timeout and fast context generation behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -8,16 +7,37 @@ const mocks = vi.hoisted(() => ({
   isActiveMemoryProviderNative: vi.fn(),
 }));
 
-vi.mock("../plugins/memory-runtime.js", () => ({
-  authorizeActiveMemorySearchHits: mocks.authorizeActiveMemorySearchHits,
-  getActiveMemoryProviderCore: mocks.getActiveMemoryProviderCore,
-  getActiveMemorySearchManagerCore: mocks.getActiveMemorySearchManagerCore,
-  isActiveMemoryProviderNative: mocks.isActiveMemoryProviderNative,
-}));
+vi.mock("../plugins/memory-runtime.js", () => mocks);
 
 import { resolveRealtimeVoiceFastContextConsult } from "./fast-context-runtime.js";
 
 const liveness = { assertCurrent() {} };
+function nativeSearch(search: () => unknown, close: () => unknown = vi.fn()) {
+  mocks.getActiveMemoryProviderCore.mockResolvedValue({ provider: { search, close } });
+}
+type ConsultParams = Parameters<typeof resolveRealtimeVoiceFastContextConsult>[0];
+function consult(
+  config: Partial<ConsultParams["config"]> = {},
+  params: Partial<Omit<ConsultParams, "config">> = {},
+) {
+  return resolveRealtimeVoiceFastContextConsult({
+    cfg: {},
+    agentId: "main",
+    sessionKey: "voice:15550001234",
+    config: {
+      enabled: true,
+      timeoutMs: 1_000,
+      maxResults: 2,
+      sources: ["memory"],
+      fallbackToConsult: true,
+      ...config,
+    },
+    args: { question: "What do you remember?" },
+    logger: {},
+    liveness,
+    ...params,
+  });
+}
 
 describe("resolveRealtimeVoiceFastContextConsult", () => {
   beforeEach(() => {
@@ -35,28 +55,12 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
   it("preserves the fast-context timeout error and clears the timer", async () => {
     vi.useFakeTimers();
     const logger = { debug: vi.fn() };
-    mocks.getActiveMemoryProviderCore.mockResolvedValue({
-      provider: {
-        close: vi.fn(),
-        search: vi.fn(() => new Promise<never>(() => {})),
-      },
-    });
+    nativeSearch(vi.fn(() => new Promise<never>(() => {})));
 
-    const result = resolveRealtimeVoiceFastContextConsult({
-      cfg: {},
-      agentId: "main",
-      sessionKey: "voice:15550001234",
-      config: {
-        enabled: true,
-        timeoutMs: 25,
-        maxResults: 3,
-        sources: ["memory", "sessions"],
-        fallbackToConsult: true,
-      },
-      args: { question: "What do you remember?" },
-      logger,
-      liveness,
-    });
+    const result = consult(
+      { timeoutMs: 25, maxResults: 3, sources: ["memory", "sessions"] },
+      { logger },
+    );
 
     await vi.advanceTimersByTimeAsync(25);
 
@@ -69,37 +73,20 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
 
   it("does not split a surrogate pair at the fast-context snippet limit", async () => {
     const safePrefix = "x".repeat(698);
-    mocks.getActiveMemoryProviderCore.mockResolvedValue({
-      provider: {
-        close: vi.fn(),
-        search: vi.fn().mockResolvedValue({
-          hits: [
-            {
-              reference: { providerId: "records", id: "test" },
-              excerpt: `${safePrefix}🚀tail`,
-              source: "memory",
-              score: 1,
-            },
-          ],
-        }),
-      },
-    });
+    nativeSearch(
+      vi.fn().mockResolvedValue({
+        hits: [
+          {
+            reference: { providerId: "records", id: "test" },
+            excerpt: `${safePrefix}🚀tail`,
+            source: "memory",
+            score: 1,
+          },
+        ],
+      }),
+    );
 
-    const result = await resolveRealtimeVoiceFastContextConsult({
-      cfg: {},
-      agentId: "main",
-      sessionKey: "voice:15550001234",
-      config: {
-        enabled: true,
-        timeoutMs: 1_000,
-        maxResults: 1,
-        sources: ["memory"],
-        fallbackToConsult: true,
-      },
-      args: { question: "What do you remember?" },
-      logger: {},
-      liveness,
-    });
+    const result = await consult({ maxResults: 1 });
 
     expect(result).toEqual({
       handled: true,
@@ -114,22 +101,11 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
       hits: [{ reference: { providerId: "records", id: "visible" }, excerpt: "Visible memory" }],
     });
     const close = vi.fn();
-    mocks.getActiveMemoryProviderCore.mockResolvedValue({ provider: { search, close } });
-    const result = await resolveRealtimeVoiceFastContextConsult({
-      cfg: {},
-      agentId: "main",
-      sessionKey: "agent:main:voice:caller",
-      config: {
-        enabled: true,
-        timeoutMs: 1000,
-        maxResults: 2,
-        sources: ["memory", "sessions"],
-        fallbackToConsult: false,
-      },
-      args: { question: "What do you remember?" },
-      logger: {},
-      liveness,
-    });
+    nativeSearch(search, close);
+    const result = await consult(
+      { sources: ["memory", "sessions"], fallbackToConsult: false },
+      { sessionKey: "agent:main:voice:caller" },
+    );
     const { context } = mocks.getActiveMemoryProviderCore.mock.calls[0]![0];
     expect(context.authority).toEqual({
       kind: "session",
@@ -153,40 +129,30 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
           active = false;
         }
       });
-      mocks.getActiveMemoryProviderCore.mockResolvedValue({
-        provider: {
-          close,
-          search: vi.fn(async () => {
-            if (during === "search") {
-              active = false;
-            }
-            return {
-              hits: [{ reference: { providerId: "records", id: "secret" }, excerpt: "Secret" }],
-            };
-          }),
-        },
-      });
-      const result = await resolveRealtimeVoiceFastContextConsult({
-        cfg: {},
-        agentId: "main",
-        sessionKey: "voice:caller",
-        config: {
-          enabled: true,
-          timeoutMs: 1000,
-          maxResults: 2,
-          sources: ["memory"],
-          fallbackToConsult: true,
-        },
-        args: { question: "What do you remember?" },
-        logger: {},
-        liveness: {
-          assertCurrent() {
-            if (!active) {
-              throw new Error("revoked");
-            }
+      nativeSearch(
+        vi.fn(async () => {
+          if (during === "search") {
+            active = false;
+          }
+          return {
+            hits: [{ reference: { providerId: "records", id: "secret" }, excerpt: "Secret" }],
+          };
+        }),
+        close,
+      );
+      const result = await consult(
+        {},
+        {
+          sessionKey: "voice:caller",
+          liveness: {
+            assertCurrent() {
+              if (!active) {
+                throw new Error("revoked");
+              }
+            },
           },
         },
-      });
+      );
       expect(result).toEqual({ handled: false });
       expect(close).toHaveBeenCalledOnce();
     },
@@ -194,21 +160,7 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
 
   describe("with a legacy memory runtime", () => {
     const legacyConsult = (sources: Array<"memory" | "sessions">, liveCheck = liveness) =>
-      resolveRealtimeVoiceFastContextConsult({
-        cfg: {},
-        agentId: "main",
-        sessionKey: "agent:main:voice:15550001234",
-        config: {
-          enabled: true,
-          timeoutMs: 1_000,
-          maxResults: 2,
-          sources,
-          fallbackToConsult: true,
-        },
-        args: { question: "What do you remember?" },
-        logger: {},
-        liveness: liveCheck,
-      });
+      consult({ sources }, { sessionKey: "agent:main:voice:15550001234", liveness: liveCheck });
 
     beforeEach(() => {
       mocks.isActiveMemoryProviderNative.mockReturnValue(false);
@@ -278,24 +230,17 @@ describe("resolveRealtimeVoiceFastContextConsult", () => {
   // The voice-call plugin released in v2026.9.7 calls the host helper without `liveness`.
   describe("released callers without liveness", () => {
     const releasedVoiceCallConsult = (fallbackToConsult: boolean) =>
-      resolveRealtimeVoiceFastContextConsult({
-        cfg: {},
-        agentId: "main",
-        sessionKey: "agent:main:voice:15550001234",
-        config: {
-          enabled: true,
-          timeoutMs: 1_000,
-          maxResults: 2,
-          sources: ["memory"],
-          fallbackToConsult,
+      consult(
+        { fallbackToConsult },
+        {
+          sessionKey: "agent:main:voice:15550001234",
+          liveness: undefined,
+          labels: {
+            audienceLabel: "caller",
+            contextName: "OpenClaw memory or session context",
+          },
         },
-        args: { question: "What do you remember?" },
-        logger: {},
-        labels: {
-          audienceLabel: "caller",
-          contextName: "OpenClaw memory or session context",
-        },
-      });
+      );
 
     it("never reads a native provider and follows the caller's fallback policy", async () => {
       await expect(releasedVoiceCallConsult(true)).resolves.toEqual({ handled: false });
