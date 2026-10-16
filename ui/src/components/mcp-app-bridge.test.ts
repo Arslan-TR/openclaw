@@ -83,7 +83,7 @@ it("confirms file paths in the pane before requesting or opening a file", async 
   const owner = {
     bridge,
     request,
-    releaseResourceSubscription: vi.fn(async () => ({})),
+    releaseResourceSubscription: vi.fn(() => Promise.resolve({})),
     sessionKey: "file-session",
     viewId: "file-view",
     iframe: frame,
@@ -315,6 +315,7 @@ it("routes vendor links through the mounted view and AppBridge only for its focu
     connection: { gatewayUrl: "ws://gateway.example:8443/openclaw" },
     connectionRevision: 1,
     subscribe: () => () => {},
+    subscribeEvents: () => () => {},
   };
   const provider = createSolidApplicationContextProvider({
     gateway,

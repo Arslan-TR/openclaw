@@ -30,7 +30,7 @@ function issuePreviewResponse(overrides: Record<string, unknown> = {}) {
 function createIssueLink() {
   const link = createLink(ISSUE_HREF);
   const request = vi.fn().mockResolvedValue(issuePreviewResponse());
-  link.provider.client = { request } as unknown as GatewayBrowserClient;
+  link.provider.client = { request, connected: true } as unknown as GatewayBrowserClient;
   return { ...link, request };
 }
 const hovercard = () => document.querySelector<HTMLElement>(".link-reader-hovercard");
@@ -97,7 +97,7 @@ describe("generic preview portal lifecycle", () => {
         )
         .mockResolvedValue(issuePreviewResponse());
       const { anchor, provider } = createLink(ISSUE_HREF);
-      provider.client = { request } as unknown as GatewayBrowserClient;
+      provider.client = { request, connected: true } as unknown as GatewayBrowserClient;
 
       await hover(anchor);
       expect(hovercard()).toBeNull();
@@ -130,7 +130,7 @@ describe("generic preview portal lifecycle", () => {
       const pending = createDeferred<ReturnType<typeof issuePreviewResponse>>();
       const { anchor, provider } = createLink(ISSUE_HREF);
       const request = vi.fn().mockReturnValue(pending.promise);
-      provider.client = { request } as unknown as GatewayBrowserClient;
+      provider.client = { request, connected: true } as unknown as GatewayBrowserClient;
       await provider.updateComplete;
       if (trigger === "pointer") {
         anchor.dispatchEvent(new MouseEvent("pointerover", { bubbles: true, composed: true }));
@@ -191,6 +191,7 @@ describe("generic preview portal lifecycle", () => {
     const { anchor, provider } = createLink(ISSUE_HREF);
     let signal: AbortSignal | undefined;
     provider.client = {
+      connected: true,
       request: vi.fn((_method, _params, options: { signal: AbortSignal }) => {
         signal = options.signal;
         return pending.promise;
@@ -249,7 +250,7 @@ describe("generic preview portal lifecycle", () => {
         .fn()
         .mockReturnValueOnce(abandoned.promise)
         .mockReturnValueOnce(current.promise);
-      provider.client = { request } as unknown as GatewayBrowserClient;
+      provider.client = { request, connected: true } as unknown as GatewayBrowserClient;
       await hover(anchor);
       await hover(replacement);
       expect(request).toHaveBeenCalledTimes(2);
@@ -277,7 +278,7 @@ describe("generic preview portal lifecycle", () => {
     "uses only the nearest provider's agent for nested %s intent",
     async (trigger) => {
       const request = vi.fn().mockResolvedValue(issuePreviewResponse());
-      const client = { request } as unknown as GatewayBrowserClient;
+      const client = { request, connected: true } as unknown as GatewayBrowserClient;
       const outer = createLink(ISSUE_HREF);
       outer.provider.client = client;
       outer.provider.agentId = "selected-agent";
@@ -316,7 +317,12 @@ describe("generic preview portal lifecycle", () => {
         .fn()
         .mockResolvedValueOnce(issuePreviewResponse())
         .mockReturnValue(pending.promise);
-      const client = { request, connectionGeneration: 1, recoveryScope: "principal-a" };
+      const client = {
+        request,
+        connected: true,
+        connectionGeneration: 1,
+        recoveryScope: "principal-a",
+      };
       const { anchor, provider } = createLink(ISSUE_HREF);
       provider.client = client as unknown as GatewayBrowserClient;
       await hover(anchor);
@@ -404,6 +410,7 @@ describe("generic preview portal lifecycle", () => {
         .mockReturnValueOnce(next.promise);
       const client = {
         request,
+        connected: true,
         connectionGeneration: 1,
         recoveryScope: "principal",
       } as unknown as GatewayBrowserClient;
@@ -430,7 +437,7 @@ describe("generic preview portal lifecycle", () => {
       if (change === "agent") {
         two.provider.agentId = "agent-c";
       } else {
-        two.provider.client = { request } as unknown as GatewayBrowserClient;
+        two.provider.client = { request, connected: true } as unknown as GatewayBrowserClient;
       }
       pending.resolve(issuePreviewResponse({ number: 99817, title: "Agent A remains current" }));
       await vi.advanceTimersByTimeAsync(0);
@@ -453,7 +460,12 @@ describe("generic preview portal lifecycle", () => {
     const stale = createDeferred<ReturnType<typeof issuePreviewResponse>>();
     const current = createDeferred<ReturnType<typeof issuePreviewResponse>>();
     const request = vi.fn().mockReturnValueOnce(stale.promise).mockReturnValueOnce(current.promise);
-    const client = { request, connectionGeneration: 1, recoveryScope: "principal-a" };
+    const client = {
+      request,
+      connected: true,
+      connectionGeneration: 1,
+      recoveryScope: "principal-a",
+    };
     const one = createLink(ISSUE_HREF);
     one.provider.client = client as unknown as GatewayBrowserClient;
     await hover(one.anchor);
@@ -564,13 +576,13 @@ describe("generic preview portal lifecycle", () => {
     provider.append(anchor);
     document.body.append(provider);
     const staleRequest = vi.fn();
-    provider.client = { request: staleRequest } as unknown as GatewayBrowserClient;
+    provider.client = { request: staleRequest, connected: true } as unknown as GatewayBrowserClient;
     provider.agentId = "first-agent";
     provider.readers = [TEST_LINK_READER];
 
     const definition = bootstrap.define();
     const request = vi.fn().mockResolvedValue(issuePreviewResponse());
-    provider.client = { request } as unknown as GatewayBrowserClient;
+    provider.client = { request, connected: true } as unknown as GatewayBrowserClient;
     provider.agentId = "second-agent";
     loaded.resolve(class extends LinkReaderHovercardProvider {});
     await definition;

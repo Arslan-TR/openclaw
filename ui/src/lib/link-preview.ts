@@ -82,17 +82,15 @@ export function loadLinkPreview(
   if (
     cached &&
     !cached.controller.signal.aborted &&
-    (cached.expiresAt > Date.now() ||
-      (client.connected === false && cached.expiresAt !== Number.POSITIVE_INFINITY)) &&
-    (cached.generation === client.connectionGeneration ||
-      (client.connected === false && cached.expiresAt !== Number.POSITIVE_INFINITY))
+    ((!client.connected && cached.preview) ||
+      (cached.expiresAt > Date.now() && cached.generation === client.connectionGeneration))
   ) {
     return subscribeToSharedRequest(cached, {}, signal);
   }
   if (cached?.expiresAt === Number.POSITIVE_INFINITY) {
     cached.controller.abort();
   }
-  if (client.connected === false || client.offlineRecoveryRetired) {
+  if (!client.connected || client.offlineRecoveryRetired) {
     return Promise.resolve({});
   }
   const controller = new AbortController();

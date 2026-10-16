@@ -32,6 +32,7 @@ function createSeededLink() {
   const pending = createDeferred<unknown>();
   const client = {
     request: vi.fn().mockReturnValue(pending.promise),
+    connected: true,
     connectionGeneration: 1,
     recoveryScope: "principal-a",
   };
@@ -162,6 +163,7 @@ describe("GitHub hovercards with authorized session details", () => {
     const request = vi.fn().mockReturnValue(pending.promise);
     provider.client = {
       request,
+      connected: true,
     } as unknown as GatewayBrowserClient;
     provider.agentId = "row-agent";
     provider.readers = [TEST_LINK_READER];

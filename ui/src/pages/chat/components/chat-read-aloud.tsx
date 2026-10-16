@@ -4,16 +4,22 @@ import { Icon } from "../../../components/solid/icon.tsx";
 import { formatUiError } from "../../../lib/format-error.ts";
 import { canCallGatewayMethod } from "../../../lib/gateway-methods.ts";
 import { projectGateway } from "../../../lib/reactive/application.ts";
-import { useOptionalApplication } from "../../../lib/reactive/context.ts";
+import { useApplication, useOptionalApplication } from "../../../lib/reactive/context.ts";
 import { projectRuntimeConfig } from "../../../lib/reactive/domain-capabilities.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import { GatewaySpeechPlayback, resolveSpeechTextLimit } from "../../../lib/speech-playback.ts";
 
 export function ReadAloud(props: { text: string }) {
   const context = useOptionalApplication();
-  if (!context) {
-    return null;
-  }
+  return (
+    <Show when={context}>
+      <ReadAloudControl text={props.text} />
+    </Show>
+  );
+}
+
+function ReadAloudControl(props: { text: string }) {
+  const context = useApplication();
   const gateway = projectGateway(context.gateway);
   const config = projectRuntimeConfig(context.runtimeConfig);
   const playback = new GatewaySpeechPlayback();

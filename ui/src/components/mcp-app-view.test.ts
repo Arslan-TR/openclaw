@@ -129,13 +129,15 @@ function expectHost(bridge: BridgeFixture["bridge"], context: Record<string, unk
 describe("mcp-app-view localization", () => {
   it("retries initialization after its sandbox deadline through the error control", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const request = vi.fn(async () => ({
-      sandboxUrl: "/mcp-app-sandbox?ticket=retry",
-      sandboxPort: 8444,
-      html: "<input value='unsaved'>",
-      toolInput: {},
-      toolResult: { content: [] },
-    }));
+    const request = vi.fn(() =>
+      Promise.resolve({
+        sandboxUrl: "/mcp-app-sandbox?ticket=retry",
+        sandboxPort: 8444,
+        html: "<input value='unsaved'>",
+        toolInput: {},
+        toolResult: { content: [] },
+      }),
+    );
     const { view, unmount } = mountView(
       { sessionKey: "agent:main:main", viewId: "view-retry" },
       {
@@ -423,7 +425,7 @@ describe("mcp-app-view localization", () => {
     const client = createTestGatewayClient(request);
     const context = {
       gateway: {
-        snapshot: { client, phase: "connected" },
+        snapshot: { client, phase: "connected", hello: null },
         connectionRevision: 1,
         connection: { gatewayUrl: "ws://gateway.example:8443/openclaw" },
         subscribe: () => () => {},

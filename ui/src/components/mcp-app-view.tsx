@@ -21,7 +21,7 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
   "mcp-app-view",
   (props, host) => {
     const context = useApplication();
-    const gateway = context ? projectGateway(context.gateway) : undefined;
+    const gateway = projectGateway(context.gateway);
     const [revision, setRevision] = createSignal(0, { ownedWrite: true });
     const controller = new McpAppViewController(host, context, () =>
       setRevision((value) => value + 1),
@@ -40,17 +40,17 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
     });
     const binding = createMemo(
       () => {
-        gateway?.read();
+        gateway.read();
         return [
-          context?.gateway.snapshot.client,
+          context.gateway.snapshot.client,
           props.sessionKey,
           props.viewId,
           props.agentId,
-          context?.gateway.connectionRevision,
-          context ? gatewayPresentationScope(context.gateway).key : undefined,
-          context?.gateway.snapshot.phase === "connected" &&
-            Boolean(context.gateway.snapshot.hello) &&
-            !hasOperatorReadAccess(context.gateway.snapshot.hello?.auth ?? null),
+          context.gateway.connectionRevision,
+          gatewayPresentationScope(context.gateway).key,
+          context.gateway.snapshot.phase === "connected" &&
+            context.gateway.snapshot.hello !== null &&
+            !hasOperatorReadAccess(context.gateway.snapshot.hello.auth ?? null),
         ] as const;
       },
       { equals: (a, b) => a.every((value, index) => value === b[index]) },
@@ -118,7 +118,7 @@ export const McpAppView = defineSolidBridge<McpAppViewProps, ViewMethods>(
               })}
               <button
                 type="button"
-                disabled={gateway?.read().snapshot.phase !== "connected"}
+                disabled={gateway.read().snapshot.phase !== "connected"}
                 onClick={() => void controller.setup(controller.binding())}
               >
                 {t("mcpApp.retry")}

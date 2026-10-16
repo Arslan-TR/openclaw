@@ -609,7 +609,7 @@ export class LinkReaderPanelOwner {
         this.setTabView(tab, { status: "ready", detail, images });
         this.requestUpdate();
       }
-    } catch (error) {
+    } catch (error: unknown) {
       if (isCurrent() && tab.view.status !== "ready") {
         tab.view = { status: "error", message: linkReaderErrorMessage(error) };
         this.requestUpdate();

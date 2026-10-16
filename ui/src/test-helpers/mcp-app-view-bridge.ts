@@ -4,7 +4,7 @@ import type { GatewayEventFrame } from "../api/gateway.ts";
 import { mountView } from "../components/mcp-app-view.test-support.ts";
 import { i18n } from "../i18n/index.ts";
 import { createApplicationGateway } from "./application-context-fixtures.ts";
-import { createTestGatewayClient } from "./gateway-client.ts";
+import { createGatewayRequestMock, createTestGatewayClient } from "./gateway-client.ts";
 import { gatewayHelloForMethods } from "./gateway-methods.ts";
 
 export function createMcpBridgeFixture(bridgeMocks: {
@@ -55,8 +55,8 @@ export function createMcpBridgeFixture(bridgeMocks: {
     const gatewayEventsReady = deferred();
     const gatewayEventsStopped = deferred();
     const unsubscribe = vi.fn();
-    const request = vi.fn(
-      async (_method: string, _params: Record<string, unknown>): Promise<unknown> => ({
+    const request = createGatewayRequestMock(() =>
+      Promise.resolve({
         sandboxUrl: "/mcp-app-sandbox?ticket=test",
         sandboxPort: 8444,
         html: "<!doctype html><button>Send</button>",

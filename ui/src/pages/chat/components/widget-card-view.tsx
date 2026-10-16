@@ -294,6 +294,16 @@ function WidgetFrame(props: {
   const height = () => reportedHeight() ?? props.params.height;
   const Frame = () => {
     let element!: HTMLIFrameElement;
+    createEffect(
+      () => [props.promptAllowed, props.params.onHeightChange] as const,
+      ([promptAllowed, onHeightChange]) => {
+        widgetFramePromptActive.set(element, promptAllowed);
+        widgetFrameResize.set(element, (nextHeight) => {
+          setReportedHeight(nextHeight);
+          onHeightChange?.(nextHeight);
+        });
+      },
+    );
     onCleanup(() => {
       widgetFrameRegistry.delete(element);
       widgetFrameResize.delete(element);
@@ -305,11 +315,6 @@ function WidgetFrame(props: {
           element = next;
           frame = next;
           props.onFrame(next);
-          widgetFramePromptActive.set(next, () => props.promptAllowed());
-          widgetFrameResize.set(next, (nextHeight) => {
-            setReportedHeight(nextHeight);
-            props.params.onHeightChange?.(nextHeight);
-          });
         }}
         src={src() || undefined}
         class="chat-tool-card__preview-frame"
@@ -481,7 +486,7 @@ function handleWidgetExportAction(
       ".chat-tool-card__widget-raw .chat-tool-card__raw-toggle",
     );
     toggle?.click();
-    return toggle && toggle.getAttribute("aria-expanded") === "true"
+    return toggle?.getAttribute("aria-expanded") === "true"
       ? "chat.toolCards.hideRawDetails"
       : "chat.toolCards.showRawDetails";
   }
@@ -608,12 +613,11 @@ function CanvasPreview(props: {
   const canExportImage = () => !props.preview.mcpApp && isInternalCanvasEntryUrl(props.preview.url);
   const hasMenu = () => canExportImage() || Boolean(props.options?.rawText);
   const hasActions = () => Boolean(canPin() || hasMenu());
-  const placementRef = widgetActionsPlacementRef(hasActions, () => props.options);
   const pinLabel = () =>
     t(pinned() ? "chat.toolCards.pinnedToDashboard" : "chat.toolCards.pinToDashboard");
   return (
     <div
-      ref={placementRef}
+      ref={widgetActionsPlacementRef(hasActions, () => props.options)}
       class="chat-tool-card__preview"
       data-content-kind={props.preview.mcpApp ? "mcp-app" : "canvas-html"}
       data-has-widget-actions={hasActions() ? "" : undefined}

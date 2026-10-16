@@ -26,20 +26,21 @@ it("retains downloaded speech through a blip but retires it when the client chan
   vi.stubGlobal("Audio", function (src: string) {
     const element = document.createElement("audio");
     Object.defineProperty(element, "src", { value: src, writable: true });
-    element.play = async () => {
+    element.play = () => {
       if (element.src.startsWith("blob:")) {
         started.resolve();
       }
+      return Promise.resolve();
     };
     element.pause = () => undefined;
     element.load = () => undefined;
     return element;
   });
-  const request = vi.fn(async () => ({
+  const request = vi.fn<() => Promise<unknown>>().mockResolvedValue({
     audioBase64: "UklGRg==",
     mimeType: "audio/wav",
     provider: "openai",
-  }));
+  });
   const runtimeConfig = createRuntimeConfigStub();
   Object.assign(runtimeConfig.state, {
     configSnapshot: { runtimeConfig: { tts: { provider: "openai" } } },

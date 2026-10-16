@@ -33,11 +33,10 @@ import { PanelIconButton } from "./solid/panel-icon-button.tsx";
 const panelStyles = `@scope (openclaw-link-reader-panel) { ${linkReaderViewStyles.map((style) => style.replace(/:host\(([^)]+)\)/gu, ":scope$1").replaceAll(":host", ":scope")).join("\n")} }`;
 
 function HostedAction(props: { owner: LinkReaderPanelOwner; revision: number }) {
-  const activate = nativeListener("click", () => props.owner.createTab());
   const label = () => t("linkReader.newTab");
   return (
     <button
-      ref={activate}
+      ref={nativeListener("click", () => props.owner.createTab())}
       class="rail-header__action bp-icon"
       type="button"
       aria-label={label()}
@@ -75,7 +74,7 @@ function PanelContent(props: { tab: ReaderTab; available: boolean; refresh: () =
             class="lr-retry"
             type="button"
             disabled={!props.available}
-            onClick={props.refresh}
+            onClick={() => props.refresh()}
           >
             {t("linkReader.retry")}
           </button>

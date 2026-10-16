@@ -1,8 +1,4 @@
-import {
-  type AppBridge,
-  McpUiHostContextSchema,
-  PostMessageTransport,
-} from "@modelcontextprotocol/ext-apps/app-bridge";
+import { PostMessageTransport } from "@modelcontextprotocol/ext-apps/app-bridge";
 import { isMcpAppViewExpiredError } from "@openclaw/gateway-protocol";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { raceWithTimeout } from "@openclaw/retry";
@@ -18,6 +14,12 @@ import type { SolidBridgeElement } from "../lit/solid-bridge.ts";
 import { OpenClawAppBridge, bindMcpAppResourceHandlers } from "./mcp-app-bridge.ts";
 import { McpAppConfirm } from "./mcp-app-confirm.ts";
 import {
+  buildMcpAppFrameHostContext,
+  loadMcpAppSandbox,
+  waitForMcpAppHandlerRegistration,
+  waitForMcpAppInitialization,
+} from "./mcp-app-frame.ts";
+import {
   buildMcpAppHostCapabilities,
   dispatchMcpAppMessage,
   isWidgetFrameInteractable,
@@ -28,7 +30,6 @@ import {
   MCP_APP_VIEW_EXPIRED_EVENT,
   type McpAppHostSandboxCsp,
 } from "./mcp-app-security.ts";
-import { collectMcpAppStyleVariables } from "./mcp-app-theme.ts";
 import { promoteToPopoverTopLayer } from "./menu-surface.ts";
 import { resolveSandboxHostUrl } from "./sandbox-host.ts";
 
@@ -55,9 +56,6 @@ type McpAppViewPayload = {
   };
 };
 
-type HostContext = NonNullable<
-  NonNullable<ConstructorParameters<typeof AppBridge>[3]>["hostContext"]
->;
 type McpAppResources = {
   bridge: OpenClawAppBridge | null;
   cleanups: Set<() => void>;
@@ -78,58 +76,6 @@ type McpAppBinding = {
 };
 
 const MCP_APP_TEARDOWN_TIMEOUT_MS = 250;
-
-async function waitForMcpAppHandlerRegistration(): Promise<void> {
-  await Promise.race([
-    new Promise<void>((resolve) => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => resolve());
-      });
-    }),
-    new Promise<void>((resolve) => {
-      window.setTimeout(resolve, 1_000);
-    }),
-  ]);
-}
-
-function hostContext(
-  element: Element | undefined,
-  height: number,
-  fillContainer: boolean,
-  displayMode: "inline" | "fullscreen",
-  availableDisplayModes: Array<"inline" | "fullscreen">,
-): HostContext {
-  const rect = element?.getBoundingClientRect();
-  const touch = navigator.maxTouchPoints > 0 || window.matchMedia?.("(pointer: coarse)").matches;
-  const themeMode = document.documentElement.dataset.themeMode;
-  // The SDK schema preserves optional style values while normalizing its complete key map.
-  return McpUiHostContextSchema.parse({
-    theme:
-      themeMode === "light" || themeMode === "dark"
-        ? themeMode
-        : window.matchMedia?.("(prefers-color-scheme: dark)").matches
-          ? "dark"
-          : "light",
-    displayMode,
-    availableDisplayModes,
-    containerDimensions: {
-      width: Math.max(1, Math.round(rect?.width || window.innerWidth)),
-      height: fillContainer ? Math.max(0, Math.round(rect?.height ?? 0)) : height,
-    },
-    locale: navigator.language || undefined,
-    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    platform: touch && window.innerWidth < 768 ? "mobile" : "web",
-    deviceCapabilities: {
-      touch,
-      hover: window.matchMedia?.("(hover: hover)").matches,
-    },
-    safeAreaInsets: { top: 0, right: 0, bottom: 0, left: 0 },
-    // Additive alongside `theme`: the string says which appearance is active,
-    // these say what it actually resolves to. Republished by the same theme
-    // subscription that re-sends this context.
-    styles: { variables: collectMcpAppStyleVariables() },
-  });
-}
 
 export type McpAppViewProps = {
   sessionKey: string;
@@ -179,7 +125,7 @@ export class McpAppViewController {
       const resources = this.resources;
       if (!resources) {
         void this.setup(this.binding());
-      } else if (resources?.reconnect) {
+      } else if (resources.reconnect) {
         const signal = this.requestAbort.signal;
         void resources.reconnect().then(
           () => {
@@ -188,7 +134,7 @@ export class McpAppViewController {
               this.notify();
             }
           },
-          (error) => {
+          (error: unknown) => {
             if (!signal.aborted && this.resources === resources) {
               this.error = error;
               this.notify();
@@ -299,7 +245,7 @@ export class McpAppViewController {
         !requestSignal.aborted &&
         this.host.viewId === binding.viewId &&
         this.host.sessionKey === binding.sessionKey &&
-        this.context?.gateway.snapshot.client === binding.client
+        this.context.gateway.snapshot.client === binding.client
       ) {
         this.inactive = "ended";
         this.confirmation.cancel();
@@ -370,11 +316,11 @@ export class McpAppViewController {
   }
 
   binding(): McpAppBinding | null {
-    const gateway = this.context?.gateway;
-    const client = gateway?.snapshot.client;
+    const gateway = this.context.gateway;
+    const client = gateway.snapshot.client;
     const denied =
       gateway.snapshot.phase === "connected" &&
-      gateway.snapshot.hello &&
+      gateway.snapshot.hello !== null &&
       !hasOperatorReadAccess(gateway.snapshot.hello.auth ?? null);
     return client && !denied
       ? {
@@ -393,7 +339,7 @@ export class McpAppViewController {
     resources: McpAppResources,
     signal: AbortSignal,
   ): boolean {
-    const gateway = this.context?.gateway;
+    const gateway = this.context.gateway;
     return (
       !signal.aborted &&
       !resources.disposed &&
@@ -403,7 +349,7 @@ export class McpAppViewController {
       this.host.sessionKey === binding.sessionKey &&
       this.host.viewId === binding.viewId &&
       (this.host.agentId || undefined) === binding.agentId &&
-      gateway?.snapshot.phase === "connected" &&
+      gateway.snapshot.phase === "connected" &&
       gateway.snapshot.client === binding.client &&
       hasOperatorReadAccess(gateway.snapshot.hello?.auth ?? null) &&
       gateway.connectionRevision === binding.connectionRevision &&
@@ -417,20 +363,19 @@ export class McpAppViewController {
     resources: McpAppResources,
     signal: AbortSignal,
   ) {
-    bridge.onopenlink = async ({ url }) => {
+    bridge.onopenlink = ({ url }) => {
       const context = this.context;
       // Both external and plugin navigation require the current, focused App.
       if (
-        !context ||
         !this.isCurrentBinding(binding, resources, signal) ||
         !isWidgetFrameInteractable(resources.iframe)
       ) {
-        return { isError: true };
+        return Promise.resolve({ isError: true });
       }
       if (!parseMcpAppLink(url)) {
-        return openExternalUrlSafe(url) ? {} : { isError: true };
+        return Promise.resolve(openExternalUrlSafe(url) ? {} : { isError: true });
       }
-      return navigateMcpAppLink(context, url) ? {} : { isError: true };
+      return Promise.resolve(navigateMcpAppLink(context, url) ? {} : { isError: true });
     };
   }
 
@@ -473,35 +418,20 @@ export class McpAppViewController {
         once: true,
       });
 
-      const proxyReady = new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => {
-          cleanupProxyReady();
-          reject(new Error(translate("mcpApp.errors.sandboxTimedOut")));
-        }, 15_000);
-        const onMessage = (event: MessageEvent) => {
-          if (
-            event.source === iframe.contentWindow &&
-            event.data?.method === "ui/notifications/sandbox-proxy-ready"
-          ) {
-            cleanupProxyReady();
-            resolve();
-          }
-        };
-        const cleanupProxyReady = this.addResourceCleanup(createdResources, () => {
-          window.clearTimeout(timeout);
-          window.removeEventListener("message", onMessage);
-        });
-        window.addEventListener("message", onMessage);
-      });
-      iframe.src = resolveSandboxHostUrl(
-        payload.sandboxUrl,
-        payload.sandboxPort,
-        payload.sandboxOrigin,
-        this.context?.gateway.connection.gatewayUrl ?? "",
-        window.location.origin,
-        translate("mcpApp.errors.invalidSandboxUrl"),
+      const addCleanup = (cleanup: () => void) =>
+        this.addResourceCleanup(createdResources, cleanup);
+      await loadMcpAppSandbox(
+        iframe,
+        resolveSandboxHostUrl(
+          payload.sandboxUrl,
+          payload.sandboxPort,
+          payload.sandboxOrigin,
+          this.context.gateway.connection.gatewayUrl,
+          window.location.origin,
+          translate("mcpApp.errors.invalidSandboxUrl"),
+        ),
+        addCleanup,
       );
-      await proxyReady;
       signal.throwIfAborted();
       if (!iframe.contentWindow) {
         throw new Error(translate("mcpApp.errors.sandboxUnavailable"));
@@ -527,7 +457,7 @@ export class McpAppViewController {
           throw new Error("Invalid App deep link");
         }
         return {
-          ...hostContext(
+          ...buildMcpAppFrameHostContext(
             mount,
             createdResources.frameHeight,
             this.host.fillContainer || this.host.displayMode === "fullscreen",
@@ -551,12 +481,12 @@ export class McpAppViewController {
         { name: "OpenClaw", version: "1.0.0" },
         buildMcpAppHostCapabilities(
           payload.csp,
-          payload.messageSupported === true,
-          payload.updateModelContextSupported === true,
+          Boolean(payload.messageSupported),
+          Boolean(payload.updateModelContextSupported),
           {
-            richModelContext: payload.richModelContextSupported === true,
-            fileResources: payload.fileResourcesSupported === true,
-            openFiles: payload.openFilesSupported === true,
+            richModelContext: Boolean(payload.richModelContextSupported),
+            fileResources: Boolean(payload.fileResourcesSupported),
+            openFiles: Boolean(payload.openFilesSupported),
           },
         ),
         { hostContext: buildHostContext() },
@@ -609,7 +539,7 @@ export class McpAppViewController {
           bridge.onrequestteardown = undefined;
         }
       });
-      if (payload.messageSupported === true) {
+      if (payload.messageSupported) {
         bridge.setMessageHandler(async (params) => {
           const accepted = await dispatchMcpAppMessage(
             iframe,
@@ -621,7 +551,7 @@ export class McpAppViewController {
           return accepted ? {} : { isError: true };
         });
       }
-      if (payload.updateModelContextSupported === true) {
+      if (payload.updateModelContextSupported) {
         bridge.setUpdateModelContextHandler(async (params) => {
           const result = await request<{ _meta?: Record<string, unknown> }>(
             "mcp.app.updateModelContext",
@@ -654,11 +584,11 @@ export class McpAppViewController {
         onConversationInputRequested: () => {
           this.host.displayMode = "inline";
         },
-        subscribeEvents: (listener) => this.context?.gateway.subscribeEvents?.(listener),
+        subscribeEvents: (listener) => this.context.gateway.subscribeEvents(listener),
       });
-      bridge.onrequestdisplaymode = async ({ mode }) => {
+      bridge.onrequestdisplaymode = ({ mode }) => {
         if ((mode !== "inline" && mode !== "fullscreen") || !modes.available.includes(mode)) {
-          return { mode: this.host.displayMode };
+          return Promise.resolve({ mode: this.host.displayMode });
         }
         this.host.displayMode = mode;
         iframe.style.height =
@@ -666,7 +596,7 @@ export class McpAppViewController {
             ? "100%"
             : `${createdResources.frameHeight}px`;
         bridge.setHostContext(buildHostContext());
-        return { mode };
+        return Promise.resolve({ mode });
       };
       this.bindOpenLinkHandler(bridge, binding, createdResources, signal);
       bridge.onsizechange = ({ height }) => {
@@ -706,25 +636,7 @@ export class McpAppViewController {
         html: payload.html,
         csp: payload.csp,
       });
-      let initializationTimeout: number | undefined;
-      const cleanupInitializationTimeout = this.addResourceCleanup(createdResources, () => {
-        if (initializationTimeout !== undefined) {
-          window.clearTimeout(initializationTimeout);
-        }
-      });
-      try {
-        await Promise.race([
-          initialized,
-          new Promise<never>((_, reject) => {
-            initializationTimeout = window.setTimeout(
-              () => reject(new Error(translate("mcpApp.errors.initializationTimedOut"))),
-              15_000,
-            );
-          }),
-        ]);
-      } finally {
-        cleanupInitializationTimeout();
-      }
+      await waitForMcpAppInitialization(initialized, addCleanup);
       signal.throwIfAborted();
       const updateHostContext = () => bridge.setHostContext(buildHostContext());
       createdResources.updateHostContext = updateHostContext;
@@ -737,10 +649,7 @@ export class McpAppViewController {
           await refreshModelContext();
         }
       };
-      const hostContextCleanup = this.context?.theme.subscribe(updateHostContext);
-      if (hostContextCleanup) {
-        this.addResourceCleanup(createdResources, hostContextCleanup);
-      }
+      this.addResourceCleanup(createdResources, this.context.theme.subscribe(updateHostContext));
       if (typeof ResizeObserver !== "undefined") {
         const hostResizeObserver = new ResizeObserver(updateHostContext);
         hostResizeObserver.observe(mount);

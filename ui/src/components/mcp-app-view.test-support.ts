@@ -14,7 +14,7 @@ export function mountView(props: Parameters<typeof McpAppView>[0], context: obje
       subscribe: () => () => {},
       ...supplied.gateway,
       get snapshot() {
-        return supplied.gateway?.snapshot ?? { client: null, phase: "stopped" };
+        return supplied.gateway?.snapshot ?? { client: null, phase: "stopped", hello: null };
       },
     },
   } as ApplicationContext);

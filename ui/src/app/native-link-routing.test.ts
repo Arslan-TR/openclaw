@@ -130,6 +130,7 @@ async function focusGitHubLink() {
   ) as LinkReaderHovercardProvider;
   provider.readers = [TEST_LINK_READER];
   provider.client = {
+    connected: true,
     request: vi.fn().mockResolvedValue({
       url: "https://github.com/openclaw/openclaw/issues/102691",
       comments: 1,

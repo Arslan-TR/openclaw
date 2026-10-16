@@ -640,7 +640,7 @@ export class TerminalConnection {
     if (result == null || signal?.aborted) {
       throw new Error("Terminal delivery could not be confirmed.");
     }
-    if (result.ok !== false || !stream || this.streams.get(sessionId) !== stream) {
+    if (result.ok || !stream || this.streams.get(sessionId) !== stream) {
       return;
     }
     this.deliverExit(sessionId, stream, {

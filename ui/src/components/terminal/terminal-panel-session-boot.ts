@@ -1,5 +1,5 @@
 import type { GhosttyTerminalController } from "@openclaw/libterminal/browser";
-import type { TerminalConnection } from "./terminal-connection.ts";
+import type { TerminalConnection, TerminalOpenResult } from "./terminal-connection.ts";
 import {
   disposeTerminalController,
   replaceTerminalController,
@@ -7,13 +7,53 @@ import {
 import { updateTerminalFont } from "./terminal-fonts.ts";
 import {
   TERMINAL_OUTPUT_ENCODER,
+  shellBasename,
   type TerminalPanelSessionControllerHost,
   type TerminalPanelSessionTab,
 } from "./terminal-panel-session-types.ts";
 import { createTerminalStartupInput } from "./terminal-startup-input.ts";
+import type { TerminalTabReadinessController } from "./terminal-tab-readiness.ts";
 import { terminalDynamicColors, terminalTheme } from "./terminal-theme.ts";
 
 type TerminalSink = Parameters<TerminalConnection["open"]>[1];
+
+export function adoptTerminalPanelSession(params: {
+  tab: TerminalPanelSessionTab;
+  result: TerminalOpenResult;
+  agentOwned: boolean;
+  connection: TerminalConnection | null;
+  readiness: TerminalTabReadinessController<TerminalPanelSessionTab>;
+  onDeliveryError: () => void;
+}): void {
+  const { tab, result } = params;
+  delete tab.cancelPendingIntent;
+  tab.gatewaySessionId = result.sessionId;
+  tab.shellName = result.title ?? shellBasename(result.shell);
+  tab.shell = result.shell;
+  tab.agentId = result.agentId;
+  tab.cwd = result.cwd;
+  tab.agentOwned =
+    result.owner !== undefined ? result.owner.startsWith("agent:") : params.agentOwned;
+  // Libterminal observes layout before the Gateway session exists. Resync the
+  // current grid now so a resize during the open/attach RPC is not lost.
+  const pendingInput = tab.pendingInput.drain();
+  if (tab.status !== "exited") {
+    const { cols, rows } = tab.controller.terminal;
+    void params.connection
+      ?.resize(result.sessionId, cols || 80, rows || 24)
+      .catch(params.onDeliveryError);
+    for (const data of pendingInput) {
+      void params.connection?.input(result.sessionId, data).catch(params.onDeliveryError);
+    }
+  }
+  if (tab.status === "connecting") {
+    if (tab.awaitFirstOutput) {
+      params.readiness.arm(tab);
+    } else {
+      params.readiness.markReady(tab);
+    }
+  }
+}
 
 /** Restore is passive once the user gives the document newer pointer or keyboard intent. */
 export function observeTerminalRestoreInput(document: Document, signal: AbortSignal) {

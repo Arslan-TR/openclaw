@@ -102,21 +102,25 @@ describe("OpenClawTerminalPanel reconnect", () => {
     createGhosttyTerminalMock.mockResolvedValue(terminal);
     let listener: Parameters<TerminalGatewayClient["addEventListener"]>[0] | undefined;
     let failedAttach = false;
-    const request = vi.fn(async (method: string) => {
+    const request = vi.fn((method: string) => {
       if (method === "terminal.open") {
-        return terminalOpenResult("retained");
+        return Promise.resolve(terminalOpenResult("retained"));
       }
       if (method === "terminal.attach") {
         if (!failedAttach) {
           failedAttach = true;
-          throw new Error("temporary attach failure");
+          return Promise.reject(new Error("temporary attach failure"));
         }
-        return { ...terminalOpenResult("retained"), buffer: "beforeafter", seq: 11 };
+        return Promise.resolve({
+          ...terminalOpenResult("retained"),
+          buffer: "beforeafter",
+          seq: 11,
+        });
       }
       if (method === "terminal.input") {
-        throw new Error("input delivery interrupted");
+        return Promise.reject(new Error("input delivery interrupted"));
       }
-      return { ok: true };
+      return Promise.resolve({ ok: true });
     });
     const client: TerminalGatewayClient = {
       forceReconnect: vi.fn(),

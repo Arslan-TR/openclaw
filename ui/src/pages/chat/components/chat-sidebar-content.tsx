@@ -422,11 +422,10 @@ export function SidebarPanel(props: SidebarPanelProps) {
     ["file", "markdown", "attachment", "session-diff"].includes(props.content?.kind ?? "");
   // Text attachments initialize their own asynchronously loaded Markdown.
   const markdownPresented = createMemo(() => props.content?.kind !== "attachment");
-  const markdownRef = markdownBlocksRef(markdownPresented);
   return (
     <div
       class={fillHost() ? "sidebar-panel-host--fill" : ""}
-      ref={markdownRef}
+      ref={markdownBlocksRef(markdownPresented)}
       onClick={(event) => props.onClick(event)}
       onKeyDown={(event) => props.onKeydown(event)}
     >
