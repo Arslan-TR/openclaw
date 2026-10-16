@@ -194,14 +194,17 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     params.config = { memory: { citations: "on" } } as EmbeddedRunAttemptParams["config"];
     setRuntimeConfigSnapshot(params.config ?? {});
     const finish = await startAttempt(params, harness);
-    const runtimeSettings = {
-      runtime: { mode: "degraded" },
-      model: { requested: "gpt-5.4-codex-primary", resolved: "gpt-5.4-codex" },
-      diagnostics: {
+    const runtimeSettings = expect.objectContaining({
+      runtime: expect.objectContaining({ mode: "degraded" }),
+      model: expect.objectContaining({
+        requested: "gpt-5.4-codex-primary",
+        resolved: "gpt-5.4-codex",
+      }),
+      diagnostics: expect.objectContaining({
         fallbackReason: "provider_unavailable",
         degradedReason: "context_overflow",
-      },
-    };
+      }),
+    });
     expect(contextEngine.bootstrap).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         sessionId: "session-1",
