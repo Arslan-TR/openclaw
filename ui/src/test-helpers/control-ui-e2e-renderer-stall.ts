@@ -90,11 +90,8 @@ function recordLongAnimationFrames() {
 }
 
 /**
- * Arm stalled-renderer evidence when a page is created, before navigation and
- * before the test opens CDP sessions. A stall that ends leaves a script-attributed
- * long animation frame. For one that never ends, V8 services `Debugger.pause` and
- * `Performance.getMetrics` inside the busy task, but `Debugger.enable` waits for
- * it, so the agent must already be enabled.
+ * Arm before navigation: long frames record completed stalls. For stuck tasks,
+ * V8 services pause/metrics requests but not Debugger.enable, so enable it now.
  */
 export async function installControlUiE2eRendererStallProbe(page: Page): Promise<void> {
   if (controlUiE2eRendererStallProbes.has(page)) {
@@ -119,8 +116,7 @@ export async function installControlUiE2eRendererStallProbe(page: Page): Promise
       await session.send("Performance.enable");
       return { session, scripts, cleanup: () => session.off("Debugger.scriptParsed", parsed) };
     } catch {
-      // Evidence is best effort: closed pages, non-Chromium contexts, and test
-      // doubles run without a probe.
+      // Closed pages, non-Chromium contexts, and test doubles may have no probe.
       return null;
     }
   })();
@@ -140,7 +136,6 @@ function stallScriptPath(url: string) {
   }
 }
 
-/** Read the work holding a renderer that missed the failure-read deadline, then release it. */
 export async function captureControlUiE2eRendererStall(
   page: Page,
   rendererRead: "completed" | "rejected" | "deadline",
@@ -165,7 +160,6 @@ export async function captureControlUiE2eRendererStall(
       return (name: string) => metrics.find((metric) => metric.name === name)?.value ?? 0;
     };
     const before = await sample();
-    // Leave at least half of the remaining budget for the stack and cleanup.
     stall.sampleMs = Math.round(Math.min(RENDERER_STALL_SAMPLE_MS, remaining() / 2));
     await new Promise((resolve) => {
       setTimeout(resolve, stall.sampleMs);

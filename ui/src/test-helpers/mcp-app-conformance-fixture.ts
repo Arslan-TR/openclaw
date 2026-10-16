@@ -417,21 +417,10 @@ export function appHtml(appModuleUrl: string): string {
 <button id="send-message">Send message</button>
 <button id="request-teardown">Request teardown</button>
 <output id="initialized">pending</output>
-<output id="capabilities"></output>
-<output id="ping"></output>
-<output id="tools"></output>
-<output id="input"></output>
-<output id="result"></output>
-<output id="app-tool"></output>
-<output id="model-tool"></output>
-<output id="resource"></output>
-<output id="context-update"></output>
-<output id="message"></output>
-<output id="teardown"></output>
-<output id="isolation"></output>
-<output id="host-theme"></output>
-<output id="host-variables"></output>
-<output id="computed-theme"></output>
+${"capabilities ping tools input result app-tool model-tool resource context-update message teardown isolation host-theme host-variables computed-theme"
+  .split(" ")
+  .map((id) => `<output id="${id}"></output>`)
+  .join("\n")}
 <script type="module">
 import {
   App,
@@ -439,6 +428,12 @@ import {
   applyHostStyleVariables,
 } from ${JSON.stringify(appModuleUrl)};
 const write = (id, value) => { document.getElementById(id).textContent = value; };
+const action = (id, output, run) => {
+  document.getElementById(id).onclick = async () => {
+    try { write(output, await run()); }
+    catch (error) { write(output, "denied:" + error); }
+  };
+};
 try { void window.top.document; write("isolation", "failed"); } catch { write("isolation", "isolated"); }
 const app = new App({ name: "OpenClaw conformance fixture", version: "1.0.0" });
 const applyHostContext = () => {
@@ -467,13 +462,11 @@ app.onteardown = async () => {
   return {};
 };
 app.onerror = (error) => console.error("mcp-conformance-app", error);
-document.getElementById("arm-refresh").onclick = async () => {
+action("arm-refresh", "arm-result", async () => {
   write("arm-result", "pending");
-  try {
-    await app.callServerTool({ name: "arm_refresh", arguments: {} });
-    write("arm-result", "armed");
-  } catch (error) { write("arm-result", "denied:" + error); }
-};
+  await app.callServerTool({ name: "arm_refresh", arguments: {} });
+  return "armed";
+});
 let activeCall;
 const callAppTool = async (timeout) => {
   activeCall = new AbortController();
@@ -486,37 +479,25 @@ const callAppTool = async (timeout) => {
   } catch (error) { write("app-tool", "denied:" + error); }
 };
 document.getElementById("call-app").onclick = () => callAppTool();
-document.getElementById("list-tools").onclick = async () => {
-  try { write("tools", JSON.stringify(await app.request({ method: "tools/list", params: {} }))); }
-  catch (error) { write("tools", "denied:" + error); }
-};
+action("list-tools", "tools", async () => JSON.stringify(await app.request({ method: "tools/list", params: {} })));
 document.getElementById("call-expiring").onclick = () => callAppTool(3000);
 document.getElementById("cancel-call").onclick = () => activeCall?.abort(new Error("fixture caller cancelled"));
-document.getElementById("call-model").onclick = async () => {
-  try { await app.callServerTool({ name: "model_only", arguments: {} }); write("model-tool", "allowed"); }
-  catch (error) { write("model-tool", "denied:" + error); }
-};
-document.getElementById("read-resource").onclick = async () => {
-  try {
-    const value = await app.readServerResource({ uri: "data://conformance/value" });
-    write("resource", JSON.stringify(value));
-  } catch (error) { write("resource", "denied:" + error); }
-};
-document.getElementById("update-context").onclick = async () => {
-  try {
-    await app.updateModelContext({ content: [{ type: "text", text: "selected item 42" }] });
-    write("context-update", "accepted");
-  } catch (error) { write("context-update", "denied:" + error); }
-};
-document.getElementById("send-message").onclick = async () => {
-  try {
-    const value = await app.sendMessage({
-      role: "user",
-      content: [{ type: "text", text: "summarize selection" }],
-    });
-    write("message", value.isError ? "denied" : "accepted");
-  } catch (error) { write("message", "denied:" + error); }
-};
+action("call-model", "model-tool", async () => {
+  await app.callServerTool({ name: "model_only", arguments: {} });
+  return "allowed";
+});
+action("read-resource", "resource", async () => JSON.stringify(await app.readServerResource({ uri: "data://conformance/value" })));
+action("update-context", "context-update", async () => {
+  await app.updateModelContext({ content: [{ type: "text", text: "selected item 42" }] });
+  return "accepted";
+});
+action("send-message", "message", async () => {
+  const value = await app.sendMessage({
+    role: "user",
+    content: [{ type: "text", text: "summarize selection" }],
+  });
+  return value.isError ? "denied" : "accepted";
+});
 document.getElementById("request-teardown").onclick = () => app.requestTeardown();
 await app.connect();
 applyHostContext();

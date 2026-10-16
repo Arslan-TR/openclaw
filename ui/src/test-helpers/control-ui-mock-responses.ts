@@ -99,10 +99,7 @@ export function createControlUiMockResponses(
   }
 
   function paramsMatch(params: unknown, match: Record<string, unknown> | undefined): boolean {
-    if (!match) {
-      return true;
-    }
-    const entries = Object.entries(match);
+    const entries = Object.entries(match ?? {});
     return (
       entries.length === 0 ||
       (isRecord(params) &&
@@ -113,17 +110,11 @@ export function createControlUiMockResponses(
   }
 
   function responseCases(value: unknown): BrowserMethodResponseCase[] | null {
-    if (!isRecord(value)) {
-      return null;
-    }
-    return Array.isArray(value.cases) ? value.cases : null;
+    return isRecord(value) && Array.isArray(value.cases) ? value.cases : null;
   }
 
   function responseSequence(value: unknown): unknown[] | null {
-    if (!isRecord(value)) {
-      return null;
-    }
-    return Array.isArray(value.sequence) ? value.sequence : null;
+    return isRecord(value) && Array.isArray(value.sequence) ? value.sequence : null;
   }
 
   function configuredResponse(
@@ -164,11 +155,7 @@ export function createControlUiMockResponses(
     const rows = payload?.sessions ?? sessions.list();
     const baseline = {
       count: rows.length,
-      defaults: {
-        contextTokens: null,
-        model: "gpt-5.5",
-        modelProvider: "openai",
-      },
+      defaults: { contextTokens: null, model: "gpt-5.5", modelProvider: "openai" },
       path: "",
       sessions: rows,
       ts: Date.now(),

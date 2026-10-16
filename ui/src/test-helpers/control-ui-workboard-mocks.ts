@@ -1,4 +1,5 @@
 import type { WorkboardCard } from "@openclaw/workboard-contract";
+import type { ControlUiMockRequestHandler } from "./control-ui-e2e-contract.ts";
 import type { ControlUiMockGateway } from "./control-ui-e2e.ts";
 import type { buildWorkboardMocks } from "./control-ui-workboard-fixtures.ts";
 
@@ -45,6 +46,27 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
   const workboardCards = new Map<string, MockCard>(seed.cards.map((card) => [card.id, card]));
   const statuses = seed.methodResponses["workboard.cards.list"].statuses;
   let revision = Date.now();
+  type Request = Parameters<ControlUiMockRequestHandler>[0];
+  const invalid = (respond: Request["respond"], message: string) =>
+    respond({ __mockError: { code: "INVALID_REQUEST", message } });
+  const appendEvent = (
+    card: MockCard | undefined,
+    id: string,
+    kind: string,
+    at: number,
+    transition: { fromStatus?: string; toStatus?: string } = {},
+  ) => [...(card?.events ?? []), { id, kind, at, ...transition }].slice(-50);
+  const summarize = (cards: MockCard[]) => {
+    const archived = cards.filter((card) => Boolean(card.metadata.archivedAt)).length;
+    return {
+      total: cards.length,
+      active: cards.length - archived,
+      archived,
+      byStatus: Object.fromEntries(
+        statuses.map((status) => [status, cards.filter((card) => card.status === status).length]),
+      ),
+    };
+  };
   const boardSummaries = () =>
     [...workboardBoards.values()].map((board) => {
       const cards = [...workboardCards.values()].filter(
@@ -52,12 +74,7 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
       );
       return Object.assign({}, board, {
         id: board.id,
-        total: cards.length,
-        active: cards.filter((card) => !card.metadata.archivedAt).length,
-        archived: cards.filter((card) => Boolean(card.metadata.archivedAt)).length,
-        byStatus: Object.fromEntries(
-          statuses.map((status) => [status, cards.filter((card) => card.status === status).length]),
-        ),
+        ...summarize(cards),
         updatedAt: Math.max(Number(board.updatedAt ?? 0), ...cards.map((card) => card.updatedAt)),
       });
     });
@@ -87,16 +104,10 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
       const agentId = card.agentId || "(default)";
       byAgent.set(agentId, (byAgent.get(agentId) ?? 0) + 1);
     }
-    const archived = cards.filter((card) => Boolean(card.metadata.archivedAt)).length;
     const ready = cards.filter((card) => card.status === "ready" && !card.metadata.archivedAt);
     respond({
       id: boardId || "all",
-      total: cards.length,
-      active: cards.length - archived,
-      archived,
-      byStatus: Object.fromEntries(
-        statuses.map((status) => [status, cards.filter((card) => card.status === status).length]),
-      ),
+      ...summarize(cards),
       byAgent: Object.fromEntries(byAgent),
       ...(cards.length ? { updatedAt: Math.max(...cards.map((card) => card.updatedAt)) } : {}),
       ...(ready.length
@@ -122,22 +133,17 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
       const existing = updating && input.id ? workboardCards.get(input.id) : undefined;
       const patch = updating ? (input.patch ?? {}) : input;
       if ((updating && !existing) || !(patch.title ?? existing?.title)?.trim()) {
-        respond({
-          __mockError: { code: "INVALID_REQUEST", message: "A valid card and title are required." },
-        });
-        return;
+        return invalid(respond, "A valid card and title are required.");
       }
       const conflict = revisionError(existing, input.expectedUpdatedAt);
       if (conflict) {
-        respond({ __mockError: conflict });
-        return;
+        return respond({ __mockError: conflict });
       }
       const now = existing ? Math.max(Date.now(), existing.updatedAt + 1) : Date.now();
       const boardId = existing?.metadata.automation.boardId ?? input.boardId ?? "default";
       const status = patch.status ?? existing?.status ?? "todo";
       if (!statuses.includes(status)) {
-        respond({ __mockError: { code: "INVALID_REQUEST", message: "Unknown card status." } });
-        return;
+        return invalid(respond, "Unknown card status.");
       }
       const card: MockCard = {
         ...existing,
@@ -166,10 +172,12 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
           automation: { boardId },
           ...(input.templateId ? { templateId: input.templateId } : {}),
         },
-        events: [
-          ...(existing?.events ?? []),
-          { id: `mock-edit-${++revision}`, kind: updating ? "edited" : "created", at: now },
-        ].slice(-50),
+        events: appendEvent(
+          existing,
+          `mock-edit-${++revision}`,
+          updating ? "edited" : "created",
+          now,
+        ),
       };
       if (!workboardBoards.has(boardId)) {
         workboardBoards.set(boardId, { id: boardId, updatedAt: now });
@@ -184,17 +192,14 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
     const card = workboardCards.get(input.id);
     const body = typeof input.body === "string" ? input.body.trim() : "";
     if (!card || !body || body.length > 2000) {
-      respond({
-        __mockError: {
-          code: "INVALID_REQUEST",
-          message: !card
-            ? "Unknown card."
-            : !body
-              ? "Comment body is required."
-              : "Comment body must be 2000 characters or fewer.",
-        },
-      });
-      return;
+      return invalid(
+        respond,
+        !card
+          ? "Unknown card."
+          : !body
+            ? "Comment body is required."
+            : "Comment body must be 2000 characters or fewer.",
+      );
     }
     const now = Date.now();
     const comment = { id: `mock-comment-${++revision}`, body, createdAt: now };
@@ -205,10 +210,7 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
         ...card.metadata,
         comments: [...(card.metadata.comments ?? []), comment].slice(-50),
       },
-      events: [
-        ...(card.events ?? []),
-        { id: `mock-comment-event-${revision}`, kind: "comment_added", at: now },
-      ].slice(-50),
+      events: appendEvent(card, `mock-comment-event-${revision}`, "comment_added", now),
     };
     workboardCards.set(card.id, updated);
     respond({ card: updated });
@@ -218,13 +220,11 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
     const input = params as { id: string; expectedUpdatedAt?: number; archived?: boolean };
     const card = workboardCards.get(input.id);
     if (!card) {
-      respond({ __mockError: { code: "INVALID_REQUEST", message: "Unknown card." } });
-      return;
+      return invalid(respond, "Unknown card.");
     }
     const conflict = revisionError(card, input.expectedUpdatedAt);
     if (conflict) {
-      respond({ __mockError: conflict });
-      return;
+      return respond({ __mockError: conflict });
     }
     const now = Math.max(Date.now(), card.updatedAt + 1);
     const archived = input.archived !== false;
@@ -232,10 +232,12 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
       ...card,
       updatedAt: now,
       metadata: { ...card.metadata, archivedAt: archived ? now : 0 },
-      events: [
-        ...(card.events ?? []),
-        { id: `mock-archive-${++revision}`, kind: archived ? "archived" : "unarchived", at: now },
-      ].slice(-50),
+      events: appendEvent(
+        card,
+        `mock-archive-${++revision}`,
+        archived ? "archived" : "unarchived",
+        now,
+      ),
     };
     workboardCards.set(card.id, updated);
     respond({ card: updated });
@@ -245,8 +247,7 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
     const input = params as { id: string; expectedUpdatedAt?: number };
     const conflict = revisionError(workboardCards.get(input.id), input.expectedUpdatedAt);
     if (conflict) {
-      respond({ __mockError: conflict });
-      return;
+      return respond({ __mockError: conflict });
     }
     const deleted = workboardCards.delete(input.id);
     const referenceUpdates: Array<{ id: string; previousUpdatedAt: number; updatedAt: number }> =
@@ -281,13 +282,11 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
     };
     const card = workboardCards.get(input.id);
     if (!card || !statuses.includes(input.status)) {
-      respond({ __mockError: { code: "INVALID_REQUEST", message: "Unknown card or status." } });
-      return;
+      return invalid(respond, "Unknown card or status.");
     }
     const conflict = revisionError(card, input.expectedUpdatedAt);
     if (conflict) {
-      respond({ __mockError: conflict });
-      return;
+      return respond({ __mockError: conflict });
     }
     const now = Math.max(Date.now(), card.updatedAt + 1);
     const moved: MockCard = {
@@ -296,16 +295,10 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
       position: input.position ?? card.position,
       updatedAt: now,
       completedAt: input.status === "done" ? now : undefined,
-      events: [
-        ...(card.events ?? []),
-        {
-          id: `mock-move-${++revision}`,
-          kind: "moved",
-          at: now,
-          fromStatus: card.status,
-          toStatus: input.status,
-        },
-      ].slice(-50),
+      events: appendEvent(card, `mock-move-${++revision}`, "moved", now, {
+        fromStatus: card.status,
+        toStatus: input.status,
+      }),
     };
     workboardCards.set(card.id, moved);
     respond({ card: moved });
@@ -318,13 +311,7 @@ export function installWorkboardBoardMock(seed: ReturnType<typeof buildWorkboard
       !Array.isArray(clearAppearance) ||
       clearAppearance.some((field) => field !== "icon" && field !== "color")
     ) {
-      respond({
-        __mockError: {
-          code: "INVALID_REQUEST",
-          message: "clearAppearance must be an array containing only icon or color.",
-        },
-      });
-      return;
+      return invalid(respond, "clearAppearance must be an array containing only icon or color.");
     }
     const id = typeof input.id === "string" ? input.id.trim().toLowerCase() : "default";
     const board: Record<string, unknown> = {

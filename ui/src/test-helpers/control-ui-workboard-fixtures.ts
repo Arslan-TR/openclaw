@@ -348,21 +348,16 @@ export function buildWorkboardMocks(
   const cardSessions = [
     sessionRow(briefSessionKey, "Weekly product brief", baseTime - 2 * 60_000, {
       status: "queued",
-      hasActiveRun: false,
     }),
     sessionRow(launchSessionKey, "Launch readiness", baseTime - 12 * 60_000, {
       status: undefined,
-      hasActiveRun: false,
       totalTokens: 2_400,
     }),
     sessionRow(stagingSessionKey, "Staging access", baseTime - 5 * 60_000, {
       status: "failed",
-      hasActiveRun: false,
       totalTokens: 1_800,
     }),
     sessionRow(handoffSessionKey, "Support handoff", baseTime - 30 * 60_000, {
-      status: "done",
-      hasActiveRun: false,
       totalTokens: 4_200,
     }),
     sessionRow(onboardingSessionKey, "Onboarding validation", baseTime, {
@@ -373,19 +368,13 @@ export function buildWorkboardMocks(
       totalTokens: 12_400,
     }),
     sessionRow(accessibilitySessionKey, "Accessibility audit", baseTime - 3 * 60_000, {
-      status: "done",
-      hasActiveRun: false,
       totalTokens: 8_600,
     }),
   ];
   cardSessions.push(
-    sessionRow("agent:main:card-states-rich", "Release handoff review", baseTime - 240_000, {
-      status: "done",
-      hasActiveRun: false,
-    }),
+    sessionRow("agent:main:card-states-rich", "Release handoff review", baseTime - 240_000),
     sessionRow("agent:main:card-states-stale", "Release investigation", baseTime - 45 * 60_000, {
       status: "running",
-      hasActiveRun: false,
     }),
     ...(["queued", "running", "timeout", "stopped", "completed", "failed"] as const).map((state) =>
       sessionRow(
@@ -410,7 +399,14 @@ export function buildWorkboardMocks(
     cardSessions.splice(0, cardSessions.length, ...buildWorkboardStateSessions(baseTime));
   }
   const history = (...messages: Parameters<typeof chatHistoryMessage>[]) => ({
-    messages: messages.map((message) => chatHistoryMessage(...message)),
+    messages: messages.map((message) =>
+      Object.assign(
+        chatHistoryMessage(...message),
+        message[0] === "user"
+          ? { __openclaw: { senderId: actor.id, senderName: actor.label } }
+          : {},
+      ),
+    ),
   });
   const conversation = (
     user: string,
@@ -485,22 +481,7 @@ export function buildWorkboardMocks(
     cards: allCards,
     sessionKey,
     cardSessions,
-    cardSessionHistories: Object.fromEntries(
-      Object.entries(cardSessionHistories).map(([key, sessionHistory]) => [
-        key,
-        {
-          ...sessionHistory,
-          messages: sessionHistory.messages.map((message) => ({
-            ...message,
-            ...(message.role === "user"
-              ? {
-                  __openclaw: { senderId: actor.id, senderName: actor.label },
-                }
-              : {}),
-          })),
-        },
-      ]),
-    ),
+    cardSessionHistories: Object.fromEntries(Object.entries(cardSessionHistories)),
     methodResponses: {
       "agents.list": {
         agents: [

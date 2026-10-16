@@ -106,6 +106,8 @@ export function createControlUiSessionFixtures(
   let materializedSequence = 0;
   let timestamp = 1_800_000_000_000;
   const canonicalKey = (key: string) => (key === "main" ? input.mainKey : key);
+  const hasKey = (row: unknown): row is { key: string } =>
+    row !== null && typeof row === "object" && "key" in row && typeof row.key === "string";
   const record = (inputKey: string) => {
     const key = canonicalKey(inputKey);
     let value = records.get(key);
@@ -438,16 +440,10 @@ export function createControlUiSessionFixtures(
   };
   const list = (wireRows?: unknown[]) => {
     const rows = wireRows ?? [...listed].map(read);
-    const keys = new Set(
-      rows.flatMap((row) =>
-        row && typeof row === "object" && "key" in row && typeof row.key === "string"
-          ? [canonicalKey(row.key)]
-          : [],
-      ),
-    );
+    const keys = new Set(rows.flatMap((row) => (hasKey(row) ? [canonicalKey(row.key)] : [])));
     return [
       ...rows.map((row) => {
-        if (!row || typeof row !== "object" || !("key" in row) || typeof row.key !== "string") {
+        if (!hasKey(row)) {
           return row;
         }
         const value = record(row.key);
@@ -525,25 +521,22 @@ export function createControlUiSessionFixtures(
       (!isRecord(params) || params.offset === undefined || params.offset === 0) &&
       response.hasMore !== true &&
       response.nextOffset == null;
-    if (!options.archiveFiltering) {
-      return {
-        ...response,
-        ...(completeChildFixture ? { totalCount: childSessions.length } : {}),
-        ...(childSessions.length !== projectedSessions.length || materializedSequence > 0
-          ? { count: childSessions.length }
-          : {}),
-        sessions: childSessions,
-      };
-    }
-    const filteredSessions = childSessions.filter(
-      (row) =>
-        isRecord(row) &&
-        (archivedFilter === "all" || (row.archived === true) === (archivedFilter === "archived")),
-    );
+    const filteredSessions = options.archiveFiltering
+      ? childSessions.filter(
+          (row) =>
+            isRecord(row) &&
+            (archivedFilter === "all" ||
+              (row.archived === true) === (archivedFilter === "archived")),
+        )
+      : childSessions;
     return {
       ...response,
       ...(completeChildFixture ? { totalCount: filteredSessions.length } : {}),
-      count: filteredSessions.length,
+      ...(options.archiveFiltering ||
+      childSessions.length !== projectedSessions.length ||
+      materializedSequence > 0
+        ? { count: filteredSessions.length }
+        : {}),
       sessions: filteredSessions,
     };
   }
@@ -637,7 +630,7 @@ export function createControlUiSessionFixtures(
     replaceCanonicalList(rows: unknown[]) {
       const replacements: ControlUiSessionFixture[] = [];
       for (const row of rows) {
-        if (!row || typeof row !== "object" || !("key" in row) || typeof row.key !== "string") {
+        if (!hasKey(row)) {
           throw new Error("Canonical sessions.list rows require a string key");
         }
         replacements.push({ ...row, key: canonicalKey(row.key) });
