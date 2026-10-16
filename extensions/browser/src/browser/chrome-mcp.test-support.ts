@@ -50,11 +50,7 @@ export type ToolCall = {
   arguments?: Record<string, unknown>;
 };
 
-export type ToolCallMock = {
-  mock: {
-    calls: Array<[ToolCall, unknown?, { signal?: AbortSignal; timeout?: number }?]>;
-  };
-};
+type ToolHandler = (call: ToolCall) => unknown;
 
 export function fakeListPagesResult() {
   return textResult("## Pages\n1: https://example.com [selected]");
@@ -66,42 +62,41 @@ export function textResult(text: string, isError = false): ChromeMcpToolResult {
 
 export type SessionPage = { id: number; url: string; selected?: boolean };
 
+export function pagesResult(pages: SessionPage[]) {
+  return { structuredContent: { pages } };
+}
+
+export function createSessionStub(callTool: (call: ToolCall) => Promise<unknown>, pid: number) {
+  const client = { callTool, close: vi.fn().mockResolvedValue(undefined) };
+  return {
+    client,
+    transport: { pid },
+    closeTransport: () => client.close(),
+    ready: Promise.resolve(),
+  } as unknown as ChromeMcpSession;
+}
+
 export function createPageSession(params: {
   pages?: SessionPage[];
   pid?: number;
-  onTool?: (call: ToolCall) => unknown;
+  onTool?: ToolHandler | Partial<Record<string, ToolHandler>>;
 }): ChromeMcpSession {
   const callTool = vi.fn(async (call: ToolCall) => {
-    const custom = await params.onTool?.(call);
+    const handler =
+      typeof params.onTool === "function" ? params.onTool : params.onTool?.[call.name];
+    const custom = await handler?.(call);
     if (custom !== undefined) {
       return custom;
     }
     if (call.name === "list_pages") {
-      return {
-        structuredContent: {
-          pages: (params.pages ?? [{ id: 1, url: "https://a.example" }]).map(
-            ({ id, url, selected }) => ({ id, url, selected }),
-          ),
-        },
-      };
+      return pagesResult(params.pages ?? [{ id: 1, url: "https://a.example" }]);
     }
     if (call.name === "evaluate_script") {
       return textResult("```json\nnull\n```");
     }
     throw new Error(`unexpected tool ${call.name}`);
   });
-  const client = {
-    callTool,
-    listTools: vi.fn(),
-    close: vi.fn().mockResolvedValue(undefined),
-    connect: vi.fn(),
-  };
-  return {
-    client,
-    transport: { pid: params.pid ?? 141 },
-    closeTransport: () => client.close(),
-    ready: Promise.resolve(),
-  } as unknown as ChromeMcpSession;
+  return createSessionStub(callTool, params.pid ?? 141);
 }
 
 export function installChromeMcpSessionTestHooks() {
@@ -121,11 +116,9 @@ export function installChromeMcpSessionTestHooks() {
 
 export const FAKE_TARGET_1 = "chrome-mcp:000000000001:1";
 const FAKE_TARGET_2 = "chrome-mcp:000000000001:2";
-const FAKE_REF = "mcp-ref:000000000001:1";
 
 export function createFakeSession(): ChromeMcpSession {
-  let currentUrl =
-    "https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session";
+  let currentUrl = "https://example.com";
   const readUrlArg = (value: unknown, fallback: string) =>
     typeof value === "string" && value.trim() ? value : fallback;
   const callTool = vi.fn(async ({ name, arguments: args }: ToolCall) => {
@@ -156,19 +149,8 @@ export function createFakeSession(): ChromeMcpSession {
     throw new Error(`unexpected tool ${name}`);
   });
 
-  const client = {
-    callTool,
-    listTools: vi.fn().mockResolvedValue({ tools: [{ name: "list_pages" }] }),
-    close: vi.fn().mockResolvedValue(undefined),
-    connect: vi.fn().mockResolvedValue(undefined),
-  };
   return {
-    client,
-    transport: { pid: 123 },
-    closeTransport: () => client.close(),
-    ready: Promise.resolve(),
-    // Legacy cases exercise unrelated call plumbing. Seed one real-shaped
-    // process-scoped routing generation so they stay terse.
+    ...createSessionStub(callTool, 123),
     routing: {
       sessionNonce: "000000000001",
       withOperationLock: async <T>(operation: () => Promise<T>) => await operation(),
@@ -177,12 +159,10 @@ export function createFakeSession(): ChromeMcpSession {
         [2, FAKE_TARGET_2],
       ]),
       nextTargetHandleId: 3,
-      snapshotsByTarget: new Map([
-        [FAKE_TARGET_1, { documentUid: "root-1", refs: new Map([[FAKE_REF, { uid: "btn-1" }]]) }],
-      ]),
-      nextSnapshotRefId: 2,
+      snapshotsByTarget: new Map(),
+      nextSnapshotRefId: 1,
     },
-  } as unknown as ChromeMcpSession;
+  };
 }
 
 export function snapshotWithControls(...children: ChromeMcpSnapshotNode[]): ChromeMcpSnapshotNode {
