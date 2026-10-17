@@ -61,6 +61,9 @@ export function deleteSessionEntryInAgentWorker(
             database,
           )
         : undefined;
+    if (publication && result.value.transcriptInventoryUnchanged) {
+      publication.transcriptInventoryUnchanged = true;
+    }
     const candidate: SessionEntryDeletionCommitted = {
       kind: "session-entry-deletion",
       result,
