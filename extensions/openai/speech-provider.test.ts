@@ -80,14 +80,11 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("advertises official speech snapshots without changing the default model", () => {
-    const provider = buildOpenAISpeechProvider();
-
     expect(provider.defaultModel).toBe("gpt-4o-mini-tts");
     expect(provider.models).toContain(OPENAI_TTS_SNAPSHOT);
   });
 
   it("normalizes provider-owned speech config from raw provider config", () => {
-    const provider = buildOpenAISpeechProvider();
     const resolved = provider.resolveConfig?.({
       cfg: {} as never,
       timeoutMs: 30_000,
@@ -134,7 +131,6 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("passes custom endpoint speech speeds through", () => {
-    const provider = buildOpenAISpeechProvider();
     const resolved = provider.resolveConfig?.({
       cfg: {} as never,
       timeoutMs: 30_000,
@@ -232,22 +228,14 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("parses preferred-OpenAI speed directive within the supported range", () => {
-    const provider = buildOpenAISpeechProvider();
-
-    expect(
-      provider.parseDirectiveToken?.(createSpeedDirectiveContext("speed", "1.5") as never),
-    ).toEqual({
+    expect(parseDirective("speed", "1.5", undefined, true)).toEqual({
       handled: true,
       overrides: { speed: 1.5 },
     });
   });
 
   it("parses explicit openai_speed alias", () => {
-    const provider = buildOpenAISpeechProvider();
-
-    expect(
-      provider.parseDirectiveToken?.(createSpeedDirectiveContext("openai_speed", "0.75") as never),
-    ).toEqual({
+    expect(parseDirective("openai_speed", "0.75", undefined, true)).toEqual({
       handled: true,
       overrides: { speed: 0.75 },
     });
@@ -265,27 +253,19 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("warns on OpenAI speed values outside the supported 0.25..4 range", () => {
-    const provider = buildOpenAISpeechProvider();
-
-    expect(
-      provider.parseDirectiveToken?.(createSpeedDirectiveContext("speed", "5") as never),
-    ).toEqual({
+    expect(parseDirective("speed", "5", undefined, true)).toEqual({
       handled: true,
       warnings: ['invalid OpenAI speed "5" (0.25-4.0)'],
     });
   });
 
   it("passes custom endpoint OpenAI-compatible speed directives through", () => {
-    const provider = buildOpenAISpeechProvider();
-
-    expect(
-      provider.parseDirectiveToken?.(
-        createSpeedDirectiveContext("speed", "4.5", "https://tts.example.com/v1") as never,
-      ),
-    ).toEqual({
-      handled: true,
-      overrides: { speed: 4.5 },
-    });
+    expect(parseDirective("speed", "4.5", { baseUrl: "https://tts.example.com/v1" }, true)).toEqual(
+      {
+        handled: true,
+        overrides: { speed: 4.5 },
+      },
+    );
   });
 
   it("uses OPENAI_TTS_BASE_URL when parsing OpenAI-compatible speed directives", () => {
