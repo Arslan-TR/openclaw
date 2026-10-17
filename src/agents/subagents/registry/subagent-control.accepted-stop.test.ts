@@ -27,11 +27,15 @@ import {
 import {
   beginSessionWorkAdmission,
   getActiveSessionLifecycleMutationCount,
-  getActiveSessionWorkAdmissionCount,
 } from "../../../sessions/session-lifecycle-admission.js";
 import { clearActiveEmbeddedRun, setActiveEmbeddedRun } from "../../embedded-agent-runner/runs.js";
 import { createEmbeddedRunHandle } from "../../embedded-agent-runner/runs.test-support.js";
 import { isSubagentRegistryWriteCommand } from "../../subagent-test-fixtures.test-helpers.js";
+import {
+  controlController,
+  createControlRunFixture,
+  expectControlIdle as expectIdle,
+} from "./subagent-control.fixtures.test-support.js";
 import { killAllControlledSubagentRuns, killSubagentRunAdmin } from "./subagent-control.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "./subagent-lifecycle-events.js";
 import {
@@ -39,40 +43,26 @@ import {
   retireSubagentGatewayBinding,
 } from "./subagent-registry-execution-cleanup.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
-import { markSubagentRunTerminated, registerSubagentRun } from "./subagent-registry.js";
-import { writeSubagentSessionEntry } from "./subagent-registry.persistence.test-support.js";
+import { markSubagentRunTerminated } from "./subagent-registry.js";
 import { rowToSubagentRunRecord } from "./subagent-registry.store.codec.js";
 import { resolveSubagentSessionStatus } from "./subagent-session-metrics.js";
 
 const fixture = useSubagentControlFixture();
+const { writeSession, register } = createControlRunFixture(() => fixture.stateDir);
 
-async function seedExecutionTarget(name: string, task: string, lifecycleRevision?: string) {
+async function seedExecutionTarget(name: string, lifecycleRevision?: string) {
   const sessionKey = `agent:main:subagent:${name}`;
   const sessionId = `${name}-session`;
   const runId = `${name}-run`;
-  const storePath = await writeSubagentSessionEntry({
-    stateDir: fixture.stateDir,
-    agentId: "main",
-    sessionKey,
-    defaultSessionId: sessionId,
-    lifecycleRevision,
-  });
+  const storePath = await writeSession(name, lifecycleRevision);
   const sessionEntry = await readSessionEntryReadOnlyInWorker({
     agentId: "main",
     storePath,
     sessionKey,
   });
-  await registerSubagentRun({
+  await register(name, storePath, {
     runId,
-    childSessionKey: sessionKey,
-    childAgentId: "main",
     sessionEntry,
-    requesterSessionKey: "agent:main:main",
-    requesterAgentId: "main",
-    requesterDisplayKey: "main",
-    task,
-    cleanup: "keep",
-    expectsCompletionMessage: false,
   });
   const context = createDirectChatContext({ getRuntimeConfig });
   const resolveGatewayContext = () => context;
@@ -116,11 +106,6 @@ function holdExecution(target: ExecutionTarget, cleanupDuringExecution = true) {
   return { registration, owner, releaseTail, execution };
 }
 
-function expectIdle() {
-  expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-  expect(getActiveSessionLifecycleMutationCount()).toBe(0);
-}
-
 function clearExecution(target: ExecutionTarget, registration: ReturnType<typeof registerAbort>) {
   registration.cleanup();
   target.context.chatAbortControllers.clear();
@@ -134,11 +119,7 @@ it.each([
 ])(
   "retains cleanup custody only for the recorded revision ($original -> $current)",
   async ({ original, current, matches }) => {
-    const target = await seedExecutionTarget(
-      "cleanup-revision",
-      "Keep exact execution cleanup custody",
-      original,
-    );
+    const target = await seedExecutionTarget("cleanup-revision", original);
     const { sessionId, runId } = target;
     const entry = subagentRuns.get(runId)!;
     expect(entry.childSessionIdentity).toEqual({ sessionId, lifecycleRevision: original });
@@ -175,14 +156,19 @@ function observeExecutionJoin(entry: ChatAbortControllerEntry, selected: () => v
   return settlement;
 }
 
-it.each(["abort", "interruption", "replacement", "already terminal"] as const)(
-  "joins accepted native Stop cleanup before refusing revoked publication (%s)",
+it.each([
+  "abort",
+  "interruption",
+  "replacement",
+  "already terminal",
+  "declined",
+  "throws",
+] as const)(
+  "joins accepted Stop cleanup before settling native or callback cancellation (%s)",
   async (mode) => {
-    const target = await seedExecutionTarget(
-      "accepted-stop",
-      "retain the selected cancellation outcome",
-      "accepted-stop-revision",
-    );
+    const callback = mode === "declined" || mode === "throws";
+    const name = callback ? "callback-stop" : "accepted-stop";
+    const target = await seedExecutionTarget(name, `${name}-revision`);
     const { sessionKey, sessionId, runId, storePath, context } = target;
     const { registration, owner, releaseTail, execution } = holdExecution(target);
     const selectedTail = createDeferred();
@@ -193,8 +179,10 @@ it.each(["abort", "interruption", "replacement", "already terminal"] as const)(
       }
     });
     const abort = vi.fn(() => registration.controller.abort());
-    const handle = createEmbeddedRunHandle({ runId, abort });
-    setActiveEmbeddedRun(sessionId, handle, sessionKey);
+    const handle = callback ? undefined : createEmbeddedRunHandle({ runId, abort });
+    if (handle) {
+      setActiveEmbeddedRun(sessionId, handle, sessionKey);
+    }
     const admission =
       mode === "interruption"
         ? await beginSessionWorkAdmission({
@@ -211,7 +199,7 @@ it.each(["abort", "interruption", "replacement", "already terminal"] as const)(
     let termination: ReturnType<typeof markSubagentRunTerminated> | undefined;
     let pending: ReturnType<typeof killSubagentRunAdmin> | undefined;
     let callerAuthorized = true;
-    const onResult = vi.fn(() => undefined);
+    const onResult = callback ? undefined : vi.fn(() => undefined);
     try {
       if (mode === "already terminal") {
         termination = markSubagentRunTerminated({ runId, reason: "killed" });
@@ -226,6 +214,15 @@ it.each(["abort", "interruption", "replacement", "already terminal"] as const)(
               throw new Error("Caller control revoked during raw execution settlement.");
             }
           },
+          beforeSessionKill: callback
+            ? () => {
+                registration.controller.abort();
+                if (mode === "declined") {
+                  return false;
+                }
+                throw new Error("callback failed after Stop");
+              }
+            : undefined,
         },
       );
       await awaitGateBeforeSettlement(
@@ -236,6 +233,15 @@ it.each(["abort", "interruption", "replacement", "already terminal"] as const)(
       expect(settlement.status).toBe("pending");
       expect(getActiveSessionLifecycleMutationCount()).toBe(0);
       expect(owner.controller.signal.aborted).toBe(mode !== "already terminal");
+      if (callback) {
+        releaseTail.resolve();
+        const result = await pending;
+        expect(result).toMatchObject({ found: true, killed: false });
+        if (mode === "throws") {
+          expect(result).toHaveProperty("error", expect.any(String));
+        }
+        return;
+      }
       callerAuthorized = false;
       if (mode === "replacement") {
         context.chatAbortControllers.set(runId, {
@@ -260,56 +266,9 @@ it.each(["abort", "interruption", "replacement", "already terminal"] as const)(
       admission?.release();
       await Promise.allSettled([termination, pending, execution]);
       clearExecution(target, registration);
-      clearActiveEmbeddedRun(sessionId, handle, sessionKey);
-      expectIdle();
-    }
-  },
-);
-
-it.each(["declined", "throws"] as const)(
-  "joins a Stop accepted by the session callback (outcome: %s)",
-  async (mode) => {
-    const target = await seedExecutionTarget(
-      "callback-stop",
-      "retain callback cancellation until raw disposal settles",
-      "callback-stop-revision",
-    );
-    const { sessionKey, runId } = target;
-    const { registration, owner, releaseTail, execution } = holdExecution(target);
-    const selectedTail = createDeferred();
-    const settlement = observeExecutionJoin(owner, selectedTail.resolve);
-    const pending = killSubagentRunAdmin(
-      { cfg: getRuntimeConfig(), sessionKey, expectedRunId: runId },
-      {
-        assertCurrent: () => {},
-        beforeSessionKill: () => {
-          registration.controller.abort();
-          if (mode === "declined") {
-            return false;
-          }
-          throw new Error("callback failed after Stop");
-        },
-      },
-    );
-    try {
-      await awaitGateBeforeSettlement(
-        selectedTail.promise,
-        pending,
-        "Stop returned before joining its exact raw execution",
-      );
-      expect(settlement.status).toBe("pending");
-      expect(getActiveSessionLifecycleMutationCount()).toBe(0);
-      expect(owner.controller.signal.aborted).toBe(true);
-      releaseTail.resolve();
-      const result = await pending;
-      expect(result).toMatchObject({ found: true, killed: false });
-      if (mode !== "declined") {
-        expect(result).toHaveProperty("error", expect.any(String));
+      if (handle) {
+        clearActiveEmbeddedRun(sessionId, handle, sessionKey);
       }
-    } finally {
-      releaseTail.resolve();
-      await Promise.allSettled([pending, execution]);
-      clearExecution(target, registration);
       expectIdle();
     }
   },
@@ -317,11 +276,7 @@ it.each(["declined", "throws"] as const)(
 
 it("joins an execution registered while its accepted Stop awaits kill-claim persistence", async () => {
   const { sessionKey, sessionId, sessionEntry, runId, storePath, context, resolveGatewayContext } =
-    await seedExecutionTarget(
-      "late-execution-stop",
-      "join the exact execution that accepts cancellation",
-      "late-execution-stop-revision",
-    );
+    await seedExecutionTarget("late-execution-stop", "late-execution-stop-revision");
   const lifecycleGeneration = getAgentEventLifecycleGeneration();
   const io = { emitAcceptance: vi.fn(), emitFinal: vi.fn() };
   const agentDedupeKeys = [`agent:${runId}`];
@@ -387,8 +342,8 @@ it("joins an execution registered while its accepted Stop awaits kill-claim pers
               const row = isSubagentRegistryWriteCommand(command)
                 ? command.input.values.find((candidate) => candidate.run_id === runId)
                 : undefined;
-              const claim = row && rowToSubagentRunRecord(row)?.killIntent;
-              const holdClaim = Boolean(claim) && !heldClaim;
+              const holdClaim =
+                Boolean(row && rowToSubagentRunRecord(row)?.killIntent) && !heldClaim;
               heldClaim ||= holdClaim;
               const receipt = await scope.execute(command, commandOptions);
               if (holdClaim) {
@@ -501,37 +456,18 @@ it.each([
     }
     const requester = "agent:main:main";
     const key = (id: string) => `agent:main:subagent:${id}`;
-    const controller = {
-      controllerSessionKey: requester,
-      controllerAgentId: "main",
-      callerSessionKey: requester,
-      callerIsSubagent: false,
-      controlScope: "children" as const,
-    };
     for (const id of ["root", "child", "healthy"]) {
-      const storePath = await writeSubagentSessionEntry({
-        stateDir: fixture.stateDir,
-        agentId: "main",
-        sessionKey: key(id),
-        defaultSessionId: `${id}-session`,
-        lifecycleRevision: `${id}-revision`,
-      });
-      await registerSubagentRun({
-        runId: id,
-        childSessionKey: key(id),
-        childAgentId: "main",
+      const storePath = await writeSession(id, `${id}-revision`);
+      await register(id, storePath, {
         requesterSessionKey: id === "child" ? key("root") : requester,
-        requesterAgentId: "main",
         requesterDisplayKey: requester,
         task: "retained cleanup ownership",
-        cleanup: "keep",
         collect: id !== "root" || !retiresDuringStop,
         sessionEntry: await readSessionEntryReadOnlyInWorker({
           agentId: "main",
           storePath,
           sessionKey: key(id),
         }),
-        expectsCompletionMessage: false,
       });
     }
     const root = subagentRuns.get("root")!;
@@ -557,7 +493,7 @@ it.each([
     const stop = () =>
       killAllControlledSubagentRuns({
         cfg: getRuntimeConfig(),
-        controller,
+        controller: controlController,
         runs: [root],
         ...(retiresDuringStop ? { suppressTaskDelivery: true } : {}),
       });

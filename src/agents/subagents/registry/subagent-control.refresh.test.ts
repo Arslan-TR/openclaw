@@ -1,7 +1,6 @@
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
 import { useSubagentControlFixture } from "./subagent-control.test-support.js";
-/** A transient discovery failure must survive successful runtime cancellation. */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../../../test/helpers/promise.js";
@@ -9,40 +8,38 @@ import { getRuntimeConfig, setRuntimeConfigSnapshot } from "../../../config/conf
 import * as sessions from "../../../config/sessions/session-accessor.js";
 import * as generations from "../../../config/sessions/session-delivery-generation.js";
 import { SqliteWorkerError } from "../../../infra/sqlite-worker-contract.js";
-import {
-  beginSessionWorkAdmission,
-  getActiveSessionLifecycleMutationCount,
-  getActiveSessionWorkAdmissionCount,
-  runExclusiveSessionLifecycleMutation,
-} from "../../../sessions/session-lifecycle-admission.js";
+import { runExclusiveSessionLifecycleMutation } from "../../../sessions/session-lifecycle-admission.js";
 import { clearActiveEmbeddedRun, setActiveEmbeddedRun } from "../../embedded-agent-runner/runs.js";
 import { createEmbeddedRunHandle } from "../../embedded-agent-runner/runs.test-support.js";
-import { enqueueSwarmRun, releaseSwarmRun } from "../swarm/swarm-scheduler.js";
+import { releaseSwarmRun } from "../swarm/swarm-scheduler.js";
 import * as killScope from "./subagent-control-kill-scope.js";
 import * as killSession from "./subagent-control-session.js";
+import {
+  beginControlAdmission,
+  controlController as controller,
+  createControlRunFixture,
+  enqueueControlRun,
+  expectControlIdle,
+} from "./subagent-control.fixtures.test-support.js";
 import { killAllControlledSubagentRuns } from "./subagent-control.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "./subagent-lifecycle-events.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import { subscribeSubagentRunChanges } from "./subagent-registry-publication.js";
 import * as registryState from "./subagent-registry-state.js";
-import { registerSubagentRun, startQueuedSubagentRun } from "./subagent-registry.js";
-import { writeSubagentSessionEntry } from "./subagent-registry.persistence.test-support.js";
+import { type registerSubagentRun, startQueuedSubagentRun } from "./subagent-registry.js";
 import { resolveSubagentSessionStatus } from "./subagent-session-metrics.js";
 
 const fixture = useSubagentControlFixture();
-
+const records = createControlRunFixture(() => fixture.stateDir);
 const owner = "agent:main:main";
 const sessionIdentity = (runId: string) => ({
   sessionId: `${runId}-session`,
   lifecycleRevision: `${runId}-revision`,
 });
 const writeSession = (runId: string, sessionKey: string, agentId = "main") =>
-  writeSubagentSessionEntry({
-    stateDir: fixture.stateDir,
-    agentId,
+  records.writeSession(runId, sessionIdentity(runId).lifecycleRevision, {
     sessionKey,
-    defaultSessionId: sessionIdentity(runId).sessionId,
-    lifecycleRevision: sessionIdentity(runId).lifecycleRevision,
+    agentId,
   });
 const registerRun = (
   runId: string,
@@ -50,28 +47,15 @@ const registerRun = (
   requesterSessionKey = owner,
   overrides: Partial<Parameters<typeof registerSubagentRun>[0]> = {},
 ) =>
-  registerSubagentRun({
-    runId,
+  records.register(runId, undefined, {
     childSessionKey,
-    childAgentId: "main",
     sessionEntry: sessionIdentity(runId),
     requesterSessionKey,
     controllerSessionKey: requesterSessionKey,
-    requesterAgentId: "main",
     requesterDisplayKey: requesterSessionKey,
-    task: runId,
-    cleanup: "keep",
     collect: true,
-    expectsCompletionMessage: false,
     ...overrides,
   });
-const controller = {
-  controllerSessionKey: owner,
-  controllerAgentId: "main",
-  callerSessionKey: owner,
-  callerIsSubagent: false,
-  controlScope: "children" as const,
-};
 
 it.for(["complete", "reject undefined"] as const)(
   "coalesces fresh refresh batches in the enclosing scope before %s",
@@ -96,7 +80,6 @@ it.for(["complete", "reject undefined"] as const)(
       registerRun("refresh-" + id, key(id), id === "root" ? owner : rootKey, {
         childAgentId: agentId(id),
         requesterDisplayKey: "main",
-        task: id,
       });
     for (const id of ["root", "first", "second"]) {
       await writeSession("refresh-" + id, key(id), agentId(id));
@@ -195,11 +178,9 @@ it.for(["complete", "reject undefined"] as const)(
       await withinTest(entered[0]!.promise, signal);
       await register("first");
       let middleSettled = false;
-      const middle = Promise.all([
-        refresh("second caller"),
-        refresh("third caller"),
-        refresh("fourth caller"),
-      ]).then((counts) => {
+      const middle = Promise.all(
+        ["second caller", "third caller", "fourth caller"].map(refresh),
+      ).then((counts) => {
         middleSettled = true;
         return counts;
       });
@@ -224,8 +205,7 @@ it.for(["complete", "reject undefined"] as const)(
       );
       await expect(scope.refresh()).rejects.toThrow("refresh scope is no longer active");
       expect(contexts).toEqual(["kill-scope", "kill-scope", "kill-scope"]);
-      expect(publishedBeforeJoin).toBe(false);
-      expect(releasedBeforeJoin).toBe(false);
+      expect([publishedBeforeJoin, releasedBeforeJoin]).toEqual([false, false]);
     } finally {
       release();
       await Promise.allSettled([...accepted, stopped]);
@@ -243,7 +223,6 @@ it("retires queued refreshes after an escaping native failure and an undefined c
   await registerRun("refresh-failure", rootKey, owner, {
     controllerSessionKey: undefined,
     requesterDisplayKey: "main",
-    task: "failed discovery",
   });
   const ready = createDeferred<killScope.KillScope>();
   const entered = createDeferred();
@@ -289,10 +268,7 @@ it("retires queued refreshes after an escaping native failure and an undefined c
       return await rejected.promise;
     },
   );
-  const outcome = stopped.then(
-    (value) => ({ ok: true as const, value }),
-    (error: unknown) => ({ ok: false as const, error }),
-  );
+  void stopped.catch(() => {});
   try {
     const scope = await withinTest(ready.promise, signal);
     const first = scope.refresh();
@@ -311,14 +287,8 @@ it("retires queued refreshes after an escaping native failure and an undefined c
     expect(await Promise.allSettled([later])).toEqual([{ status: "rejected", reason: failure }]);
     expect(reads, "native uncertainty retires the accepted successor batch").toBe(1);
     finishRun.resolve();
-    const result = await outcome;
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toBeInstanceOf(AggregateError);
-      if (result.error instanceof AggregateError) {
-        expect(result.error.errors).toEqual([undefined, failure]);
-      }
-    }
+    await expect(stopped).rejects.toBeInstanceOf(AggregateError);
+    await expect(stopped).rejects.toMatchObject({ errors: [undefined, failure] });
     await expect(scope.refresh()).rejects.toThrow("refresh scope is no longer active");
     expect(reads).toBe(1);
   } finally {
@@ -346,27 +316,13 @@ it("retains a captured child prefix when the next child's session preparation fa
   const firstStart = vi.fn(async () => {});
   const secondStart = vi.fn(async () => {});
   const unrelatedStart = vi.fn(async () => {});
-  for (const [runId, start] of [
-    ["prefix-first", firstStart],
-    ["prefix-second", secondStart],
+  for (const [runId, groupId, active, start] of [
+    ["prefix-first", "prefix", "prefix-root", firstStart],
+    ["prefix-second", "prefix", "prefix-root", secondStart],
+    ["unrelated-prefix", "unrelated-prefix", "unrelated-active", unrelatedStart],
   ] as const) {
-    enqueueSwarmRun({
-      groupId: "prefix",
-      runId,
-      maxConcurrent: 1,
-      activeRunIds: ["prefix-root"],
-      start,
-      onStartFailure: () => true,
-    });
+    enqueueControlRun(groupId, runId, [active], start);
   }
-  enqueueSwarmRun({
-    groupId: "unrelated-prefix",
-    runId: "unrelated-prefix",
-    maxConcurrent: 1,
-    activeRunIds: ["unrelated-active"],
-    start: unrelatedStart,
-    onStartFailure: () => true,
-  });
   const prepare = generations.prepareSessionGenerationFacts;
   let capturedFirst = false;
   let failedReads = 0;
@@ -410,8 +366,6 @@ it("retains a captured child prefix when the next child's session preparation fa
   expect(unrelatedStart).toHaveBeenCalledOnce();
 });
 
-// Sweep retained identity checks after admission interruption. Every injected
-// failure must remain visible while independent siblings still settle.
 it.each([
   ...[undefined, 2, 4].map((faultAt) => ({ phase: "ancestor drain", faultAt })),
   { phase: "later sibling drain", faultAt: 1 },
@@ -437,13 +391,8 @@ it.each([
     const a = subagentRuns.get("a")!;
     const d = subagentRuns.get("d")!;
     const healthy = subagentRuns.get("healthy")!;
-    const admit = (sessionKey: string, sessionId: string, onInterrupt: () => void) =>
-      beginSessionWorkAdmission({
-        scope: storePath,
-        identities: [sessionKey, sessionId],
-        assertAllowed: () => {},
-        onInterrupt,
-      });
+    const admit = (key: string, id: string, interrupt: () => void) =>
+      beginControlAdmission(storePath, key, id, interrupt);
     const entered = createDeferred();
     const admissionA = await admit(aKey, "a-session", entered.resolve);
     const interruptD = vi.fn(() => admissionD.release());
@@ -520,16 +469,8 @@ it.each([
       expect(subagentRuns.has("g")).toBe(false);
       // D, not the interrupted ancestor A, owns this accepted late registration.
       await admissionD.run(async () => {
-        await registerRun("g", gKey, dKey, {
-          task: "late grandchild",
-          queued: true,
-        });
-        enqueueSwarmRun({
-          groupId: "late-refresh",
-          runId: "g",
-          maxConcurrent: 1,
-          activeRunIds: ["d"],
-          start: startG,
+        await registerRun("g", gKey, dKey, { queued: true });
+        enqueueControlRun("late-refresh", "g", ["d"], startG, {
           onStartFailure: startFailure,
         });
       });
@@ -589,8 +530,7 @@ it.each([
         clearActiveEmbeddedRun("a-session", handleA, aKey);
         clearActiveEmbeddedRun("d-session", handleD, dKey);
       }
-      expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-      expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+      expectControlIdle();
     }
   },
 );
