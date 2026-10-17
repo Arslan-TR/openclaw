@@ -1,10 +1,25 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../test/helpers/promise.js";
 import { resolveSessionAuthSelection } from "../../agents/auth-profiles/session-override.js";
-import { resolveEmbeddedSessionLane } from "../../agents/embedded-agent-runner/lanes.js";
+import { getActiveNativeAttempt } from "../../agents/embedded-agent-runner/run-state.js";
+import {
+  clearActiveEmbeddedRun,
+  setActiveEmbeddedRun,
+} from "../../agents/embedded-agent-runner/runs.js";
 import type { SessionEntry } from "../../config/sessions.js";
-import { clearCommandLane, enqueueCommandInLane } from "../../process/command-queue.js";
+import { formatSqliteSessionFileMarker } from "../../config/sessions/legacy-sqlite-marker.js";
+import { createReplyOperation, isSessionRunActive } from "../../sessions/session-controller.js";
+import { beginSessionEffect } from "../../sessions/session-controller.lifecycle.js";
+import {
+  reserveSessionControllerSource,
+  retireSessionControllerInput,
+} from "../../sessions/session-controller.mailbox.js";
+import { captureSessionTarget } from "../../sessions/session-controller.target.js";
 import { parseInlineSessionDirectives } from "./directive-handling.parse.js";
 import { prepareReplyRunAdmission } from "./get-reply-run-admission.js";
 import type { PreparedReplyRunContext } from "./get-reply-run-context.js";
@@ -13,9 +28,8 @@ import { buildReplyPromptEnvelope } from "./prompt-prelude.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
 import { enqueueFollowupRun } from "./queue/enqueue.js";
 import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
-import { createReplyOperation } from "./reply-run-registry.js";
+import { bindReplySourceInput } from "./reply-source-binding.js";
 import { resolveFollowupRunToolAuthorityFingerprintAsync } from "./reply-tool-authority.test-support.js";
-import { drainFormattedSystemEvents } from "./session-system-events.js";
 import { createTypingController } from "./typing.js";
 
 vi.mock("../../agents/auth-profiles/session-override.js", () => ({
@@ -24,8 +38,8 @@ vi.mock("../../agents/auth-profiles/session-override.js", () => ({
 vi.mock("./session-system-events.js", () => ({
   drainFormattedSystemEvents: vi.fn(async () => undefined),
 }));
-vi.mock("./queue/drain.js", () => ({
-  clearFollowupDrainCallback: () => {},
+vi.mock("./queue/drain.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./queue/drain.js")>()),
   scheduleFollowupDrain: () => {
     throw new Error("Admission fixture must not start a drain");
   },
@@ -37,9 +51,13 @@ vi.mock("./get-reply-run-helpers.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./get-reply-run-helpers.js")>()),
   loadAgentRunnerRuntime: async () => ({ runReplyAgent: vi.fn() }),
   loadEmbeddedAgentRuntime: async () => ({
-    resolveActiveEmbeddedRunSessionId: () => undefined,
-    resolveActiveEmbeddedRunSessionIdBySessionFile: () => undefined,
-    resolveEmbeddedSessionLane,
+    preemptAndDrainEmbeddedHeartbeatRun: async () => "not-heartbeat",
+    resolveActiveEmbeddedRunSessionIdBySessionFile: (
+      await import("../../agents/embedded-agent-runner/runs.js")
+    ).resolveActiveEmbeddedRunSessionIdBySessionFile,
+    resolveActiveEmbeddedRunBySessionFile: (
+      await import("../../agents/embedded-agent-runner/runs.js")
+    ).resolveActiveEmbeddedRunBySessionFile,
   }),
   loadSessionUpdatesRuntime: async () => ({
     ensureSkillSnapshot: async ({ sessionEntry }: { sessionEntry: SessionEntry }) => ({
@@ -51,6 +69,7 @@ vi.mock("./get-reply-run-helpers.js", async (importOriginal) => ({
 function createAdmissionFixture() {
   const sessionKey = "agent:main:slack:channel:room:thread:100.1";
   const sessionId = "session";
+  const storePath = "/tmp/agent/sessions/sessions.json";
   const entry: SessionEntry = { sessionId, updatedAt: 1 };
   const ctx = { SessionKey: sessionKey, Provider: "slack", ChatType: "channel" };
   const body = "Use the revised request";
@@ -93,7 +112,7 @@ function createAdmissionFixture() {
       systemSent: true,
       sessionKey,
       sessionId,
-      storePath: "/tmp/agent/sessions/sessions.json",
+      storePath,
       sessionStore: { [sessionKey]: entry },
       workspaceDir: "/tmp/workspace",
       abortedLastRun: false,
@@ -149,12 +168,103 @@ function createAdmissionFixture() {
       }),
     refreshInboundContextAfterAdmissionWait: () => {},
   };
-  return { context, entry, sessionKey, sessionId };
+  return { context, entry, sessionKey, sessionId, storePath };
 }
 
 afterEach(() => vi.clearAllMocks());
 
 describe("prepared reply transcript identity", () => {
+  it.for(["steer", "followup", "interrupt"] as const)(
+    "preserves sessionless native %s admission with an alias-only effect",
+    async (mode, { signal }) => {
+      const { context, sessionId, storePath } = createAdmissionFixture();
+      const sessionFile = formatSqliteSessionFileMarker({ agentId: "main", sessionId, storePath });
+      const native = {
+        queueMessage: vi.fn(async () => {}),
+        isStreaming: () => true,
+        isCompacting: () => false,
+        abort: vi.fn(),
+      };
+      const interrupted = createDeferred();
+      const effect = await beginSessionEffect({
+        scope: storePath,
+        identities: [sessionId],
+        onInterrupt: () => {
+          native.abort();
+          interrupted.resolve();
+        },
+      });
+      const registration = setActiveEmbeddedRun(sessionId, native, undefined, sessionFile, "main");
+      if (!registration) {
+        throw new Error("Expected native registration");
+      }
+      const cleanup = createDeferred();
+      if (mode === "interrupt") {
+        vi.useFakeTimers();
+        registration.runCleanupSettlement = cleanup.promise;
+      }
+      const pending = prepareReplyRunAdmission({
+        ...context,
+        effectiveQueueMode: mode,
+        params: {
+          ...context.params,
+          ctx: { ...context.params.ctx, SessionKey: undefined },
+          sessionCtx: { ...context.params.sessionCtx, SessionKey: undefined },
+          sessionKey: undefined,
+          sessionStore: undefined,
+        },
+      });
+      try {
+        expect(isSessionRunActive(sessionId)).toBe(false);
+        expect(getActiveNativeAttempt(sessionId)).toBeUndefined();
+        if (mode === "interrupt") {
+          await withinTest(
+            awaitGateBeforeSettlement(
+              interrupted.promise,
+              pending,
+              "Sessionless interrupt bypassed its active native producer",
+            ),
+            signal,
+          );
+          expect(native.abort).toHaveBeenCalledOnce();
+          let admitted = false;
+          void pending.then(
+            () => {
+              admitted = true;
+            },
+            () => {},
+          );
+          clearActiveEmbeddedRun(sessionId, native);
+          effect.release();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(admitted).toBe(false);
+          cleanup.resolve();
+        }
+        const prepared = await withinTest(pending, signal);
+        expect(prepared).toMatchObject({
+          kind: "ready",
+          isActive: true,
+          shouldSteer: mode === "steer",
+          shouldFollowup: mode !== "interrupt",
+          resolvedQueue: { mode },
+        });
+        if (prepared.kind !== "ready") {
+          throw new Error("Expected prepared sessionless reply");
+        }
+        expect(await prepared.isRunActive()).toBe(mode !== "interrupt");
+        clearActiveEmbeddedRun(sessionId, native);
+        expect(await prepared.isRunActive()).toBe(false);
+        expect(native.queueMessage).not.toHaveBeenCalled();
+      } finally {
+        clearActiveEmbeddedRun(sessionId, native);
+        effect.release();
+        cleanup.resolve();
+        await pending.catch(() => {});
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("carries an inherited thinking request through admission to candidate selection", async () => {
     const { context, entry } = createAdmissionFixture();
     entry.thinkingLevel = "high";
@@ -179,87 +289,62 @@ describe("prepared reply transcript identity", () => {
     expect(entry.thinkingLevel).toBe("high");
   });
 
-  it.each([
-    { sessionKey: "global", agentId: "research" },
-    { sessionKey: undefined, agentId: "main" },
-  ])(
-    "interrupt clears only owned work for $agentId/$sessionKey",
-    async ({ sessionKey, agentId }) => {
-      const { context, entry, sessionId } = createAdmissionFixture();
-      const lane = resolveEmbeddedSessionLane(sessionKey ?? sessionId);
-      const entered = createDeferred();
-      const release = createDeferred();
-      const blocker = enqueueCommandInLane(lane, async () => {
-        entered.resolve();
-        await release.promise;
+  it.each(["steer", "followup"] as const)(
+    "preserves normal %s policy when the native heartbeat declines preemption",
+    async (mode) => {
+      const { context, sessionKey, sessionId, storePath } = createAdmissionFixture();
+      const target = captureSessionTarget({
+        storeScope: storePath,
+        sessionKey,
+        incarnation: sessionId,
+        agentId: "main",
       });
-      await entered.promise;
-      const queued = sessionKey
-        ? [
-            enqueueCommandInLane(lane, async () => "main", {
-              sessionTarget: { agentId: "main", sessionKey, sessionId: "main-session" },
-            }),
-            enqueueCommandInLane(lane, async () => "untagged"),
-            enqueueCommandInLane(lane, async () => "research", {
-              sessionTarget: { agentId, sessionKey, sessionId },
-            }),
-            enqueueCommandInLane(lane, async () => "older research", {
-              sessionTarget: { agentId, sessionKey, sessionId: "older-session" },
-            }),
-          ]
-        : [enqueueCommandInLane(lane, async () => "queued")];
-      const followup = createQueueTestRun({ prompt: "preserved research followup" });
-      if (sessionKey) {
-        Object.assign(followup.run, { agentId, sessionKey, sessionId });
-        enqueueFollowupRun(sessionKey, followup, { mode: "followup" }, "none", undefined, false);
-      }
-      const results = Promise.allSettled(queued);
+      const operation = createReplyOperation({
+        sessionKey,
+        sessionId,
+        target,
+        turnKind: "heartbeat",
+        resetTriggered: false,
+      });
+      const preemptByVisibleTurn = vi.fn(() => false);
+      const abort = vi.fn();
+      const native = {
+        runId: `declined-heartbeat-${mode}`,
+        queueMessage: vi.fn(async () => {}),
+        isStreaming: () => true,
+        isCompacting: () => false,
+        preemptByVisibleTurn,
+        abort,
+      };
+      setActiveEmbeddedRun(sessionId, native, sessionKey, undefined, "main", operation);
+      const input = reserveSessionControllerSource(sessionKey, { target, policy: { mode } });
       try {
         const prepared = await prepareReplyRunAdmission({
           ...context,
-          effectiveQueueMode: "interrupt",
-          runtimePolicySessionKey: sessionKey,
-          promptSessionCtx: sessionKey
-            ? context.promptSessionCtx
-            : { ...context.promptSessionCtx, SessionKey: undefined },
+          effectiveQueueMode: mode,
           params: {
             ...context.params,
-            agentId,
-            sessionKey,
-            sessionStore: sessionKey ? { [sessionKey]: entry } : undefined,
-            ctx: { ...context.params.ctx, SessionKey: sessionKey },
-            sessionCtx: { ...context.params.sessionCtx, SessionKey: sessionKey },
+            opts: bindReplySourceInput({}, input),
           },
         });
-        expect(prepared.kind).toBe("ready");
-        if (sessionKey) {
-          expect(getExistingFollowupQueue(sessionKey)?.items).toEqual([followup]);
-        } else {
-          expect(drainFormattedSystemEvents).not.toHaveBeenCalled();
-        }
-        release.resolve();
-        await blocker;
-        const cleared = {
-          status: "rejected",
-          reason: expect.objectContaining({ name: "CommandLaneClearedError" }),
-        };
-        expect(await results).toEqual(
-          sessionKey
-            ? [
-                { status: "fulfilled", value: "main" },
-                { status: "fulfilled", value: "untagged" },
-                cleared,
-                cleared,
-              ]
-            : [cleared],
-        );
+        expect(preemptByVisibleTurn).toHaveBeenCalledOnce();
+        expect(prepared).toMatchObject({
+          kind: "ready",
+          isActive: true,
+          shouldSteer: mode === "steer",
+          shouldFollowup: true,
+          resolvedQueue: { mode },
+        });
+        expect(getActiveNativeAttempt(sessionId)).toBe(native);
+        expect(operation.result).toBeNull();
+        expect(operation.abortSignal.aborted).toBe(false);
+        expect(input.abortSignal.aborted).toBe(false);
+        expect(abort).not.toHaveBeenCalled();
+        expect(native.queueMessage).not.toHaveBeenCalled();
       } finally {
-        release.resolve();
-        clearCommandLane(lane);
-        if (sessionKey) {
-          clearFollowupQueue(sessionKey);
-        }
-        await Promise.allSettled([blocker, results]);
+        retireSessionControllerInput(input);
+        clearActiveEmbeddedRun(sessionId, native, sessionKey);
+        operation.complete();
       }
     },
   );
