@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import { constants, DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { restoreDoctorMigrationBackup } from "../commands/doctor-migration-backup-restore.js";
 import { createScopedMigrationSnapshot } from "../infra/sqlite-migration-scoped-snapshot.js";
+import { beginAgentDeletionJournal } from "../test-utils/agent-deletion-journal.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
+import { AGENT_DATABASE_MAINTENANCE_LEASE } from "./openclaw-agent-db-lease.js";
 import { withAgentDatabaseMaintenanceLease } from "./openclaw-agent-db-maintenance-lease.js";
 import { getOpenClawAgentMigrationSchema } from "./openclaw-agent-db-schema-helpers.js";
 import { ensureOpenClawAgentDatabaseSchema } from "./openclaw-agent-db-schema.js";
@@ -12,6 +14,7 @@ import {
   assertOpenClawMigrationWitnessPreserved,
   captureOpenClawMigrationWitness,
 } from "./openclaw-migration-witness.js";
+import { openOpenClawStateDatabase } from "./openclaw-state-db.js";
 import { resolveSchemaMigrationBackupTables } from "./schema-migration-backup-scope.js";
 import { assertSqliteMigrationScopePreserved } from "./sqlite-migration-scope.test-support.js";
 
@@ -79,6 +82,121 @@ function retained(database: DatabaseSync) {
 }
 
 describe("agent index retirement migration", () => {
+  it.each([
+    ["version", "commit"],
+    ["version", "deletion"],
+    ["version", "lease loss"],
+    ["index repair", "commit"],
+    ["index repair", "deletion"],
+  ] as const)("keeps shared writers available during %s and guards %s", async (phase, outcome) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const pathname = state.statePath("registered-migration.sqlite");
+      using database = new DatabaseSync(pathname);
+      seed(database);
+      if (phase === "index repair") {
+        database.exec(`
+          DROP INDEX idx_agent_session_nodes_last_interaction_at;
+          DROP INDEX idx_agent_session_reactions_message;
+          DROP INDEX idx_agent_cache_expiry;
+          PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION};
+          UPDATE schema_meta SET schema_version = ${OPENCLAW_AGENT_SCHEMA_VERSION};
+          UPDATE session_nodes SET entry_valid = 1;
+        `);
+      }
+      const previousVersion = database.prepare("PRAGMA user_version").get()?.user_version;
+      const before = retained(database);
+      const indexes = database
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name")
+        .all();
+      const shared = openOpenClawStateDatabase({ env: state.env });
+      using writer = new DatabaseSync(shared.path);
+      writer.exec("PRAGMA busy_timeout = 0");
+      let wroteDuringDdl = false;
+      let migrationFailure: unknown;
+      const execute = database.exec.bind(database);
+      const exec = vi.spyOn(database, "exec").mockImplementation((sql) => {
+        execute(sql);
+        const trigger =
+          phase === "version"
+            ? "DROP INDEX IF EXISTS idx_agent_session_nodes_last_interaction_at"
+            : "CREATE INDEX main.idx_agent_cache_expiry";
+        if (wroteDuringDdl || !sql.includes(trigger)) {
+          return;
+        }
+        expect(database.isTransaction).toBe(true);
+        writer.exec(`BEGIN IMMEDIATE;
+          INSERT INTO config_machine_state (state_key, value_json, updated_at_ms)
+            VALUES ('migration-heartbeat-peer', '{}', 1);
+          COMMIT;`);
+        wroteDuringDdl = true;
+        if (outcome === "deletion") {
+          beginAgentDeletionJournal(
+            {
+              agentId: "main",
+              operationId: "delete-during-migration",
+              agentDir: state.agentDir("main"),
+              workspaceDir: state.workspaceDir,
+              sessionsDir: state.sessionsDir("main"),
+              databasePaths: [pathname],
+              deleteFiles: false,
+            },
+            { env: state.env },
+          );
+        } else if (outcome === "lease loss") {
+          writer
+            .prepare("UPDATE state_leases SET expires_at = 0 WHERE scope = ? AND lease_key = ?")
+            .run(AGENT_DATABASE_MAINTENANCE_LEASE.scope, AGENT_DATABASE_MAINTENANCE_LEASE.key);
+        }
+      });
+      try {
+        const maintenanceFailure = await withAgentDatabaseMaintenanceLease(
+          { env: state.env },
+          async () => {
+            try {
+              ensureOpenClawAgentDatabaseSchema(database, {
+                agentId: "main",
+                env: state.env,
+                path: pathname,
+                register: true,
+              });
+            } catch (error) {
+              migrationFailure = error;
+            }
+          },
+        ).catch((error: unknown) => error);
+        expect(wroteDuringDdl, String(migrationFailure)).toBe(true);
+        expect(
+          writer
+            .prepare(
+              "SELECT value_json FROM config_machine_state WHERE state_key = 'migration-heartbeat-peer'",
+            )
+            .get(),
+        ).toEqual({ value_json: "{}" });
+        expect(retained(database)).toEqual(before);
+        if (outcome === "commit") {
+          expect(migrationFailure).toBeUndefined();
+          expect(maintenanceFailure).toBeUndefined();
+          expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
+            OPENCLAW_AGENT_SCHEMA_VERSION,
+          );
+        } else {
+          expect(migrationFailure).toBeInstanceOf(Error);
+          expect(migrationFailure).toMatchObject({
+            message: expect.stringMatching(outcome === "deletion" ? /deleted/u : /was lost/u),
+          });
+          expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(previousVersion);
+          expect(
+            database
+              .prepare("SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name")
+              .all(),
+          ).toEqual(indexes);
+        }
+      } finally {
+        exec.mockRestore();
+      }
+    });
+  });
+
   it("retains the exact schema-28 admission contract", () => {
     expect(getOpenClawAgentMigrationSchema(28)).toBe(schemaV28);
   });

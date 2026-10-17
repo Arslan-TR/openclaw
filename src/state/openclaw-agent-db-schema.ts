@@ -295,7 +295,7 @@ function ensureAgentSchema(
   agentId: string,
   pathname: string,
   targetVersion = OPENCLAW_AGENT_SCHEMA_VERSION,
-  withMutation: AgentSchemaMutationGuard = (run) => run(),
+  withCommit: AgentSchemaMutationGuard = (run) => run(),
   onMigrationWarning?: (warning: string) => void,
   versionMigrationOnly = false,
   integrityCheck?: "quick" | "full",
@@ -580,10 +580,10 @@ function ensureAgentSchema(
       }
       finishStorageMigration();
     };
-    runSqliteImmediateTransactionSync(db, () => withMutation(mutate), {
+    runSqliteImmediateTransactionSync(db, mutate, {
       databaseLabel: pathname,
       operationLabel: "agent.schema.ensure",
-      withCommit: withMutation,
+      withCommit,
     });
   } finally {
     if (db.isOpen) {
@@ -657,7 +657,7 @@ export function* ensureOpenClawAgentDatabaseSchemaSteps(
       { env: databaseOptions.env, initializationAgentPaths: [pathname] },
     );
   };
-  // Validate history before touching an independent store, without holding shared -> agent locks.
+  // Check admission now; hold shared state only for commit so maintenance heartbeats can run.
   withRegistrationFence(() => undefined);
   if (db.location()) {
     maintenanceAuthority.invalidateOpenClawAgentDatabaseIntegrityBeforeMutation(pathname);
@@ -668,7 +668,7 @@ export function* ensureOpenClawAgentDatabaseSchemaSteps(
   assertExistingAgentSchemaOwner(readExistingAgentSchemaMeta(db), agentId, pathname);
   const withIntegrityMutation: AgentSchemaMutationGuard = (run) =>
     deletionFence
-      ? runSqliteImmediateTransactionSync(db, () => withRegistrationFence(run), {
+      ? runSqliteImmediateTransactionSync(db, run, {
           databaseLabel: pathname,
           operationLabel: "agent.schema.integrity",
           withCommit: withRegistrationFence,
@@ -729,12 +729,7 @@ export function* ensureOpenClawAgentDatabaseSchemaSteps(
     admittedDb = db;
   }
   if (databaseOptions.register === true) {
-    registerOpenClawAgentDatabase({
-      agentId,
-      path: pathname,
-      env: databaseOptions.env,
-      admittedDb,
-    });
+    registerOpenClawAgentDatabase({ agentId, path: pathname, env: options.env, admittedDb });
   }
 }
 
