@@ -1,4 +1,3 @@
-// Hooks CLI tests cover hook command registration and output behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
@@ -26,7 +25,6 @@ const hook: HookStatusEntry = {
   name: "session-memory",
   description: "Save session context to memory",
   source: "openclaw-bundled",
-  pluginId: undefined,
   filePath: "/tmp/hooks/session-memory/HOOK.md",
   baseDir: "/tmp/hooks/session-memory",
   handlerPath: "/tmp/hooks/session-memory/handler.js",
@@ -39,7 +37,6 @@ const hook: HookStatusEntry = {
   enabledByConfig: true,
   requirementsSatisfied: true,
   loadable: true,
-  blockedReason: undefined,
   managedByPlugin: false,
   ...createEmptyInstallChecks(),
 };
@@ -51,6 +48,16 @@ function withHook(overrides: Partial<HookStatusEntry> = {}): HookStatusReport {
   };
 }
 const eventless = withHook({ events: [], loadable: false, blockedReason: "no events defined" });
+const list = (overrides: Partial<HookStatusEntry>, verbose = true) =>
+  formatHooksList(withHook(overrides), { verbose });
+const info = (overrides: Partial<HookStatusEntry>) =>
+  formatHookInfo({ ...hook, ...overrides }, overrides.name ?? hook.name, {});
+
+function hooksProgram() {
+  const program = new Command().enablePositionalOptions().exitOverride();
+  registerHooksCli(program);
+  return program;
+}
 
 beforeEach(() => {
   runPluginInstallCommandMock.mockReset();
@@ -58,56 +65,71 @@ beforeEach(() => {
 });
 
 describe("hooks cli formatting", () => {
-  it("shows eventless hooks as blocked by their event declaration in verbose list output", () => {
-    const output = formatHooksList(eventless, { verbose: true });
-
-    expect(output).toContain("0/1 ready");
-    expect(output).toContain("no events defined");
-    expect(output).not.toContain("missing requirements");
-  });
-
-  it("does not report disabled hook policy as a missing requirement", () => {
-    const disabledReport = withHook({
-      enabledByConfig: false,
-      loadable: false,
-      blockedReason: "workspace hook (disabled by default)",
-    });
-    const output = formatHooksList(disabledReport, { verbose: true });
-    expect(output).toContain("disabled");
-    expect(output).not.toContain("workspace hook");
-  });
-
-  it("shows eventless hooks as blocked by their event declaration in info output", () => {
-    const output = formatHookInfo(eventless.hooks[0], "session-memory", {});
-
-    expect(output).toContain("No events defined");
-    expect(output).toContain("Blocked reason: no events defined");
-    expect(output).not.toContain("Missing requirements");
-  });
-
-  it("keeps missing requirement hooks labeled as missing requirements in info output", () => {
-    const output = formatHookInfo(
-      withHook({
-        requirementsSatisfied: false,
-        loadable: false,
-        blockedReason: "missing requirements",
-        requirements: { ...hook.requirements, env: ["DEMO_HOOK_TOKEN"] },
-        missing: { ...hook.missing, env: ["DEMO_HOOK_TOKEN"] },
-      }).hooks[0],
-      "session-memory",
-      {},
-    );
-
-    expect(output).toContain("Missing requirements");
-    expect(output).toContain("DEMO_HOOK_TOKEN");
-  });
-
-  it("classifies eventless hooks as not ready in human check output", () => {
-    const output = formatHooksCheck(eventless, {});
-
-    expect(output).toContain("Ready: 0");
-    expect(output).toContain("Not ready: 1");
-    expect(output).toContain("session-memory - no events defined");
+  it.each<[name: string, render: () => string, includes: string[], excludes?: string[]]>([
+    [
+      "eventless list",
+      () => formatHooksList(eventless, { verbose: true }),
+      ["0/1 ready", "no events defined"],
+      ["missing requirements"],
+    ],
+    [
+      "disabled list",
+      () =>
+        list({
+          enabledByConfig: false,
+          loadable: false,
+          blockedReason: "workspace hook (disabled by default)",
+        }),
+      ["disabled"],
+      ["workspace hook"],
+    ],
+    [
+      "plugin-managed list",
+      () =>
+        list({ source: "openclaw-plugin", pluginId: "voice-call", managedByPlugin: true }, false),
+      ["plugin:voice-call"],
+    ],
+    [
+      "eventless info",
+      () => formatHookInfo(eventless.hooks[0], "session-memory", {}),
+      ["No events defined", "Blocked reason: no events defined"],
+      ["Missing requirements"],
+    ],
+    [
+      "missing requirements info",
+      () =>
+        info({
+          requirementsSatisfied: false,
+          loadable: false,
+          blockedReason: "missing requirements",
+          requirements: { ...hook.requirements, env: ["DEMO_HOOK_TOKEN"] },
+          missing: { ...hook.missing, env: ["DEMO_HOOK_TOKEN"] },
+        }),
+      ["Missing requirements", "DEMO_HOOK_TOKEN"],
+    ],
+    [
+      "unknown events info",
+      () =>
+        info({
+          name: "typo-hook",
+          events: ["command:nwe", "command:new"],
+          unknownEvents: ["command:nwe"],
+        }),
+      ["Event not emitted by core (likely typo): command:nwe"],
+    ],
+    [
+      "eventless check",
+      () => formatHooksCheck(eventless, {}),
+      ["Ready: 0", "Not ready: 1", "session-memory - no events defined"],
+    ],
+  ])("formats %s", (_name, render, includes, excludes = []) => {
+    const output = render();
+    for (const text of includes) {
+      expect(output).toContain(text);
+    }
+    for (const text of excludes) {
+      expect(output).not.toContain(text);
+    }
   });
 
   it("classifies eventless hooks as not eligible in JSON check output", () => {
@@ -129,117 +151,86 @@ describe("hooks cli formatting", () => {
     });
   });
 
-  it("labels plugin-managed hooks with plugin id", () => {
-    const pluginReport = withHook({
-      source: "openclaw-plugin",
-      pluginId: "voice-call",
-      managedByPlugin: true,
-    });
-
-    const output = formatHooksList(pluginReport, {});
-    expect(output).toContain("plugin:voice-call");
-  });
-
-  it("warns about unknown events in hook info", () => {
-    const typoReport = withHook({
-      name: "typo-hook",
-      events: ["command:nwe", "command:new"],
-      unknownEvents: ["command:nwe"],
-    });
-
-    const output = formatHookInfo(typoReport.hooks[0], "typo-hook", {});
-    expect(output).toContain("Event not emitted by core (likely typo): command:nwe");
-  });
-
-  it("forwards install-policy acknowledgement through the deprecated install alias", async () => {
-    runPluginInstallCommandMock.mockResolvedValueOnce(undefined);
-    const program = new Command().exitOverride();
-    registerHooksCli(program);
-
-    await program.parseAsync(
-      ["hooks", "install", "npm:demo-hooks", "--force", "--acknowledge-install-policy-warning"],
-      { from: "user" },
-    );
-
-    expect(runPluginInstallCommandMock).toHaveBeenCalledWith({
-      raw: "npm:demo-hooks",
-      allowInstallPolicyWarningPrompt: true,
-      opts: expect.objectContaining({ force: true, acknowledgeInstallPolicyWarning: true }),
-      invalidateRuntimeCache: false,
-    });
-  });
-
-  it("forwards install-policy acknowledgement through the deprecated update alias", async () => {
-    runPluginUpdateCommandMock.mockResolvedValueOnce(undefined);
-    const program = new Command().exitOverride();
-    registerHooksCli(program);
-
-    await program.parseAsync(
-      ["hooks", "update", "demo-hooks", "--acknowledge-install-policy-warning"],
-      { from: "user" },
-    );
-
-    expect(runPluginUpdateCommandMock).toHaveBeenCalledWith({
-      ids: ["demo-hooks"],
-      opts: expect.objectContaining({ acknowledgeInstallPolicyWarning: true }),
-    });
-  });
+  it.each([
+    {
+      args: ["install", "npm:demo-hooks", "--force"],
+      mock: runPluginInstallCommandMock,
+      expected: {
+        raw: "npm:demo-hooks",
+        allowInstallPolicyWarningPrompt: true,
+        opts: expect.objectContaining({ force: true, acknowledgeInstallPolicyWarning: true }),
+        invalidateRuntimeCache: false,
+      },
+    },
+    {
+      args: ["update", "demo-hooks"],
+      mock: runPluginUpdateCommandMock,
+      expected: {
+        ids: ["demo-hooks"],
+        opts: expect.objectContaining({ acknowledgeInstallPolicyWarning: true }),
+      },
+    },
+  ])(
+    "forwards install-policy acknowledgement through deprecated $args",
+    async ({ args, mock, expected }) => {
+      mock.mockResolvedValueOnce(undefined);
+      await hooksProgram().parseAsync(["hooks", ...args, "--acknowledge-install-policy-warning"], {
+        from: "user",
+      });
+      expect(mock).toHaveBeenCalledWith(expected);
+    },
+  );
 });
 
-describe("hooks config write ownership", () => {
-  it("preserves env references while disable waits for the write lock", async () => {
-    await withOpenClawTestState(
-      {
-        label: "hook-write-env",
-        env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1", OPENCLAW_TEST_HOOK_PREFIX: "before-lock" },
-      },
-      async (state) => {
-        const hookDir = path.join(state.workspaceDir, "hooks", "fixture-hook");
-        await fs.mkdir(hookDir, { recursive: true });
-        await fs.writeFile(
-          path.join(hookDir, "HOOK.md"),
-          '---\nname: fixture-hook\ndescription: Fixture hook\nmetadata: {"openclaw":{"events":["command:new"]}}\n---\n',
-        );
-        await fs.writeFile(
-          path.join(hookDir, "handler.js"),
-          "export default async function () {}\n",
-        );
-        await state.writeConfig({
-          messages: { responsePrefix: "${OPENCLAW_TEST_HOOK_PREFIX}" },
-          agents: {
-            ownership: "explicit",
-            entries: { fixture: { workspace: state.workspaceDir } },
-            defaults: { systemAgent: { agentId: "fixture" } },
+it("preserves env references while disable waits for the write lock", async () => {
+  await withOpenClawTestState(
+    {
+      label: "hook-write-env",
+      env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1", OPENCLAW_TEST_HOOK_PREFIX: "before-lock" },
+    },
+    async (state) => {
+      const hookDir = path.join(state.workspaceDir, "hooks", "fixture-hook");
+      await fs.mkdir(hookDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hookDir, "HOOK.md"),
+        '---\nname: fixture-hook\ndescription: Fixture hook\nmetadata: {"openclaw":{"events":["command:new"]}}\n---\n',
+      );
+      await fs.writeFile(path.join(hookDir, "handler.js"), "export default async function () {}\n");
+      await state.writeConfig({
+        messages: { responsePrefix: "${OPENCLAW_TEST_HOOK_PREFIX}" },
+        agents: {
+          ownership: "explicit",
+          entries: { fixture: { workspace: state.workspaceDir } },
+          defaults: { systemAgent: { agentId: "fixture" } },
+        },
+        hooks: {
+          internal: {
+            enabled: true,
+            entries: { "fixture-hook": { enabled: true } },
           },
-          hooks: {
-            internal: {
-              enabled: true,
-              entries: { "fixture-hook": { enabled: true } },
-            },
-          },
-        });
-        const raw = await fs.readFile(state.configPath, "utf8");
-        const program = new Command().enablePositionalOptions();
-        registerHooksCli(program);
-        await withContendedConfigMutation(
-          state.configPath,
-          () =>
-            program.parseAsync(["hooks", "disable", "fixture-hook", "--agent", "fixture"], {
-              from: "user",
-            }),
-          async () => {
-            expect(await fs.readFile(state.configPath, "utf8")).toBe(raw);
-            process.env.OPENCLAW_TEST_HOOK_PREFIX = "after-lock";
-          },
-        );
-        expect(JSON.parse(await fs.readFile(state.configPath, "utf8"))).toMatchObject({
-          messages: { responsePrefix: "${OPENCLAW_TEST_HOOK_PREFIX}" },
-          hooks: { internal: { entries: { "fixture-hook": { enabled: false } } } },
-        });
-        const fresh = await readConfigFileSnapshot();
-        expect(fresh.valid).toBe(true);
-        expect(fresh.sourceConfig.messages?.responsePrefix).toBe("after-lock");
-      },
-    );
-  });
+        },
+      });
+      const raw = await fs.readFile(state.configPath, "utf8");
+      const program = hooksProgram();
+      await withContendedConfigMutation(
+        state.configPath,
+        () =>
+          program.parseAsync(["hooks", "disable", "fixture-hook", "--agent", "fixture"], {
+            from: "user",
+          }),
+        async () => {
+          expect(await fs.readFile(state.configPath, "utf8")).toBe(raw);
+          process.env.OPENCLAW_TEST_HOOK_PREFIX = "after-lock";
+        },
+      );
+      expect(JSON.parse(await fs.readFile(state.configPath, "utf8"))).toMatchObject({
+        messages: { responsePrefix: "${OPENCLAW_TEST_HOOK_PREFIX}" },
+        hooks: { internal: { entries: { "fixture-hook": { enabled: false } } } },
+      });
+      expect(await readConfigFileSnapshot()).toMatchObject({
+        valid: true,
+        sourceConfig: { messages: { responsePrefix: "after-lock" } },
+      });
+    },
+  );
 });

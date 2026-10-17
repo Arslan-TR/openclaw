@@ -1,4 +1,3 @@
-// Hooks CLI process tests join plugin-owned handles and reject forced process exit.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
@@ -21,6 +20,7 @@ import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import { getFreePort } from "../test-utils/ports.js";
 import { cliRecoveryEntrypoints } from "./cli-entrypoint.test-support.js";
+import { writeCliPluginFixture, writeFixtureJson } from "./cli-fixtures.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const activeChildren = new Set<ChildProcessWithoutNullStreams>();
@@ -49,27 +49,10 @@ async function createLingeringPluginFixture() {
   const pluginDir = path.join(root, "linger-plugin");
   const markerPath = path.join(root, "registered");
   await fs.mkdir(stateDir, { recursive: true });
-  await fs.mkdir(pluginDir, { recursive: true });
-  await fs.writeFile(
-    path.join(pluginDir, "package.json"),
-    JSON.stringify({
-      name: "linger-plugin",
-      version: "1.0.0",
-      type: "module",
-      openclaw: { extensions: ["./index.js"] },
-    }),
-  );
-  await fs.writeFile(
-    path.join(pluginDir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id: "linger",
-      name: "Linger",
-      activation: { onCapabilities: ["hook"] },
-      configSchema: { type: "object", additionalProperties: false, properties: {} },
-    }),
-  );
-  await fs.writeFile(
-    path.join(pluginDir, "index.js"),
+  await writeCliPluginFixture(
+    pluginDir,
+    "linger-plugin",
+    { id: "linger", name: "Linger", activation: { onCapabilities: ["hook"] } },
     [
       'import fs from "node:fs";',
       "export default {",
@@ -86,15 +69,12 @@ async function createLingeringPluginFixture() {
     ].join("\n"),
   );
   const configPath = path.join(stateDir, "openclaw.json");
-  await fs.writeFile(
-    configPath,
-    JSON.stringify({
-      plugins: {
-        load: { paths: [pluginDir] },
-        entries: { linger: { enabled: true } },
-      },
-    }),
-  );
+  await writeFixtureJson(configPath, {
+    plugins: {
+      load: { paths: [pluginDir] },
+      entries: { linger: { enabled: true } },
+    },
+  });
   return { configPath, markerPath, stateDir };
 }
 
@@ -194,7 +174,6 @@ async function runHooksCli(params: {
   nodeExecutable?: string;
   stdin?: string;
 }) {
-  const startedAt = performance.now();
   const child = spawn(
     params.nodeExecutable ?? process.execPath,
     [
@@ -227,21 +206,14 @@ async function runHooksCli(params: {
   }>((resolve, reject) => {
     let timedOut = false;
     let outputObserved = false;
-    let outputAfterMs: number | null = null;
-    let exit: { afterMs: number; code: number | null; signal: NodeJS.Signals | null } | null = null;
     const processState = () => ({
-      afterMs: Math.round(performance.now() - startedAt),
-      outputAfterMs,
-      exit,
+      outputObserved,
       exitCode: child.exitCode,
       signalCode: child.signalCode,
       stdoutClosed: child.stdout.closed,
       stderrClosed: child.stderr.closed,
     });
     let timeoutState: ReturnType<typeof processState> | undefined;
-    child.once("exit", (code, signal) => {
-      exit = { afterMs: Math.round(performance.now() - startedAt), code, signal };
-    });
     const onTimeout = () => {
       timedOut = true;
       timeoutState ??= processState();
@@ -253,7 +225,6 @@ async function runHooksCli(params: {
     let timer = setTimeout(onTimeout, initialTimeoutMs);
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
-      outputAfterMs ??= Math.round(performance.now() - startedAt);
       if (timedOut || params.completion === "exit" || outputObserved) {
         return;
       }
@@ -276,7 +247,7 @@ async function runHooksCli(params: {
         const timeoutMessage =
           params.completion === "exit"
             ? `${params.label} did not exit within ${exitOnlyTimeoutMs}ms`
-            : timeoutState?.outputAfterMs != null
+            : timeoutState?.outputObserved
               ? `${params.label} did not exit within ${exitAfterOutputTimeoutMs}ms after emitting output`
               : `${params.label} did not emit output within ${outputTimeoutMs}ms`;
         reject(

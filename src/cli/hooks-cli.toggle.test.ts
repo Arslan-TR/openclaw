@@ -1,4 +1,3 @@
-// Hook command tests cover metadata config keys and missing-hook exit status.
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GatewayClientRequestError } from "../../packages/gateway-client/src/request-error.js";
@@ -188,6 +187,13 @@ async function expectToggleFailure(command: string, identifier: string, message:
   expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
 }
 
+function expectOneShotOutput(json: boolean, code: number) {
+  expect(capture.runtimeLogs).toHaveLength(1);
+  expect(capture.defaultRuntime.writeStdout).toHaveBeenCalledTimes(json ? 1 : 0);
+  expect(mocks.requestExitAfterOneShotOutput).toHaveBeenCalledWith(capture.defaultRuntime, code);
+  expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
+}
+
 function createGatewayCloseError(code = 1006) {
   return new GatewayTransportError({
     kind: "closed",
@@ -344,20 +350,16 @@ describe("hooks CLI metadata config keys", () => {
 
       await runHooks(...argv(identifier, output));
 
-      expect(capture.runtimeLogs).toHaveLength(1);
+      expectOneShotOutput(json, 0);
       if (json) {
         expect(JSON.parse(capture.runtimeLogs[0] ?? "")).toMatchObject({
           name: selected.name,
           hookKey: selected.hookKey,
         });
-        expect(capture.defaultRuntime.writeStdout).toHaveBeenCalledOnce();
       } else {
         expect(capture.runtimeLogs[0]).toContain(`${selected.name} `);
         expect(capture.runtimeLogs[0]).not.toContain("another-hook");
-        expect(capture.defaultRuntime.writeStdout).not.toHaveBeenCalled();
       }
-      expect(mocks.requestExitAfterOneShotOutput).toHaveBeenCalledWith(capture.defaultRuntime, 0);
-      expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
       expect(capture.runtimeErrors).toEqual([]);
     });
 
@@ -367,22 +369,18 @@ describe("hooks CLI metadata config keys", () => {
         const json = output !== "human";
         await runHooks(...argv("missing-hook", output));
 
-        expect(capture.runtimeLogs).toHaveLength(1);
+        expectOneShotOutput(json, 1);
         if (json) {
           expect(JSON.parse(capture.runtimeLogs[0] ?? "")).toEqual({
             ok: false,
             error: { type: "cli_error", message: 'Hook "missing-hook" not found.' },
             hook: "missing-hook",
           });
-          expect(capture.defaultRuntime.writeStdout).toHaveBeenCalledOnce();
         } else {
           expect(capture.runtimeLogs[0]).toBe(
             'Hook "missing-hook" not found. Run `openclaw hooks list` to see available hooks.',
           );
-          expect(capture.defaultRuntime.writeStdout).not.toHaveBeenCalled();
         }
-        expect(mocks.requestExitAfterOneShotOutput).toHaveBeenCalledWith(capture.defaultRuntime, 1);
-        expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
       },
     );
   });
@@ -470,21 +468,10 @@ describe("hooks CLI metadata config keys", () => {
     await runHooks("--agent", "research", "enable", "display-name");
     expect(mocks.resolveDefaultAgentId).not.toHaveBeenCalled();
     expect(mocks.resolveAgentWorkspaceDir).toHaveBeenCalledWith(explicitFleet, "research");
+    const nextConfig = structuredClone(explicitFleet);
+    Object.assign(nextConfig.hooks.internal.entries["metadata-key"], { enabled: true });
     expect(mocks.replaceConfigFile).toHaveBeenCalledWith({
-      nextConfig: {
-        ...explicitFleet,
-        hooks: {
-          internal: {
-            enabled: true,
-            entries: {
-              "metadata-key": {
-                env: { HOOK_ENV: "preserved" },
-                enabled: true,
-              },
-            },
-          },
-        },
-      },
+      nextConfig,
       baseHash: "config-hash",
     });
   });

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { createFixtureLifetime } from "../../test/helpers/fixture-lifetime.js";
 import {
   createBuiltRuntime,
@@ -121,16 +121,16 @@ if (threads.isMainThread) record("ready");
       }),
     }),
     run: (args: string[]) =>
-      source
-        ? tempDirs.track(
-            runSourceRuntime(
+      tempDirs.track(
+        source
+          ? runSourceRuntime(
               runtimeRoot,
               childEnv,
               [path.join(runtimeRoot, "src/entry.ts"), ...args],
               CLI_CHILD_TIMEOUT_MS,
-            ),
-          )
-        : tempDirs.track(runBuiltRuntime(runtimeRoot, childEnv, args, CLI_CHILD_TIMEOUT_MS)),
+            )
+          : runBuiltRuntime(runtimeRoot, childEnv, args, CLI_CHILD_TIMEOUT_MS),
+      ),
   };
 }
 
@@ -149,54 +149,41 @@ function snapshotState(stateDir: string) {
     });
 }
 
-describe("candidate service capability startup", () => {
-  it(
-    "answers capability and version probes without state writes or locks while a Gateway owns an older schema",
-    async () => {
-      const fixture = createFixture();
-      const before = snapshotState(fixture.stateDir);
-      try {
-        const result = await fixture.run([
-          "gateway",
-          "install",
-          "--update-executor",
-          "check",
-          "--json",
-        ]);
+it(
+  "answers capability and version probes without state writes or locks while a Gateway owns an older schema",
+  async () => {
+    const fixture = createFixture();
+    const before = snapshotState(fixture.stateDir);
+    try {
+      const capability = {
+        updateExecutor: "root-spawner-v1",
+        targetRootBinding: true,
+        definitionBackup: true,
+        retainedOwnerBinding: true,
+        originalDefinitionBinding: true,
+        originalRuntimePinBinding: true,
+      };
+      for (const option of [["--update-executor", "check"], ["--update-executor=check"]]) {
+        const result = await fixture.run(["gateway", "install", ...option, "--json"]);
         expect(result.code, `${result.stderr}\n${result.stdout}`).toBe(0);
-        expect(JSON.parse(result.stdout)).toEqual({
-          updateExecutor: "root-spawner-v1",
-          targetRootBinding: true,
-          definitionBackup: true,
-          retainedOwnerBinding: true,
-          originalDefinitionBinding: true,
-          originalRuntimePinBinding: true,
-        });
-        const locked = await fixture.run([
-          "gateway",
-          "install",
-          "--update-executor=check",
-          "--json",
-        ]);
-        expect(locked.code, locked.stderr).toBe(0);
-        expect(JSON.parse(locked.stdout)).toEqual(JSON.parse(result.stdout));
-        const version = await fixture.run(["--version"]);
-        expect(version.code, version.stderr).toBe(0);
-        expect(version.stdout).toMatch(/^OpenClaw /u);
-        expect(fixture.probeOperations()).toEqual(["ready", "ready", "ready"]);
-        expect(snapshotState(fixture.stateDir)).toEqual(before);
-        const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
-        try {
-          expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
-            OPENCLAW_STATE_SCHEMA_VERSION - 1,
-          );
-        } finally {
-          database.close();
-        }
-      } finally {
-        fixture.gateway.release();
+        expect(JSON.parse(result.stdout)).toEqual(capability);
       }
-    },
-    getCliProcessTestTimeout(CLI_CHILD_TIMEOUT_MS, CLI_CHILD_TIMEOUT_MS, CLI_CHILD_TIMEOUT_MS),
-  );
-});
+      const version = await fixture.run(["--version"]);
+      expect(version.code, version.stderr).toBe(0);
+      expect(version.stdout).toMatch(/^OpenClaw /u);
+      expect(fixture.probeOperations()).toEqual(["ready", "ready", "ready"]);
+      expect(snapshotState(fixture.stateDir)).toEqual(before);
+      const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+      try {
+        expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
+          OPENCLAW_STATE_SCHEMA_VERSION - 1,
+        );
+      } finally {
+        database.close();
+      }
+    } finally {
+      fixture.gateway.release();
+    }
+  },
+  getCliProcessTestTimeout(CLI_CHILD_TIMEOUT_MS, CLI_CHILD_TIMEOUT_MS, CLI_CHILD_TIMEOUT_MS),
+);

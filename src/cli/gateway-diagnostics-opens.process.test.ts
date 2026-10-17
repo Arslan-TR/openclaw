@@ -7,6 +7,7 @@ import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { writeCliPluginFixture, writeFixtureJson } from "./cli-fixtures.test-support.js";
 import {
   prepareGatewayCliFixture,
   runIsolatedGatewayCli,
@@ -20,27 +21,11 @@ import {
 async function prepareMessageReadPlugin(root: string): Promise<string> {
   const bundledDir = path.join(root, "extensions");
   const pluginDir = path.join(bundledDir, "discord");
-  await fs.mkdir(pluginDir, { recursive: true });
-  await fs.writeFile(
-    path.join(pluginDir, "package.json"),
-    JSON.stringify({
-      name: "@openclaw/discord",
-      version: "1.0.0",
-      type: "module",
-      openclaw: { extensions: ["./index.js"] },
-    }),
-  );
-  await fs.writeFile(
-    path.join(pluginDir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id: "discord",
-      channels: ["discord"],
-      configSchema: { type: "object", properties: {}, additionalProperties: false },
-    }),
-  );
   // Exercise discovery and Gateway routing without requiring built plugin SDK artifacts.
-  await fs.writeFile(
-    path.join(pluginDir, "index.js"),
+  await writeCliPluginFixture(
+    pluginDir,
+    "@openclaw/discord",
+    { id: "discord", channels: ["discord"] },
     `const plugin = {
   id: "discord",
   meta: { id: "discord", label: "Synthetic Discord", docsPath: "/channels/discord", blurb: "CLI read fixture" },
@@ -86,19 +71,16 @@ it.each([
     auth: token ? { mode: "token", token } : { mode: "none" },
   });
   const config = JSON.parse(await fs.readFile(configPath, "utf8"));
-  await fs.writeFile(
-    configPath,
-    JSON.stringify({
-      ...config,
-      ...(message
-        ? {
-            agents: { entries: { main: {} } },
-            channels: { discord: { enabled: true, token: "synthetic-discord-token" } },
-          }
-        : {}),
-      diagnostics: { flags: ["timeline"] },
-    }),
-  );
+  await writeFixtureJson(configPath, {
+    ...config,
+    ...(message
+      ? {
+          agents: { entries: { main: {} } },
+          channels: { discord: { enabled: true, token: "synthetic-discord-token" } },
+        }
+      : {}),
+    diagnostics: { flags: ["timeline"] },
+  });
   const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
   openOpenClawStateDatabase({ path: databasePath });
   closeOpenClawStateDatabaseForTest();
