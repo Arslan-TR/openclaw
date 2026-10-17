@@ -43,11 +43,7 @@ async function terminateChild(child: ChildProcessWithoutNullStreams): Promise<vo
   await once(child, "close");
 }
 
-async function createLingeringPluginFixture(): Promise<{
-  configPath: string;
-  markerPath: string;
-  stateDir: string;
-}> {
+async function createLingeringPluginFixture() {
   const root = tempDirs.make("openclaw-hooks-cli-");
   const stateDir = path.join(root, "state");
   const pluginDir = path.join(root, "linger-plugin");
@@ -104,11 +100,7 @@ async function createLingeringPluginFixture(): Promise<{
 
 async function createRelayPreloadFixture(
   mode: "natural-exit" | "missing-drain-callbacks" = "natural-exit",
-): Promise<{
-  markerPath: string;
-  preloadPath: string;
-  stateDir: string;
-}> {
+) {
   const root = tempDirs.make("openclaw-hooks-relay-");
   const markerPath = path.join(root, "loaded");
   const preloadPath = path.join(root, "natural-exit.mjs");
@@ -134,13 +126,7 @@ async function createRelayPreloadFixture(
   return { markerPath, preloadPath, stateDir };
 }
 
-async function createTimeoutOwnershipFixture(): Promise<{
-  nodeWrapperPath: string;
-  pidLogPath: string;
-  preloadPath: string;
-  readyMarkerPath: string;
-  stateDir: string;
-}> {
+async function createTimeoutOwnershipFixture() {
   const root = tempDirs.make("openclaw-hooks-timeout-owner-");
   const nodeWrapperPath = path.join(root, "node-with-tsx");
   const pidLogPath = path.join(root, "pids");
@@ -179,6 +165,14 @@ async function readPidFile(filePath: string): Promise<number[]> {
   } catch {
     return [];
   }
+}
+
+function relayEnv(fixture: Awaited<ReturnType<typeof createRelayPreloadFixture>>) {
+  return {
+    LINGER_MARKER: fixture.markerPath,
+    NODE_OPTIONS: `--import=${pathToFileURL(fixture.preloadPath).href}`,
+    OPENCLAW_STATE_DIR: fixture.stateDir,
+  };
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -333,11 +327,7 @@ describe("hooks CLI process lifecycle", () => {
         completion: "exit",
         label: "dedicated relay error",
         nodeExecutable: resolveTestNodeExecPath(),
-        env: {
-          LINGER_MARKER: fixture.markerPath,
-          NODE_OPTIONS: `--import=${pathToFileURL(fixture.preloadPath).href}`,
-          OPENCLAW_STATE_DIR: fixture.stateDir,
-        },
+        env: relayEnv(fixture),
       });
       expect(result, result.stderr).toMatchObject({ code: 1, signal: null });
       expect(result.stdout).toBe("");
@@ -462,17 +452,13 @@ describe("hooks CLI process lifecycle", () => {
         label: "hooks relay explicit state database",
         nodeExecutable: resolveTestNodeExecPath(),
         env: {
-          LINGER_MARKER: fixture.markerPath,
-          NODE_OPTIONS: `--import=${pathToFileURL(fixture.preloadPath).href}`,
+          ...relayEnv(fixture),
           OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-          OPENCLAW_STATE_DIR: fixture.stateDir,
         },
         stdin: JSON.stringify({ hook_event_name: "PostToolUse" }),
       });
 
-      expect(result, result.stderr).toMatchObject({ code: 0, signal: null });
-      expect(result.stderr).toBe("");
-      expect(result.stdout).toBe("");
+      expect(result, result.stderr).toEqual({ code: 0, signal: null, stderr: "", stdout: "" });
       await expect(fs.readFile(fixture.markerPath, "utf8")).resolves.toBe("loaded\n");
     },
     90_000,

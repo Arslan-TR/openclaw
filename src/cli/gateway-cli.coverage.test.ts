@@ -123,6 +123,33 @@ function firstMockArg(mock: { mock: { calls: ReadonlyArray<ReadonlyArray<unknown
   return call[0];
 }
 
+async function expectJsonValidationFailure(args: string[], message: unknown) {
+  await expectGatewayExit(["gateway", ...args, "--json"]);
+  expect(callGateway).not.toHaveBeenCalled();
+  expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
+    ok: false,
+    error: { type: "cli_error", message },
+  });
+  expect(runtimeErrors).toHaveLength(0);
+}
+
+function costTotals(overrides: Partial<CostUsageSummary["totals"]>): CostUsageSummary["totals"] {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    totalCost: 0,
+    inputCost: 0,
+    outputCost: 0,
+    cacheReadCost: 0,
+    cacheWriteCost: 0,
+    missingCostEntries: 0,
+    ...overrides,
+  };
+}
+
 describe("gateway-cli coverage", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
@@ -212,23 +239,15 @@ describe("gateway-cli coverage", () => {
       updatedAt: 1,
       days: 7,
       daily: [],
-      totals: {
+      totals: costTotals({
         input: 12,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
         totalTokens: 12,
-        totalCost: 0,
-        inputCost: 0,
-        outputCost: 0,
-        cacheReadCost: 0,
-        cacheWriteCost: 0,
         missingCostEntries: 12,
         missingCostByModel: {
           "openai/gpt-5.6-sol": 10,
           "openai-codex/gpt-5.5": 2,
         },
-      },
+      }),
       cacheStatus: {
         status: "fresh",
         cachedFiles: 1,
@@ -244,90 +263,59 @@ describe("gateway-cli coverage", () => {
     );
   });
 
-  it.each([true])(
-    "preserves the first partial usage-cost result (unavailable: %s)",
-    async (unavailable) => {
-      const totals = {
-        input: 100,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 100,
-        totalCost: 0.1,
-        inputCost: 0.1,
-        outputCost: 0,
-        cacheReadCost: 0,
-        cacheWriteCost: 0,
-        missingCostEntries: 0,
-        ...(unavailable ? { usageReport: { state: "unavailable" as const } } : {}),
-      };
-      const summary: CostUsageSummary = {
-        updatedAt: 1,
-        days: 7,
-        daily: [{ date: "2026-09-01", ...totals }],
-        totals,
-        cacheStatus: { status: "partial", cachedFiles: 1, pendingFiles: 2, staleFiles: 2 },
-      };
-      callGateway.mockResolvedValue(summary);
-
-      await runGatewayCommand(["gateway", "usage-cost", "--all-agents", "--days", "7"]);
-
-      expect(callGateway).toHaveBeenCalledOnce();
-      expect(firstMockArg(callGateway)).toMatchObject({
-        method: "usage.cost",
-        params: { days: 7, agentScope: "all" },
-        timeoutMs: 10_000,
-      });
-      const output = runtimeLogs.join("\n");
-      const figures = unavailable
-        ? "unavailable (known subtotal: $0.10 · 100 tokens)"
-        : "$0.10 · 100 tokens";
-      expect(output).toContain(`Total: ${figures}`);
-      expect(output).toContain(`Latest day: 2026-09-01 · ${figures}`);
-      expect(output).toContain(
-        `Usage totals may be incomplete (partial). Run this command again later.\nTotal: ${figures}`,
-      );
-    },
-  );
-
-  it("rejects combining --agent with --all-agents for usage-cost", async () => {
-    await expectGatewayExit([
-      "gateway",
-      "usage-cost",
-      "--agent",
-      "alpha",
-      "--all-agents",
-      "--json",
-    ]);
-
-    expect(callGateway).not.toHaveBeenCalled();
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
-      ok: false,
-      error: { type: "cli_error", message: "Use --agent or --all-agents, not both" },
+  it("preserves the first unavailable partial usage-cost result", async () => {
+    const totals = costTotals({
+      input: 100,
+      totalTokens: 100,
+      totalCost: 0.1,
+      inputCost: 0.1,
+      usageReport: { state: "unavailable" },
     });
-    expect(runtimeErrors).toHaveLength(0);
+    const summary: CostUsageSummary = {
+      updatedAt: 1,
+      days: 7,
+      daily: [{ date: "2026-09-01", ...totals }],
+      totals,
+      cacheStatus: { status: "partial", cachedFiles: 1, pendingFiles: 2, staleFiles: 2 },
+    };
+    callGateway.mockResolvedValue(summary);
+
+    await runGatewayCommand(["gateway", "usage-cost", "--all-agents", "--days", "7"]);
+
+    expect(callGateway).toHaveBeenCalledOnce();
+    expect(firstMockArg(callGateway)).toMatchObject({
+      method: "usage.cost",
+      params: { days: 7, agentScope: "all" },
+      timeoutMs: 10_000,
+    });
+    const output = runtimeLogs.join("\n");
+    const figures = "unavailable (known subtotal: $0.10 · 100 tokens)";
+    expect(output).toContain(`Total: ${figures}`);
+    expect(output).toContain(`Latest day: 2026-09-01 · ${figures}`);
+    expect(output).toContain(
+      `Usage totals may be incomplete (partial). Run this command again later.\nTotal: ${figures}`,
+    );
   });
 
-  it.each(["7d"])("rejects malformed usage-cost --days %j", async (days) => {
-    await expectGatewayExit(["gateway", "usage-cost", "--days", days, "--json"]);
+  it("rejects combining --agent with --all-agents for usage-cost", async () => {
+    await expectJsonValidationFailure(
+      ["usage-cost", "--agent", "alpha", "--all-agents"],
+      "Use --agent or --all-agents, not both",
+    );
+  });
 
-    expect(callGateway).not.toHaveBeenCalled();
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
-      ok: false,
-      error: { type: "cli_error", message: expect.stringContaining("Invalid --days") },
-    });
-    expect(runtimeErrors).toHaveLength(0);
+  it("rejects malformed usage-cost --days", async () => {
+    await expectJsonValidationFailure(
+      ["usage-cost", "--days", "7d"],
+      expect.stringContaining("Invalid --days"),
+    );
   });
 
   it("rejects a malformed health --timeout before calling Gateway", async () => {
-    await expectGatewayExit(["gateway", "health", "--timeout", "abc", "--json"]);
-
-    expect(callGateway).not.toHaveBeenCalled();
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
-      ok: false,
-      error: { type: "cli_error", message: expect.stringContaining("Invalid --timeout") },
-    });
-    expect(runtimeErrors).toHaveLength(0);
+    await expectJsonValidationFailure(
+      ["health", "--timeout", "abc"],
+      expect.stringContaining("Invalid --timeout"),
+    );
   });
 
   it("writes JSON for gateway health transport failures in JSON mode", async () => {
@@ -746,20 +734,9 @@ describe("gateway-cli coverage", () => {
   );
 
   it("renders invalid gateway call params as JSON before calling Gateway", async () => {
-    await expectGatewayExit([
-      "gateway",
-      "call",
-      "system-presence",
-      "--params",
-      "not-json",
-      "--json",
-    ]);
-
-    expect(callGateway).not.toHaveBeenCalled();
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
-      ok: false,
-      error: { type: "cli_error", message: "--params must be valid JSON." },
-    });
-    expect(runtimeErrors).toHaveLength(0);
+    await expectJsonValidationFailure(
+      ["call", "system-presence", "--params", "not-json"],
+      "--params must be valid JSON.",
+    );
   });
 });

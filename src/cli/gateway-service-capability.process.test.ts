@@ -26,7 +26,7 @@ const CLI_CHILD_TIMEOUT_MS = 60_000;
 const tempDirs = createFixtureLifetime();
 afterEach(() => tempDirs.cleanup());
 
-function createFixture({ guardReadOnly = false } = {}) {
+function createFixture() {
   const root = tempDirs.createTempDir("openclaw-service-capability-");
   const stateDir = path.join(root, "state");
   const configPath = path.join(root, "openclaw.json");
@@ -59,10 +59,9 @@ function createFixture({ guardReadOnly = false } = {}) {
   const lockPath = resolveGatewayStateOwnerPath(databasePath);
   const operationsPath = path.join(root, "probe-operations.jsonl");
   const preloadPath = path.join(root, "guard-probe.cjs");
-  if (guardReadOnly) {
-    fs.writeFileSync(
-      preloadPath,
-      `const fs = require("node:fs");
+  fs.writeFileSync(
+    preloadPath,
+    `const fs = require("node:fs");
 const path = require("node:path");
 const threads = require("node:worker_threads");
 const append = fs.appendFileSync;
@@ -96,11 +95,8 @@ threads.Worker = new Proxy(threads.Worker, {
 require("node:module").syncBuiltinESMExports();
 if (threads.isMainThread) record("ready");
 `,
-    );
-  }
-  const childEnv = guardReadOnly
-    ? { ...env, NODE_OPTIONS: `--require ${JSON.stringify(preloadPath)}` }
-    : env;
+  );
+  const childEnv = { ...env, NODE_OPTIONS: `--require ${JSON.stringify(preloadPath)}` };
   const startTime = getFileLockProcessStartTime(process.pid);
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   return {
@@ -157,7 +153,7 @@ describe("candidate service capability startup", () => {
   it(
     "answers capability and version probes without state writes or locks while a Gateway owns an older schema",
     async () => {
-      const fixture = createFixture({ guardReadOnly: true });
+      const fixture = createFixture();
       const before = snapshotState(fixture.stateDir);
       try {
         const result = await fixture.run([

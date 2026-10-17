@@ -29,6 +29,10 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const preparedCliEntry = resolveRuntimeWorkerUrl(cliRecoveryEntrypoints.cli);
 const SLOW_DOTENV_CHILD_PROCESS_TIMEOUT_MS = 240_000;
 const SLOW_DOTENV_TEST_TIMEOUT_MS = SLOW_DOTENV_CHILD_PROCESS_TIMEOUT_MS + 10_000;
+const dotenvLoggingConfig = {
+  logging: { consoleStyle: "${OPENCLAW_TEST_CONSOLE_STYLE}", level: "silent" },
+};
+const dotenvStateEnv = () => ({ OPENCLAW_TEST_CONSOLE_STYLE: "json" });
 const LAZY_GROUP_HELP_CASES = [
   { group: "backup", usageCommand: "backup", registry: "core" },
   { group: "capability", usageCommand: "infer|capability", registry: "subcli" },
@@ -175,19 +179,10 @@ async function runCliProcess(params: {
     timeoutMs: params.timeoutMs,
   });
   const { stdout, stderr } = exit;
-  if (exit.signal) {
+  if (exit.signal || exit.code !== expectedExitCode) {
     throw new Error(
       formatCliProcessFailure({
-        reason: `CLI process was killed by signal ${exit.signal} (expected exit code ${expectedExitCode})`,
-        stderr,
-        stdout,
-      }),
-    );
-  }
-  if (exit.code !== expectedExitCode) {
-    throw new Error(
-      formatCliProcessFailure({
-        reason: `CLI process exited with code ${exit.code} (expected ${expectedExitCode})`,
+        reason: `CLI process exited with code ${exit.code}, signal ${exit.signal} (expected code ${expectedExitCode}, no signal)`,
         stderr,
         stdout,
       }),
@@ -201,6 +196,29 @@ function parseJsonLines(stdout: string): Array<Record<string, unknown>> {
     .split(/\r?\n/u)
     .filter(Boolean)
     .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function captureHelp() {
+  const output = { stdout: "", stderr: "" };
+  const program = new Command()
+    .name("openclaw")
+    .exitOverride()
+    .configureOutput({
+      writeOut: (value) => {
+        output.stdout += value;
+      },
+      writeErr: (value) => {
+        output.stderr += value;
+      },
+    });
+  return { program, output };
+}
+
+async function expectInProcessHelp(program: Command, args: string[], output: { stderr: string }) {
+  const result = await program.parseAsync(args, { from: "user" }).catch((cause: unknown) => cause);
+  expect(result).toBeInstanceOf(CommanderError);
+  expect(result).toMatchObject({ code: "commander.helpDisplayed", exitCode: 0 });
+  expect(output.stderr).toBe("");
 }
 
 describe("CLI help process exit", () => {
@@ -266,33 +284,15 @@ describe("CLI help process exit", () => {
   it.concurrent.each(LAZY_GROUP_HELP_CASES)(
     "renders in-process help for $group",
     async ({ group, usageCommand, registry }) => {
-      let stdout = "";
-      let stderr = "";
-      const program = new Command()
-        .name("openclaw")
-        .exitOverride()
-        .configureOutput({
-          writeOut: (value) => {
-            stdout += value;
-          },
-          writeErr: (value) => {
-            stderr += value;
-          },
-        });
+      const { program, output } = captureHelp();
       const argv = ["node", "openclaw", group, "--help"];
       const registered =
         registry === "core"
           ? await registerCoreCliByName(program, createProgramContext(), group)
           : await registerSubCliByName(program, group, argv);
-      const parseResult = await program
-        .parseAsync(argv.slice(2), { from: "user" })
-        .catch((cause: unknown) => cause);
-
       expect(registered).toBe(true);
-      expect(parseResult).toBeInstanceOf(CommanderError);
-      expect(parseResult).toMatchObject({ code: "commander.helpDisplayed", exitCode: 0 });
-      expect(stderr).toBe("");
-      expect(stdout).toContain(`Usage: openclaw ${usageCommand} [options] [command]`);
+      await expectInProcessHelp(program, argv.slice(2), output);
+      expect(output.stdout).toContain(`Usage: openclaw ${usageCommand} [options] [command]`);
     },
   );
 
@@ -300,35 +300,17 @@ describe("CLI help process exit", () => {
     { args: ["acp", "--help"], usage: "Usage: openclaw acp [options] [command]" },
     { args: ["acp", "client", "--help"], usage: "Usage: openclaw acp client [options]" },
   ])("renders in-process ACP help for $args", async ({ args, usage }) => {
-    let stdout = "";
-    let stderr = "";
+    const { program, output } = captureHelp();
     let actionStarted = false;
-    const program = new Command()
-      .name("openclaw")
-      .exitOverride()
-      .configureOutput({
-        writeOut: (value) => {
-          stdout += value;
-        },
-        writeErr: (value) => {
-          stderr += value;
-        },
-      });
     program.hook("preAction", () => {
       actionStarted = true;
     });
     const argv = ["node", "openclaw", ...args];
 
     const registered = await registerSubCliByName(program, "acp", argv);
-    const parseResult = await program
-      .parseAsync(argv.slice(2), { from: "user" })
-      .catch((cause: unknown) => cause);
-
     expect(registered).toBe(true);
-    expect(parseResult).toBeInstanceOf(CommanderError);
-    expect(parseResult).toMatchObject({ code: "commander.helpDisplayed", exitCode: 0 });
-    expect(stderr).toBe("");
-    expect(stdout.split(/\r?\n/u).find((line) => line.startsWith("Usage:"))).toBe(usage);
+    await expectInProcessHelp(program, argv.slice(2), output);
+    expect(output.stdout.split(/\r?\n/u).find((line) => line.startsWith("Usage:"))).toBe(usage);
     expect(actionStarted).toBe(false);
   });
 });
@@ -636,14 +618,9 @@ describe("JSON console style process output", () => {
     async () => {
       const result = await runCliProcess({
         args: ["--container"],
-        config: {
-          logging: {
-            consoleStyle: "${OPENCLAW_TEST_CONSOLE_STYLE}",
-            level: "silent",
-          },
-        },
+        config: dotenvLoggingConfig,
         env: { OPENCLAW_TEST_CONSOLE_STYLE: undefined },
-        stateEnv: () => ({ OPENCLAW_TEST_CONSOLE_STYLE: "json" }),
+        stateEnv: dotenvStateEnv,
         timeoutMs: SLOW_DOTENV_CHILD_PROCESS_TIMEOUT_MS,
         expectedExitCode: 2,
       });
@@ -663,12 +640,7 @@ describe("JSON console style process output", () => {
     async () => {
       const result = await runCliProcess({
         args: ["gateway", "status"],
-        config: {
-          logging: {
-            consoleStyle: "${OPENCLAW_TEST_CONSOLE_STYLE}",
-            level: "silent",
-          },
-        },
+        config: dotenvLoggingConfig,
         env: {
           OPENCLAW_DEBUG: undefined,
           OPENCLAW_GATEWAY_STARTUP_TRACE: "1",
@@ -676,7 +648,7 @@ describe("JSON console style process output", () => {
           OPENCLAW_UPDATE_IN_PROGRESS: undefined,
         },
         failRunMainImport: true,
-        stateEnv: () => ({ OPENCLAW_TEST_CONSOLE_STYLE: "json" }),
+        stateEnv: dotenvStateEnv,
         timeoutMs: SLOW_DOTENV_CHILD_PROCESS_TIMEOUT_MS,
         expectedExitCode: 1,
       });

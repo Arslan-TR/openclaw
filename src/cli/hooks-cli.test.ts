@@ -1,12 +1,11 @@
 // Hooks CLI tests cover hook command registration and output behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { expectDefined } from "@openclaw/normalization-core";
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { withContendedConfigMutation } from "../../test/helpers/config-mutation-lock.js";
 import { readConfigFileSnapshot } from "../config/config.js";
-import type { HookStatusReport } from "../hooks/hooks-status.js";
+import type { HookStatusEntry, HookStatusReport } from "../hooks/hooks-status.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { formatHookInfo, formatHooksCheck, formatHooksList } from "./hooks-cli.format.js";
 import { registerHooksCli } from "./hooks-cli.js";
@@ -23,100 +22,44 @@ vi.mock("./plugins-update-command.js", () => ({
   runPluginUpdateCommand: runPluginUpdateCommandMock,
 }));
 
-const report: HookStatusReport = {
-  workspaceDir: "/tmp/workspace",
-  managedHooksDir: "/tmp/hooks",
-  hooks: [
-    {
-      name: "session-memory",
-      description: "Save session context to memory",
-      source: "openclaw-bundled",
-      pluginId: undefined,
-      filePath: "/tmp/hooks/session-memory/HOOK.md",
-      baseDir: "/tmp/hooks/session-memory",
-      handlerPath: "/tmp/hooks/session-memory/handler.js",
-      hookKey: "session-memory",
-      emoji: "💾",
-      homepage: "https://docs.openclaw.ai/automation/hooks#session-memory",
-      events: ["command:new"],
-      unknownEvents: [],
-      always: false,
-      enabledByConfig: true,
-      requirementsSatisfied: true,
-      loadable: true,
-      blockedReason: undefined,
-      managedByPlugin: false,
-      ...createEmptyInstallChecks(),
-    },
-  ],
+const hook: HookStatusEntry = {
+  name: "session-memory",
+  description: "Save session context to memory",
+  source: "openclaw-bundled",
+  pluginId: undefined,
+  filePath: "/tmp/hooks/session-memory/HOOK.md",
+  baseDir: "/tmp/hooks/session-memory",
+  handlerPath: "/tmp/hooks/session-memory/handler.js",
+  hookKey: "session-memory",
+  emoji: "💾",
+  homepage: "https://docs.openclaw.ai/automation/hooks#session-memory",
+  events: ["command:new"],
+  unknownEvents: [],
+  always: false,
+  enabledByConfig: true,
+  requirementsSatisfied: true,
+  loadable: true,
+  blockedReason: undefined,
+  managedByPlugin: false,
+  ...createEmptyInstallChecks(),
 };
+function withHook(overrides: Partial<HookStatusEntry> = {}): HookStatusReport {
+  return {
+    workspaceDir: "/tmp/workspace",
+    managedHooksDir: "/tmp/hooks",
+    hooks: [{ ...hook, ...overrides }],
+  };
+}
+const eventless = withHook({ events: [], loadable: false, blockedReason: "no events defined" });
 
 beforeEach(() => {
   runPluginInstallCommandMock.mockReset();
   runPluginUpdateCommandMock.mockReset();
 });
 
-function createPluginManagedHookReport(): HookStatusReport {
-  return {
-    ...report,
-    hooks: [
-      {
-        ...expectDefined(report.hooks[0], "report.hooks[0] test invariant"),
-        name: "plugin-hook",
-        description: "Hook from plugin",
-        source: "openclaw-plugin",
-        pluginId: "voice-call",
-        filePath: "/tmp/hooks/plugin-hook/HOOK.md",
-        baseDir: "/tmp/hooks/plugin-hook",
-        handlerPath: "/tmp/hooks/plugin-hook/handler.js",
-        hookKey: "plugin-hook",
-        emoji: "🔗",
-        homepage: undefined,
-        managedByPlugin: true,
-      },
-    ],
-  };
-}
-
-function createEventlessHookReport(): HookStatusReport {
-  return {
-    ...report,
-    hooks: [
-      {
-        ...expectDefined(report.hooks[0], "report.hooks[0] test invariant"),
-        events: [],
-        loadable: false,
-        blockedReason: "no events defined",
-      },
-    ],
-  };
-}
-
-function createMissingRequirementHookReport(): HookStatusReport {
-  return {
-    ...report,
-    hooks: [
-      {
-        ...expectDefined(report.hooks[0], "report.hooks[0] test invariant"),
-        requirementsSatisfied: false,
-        loadable: false,
-        blockedReason: "missing requirements",
-        requirements: {
-          ...expectDefined(report.hooks[0], "report.hooks[0] test invariant").requirements,
-          env: ["DEMO_HOOK_TOKEN"],
-        },
-        missing: {
-          ...expectDefined(report.hooks[0], "report.hooks[0] test invariant").missing,
-          env: ["DEMO_HOOK_TOKEN"],
-        },
-      },
-    ],
-  };
-}
-
 describe("hooks cli formatting", () => {
   it("shows eventless hooks as blocked by their event declaration in verbose list output", () => {
-    const output = formatHooksList(createEventlessHookReport(), { verbose: true });
+    const output = formatHooksList(eventless, { verbose: true });
 
     expect(output).toContain("0/1 ready");
     expect(output).toContain("no events defined");
@@ -124,24 +67,18 @@ describe("hooks cli formatting", () => {
   });
 
   it("does not report disabled hook policy as a missing requirement", () => {
-    const disabledReport: HookStatusReport = {
-      ...report,
-      hooks: [
-        {
-          ...expectDefined(report.hooks[0], "report.hooks[0] test invariant"),
-          enabledByConfig: false,
-          loadable: false,
-          blockedReason: "workspace hook (disabled by default)",
-        },
-      ],
-    };
+    const disabledReport = withHook({
+      enabledByConfig: false,
+      loadable: false,
+      blockedReason: "workspace hook (disabled by default)",
+    });
     const output = formatHooksList(disabledReport, { verbose: true });
     expect(output).toContain("disabled");
     expect(output).not.toContain("workspace hook");
   });
 
   it("shows eventless hooks as blocked by their event declaration in info output", () => {
-    const output = formatHookInfo(createEventlessHookReport().hooks[0], "session-memory", {});
+    const output = formatHookInfo(eventless.hooks[0], "session-memory", {});
 
     expect(output).toContain("No events defined");
     expect(output).toContain("Blocked reason: no events defined");
@@ -150,7 +87,13 @@ describe("hooks cli formatting", () => {
 
   it("keeps missing requirement hooks labeled as missing requirements in info output", () => {
     const output = formatHookInfo(
-      createMissingRequirementHookReport().hooks[0],
+      withHook({
+        requirementsSatisfied: false,
+        loadable: false,
+        blockedReason: "missing requirements",
+        requirements: { ...hook.requirements, env: ["DEMO_HOOK_TOKEN"] },
+        missing: { ...hook.missing, env: ["DEMO_HOOK_TOKEN"] },
+      }).hooks[0],
       "session-memory",
       {},
     );
@@ -160,7 +103,7 @@ describe("hooks cli formatting", () => {
   });
 
   it("classifies eventless hooks as not ready in human check output", () => {
-    const output = formatHooksCheck(createEventlessHookReport(), {});
+    const output = formatHooksCheck(eventless, {});
 
     expect(output).toContain("Ready: 0");
     expect(output).toContain("Not ready: 1");
@@ -168,7 +111,7 @@ describe("hooks cli formatting", () => {
   });
 
   it("classifies eventless hooks as not eligible in JSON check output", () => {
-    const output = JSON.parse(formatHooksCheck(createEventlessHookReport(), { json: true }));
+    const output = JSON.parse(formatHooksCheck(eventless, { json: true }));
 
     expect(output).toMatchObject({
       total: 1,
@@ -187,25 +130,22 @@ describe("hooks cli formatting", () => {
   });
 
   it("labels plugin-managed hooks with plugin id", () => {
-    const pluginReport = createPluginManagedHookReport();
+    const pluginReport = withHook({
+      source: "openclaw-plugin",
+      pluginId: "voice-call",
+      managedByPlugin: true,
+    });
 
     const output = formatHooksList(pluginReport, {});
     expect(output).toContain("plugin:voice-call");
   });
 
   it("warns about unknown events in hook info", () => {
-    const typoReport: HookStatusReport = {
-      workspaceDir: "/tmp/workspace",
-      managedHooksDir: "/tmp/hooks",
-      hooks: [
-        {
-          ...expectDefined(report.hooks[0], "report.hooks[0] test invariant"),
-          name: "typo-hook",
-          events: ["command:nwe", "command:new"],
-          unknownEvents: ["command:nwe"],
-        },
-      ],
-    };
+    const typoReport = withHook({
+      name: "typo-hook",
+      events: ["command:nwe", "command:new"],
+      unknownEvents: ["command:nwe"],
+    });
 
     const output = formatHookInfo(typoReport.hooks[0], "typo-hook", {});
     expect(output).toContain("Event not emitted by core (likely typo): command:nwe");

@@ -7,44 +7,40 @@ const loaded = vi.hoisted(() => {
   const modules = new Set<string>();
   return {
     modules,
-    mark(name: string) {
+    track<T>(name: string, exports: T): T {
       modules.add(name);
+      return exports;
     },
   };
 });
 
-vi.mock("./gateway-cli/run.js", () => {
-  loaded.mark("gateway-run-runtime");
-  return {
+vi.mock("./gateway-cli/run.js", () =>
+  loaded.track("gateway-run-runtime", {
     resolveGatewayRunOptions: vi.fn((opts) => opts),
     runGatewayCommand: vi.fn(async () => {}),
-  };
-});
+  }),
+);
 
-vi.mock("./gateway-rpc.runtime.js", () => {
-  loaded.mark("gateway-call-runtime");
-  return {
+vi.mock("./gateway-rpc.runtime.js", () =>
+  loaded.track("gateway-call-runtime", {
     callGatewayFromCliRuntime: vi.fn(async () => ({})),
-  };
-});
+  }),
+);
 
-vi.mock("../gateway/call.js", () => {
-  loaded.mark("gateway-transport-runtime");
-  return {
+vi.mock("../gateway/call.js", () =>
+  loaded.track("gateway-transport-runtime", {
     formatGatewayTransportErrorJson: vi.fn(() => null),
-  };
-});
+  }),
+);
 
-vi.mock("./progress.js", () => {
-  loaded.mark("cli-progress-runtime");
-  return {
+vi.mock("./progress.js", () =>
+  loaded.track("cli-progress-runtime", {
     withProgress: vi.fn(async (_opts, run) => await run({})),
-  };
-});
+  }),
+);
 
-vi.mock("../runtime.js", () => {
-  loaded.mark("default-runtime");
-  return {
+vi.mock("../runtime.js", () =>
+  loaded.track("default-runtime", {
     defaultRuntime: {
       error: vi.fn(),
       exit: vi.fn(),
@@ -52,94 +48,78 @@ vi.mock("../runtime.js", () => {
       writeJson: vi.fn(),
       writeStdout: vi.fn(),
     },
-  };
-});
+  }),
+);
 
-vi.mock("../commands/doctor.js", () => {
-  loaded.mark("doctor-command");
-  return { doctorCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/doctor.js", () =>
+  loaded.track("doctor-command", { doctorCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/dashboard.js", () => {
-  loaded.mark("dashboard-command");
-  return { dashboardCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/dashboard.js", () =>
+  loaded.track("dashboard-command", { dashboardCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/reset.js", () => {
-  loaded.mark("reset-command");
-  return { resetCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/reset.js", () =>
+  loaded.track("reset-command", { resetCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/uninstall.js", () => {
-  loaded.mark("uninstall-command");
-  return { uninstallCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/uninstall.js", () =>
+  loaded.track("uninstall-command", { uninstallCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/status.js", () => {
-  loaded.mark("status-command");
-  return { statusCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/status.js", () =>
+  loaded.track("status-command", { statusCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/health.js", () => {
-  loaded.mark("health-command");
-  return {
+vi.mock("../commands/health.js", () =>
+  loaded.track("health-command", {
     formatHealthChannelLines: vi.fn(() => []),
     healthCommand: vi.fn(async () => {}),
-  };
-});
+  }),
+);
 
-vi.mock("../commands/sessions.js", () => {
-  loaded.mark("sessions-command");
-  return { sessionsCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/sessions.js", () =>
+  loaded.track("sessions-command", { sessionsCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/sessions-cleanup.js", () => {
-  loaded.mark("sessions-cleanup-command");
-  return { sessionsCleanupCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/sessions-cleanup.js", () =>
+  loaded.track("sessions-cleanup-command", { sessionsCleanupCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/export-trajectory.js", () => {
-  loaded.mark("export-trajectory-command");
-  return { exportTrajectoryCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/export-trajectory.js", () =>
+  loaded.track("export-trajectory-command", { exportTrajectoryCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/configure.commands.js", () => {
-  loaded.mark("configure-command");
-  return { configureCommandFromSectionsArg: vi.fn(async () => {}) };
-});
+vi.mock("../commands/configure.commands.js", () =>
+  loaded.track("configure-command", { configureCommandFromSectionsArg: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/configure.wizard.js", () => {
-  loaded.mark("configure-wizard");
-  return { runConfigureWizard: vi.fn(async () => {}) };
-});
+vi.mock("../commands/configure.wizard.js", () =>
+  loaded.track("configure-wizard", { runConfigureWizard: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/onboard.js", () => {
-  loaded.mark("onboard-command");
-  return { setupWizardCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/onboard.js", () =>
+  loaded.track("onboard-command", { setupWizardCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/setup.js", () => {
-  loaded.mark("setup-command");
-  return { setupCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/setup.js", () =>
+  loaded.track("setup-command", { setupCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/agent-via-gateway.js", () => {
-  loaded.mark("agent-via-gateway-command");
-  return { agentCliCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/agent-via-gateway.js", () =>
+  loaded.track("agent-via-gateway-command", { agentCliCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/agent-exec.js", () => {
-  loaded.mark("agent-exec-command");
-  return { agentExecCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/agent-exec.js", () =>
+  loaded.track("agent-exec-command", { agentExecCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/agents.commands.add.js", () => {
-  loaded.mark("agents-add-command");
-  return { agentsAddCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/agents.commands.add.js", () =>
+  loaded.track("agents-add-command", { agentsAddCommand: vi.fn(async () => {}) }),
+);
 
 vi.mock("../commands/agents.commands.bind.js", async (importOriginal) => {
-  loaded.mark("agents-bind-command");
+  loaded.track("agents-bind-command", undefined);
   return {
     ...(await importOriginal<typeof import("../commands/agents.commands.bind.js")>()),
     agentsBindingsCommand: vi.fn(async () => {}),
@@ -147,68 +127,57 @@ vi.mock("../commands/agents.commands.bind.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../commands/agents.commands.delete.js", () => {
-  loaded.mark("agents-delete-command");
-  return { agentsDeleteCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/agents.commands.delete.js", () =>
+  loaded.track("agents-delete-command", { agentsDeleteCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/agents.commands.identity.js", () => {
-  loaded.mark("agents-identity-command");
-  return { agentsSetIdentityCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/agents.commands.identity.js", () =>
+  loaded.track("agents-identity-command", { agentsSetIdentityCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("../commands/agents.commands.list.js", () => {
-  loaded.mark("agents-list-command");
-  return { agentsListCommand: vi.fn(async () => {}) };
-});
+vi.mock("../commands/agents.commands.list.js", () =>
+  loaded.track("agents-list-command", { agentsListCommand: vi.fn(async () => {}) }),
+);
 
-vi.mock("@clack/prompts", () => {
-  loaded.mark("clack-prompts");
-  return {
+vi.mock("@clack/prompts", () =>
+  loaded.track("clack-prompts", {
     confirm: vi.fn(async () => true),
-  };
-});
+  }),
+);
 
-vi.mock("../secrets/apply.js", () => {
-  loaded.mark("secrets-apply-runtime");
-  return {
+vi.mock("../secrets/apply.js", () =>
+  loaded.track("secrets-apply-runtime", {
     runSecretsApply: vi.fn(async () => ({})),
-  };
-});
+  }),
+);
 
-vi.mock("../secrets/audit.js", () => {
-  loaded.mark("secrets-audit-runtime");
-  return {
+vi.mock("../secrets/audit.js", () =>
+  loaded.track("secrets-audit-runtime", {
     resolveSecretsAuditExitCode: vi.fn(() => 0),
     runSecretsAudit: vi.fn(async () => ({})),
-  };
-});
+  }),
+);
 
-vi.mock("../secrets/configure.js", () => {
-  loaded.mark("secrets-configure-runtime");
-  return {
+vi.mock("../secrets/configure.js", () =>
+  loaded.track("secrets-configure-runtime", {
     runSecretsConfigureInteractive: vi.fn(async () => ({})),
-  };
-});
+  }),
+);
 
-vi.mock("../secrets/plan.js", () => {
-  loaded.mark("secrets-plan-runtime");
-  return {
+vi.mock("../secrets/plan.js", () =>
+  loaded.track("secrets-plan-runtime", {
     isSecretsApplyPlan: vi.fn(() => true),
-  };
-});
+  }),
+);
 
-function makeProgram(): Command {
-  const program = new Command();
-  program.name("openclaw");
-  program.exitOverride();
-  return program;
-}
-
-async function expectHelpExit(program: Command, argv: string[]): Promise<void> {
-  await expect(program.parseAsync(argv, { from: "user" })).rejects.toMatchObject({
-    exitCode: 0,
-  });
+async function expectHelpExit(register: (program: Command) => void, ...commands: string[]) {
+  const program = new Command().name("openclaw").exitOverride();
+  register(program);
+  for (const command of commands) {
+    await expect(
+      program.parseAsync([...command.split(" "), "--help"], { from: "user" }),
+    ).rejects.toMatchObject({ exitCode: 0 });
+  }
 }
 
 describe("subcommand help cold imports", () => {
@@ -219,10 +188,7 @@ describe("subcommand help cold imports", () => {
 
   it("keeps gateway help out of gateway action/runtime modules", async () => {
     const { registerGatewayCli } = await import("./gateway-cli/register.js");
-    const program = makeProgram();
-
-    registerGatewayCli(program);
-    await expectHelpExit(program, ["gateway", "--help"]);
+    await expectHelpExit(registerGatewayCli, "gateway");
 
     expect(loaded.modules).not.toContain("gateway-run-runtime");
     expect(loaded.modules).not.toContain("gateway-call-runtime");
@@ -232,10 +198,7 @@ describe("subcommand help cold imports", () => {
 
   it("keeps maintenance help out of command action modules", async () => {
     const { registerMaintenanceCommands } = await import("./program/register.maintenance.js");
-    const program = makeProgram();
-
-    registerMaintenanceCommands(program);
-    await expectHelpExit(program, ["doctor", "--help"]);
+    await expectHelpExit(registerMaintenanceCommands, "doctor");
 
     expect(loaded.modules).not.toContain("doctor-command");
     expect(loaded.modules).not.toContain("dashboard-command");
@@ -246,11 +209,7 @@ describe("subcommand help cold imports", () => {
   it("keeps status and health help out of command action modules", async () => {
     const { registerStatusHealthSessionsCommands } =
       await import("./program/register.status-health-sessions.js");
-    const program = makeProgram();
-
-    registerStatusHealthSessionsCommands(program);
-    await expectHelpExit(program, ["status", "--help"]);
-    await expectHelpExit(program, ["health", "--help"]);
+    await expectHelpExit(registerStatusHealthSessionsCommands, "status", "health");
 
     expect(loaded.modules).not.toContain("status-command");
     expect(loaded.modules).not.toContain("health-command");
@@ -261,10 +220,7 @@ describe("subcommand help cold imports", () => {
 
   it("keeps configure help out of configure action/wizard modules", async () => {
     const { registerConfigureCommand } = await import("./program/register.configure.js");
-    const program = makeProgram();
-
-    registerConfigureCommand(program);
-    await expectHelpExit(program, ["configure", "--help"]);
+    await expectHelpExit(registerConfigureCommand, "configure");
 
     expect(loaded.modules).not.toContain("configure-command");
     expect(loaded.modules).not.toContain("configure-wizard");
@@ -273,10 +229,7 @@ describe("subcommand help cold imports", () => {
 
   it("keeps setup help out of setup and onboard action modules", async () => {
     const { registerSetupCommand } = await import("./program/register.setup.js");
-    const program = makeProgram();
-
-    registerSetupCommand(program);
-    await expectHelpExit(program, ["setup", "--help"]);
+    await expectHelpExit(registerSetupCommand, "setup");
 
     expect(loaded.modules).not.toContain("setup-command");
     expect(loaded.modules).not.toContain("onboard-command");
@@ -285,10 +238,7 @@ describe("subcommand help cold imports", () => {
 
   it("keeps onboard help out of onboard action modules", async () => {
     const { registerOnboardCommand } = await import("./program/register.onboard.js");
-    const program = makeProgram();
-
-    registerOnboardCommand(program);
-    await expectHelpExit(program, ["onboard", "--help"]);
+    await expectHelpExit(registerOnboardCommand, "onboard");
 
     expect(loaded.modules).not.toContain("onboard-command");
     expect(loaded.modules).not.toContain("default-runtime");
@@ -299,11 +249,10 @@ describe("subcommand help cold imports", () => {
     async (command) => {
       const { registerAgentsCommands } = await import("./program/register.agent.js");
       const { registerAgentTurnCommand } = await import("./program/register.agent-turn.js");
-      const program = makeProgram();
-
-      registerAgentTurnCommand(program, { agentChannelOptions: "last|telegram|discord" });
-      registerAgentsCommands(program);
-      await expectHelpExit(program, [...command.split(" "), "--help"]);
+      await expectHelpExit((program) => {
+        registerAgentTurnCommand(program, { agentChannelOptions: "last|telegram|discord" });
+        registerAgentsCommands(program);
+      }, command);
 
       expect(loaded.modules).not.toContain("agent-via-gateway-command");
       expect(loaded.modules).not.toContain("agent-exec-command");
@@ -318,10 +267,7 @@ describe("subcommand help cold imports", () => {
 
   it("keeps secrets help out of secrets action modules", async () => {
     const { registerSecretsCli } = await import("./secrets-cli.js");
-    const program = makeProgram();
-
-    registerSecretsCli(program);
-    await expectHelpExit(program, ["secrets", "--help"]);
+    await expectHelpExit(registerSecretsCli, "secrets");
 
     expect(loaded.modules).not.toContain("clack-prompts");
     expect(loaded.modules).not.toContain("secrets-apply-runtime");
