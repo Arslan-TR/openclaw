@@ -1,10 +1,9 @@
 import { createServer, type ServerResponse } from "node:http";
+import { buffer } from "node:stream/consumers";
 import { expect } from "vitest";
+import { writeToolCall } from "../../../src/gateway/gateway-provider-fixture.test-support.ts";
 import { reserveTestPortListener } from "../../../src/test-utils/port-claims.js";
-import {
-  writeOpenAiResponsesSse,
-  writeOpenAiResponsesText,
-} from "../../../test/helpers/openai-responses-sse.ts";
+import { writeOpenAiResponsesText } from "../../../test/helpers/openai-responses-sse.ts";
 import { createOpenClawTestInstance } from "../../../test/helpers/openclaw-test-instance.ts";
 import { createDeferred, withinTest } from "../../../test/helpers/promise.ts";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
@@ -49,10 +48,7 @@ export async function createWaitClockInstance(port: number, controlUiRoot: strin
             api: "openai-responses",
             apiKey: "synthetic-wait-fixture-key",
             baseUrl: "http://127.0.0.1:" + port + "/v1",
-            models: [
-              { id: "parent", name: "Fixture parent" },
-              { id: "child", name: "Fixture child" },
-            ],
+            models: ["parent", "child"].map((id) => ({ id, name: id })),
           },
         },
       },
@@ -75,46 +71,9 @@ function toolResult(input: ProviderInput[] | undefined, toolName: string) {
   const result: {
     status?: string;
     childSessionKey?: string;
-    runId?: string;
     pendingChildren?: unknown[];
   } = JSON.parse(output!);
   return result;
-}
-
-function writeTool(
-  response: ServerResponse,
-  name: string,
-  callId: string,
-  args: Record<string, unknown>,
-) {
-  const item = {
-    type: "function_call",
-    id: "fc_" + callId,
-    call_id: callId,
-    name,
-    arguments: JSON.stringify(args),
-  };
-  const argumentEvent = (phase: "delta" | "done", field: "delta" | "arguments") => ({
-    type: `response.function_call_arguments.${phase}`,
-    output_index: 0,
-    item_id: item.id,
-    [field]: item.arguments,
-  });
-  writeOpenAiResponsesSse(response, [
-    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
-    argumentEvent("delta", "delta"),
-    argumentEvent("done", "arguments"),
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: callId,
-        status: "completed",
-        output: [item],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      },
-    },
-  ]);
 }
 
 function writeReply(response: ServerResponse, text: string, id: string) {
@@ -148,12 +107,8 @@ export async function startWaitClockProvider() {
             response.writeHead(404).end();
             return;
           }
-          const chunks: Buffer[] = [];
-          for await (const chunk of request) {
-            chunks.push(Buffer.from(chunk));
-          }
           const body: { model: string; tools?: Array<{ name?: string }>; input?: ProviderInput[] } =
-            JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            JSON.parse((await buffer(request)).toString("utf8"));
           if (body.model === "child") {
             expect(childResponse, "the child must not retry while held").toBeUndefined();
             childResponse = response;
@@ -163,10 +118,8 @@ export async function startWaitClockProvider() {
           expect(body.model).toBe("parent");
           const step = parentRequests++;
           if (step === 0) {
-            expect(body.tools).toEqual(
-              expect.arrayContaining([expect.objectContaining({ name: "sessions_spawn" })]),
-            );
-            writeTool(response, "sessions_spawn", "launch_review", {
+            expect(body.tools).toContainEqual(expect.objectContaining({ name: "sessions_spawn" }));
+            writeToolCall(response, "sessions_spawn", {
               runtime: "subagent",
               visible: true,
               agentId: "main",
@@ -181,13 +134,13 @@ export async function startWaitClockProvider() {
             receipts.push({ step, tool: "sessions_spawn", result });
             expect(result.status).toBe("accepted");
             expect(result.childSessionKey).toMatch(/^agent:main:dashboard:/);
-            writeTool(response, "sessions_yield", "initial_yield", {
+            writeToolCall(response, "sessions_yield", {
               acknowledgment: waitClockFixture.acknowledgment,
             });
           } else if (step === 2) {
             expect(JSON.stringify(body.input)).toContain(waitClockFixture.updatePrompt);
             expect(childReleased).toBe(false);
-            writeTool(response, "sessions_yield", "update_yield", {});
+            writeToolCall(response, "sessions_yield", {});
           } else if (step === 3) {
             const result = toolResult(body.input, "sessions_yield");
             receipts.push({ step, tool: "sessions_yield", result });

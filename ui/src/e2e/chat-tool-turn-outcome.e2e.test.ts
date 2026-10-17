@@ -119,17 +119,6 @@ async function captureToolActivityProof(page: Page, name: string) {
   );
 }
 
-async function expandCompletedWorkGroups(page: Page) {
-  const workSummaries = page.locator(".chat-work-group > .chat-activity-group__summary");
-  await workSummaries.first().waitFor();
-  for (let index = 0; index < (await workSummaries.count()); index += 1) {
-    const summary = workSummaries.nth(index);
-    if ((await summary.getAttribute("aria-expanded")) !== "true") {
-      await summary.click();
-    }
-  }
-}
-
 suite.define(() => {
   registerItemOnlyOutcomeTest(suite, captureToolActivityProof);
 
@@ -214,7 +203,7 @@ suite.define(() => {
         }),
       );
       expect(bodyGeometry.length).toBeGreaterThanOrEqual(3);
-      expect(bodyGeometry).toEqual(Array(bodyGeometry.length).fill(true));
+      expect(bodyGeometry.every((valid) => valid)).toBe(true);
 
       const modeGroup = page.locator(".chat-tool-card__modes");
       await modeGroup.getByRole("tablist", { name: "Tool detail view" }).waitFor();
@@ -270,7 +259,12 @@ suite.define(() => {
       true,
     );
     expect(await page.getByText("Command could not finish", { exact: false }).count()).toBe(0);
-    await expandCompletedWorkGroups(page);
+    for (let index = 0; index < (await workSummaries.count()); index += 1) {
+      const summary = workSummaries.nth(index);
+      if ((await summary.getAttribute("aria-expanded")) !== "true") {
+        await summary.click();
+      }
+    }
 
     expect(await page.locator(".chat-tool-msg-summary__label").allTextContents()).toEqual([
       "Tool output",
@@ -637,6 +631,7 @@ suite.define(() => {
       const now = Date.now();
       const emit = agentEvents(gateway, runId, now);
       const toolCallId = `call-guardian-${reviewStatus}`;
+      const reviewFacts = { riskLevel, userAuthorization, rationale };
 
       await emit(1, "tool", {
         toolCallId,
@@ -649,9 +644,7 @@ suite.define(() => {
         reviewId: `review-${reviewStatus}`,
         targetItemId: toolCallId,
         status: eventStatus,
-        riskLevel,
-        userAuthorization,
-        rationale,
+        ...reviewFacts,
       });
       await emit(3, "tool", {
         phase: "review",
@@ -662,9 +655,7 @@ suite.define(() => {
           id: `review-${reviewStatus}`,
           label: "Guardian",
           status: reviewStatus,
-          riskLevel,
-          userAuthorization,
-          rationale,
+          ...reviewFacts,
         },
       });
       if (groupOutcome !== "reviewing") {

@@ -9,13 +9,6 @@ const suite = createControlUiE2eSuite({ name: "Expanded video gallery" });
 const video = readFileSync(new URL("./fixtures/video-poster.mp4", import.meta.url));
 const clip = (name: string) => `MEDIA:https://example.com/gallery-proof/${name}.mp4`;
 
-type NativeControlNode = {
-  backendNodeId: number;
-  attributes?: string[];
-  children?: NativeControlNode[];
-  shadowRoots?: NativeControlNode[];
-};
-
 // CDP is used only to locate Chromium's closed native controls. Input is real mouse input.
 async function nativeVideoControlBox(cdp: CDPSession, control: string) {
   const { result } = await cdp.send("Runtime.evaluate", {
@@ -30,19 +23,16 @@ async function nativeVideoControlBox(cdp: CDPSession, control: string) {
     pierce: true,
   });
   await cdp.send("Runtime.releaseObject", { objectId: result.objectId });
-  const find = (candidate: NativeControlNode): NativeControlNode | undefined => {
+  const pending = [node];
+  let native: typeof node | undefined;
+  while (pending.length) {
+    const candidate = pending.pop()!;
     if (candidate.attributes?.includes("-webkit-media-controls-" + control)) {
-      return candidate;
+      native = candidate;
+      break;
     }
-    for (const child of [...(candidate.children ?? []), ...(candidate.shadowRoots ?? [])]) {
-      const found = find(child);
-      if (found) {
-        return found;
-      }
-    }
-    return undefined;
-  };
-  const native = find(node);
+    pending.push(...[...(candidate.children ?? []), ...(candidate.shadowRoots ?? [])].toReversed());
+  }
   if (!native) {
     throw new Error("Missing native control " + control);
   }
@@ -69,15 +59,12 @@ async function verifyGallery(page: Page, context: BrowserContext, mobile: boolea
   });
   const gateway = await installMockGateway(page, {
     historyMessages: [
-      { role: "user", content: "Compare these clips." },
-      {
-        role: "assistant",
-        content: `**Before**\n${clip("before")}\n\n**After**\n${clip("after")}`,
-      },
-      { role: "assistant", content: `**Alternate**\n${clip("alternate")}` },
-      { role: "user", content: "A separate turn." },
-      { role: "assistant", content: clip("separate") },
-    ].map(({ role, content }, index) => ({
+      ["user", "Compare these clips."],
+      ["assistant", `**Before**\n${clip("before")}\n\n**After**\n${clip("after")}`],
+      ["assistant", `**Alternate**\n${clip("alternate")}`],
+      ["user", "A separate turn."],
+      ["assistant", clip("separate")],
+    ].map(([role, content], index) => ({
       role,
       content,
       timestamp: 1800000000000 + index * 1000,
@@ -107,12 +94,11 @@ async function verifyGallery(page: Page, context: BrowserContext, mobile: boolea
     await expect.poll(() => player.getAttribute("src")).toContain(`${name}.mp4`);
   };
   await expect.poll(ready).toBeGreaterThanOrEqual(2);
-  await expect.poll(async () => (await counter.textContent())?.trim()).toBe("1 / 3");
+  await expect.poll(position).toBe("1 / 3");
   expect(
     await viewer.evaluate((element) => {
-      const root = element;
-      const videoBox = root.querySelector("video")!.getBoundingClientRect();
-      return [...root.querySelectorAll(".actions, .navigation, .gallery-counter")].every(
+      const videoBox = element.querySelector("video")!.getBoundingClientRect();
+      return [...element.querySelectorAll(".actions, .navigation, .gallery-counter")].every(
         (control) => {
           const box = control.getBoundingClientRect();
           return (
@@ -162,26 +148,26 @@ async function verifyGallery(page: Page, context: BrowserContext, mobile: boolea
     await expect.poll(fullscreen).toBe(false);
     expect(await viewer.count()).toBe(1);
   }
-  await controls.detach();
   const retained = await player.elementHandle();
   if (mobile) {
-    const touch = await context.newCDPSession(page);
     const touchEvent = (
       type: "touchStart" | "touchMove" | "touchEnd",
       ...touchPoints: Array<{ x: number; y: number; id: number }>
-    ) => touch.send("Input.dispatchTouchEvent", { type, touchPoints });
-    const timeline = await nativeVideoControlBox(touch, "timeline");
+    ) => controls.send("Input.dispatchTouchEvent", { type, touchPoints });
+    const drag = async (point: { x: number; y: number; id: number }, dx: number, steps = 1) => {
+      await touchEvent("touchStart", point);
+      for (let step = 1; step <= steps; step++) {
+        await touchEvent("touchMove", { ...point, x: point.x + (dx * step) / steps });
+      }
+      await touchEvent("touchEnd");
+    };
+    const timeline = await nativeVideoControlBox(controls, "timeline");
     const timelinePoint = {
       x: timeline.x + timeline.width * 0.2,
       y: timeline.y + timeline.height / 2,
       id: 1,
     };
-    await touchEvent("touchStart", timelinePoint);
-    await touchEvent("touchMove", {
-      ...timelinePoint,
-      x: timeline.x + timeline.width * 0.6,
-    });
-    await touchEvent("touchEnd");
+    await drag(timelinePoint, timeline.width * 0.4);
     await expect.poll(time).toBeGreaterThan(0.3);
     expect(await position()).toBe("2 / 3");
     const swipe = async (dx: number) => {
@@ -190,19 +176,15 @@ async function verifyGallery(page: Page, context: BrowserContext, mobile: boolea
         throw new Error("Missing video geometry");
       }
       const point = { x: box.x + box.width / 2, y: box.y + box.height / 3, id: 1 };
-      await touchEvent("touchStart", point);
-      for (let step = 1; step <= 5; step++) {
-        await touchEvent("touchMove", { ...point, x: point.x + (dx * step) / 5 });
-      }
-      await touchEvent("touchEnd");
+      await drag(point, dx, 5);
     };
     await swipe(-100);
     await expect.poll(() => player.getAttribute("src")).toContain("alternate.mp4");
     await swipe(100);
     await expect.poll(() => player.getAttribute("src")).toContain("after.mp4");
-    await touch.detach();
     expect(await page.locator(".content[inert]").count()).toBe(0);
   }
+  await controls.detach();
   await viewer.getByRole("button", { name: "Close video preview", exact: true }).focus();
   await page.keyboard.press("Escape");
   await expect.poll(() => viewer.count()).toBe(0);

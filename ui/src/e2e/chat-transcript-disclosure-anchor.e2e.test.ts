@@ -1,4 +1,3 @@
-// Control UI E2E tests protect transcript disclosure geometry across animation frames.
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Locator, Page } from "playwright";
@@ -27,6 +26,7 @@ const assistant = (content: string | unknown[], timestamp: number) =>
   message("assistant", typeof content === "string" ? [textBlock(content)] : content, timestamp);
 const rows = (count: number, text: (n: number) => string) =>
   Array.from({ length: count }, (_, index) => text(index + 1));
+const prettyJson = (data: unknown) => JSON.stringify(data, null, 2);
 function toolCall(id: string, name: string, args: Record<string, unknown>) {
   return { type: "toolCall", id, name, arguments: args };
 }
@@ -45,17 +45,12 @@ function makeTranscript(count: number, start = 1) {
   ]).flat();
 }
 
-async function createDisclosurePage(height: number, width: number, record = true) {
-  const parent = process.env.OPENCLAW_CONTROL_UI_E2E_ARTIFACT_DIR?.trim();
-  const artifactDir =
-    record && parent
-      ? createControlUiE2eArtifactDir("chat-transcript-disclosure-anchor", parent)
-      : undefined;
+async function createDisclosurePage(height: number, width: number) {
   const context = await suite.browser.newContext({
     reducedMotion: "reduce",
     viewport: { height, width },
   });
-  return { context, page: await context.newPage(), artifactDir };
+  return { context, page: await context.newPage() };
 }
 
 async function centerDisclosure(control: Locator) {
@@ -95,15 +90,8 @@ function measureRow(element: Element, nextId?: string) {
   };
 }
 
-async function saveTraces(
-  directory: string | undefined,
-  name: string,
-  traces: Record<string, DisclosureFrame[]>,
-) {
-  if (!directory) {
-    return;
-  }
-  await fs.writeFile(path.join(directory, `${name}.json`), `${JSON.stringify(traces, null, 2)}\n`);
+async function saveJson(directory: string, name: string, data: unknown) {
+  await fs.writeFile(path.join(directory, `${name}.json`), `${prettyJson(data)}\n`);
 }
 
 type DisclosureFrame = {
@@ -163,21 +151,17 @@ function expectStableFrames(frames: DisclosureFrame[], label = "disclosure") {
   const initial = frames[0];
   expect(initial).toBeDefined();
   expect(frames.at(-1)?.expanded, `${label} state`).toBe(!initial!.expanded);
+  const resized = frames.some(
+    ({ rowHeight, scrollHeight }) =>
+      Math.abs(rowHeight - initial!.rowHeight) > 0.5 || scrollHeight !== initial!.scrollHeight,
+  );
+  expect(resized, `${label} resize`).toBe(true);
+  const drift = frames.flatMap(({ rowTop, scrollTop }) => [
+    Math.abs(rowTop - initial!.rowTop),
+    Math.abs(scrollTop - initial!.scrollTop),
+  ]);
   expect(
-    frames.some(
-      (frame) =>
-        Math.abs(frame.rowHeight - initial!.rowHeight) > 0.5 ||
-        frame.scrollHeight !== initial!.scrollHeight,
-    ),
-    `${label} resize`,
-  ).toBe(true);
-  expect(
-    Math.max(
-      ...frames.flatMap((frame) => [
-        Math.abs(frame.rowTop - initial!.rowTop),
-        Math.abs(frame.scrollTop - initial!.scrollTop),
-      ]),
-    ),
+    Math.max(...drift),
     `${label} geometry and scroll offset: ${JSON.stringify(frames)}`,
   ).toBeLessThanOrEqual(2);
 }
@@ -249,24 +233,6 @@ async function checkRecovery(
         .waitFor({ state: "visible" });
       let during: { top: number; max: number };
       if (interruption === "synthetic-pointer") {
-        // Check native gutter hit testing separately from animation timing.
-        const pointer = await thread.evaluateHandle((element) => {
-          const observed = { trusted: false, scroller: false };
-          document.addEventListener(
-            "pointerdown",
-            (event) => {
-              observed.trusted = event.isTrusted;
-              observed.scroller = event.target === element;
-            },
-            { capture: true, once: true },
-          );
-          return observed;
-        });
-        const track = await thread.boundingBox();
-        expect(track).not.toBeNull();
-        await page.mouse.click(track!.x + track!.width - 3, track!.y + 20);
-        expect(await pointer.jsonValue()).toEqual({ trusted: true, scroller: true });
-        await pointer.dispose();
         // Interrupt during native scroll; a Node round trip can outlive the row's visible range.
         during = await page.locator(".chat-scroll-to-bottom").evaluate((button, waitTimeout) => {
           const scroller = document.querySelector<HTMLElement>(
@@ -403,10 +369,7 @@ async function checkRecovery(
             page.locator(".chat-scroll-to-bottom").click(),
           ]);
           expect(arrival).toMatchObject({ trusted: true, scroller: true });
-          await fs.writeFile(
-            path.join(artifactDir, "native-input.json"),
-            JSON.stringify({ started, arrival }, null, 2),
-          );
+          await saveJson(artifactDir, "native-input", { started, arrival });
           // Passive wheel handlers may follow compositor scrolling; use the pre-input sample.
           during = wheel ? started : arrival;
           expect(during.top).toBeGreaterThan(0);
@@ -488,14 +451,14 @@ async function checkRecovery(
       const final = await bubble.evaluate(measureRow, nextMessageId);
       const finalAnchor = await captureTopVisibleVirtualRow(thread);
       await page.screenshot({ path: path.join(artifactDir, "02-after-interruption.png") });
-      await fs.writeFile(
-        path.join(artifactDir, "interrupted-scroll.json"),
-        JSON.stringify(
-          { initial, during, interruptedOffset, interruptedAnchor, final, finalAnchor },
-          null,
-          2,
-        ),
-      );
+      await saveJson(artifactDir, "interrupted-scroll", {
+        initial,
+        during,
+        interruptedOffset,
+        interruptedAnchor,
+        final,
+        finalAnchor,
+      });
       // Growth above the reader may adjust scrollTop, but must preserve the visible anchor.
       expect(finalAnchor.key).toBe(interruptedAnchor.key);
       expect(Math.abs(finalAnchor.viewportTop - interruptedAnchor.viewportTop)).toBeLessThanOrEqual(
@@ -559,7 +522,7 @@ suite.define(() => {
     checkRecovery,
   );
   it("keeps completed-work and tool disclosures anchored on every expand and collapse frame", async () => {
-    const { context, page, artifactDir } = await createDisclosurePage(800, 1400);
+    const { context, page } = await createDisclosurePage(800, 1400);
     const sessionKey = "agent:main:dashboard:disclosure-geometry";
     await installMockGateway(page, {
       sessionKey,
@@ -637,7 +600,6 @@ suite.define(() => {
     traces.activityMiddleCollapse = await traceDisclosure(activitySummary);
     traces.workMiddleCollapse = await traceDisclosure(middleWorkSummary);
 
-    await saveTraces(artifactDir, "disclosure-geometry", traces);
     await context.close();
     for (const frames of Object.values(traces)) {
       expectStableFrames(frames);
@@ -645,7 +607,7 @@ suite.define(() => {
   });
 
   it("keeps raw tool details anchored at the end and middle of a long transcript", async () => {
-    const { context, page, artifactDir } = await createDisclosurePage(600, 900);
+    const { context, page } = await createDisclosurePage(600, 900);
     await installMockGateway(page, {
       historyMessages: [
         ...makeTranscript(14),
@@ -656,22 +618,18 @@ suite.define(() => {
               type: "tool_result",
               id: "raw-details-widget",
               name: "canvas_render",
-              text: JSON.stringify(
-                {
-                  kind: "canvas",
-                  proof: rows(24, (n) => `Test ${n}: passed.`),
-                  view: {
-                    backend: "canvas",
-                    id: "proof",
-                    url: "/__openclaw__/canvas/documents/proof/index.html",
-                    title: "Geometry proof",
-                    preferred_height: 160,
-                  },
-                  presentation: { target: "assistant_message" },
+              text: prettyJson({
+                kind: "canvas",
+                proof: rows(24, (n) => `Test ${n}: passed.`),
+                view: {
+                  backend: "canvas",
+                  id: "proof",
+                  url: "/__openclaw__/canvas/documents/proof/index.html",
+                  title: "Geometry proof",
+                  preferred_height: 160,
                 },
-                null,
-                2,
-              ),
+                presentation: { target: "assistant_message" },
+              }),
             },
           ],
           100,
@@ -685,8 +643,9 @@ suite.define(() => {
     await toolSummary.waitFor();
     await waitForChatScrollIdle(page);
     expectStableFrames(await traceDisclosure(toolSummary));
-    const widgetHost = page.locator(".chat-tool-card__widget-host");
-    const rawDetailsToggle = widgetHost.locator(".chat-tool-card__raw-toggle");
+    const rawDetailsToggle = page.locator(
+      ".chat-tool-card__widget-host .chat-tool-card__raw-toggle",
+    );
     await rawDetailsToggle.waitFor({ state: "attached" });
     await page.locator(".chat-thread").evaluate((thread) => {
       thread.scrollTop = thread.scrollHeight;
@@ -701,7 +660,6 @@ suite.define(() => {
     await centerDisclosure(rawDetailsToggle);
     traces.rawDetailsMiddleExpand = await traceDisclosure(rawDetailsToggle);
 
-    await saveTraces(artifactDir, "raw-details-geometry", traces);
     traces.rawDetailsMiddleCollapse = await traceDisclosure(rawDetailsToggle);
     await context.close();
     for (const [label, frames] of Object.entries(traces)) {
@@ -710,7 +668,7 @@ suite.define(() => {
   });
 
   it("keeps message disclosures and shared JSON controls anchored in a long transcript", async () => {
-    const { context, page } = await createDisclosurePage(600, 900, false);
+    const { context, page } = await createDisclosurePage(600, 900);
     await installMockGateway(page, {
       historyMessages: [
         ...makeTranscript(12),

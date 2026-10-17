@@ -1,9 +1,12 @@
-import { writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
-import { hostname } from "node:os";
-import path from "node:path";
 import type { Page } from "playwright";
 import { expect, it } from "vitest";
+import { createQaVoicePreflightWav } from "../../../extensions/qa-lab/src/voice-preflight.fixture.ts";
+import {
+  closeProvider,
+  listenProvider,
+  readProviderBody,
+} from "../../../src/gateway/gateway-provider-fixture.test-support.ts";
 import { writeOpenAiResponsesText } from "../../../test/helpers/openai-responses-sse.ts";
 import {
   createOpenClawTestInstance,
@@ -29,74 +32,36 @@ type HistoryFrame = {
   payload?: { deltaCursor?: string };
 };
 
-function speechWav() {
-  const samples = 1_600;
-  const wav = Buffer.alloc(44 + samples * 2);
-  wav.write("RIFF", 0);
-  wav.writeUInt32LE(wav.length - 8, 4);
-  wav.write("WAVEfmt ", 8);
-  wav.writeUInt32LE(16, 16);
-  wav.writeUInt16LE(1, 20);
-  wav.writeUInt16LE(1, 22);
-  wav.writeUInt32LE(16_000, 24);
-  wav.writeUInt32LE(32_000, 28);
-  wav.writeUInt16LE(2, 32);
-  wav.writeUInt16LE(16, 34);
-  wav.write("data", 36);
-  wav.writeUInt32LE(samples * 2, 40);
-  for (let index = 0; index < samples; index++) {
-    wav.writeInt16LE(
-      Math.round(Math.sin((index * 2 * Math.PI * 440) / 16_000) * 4_000),
-      44 + index * 2,
-    );
-  }
-  return wav;
-}
-
 async function startProvider() {
   const speech: ServerResponse[] = [];
   let turns = 0;
   let requests = 0;
-  const server = createServer((request, response) => {
+  const server = createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/speech") {
       request.resume();
       speech.push(response);
     } else if (request.method === "POST" && request.url === "/v1/responses") {
-      let body = "";
-      request.setEncoding("utf8");
-      request.on("data", (chunk: string) => {
-        body += chunk;
-      });
-      request.on("end", () => {
-        const input: { model: string } = JSON.parse(body);
-        const index = input.model === "echo" ? turns++ : -1;
-        const text = input.model === "metadata" ? "Speech fixture" : replies[index];
-        if (text === undefined) {
-          response.writeHead(400).end("Unexpected model turn");
-          return;
-        }
-        requests += 1;
-        writeOpenAiResponsesText(response, {
-          text,
-          messageId: `speech-answer-${requests}`,
-          responseId: `speech-response-${requests}`,
-        });
+      const input: { model: string } = JSON.parse(await readProviderBody(request));
+      const index = input.model === "echo" ? turns++ : -1;
+      const text = input.model === "metadata" ? "Speech fixture" : replies[index];
+      if (text === undefined) {
+        response.writeHead(400).end("Unexpected model turn");
+        return;
+      }
+      requests += 1;
+      writeOpenAiResponsesText(response, {
+        text,
+        messageId: `speech-answer-${requests}`,
+        responseId: `speech-response-${requests}`,
       });
     } else {
       request.resume();
       response.writeHead(404).end();
     }
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Speech fixture did not bind a TCP port");
-  }
+  const baseUrl = await listenProvider(server);
   return {
-    port: address.port,
+    baseUrl,
     speech,
     turns: () => turns,
     release(index: number) {
@@ -104,15 +69,9 @@ async function startProvider() {
       if (!response) {
         throw new Error("Speech synthesis has not reached its gate");
       }
-      response.writeHead(200, { "content-type": "audio/wav" }).end(speechWav());
+      response.writeHead(200, { "content-type": "audio/wav" }).end(createQaVoicePreflightWav());
     },
-    async close() {
-      const closed = new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-      server.closeAllConnections();
-      await closed;
-    },
+    close: () => closeProvider(server),
   };
 }
 
@@ -161,12 +120,9 @@ const suite = createControlUiE2eSuite({
               "speech-fixture": {
                 api: "openai-responses",
                 apiKey: "synthetic-unused-key",
-                baseUrl: `http://127.0.0.1:${provider.port}/v1`,
+                baseUrl: provider.baseUrl,
                 request: { allowPrivateNetwork: true },
-                models: [
-                  { id: "echo", name: "Echo" },
-                  { id: "metadata", name: "Metadata" },
-                ],
+                models: ["Echo", "Metadata"].map((name) => ({ id: name.toLowerCase(), name })),
               },
             },
           },
@@ -183,7 +139,7 @@ const suite = createControlUiE2eSuite({
                   "--eval",
                   'import { writeFile } from "node:fs/promises"; process.stdin.resume(); const response = await fetch(process.argv[2]); if (!response.ok) throw new Error("Speech fixture failed"); await writeFile(process.argv[1], Buffer.from(await response.arrayBuffer()));',
                   "{{OutputPath}}",
-                  `http://127.0.0.1:${provider.port}/speech`,
+                  new URL("/speech", provider.baseUrl).href,
                 ],
                 outputFormat: "wav",
                 timeoutMs: 60_000,
@@ -193,8 +149,6 @@ const suite = createControlUiE2eSuite({
         },
       });
       expect(instance.env.OPENCLAW_HOME).toBe(instance.homeDir);
-      expect(instance.env.OPENCLAW_STATE_DIR).toBe(instance.stateDir);
-      expect(instance.env.OPENCLAW_CONFIG_PATH).toBe(instance.configPath);
       expect(instance.env.HOME).toBe(process.env.HOME);
       await instance.startGateway();
       return {
@@ -254,6 +208,7 @@ async function verifySpeech(page: Page, url: string) {
   await enterControlUiSession(page);
   await waitForControlUiGatewayReady(page);
   const composer = page.getByRole("textbox", { name: "Chat composer", exact: true });
+  const stop = page.getByRole("button", { name: "Stop generating", exact: true });
   const send = async (text: string) => {
     await composer.fill(text);
     await page.getByRole("button", { name: "Send message", exact: true }).click();
@@ -264,20 +219,12 @@ async function verifySpeech(page: Page, url: string) {
     await expect.poll(() => bubble.count()).toBe(1);
     await expect.poll(() => bubble.locator("audio").count()).toBe(1);
     const audio = bubble.locator("audio");
-    await audio.evaluate((element) => {
-      if (!(element instanceof HTMLAudioElement)) {
-        throw new Error("Expected audio");
-      }
-      element.load();
-    });
+    await audio.evaluate((element: HTMLAudioElement) => element.load());
     await expect
       .poll(
         () =>
           audio.evaluate(
-            (element) =>
-              element instanceof HTMLAudioElement &&
-              element.readyState >= 2 &&
-              element.duration > 0,
+            (element: HTMLAudioElement) => element.readyState >= 2 && element.duration > 0,
           ),
         { message: "The speech attachment must have decoded audio" },
       )
@@ -387,9 +334,7 @@ async function verifySpeech(page: Page, url: string) {
     }
     provider.release(index);
     await assertSpeech(text, index + 1);
-    await page
-      .getByRole("button", { name: "Stop generating", exact: true })
-      .waitFor({ state: "detached" });
+    await stop.waitFor({ state: "detached" });
     await page.reload();
     await waitForControlUiGatewayReady(page);
     await assertSpeech(text, index + 1);
@@ -398,9 +343,7 @@ async function verifySpeech(page: Page, url: string) {
   await page.locator(".chat-bubble").getByText("TTS disabled for this chat.").waitFor();
   await send("Please give a text-only answer.");
   await expect.poll(() => answer(replies[2]).count()).toBe(1);
-  await page
-    .getByRole("button", { name: "Stop generating", exact: true })
-    .waitFor({ state: "detached" });
+  await stop.waitFor({ state: "detached" });
   await expect.poll(() => answer(replies[2]).count()).toBe(1);
   await answer(replies[2]).waitFor();
   expect(await answer(replies[2]).locator("audio").count()).toBe(0);
@@ -411,58 +354,28 @@ async function verifySpeech(page: Page, url: string) {
 
 suite.define(() => {
   it("attaches delayed speech to each original answer live and after reload", async (context) => {
-    try {
-      await suite.runScenario(context, {
-        retainedState: () => instance.stateDir,
-        run: async () => {
-          const created = await instance.cli([
-            "gateway",
-            "call",
-            "sessions.create",
-            "--json",
-            "--params",
-            JSON.stringify({ key: sessionKey, agentId: "main", label: "Speech supplements" }),
-          ]);
-          expect(created.code, created.stderr).toBe(0);
-          const dashboard = await instance.cli(["dashboard", "--json"]);
-          expect(dashboard.code, dashboard.stderr).toBe(0);
-          const { browserUrl }: { browserUrl: string } = JSON.parse(dashboard.stdout);
-          const url = new URL(browserUrl);
-          url.pathname = "/chat/main/speech-supplement";
-          await suite.withPage(
-            { locale: "en-US", serviceWorkers: "block", viewport: { width: 1280, height: 900 } },
-            ({ page }) => verifySpeech(page, url.href),
-          );
-        },
-      });
-    } catch (error) {
-      let gatewayLog = instance.logs();
-      for (const value of [
-        instance.gatewayToken,
-        instance.hookToken,
-        instance.stateDir,
-        instance.homeDir,
-        process.cwd(),
-        hostname(),
-      ]) {
-        gatewayLog = gatewayLog.split(value).join("<fixture>");
-      }
-      if (process.env.HOME) {
-        gatewayLog = gatewayLog.split(process.env.HOME).join("<home>");
-      }
-      await writeFile(
-        path.join(suite.artifactDir, "speech-fixture.failure.json"),
-        JSON.stringify(
-          {
-            speechRequests: provider.speech.length,
-            primaryTurns: provider.turns(),
-            gatewayLog,
-          },
-          null,
-          2,
-        ) + "\n",
-      );
-      throw error;
-    }
+    await suite.runScenario(context, {
+      retainedState: () => instance.stateDir,
+      run: async () => {
+        const created = await instance.cli([
+          "gateway",
+          "call",
+          "sessions.create",
+          "--json",
+          "--params",
+          JSON.stringify({ key: sessionKey, agentId: "main", label: "Speech supplements" }),
+        ]);
+        expect(created.code, created.stderr).toBe(0);
+        const dashboard = await instance.cli(["dashboard", "--json"]);
+        expect(dashboard.code, dashboard.stderr).toBe(0);
+        const { browserUrl }: { browserUrl: string } = JSON.parse(dashboard.stdout);
+        const url = new URL(browserUrl);
+        url.pathname = "/chat/main/speech-supplement";
+        await suite.withPage(
+          { locale: "en-US", serviceWorkers: "block", viewport: { width: 1280, height: 900 } },
+          ({ page }) => verifySpeech(page, url.href),
+        );
+      },
+    });
   }, 180_000);
 });

@@ -1,5 +1,3 @@
-import { writeFile } from "node:fs/promises";
-import path from "node:path";
 import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
 import { waitForLayoutSettled } from "../pages/chat/chat-layout.browser.test-support.ts";
@@ -8,19 +6,21 @@ import {
   waitForControlUiProofSurface,
 } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import {
-  captureUiProofEnabled,
   createChatFlowE2eSuite,
   installMockGateway,
   newChatPage,
 } from "./chat-flow.test-support.ts";
 
 const suite = createChatFlowE2eSuite();
-const artifactPath = (name: string) => path.join(suite.artifactDir, "user-bubble-clamp", name);
 const preview = (root: Page | Locator) => root.locator(".chat-message-disclosure__content");
 const height = (content: Locator) => content.evaluate((element) => element.clientHeight);
+const overflow = (content: Locator) =>
+  content.evaluate((element) => element.scrollHeight - element.clientHeight);
 const mask = (content: Locator) =>
   content.evaluate((element) => getComputedStyle(element).maskImage);
 const message = (content: unknown, timestamp = 1, role = "user") => ({ role, content, timestamp });
+const repeatRows = (count: number, row: (index: number) => string) =>
+  Array.from({ length: count }, (_, index) => row(index));
 const browserOptions = (width = 1440, colorScheme: "light" | "dark" = "light") => ({
   locale: "en-US",
   serviceWorkers: "block" as const,
@@ -28,17 +28,9 @@ const browserOptions = (width = 1440, colorScheme: "light" | "dark" = "light") =
   colorScheme,
 });
 
-async function screenshot(target: Page | Locator, name: string) {
-  if (captureUiProofEnabled) {
-    await target.screenshot({ path: artifactPath(name) });
-  }
-}
-
 async function openChat(
   historyMessages: unknown[],
-  options: Parameters<typeof suite.newBrowserContext>[0] = {
-    viewport: { width: 1440, height: 844 },
-  },
+  options = { viewport: { width: 1440, height: 844 } },
 ) {
   const page = await newChatPage(suite, options);
   await installMockGateway(page, { historyMessages });
@@ -75,10 +67,7 @@ function measureText(element: Element, mode: "preview" | "details" | "reveal") {
       }
     }
   }
-  const transcript = element.closest<HTMLElement>(".chat-thread");
-  if (!transcript) {
-    throw new Error("Disclosure content has no transcript");
-  }
+  const transcript = element.closest<HTMLElement>(".chat-thread")!;
   const transcriptBounds = bounds(transcript);
   const left = transcriptBounds.left + transcript.clientLeft;
   const top = transcriptBounds.top + transcript.clientTop;
@@ -103,22 +92,19 @@ function measureText(element: Element, mode: "preview" | "details" | "reveal") {
 }
 
 async function expectCenteredToggle(bubble: Locator) {
-  const { above, below } = await bubble.evaluate((element) => {
+  const difference = await bubble.evaluate((element) => {
     const content = element.querySelector(".chat-message-disclosure__content")!;
     const toggle = element.querySelector(".chat-message-disclosure__toggle")!;
     const surface = element.classList.contains("chat-bubble--with-images")
       ? content.parentElement!
       : element;
     const button = toggle.getBoundingClientRect();
-    return {
-      above: button.top - content.getBoundingClientRect().bottom,
-      below:
-        surface.getBoundingClientRect().bottom -
-        Number.parseFloat(getComputedStyle(surface).borderBottomWidth) -
-        button.bottom,
-    };
+    const above = button.top - content.getBoundingClientRect().bottom;
+    const border = Number.parseFloat(getComputedStyle(surface).borderBottomWidth);
+    const below = surface.getBoundingClientRect().bottom - border - button.bottom;
+    return Math.abs(above - below);
   });
-  expect(Math.abs(above - below)).toBeLessThanOrEqual(1);
+  expect(difference).toBeLessThanOrEqual(1);
 }
 
 async function expectReadableLastLine(page: Page, content: Locator) {
@@ -164,47 +150,44 @@ async function expectReadableLastLine(page: Page, content: Locator) {
     );
   }
   const rows = await content.evaluate(
-    async (_, { images, sampleRows, bounds: clip, viewport: size }) => {
-      const sampleImage = async (source: string) => {
-        const image = new Image();
-        image.src = source;
-        await image.decode();
-        const canvas = document.createElement("canvas");
-        canvas.width = image.width;
-        canvas.height = image.height;
-        const context = canvas.getContext("2d")!;
-        context.drawImage(image, 0, 0);
-        const scaleX = image.width / size.width;
-        const scaleY = image.height / size.height;
-        const left = Math.floor(clip.left * scaleX);
-        const right = Math.ceil(clip.right * scaleX);
-        const top = Math.floor(clip.top * scaleY);
-        const sampleRow = (relativeY: number) => {
-          // Match an enclosing element crop while scaling CSS rows to device pixels.
-          const y = top + Math.floor(relativeY * scaleY);
-          if (left < 0 || right > image.width || right <= left || y < 0 || y >= image.height) {
-            throw new Error("Disclosure sample falls outside the captured viewport");
-          }
-          const { data } = context.getImageData(left, y, right - left, 1);
-          const values: number[] = [];
-          for (let x = 0; x < right - left; x++) {
-            values.push(data.subarray(x * 4, x * 4 + 3).reduce((sum, value) => sum + value, 0));
-          }
-          return Math.max(...values) - Math.min(...values);
-        };
-        return {
-          dimensions: { width: image.width, height: image.height },
-          upper: sampleRow(sampleRows.upper),
-          lower: sampleRow(sampleRows.lower),
-        };
-      };
-      return Promise.all([sampleImage(images.masked), sampleImage(images.unmasked)]);
-    },
+    (_, { images, sampleRows, bounds: clip, viewport: size }) =>
+      Promise.all(
+        images.map(async (source) => {
+          const image = new Image();
+          image.src = source;
+          await image.decode();
+          const canvas = document.createElement("canvas");
+          canvas.width = image.width;
+          canvas.height = image.height;
+          const context = canvas.getContext("2d")!;
+          context.drawImage(image, 0, 0);
+          const scaleX = image.width / size.width;
+          const scaleY = image.height / size.height;
+          const left = Math.floor(clip.left * scaleX);
+          const right = Math.ceil(clip.right * scaleX);
+          const top = Math.floor(clip.top * scaleY);
+          const sampleRow = (relativeY: number) => {
+            // Match an enclosing element crop while scaling CSS rows to device pixels.
+            const y = top + Math.floor(relativeY * scaleY);
+            if (left < 0 || right > image.width || right <= left || y < 0 || y >= image.height) {
+              throw new Error("Disclosure sample falls outside the captured viewport");
+            }
+            const { data } = context.getImageData(left, y, right - left, 1);
+            const values: number[] = [];
+            for (let x = 0; x < right - left; x++) {
+              values.push(data.subarray(x * 4, x * 4 + 3).reduce((sum, value) => sum + value, 0));
+            }
+            return Math.max(...values) - Math.min(...values);
+          };
+          return {
+            dimensions: { width: image.width, height: image.height },
+            upper: sampleRow(sampleRows.upper),
+            lower: sampleRow(sampleRows.lower),
+          };
+        }),
+      ),
     {
-      images: {
-        masked: `data:image/png;base64,${masked.toString("base64")}`,
-        unmasked: `data:image/png;base64,${unmasked.toString("base64")}`,
-      },
+      images: [masked, unmasked].map((png) => `data:image/png;base64,${png.toString("base64")}`),
       sampleRows: {
         upper: Math.floor(lineTop + lineHeight / 2 - bounds.top) - 1,
         lower: Math.floor(baseline - bounds.top - 1),
@@ -213,13 +196,11 @@ async function expectReadableLastLine(page: Page, content: Locator) {
       viewport,
     },
   );
-  expect(rows[0].dimensions).toEqual(rows[1].dimensions);
-  const upperAlpha = rows[0].upper / rows[1].upper;
-  const lowerAlpha = rows[0].lower / rows[1].lower;
+  expect(rows[0]!.dimensions).toEqual(rows[1]!.dimensions);
+  const upperAlpha = rows[0]!.upper / rows[1]!.upper;
+  const lowerAlpha = rows[0]!.lower / rows[1]!.lower;
   expect(upperAlpha, "the upper half remains legible").toBeGreaterThan(0.65);
-  expect(upperAlpha, "the fade reaches the upper half instead of ending abruptly").toBeLessThan(
-    0.9,
-  );
+  expect(upperAlpha, "the fade reaches the upper half").toBeLessThan(0.9);
   expect(lowerAlpha, "the bottom of the line visibly fades").toBeLessThan(upperAlpha - 0.2);
 }
 
@@ -239,9 +220,9 @@ suite.define(() => {
         );
       const text =
         layout === "list"
-          ? Array.from(
-              { length: 18 },
-              (_, index) =>
+          ? repeatRows(
+              18,
+              (index) =>
                 `- Review sample item ${index + 1}: keep the project notes clear and explain the next useful step.`,
             ).join("\n")
           : prose;
@@ -260,9 +241,9 @@ suite.define(() => {
           ]),
           // Source exceeds the threshold, but all five rendered lines fit the full preview.
           message(
-            Array.from(
-              { length: 5 },
-              (_, index) => `[Short link ${index + 1}](https://example.com/${"a".repeat(300)})`,
+            repeatRows(
+              5,
+              (index) => `[Short link ${index + 1}](https://example.com/${"a".repeat(300)})`,
             ).join("\n"),
             2,
           ),
@@ -290,13 +271,7 @@ suite.define(() => {
         layout === "list" ? text.split("\n").map((item) => item.slice(2)) : text.split("\n\n"),
       );
       const collapsedHeight = await height(content);
-      expect(await content.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(
-        true,
-      );
-      await screenshot(
-        bubble,
-        `${theme}-${width}-${withImage ? "image" : "text"}-${layout}-collapsed.png`,
-      );
+      expect(await overflow(content)).toBeGreaterThan(0);
 
       await toggle.click();
       const collapse = bubble.getByRole("button", { name: "Show less" });
@@ -382,7 +357,7 @@ suite.define(() => {
   it("keeps densely spaced block art within five preview rows", async () => {
     const page = await openChat([
       message(
-        `\`\`\`\n${Array.from({ length: 24 }, () => "█▀▄ ".repeat(20)).join("\n")}\n\`\`\`\n\n${"Follow the sample notes. ".repeat(60)}`,
+        `\`\`\`\n${repeatRows(24, () => "█▀▄ ".repeat(20)).join("\n")}\n\`\`\`\n\n${"Follow the sample notes. ".repeat(60)}`,
       ),
     ]);
     const content = preview(page);
@@ -398,114 +373,87 @@ suite.define(() => {
     expect(visibleRows).toBe(5);
   });
 
-  it.each([{ name: "mobile", width: 390, height: 844 }])(
-    "keeps collapsed paragraphs readable after reload and browser reveal ($name)",
-    async (viewport) => {
-      const paragraphs = [
-        ...Array.from(
-          { length: 8 },
-          (_, index) =>
-            `Background paragraph ${index + 1}. Please review the synthetic project notes and summarize the next steps. Keep the explanation clear enough for someone reading the conversation later.`,
-        ),
-        ...["First", "Second"].map((label) =>
-          [
-            `${label} request:`,
-            "<review_request>",
-            "<input>Read the sample notes and explain the next step,",
-            "then describe the expected result.</input>",
-            "<context>The sample is ready for review.</context>",
-            "</review_request>",
-          ].join("\n"),
-        ),
-        "Final prompt tail: the complete request remains available.",
-      ];
-      const page = await openChat(
+  it("keeps collapsed paragraphs readable after reload and browser reveal (mobile)", async () => {
+    const paragraphs = [
+      ...repeatRows(
+        8,
+        (index) =>
+          `Background paragraph ${index + 1}. Please review the synthetic project notes and summarize the next steps. Keep the explanation clear enough for someone reading the conversation later.`,
+      ),
+      ...["First", "Second"].map((label) =>
         [
-          message(paragraphs.join("\n\n")),
-          message("Short follow-up request.", 2),
-          message("The sample review is complete.", 3, "assistant"),
-        ],
-        browserOptions(viewport.width),
-      );
-      const bubble = page.locator(".chat-group.user .chat-bubble").first();
-      const toggle = bubble.getByRole("button", { name: "Show more", exact: true });
-      await toggle.waitFor({ state: "visible" });
-      await page.reload();
-      await toggle.waitFor({ state: "visible" });
-      const content = preview(bubble);
-      const markdown = content.locator(".chat-text");
-      const initialCollapsedHeight = await height(content);
-      expect(await content.evaluate((element) => element.scrollTop)).toBe(0);
-      expect(await markdown.locator("p").allTextContents()).toEqual(paragraphs);
+          `${label} request:`,
+          "<review_request>",
+          "<input>Read the sample notes and explain the next step,",
+          "then describe the expected result.</input>",
+          "<context>The sample is ready for review.</context>",
+          "</review_request>",
+        ].join("\n"),
+      ),
+      "Final prompt tail: the complete request remains available.",
+    ];
+    const page = await openChat(
+      [
+        message(paragraphs.join("\n\n")),
+        message("Short follow-up request.", 2),
+        message("The sample review is complete.", 3, "assistant"),
+      ],
+      browserOptions(390),
+    );
+    const bubble = page.locator(".chat-group.user .chat-bubble").first();
+    const toggle = bubble.getByRole("button", { name: "Show more", exact: true });
+    await toggle.waitFor({ state: "visible" });
+    await page.reload();
+    await toggle.waitFor({ state: "visible" });
+    const content = preview(bubble);
+    const markdown = content.locator(".chat-text");
+    const initialCollapsedHeight = await height(content);
+    expect(await content.evaluate((element) => element.scrollTop)).toBe(0);
+    expect(await markdown.locator("p").allTextContents()).toEqual(paragraphs);
 
-      // Browser descendant reveal can scroll an overflow-hidden preview without expanding it.
-      const revealedParagraph = markdown.locator("p").nth(9);
-      await revealedParagraph.scrollIntoViewIfNeeded();
-      const measured = await revealedParagraph.evaluate(measureText, "reveal");
-      const verticalBounds = ({ top, bottom }: { top: number; bottom: number }) => ({
-        top,
-        bottom,
-      });
-      const geometry = {
-        scrollTop: measured.scrollTop,
-        clip: verticalBounds(measured.clip),
-        paragraph: verticalBounds(measured.paragraph),
-        lines: measured.lines.map(verticalBounds),
-      };
-      await screenshot(page, `${viewport.name}-revealed.png`);
-      if (captureUiProofEnabled) {
-        await writeFile(
-          artifactPath(`${viewport.name}-geometry.json`),
-          `${JSON.stringify(geometry, null, 2)}\n`,
-        );
-      }
-      expect(await toggle.getAttribute("aria-expanded")).toBe("false");
-      expect(geometry.scrollTop).toBeGreaterThan(0);
-      expect(
-        geometry.lines.filter(
-          (line) => line.top >= geometry.clip.top && line.bottom <= geometry.clip.bottom,
-        ).length,
-      ).toBeGreaterThan(0);
-      expect(geometry.lines.length).toBeGreaterThanOrEqual(6);
-      for (const line of geometry.lines) {
-        expect(line.top, "text starts within its own paragraph").toBeGreaterThanOrEqual(
-          geometry.paragraph.top - 1,
-        );
-        expect(
-          line.bottom,
-          "text ends within its own paragraph without overlapping the next",
-        ).toBeLessThanOrEqual(geometry.paragraph.bottom + 1);
-      }
-      const collapsedHeight = await height(content);
-      expect(collapsedHeight).toBe(initialCollapsedHeight);
+    // Browser descendant reveal can scroll an overflow-hidden preview without expanding it.
+    const revealedParagraph = markdown.locator("p").nth(9);
+    await revealedParagraph.scrollIntoViewIfNeeded();
+    const geometry = await revealedParagraph.evaluate(measureText, "reveal");
+    expect(await toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(geometry.scrollTop).toBeGreaterThan(0);
+    expect(
+      geometry.lines.some(
+        (line) => line.top >= geometry.clip.top && line.bottom <= geometry.clip.bottom,
+      ),
+    ).toBe(true);
+    expect(geometry.lines.length).toBeGreaterThanOrEqual(6);
+    const { top, bottom } = geometry.paragraph;
+    for (const line of geometry.lines) {
+      expect(line.top, "text starts within paragraph").toBeGreaterThanOrEqual(top - 1);
+      expect(line.bottom, "text ends within paragraph").toBeLessThanOrEqual(bottom + 1);
+    }
+    const collapsedHeight = await height(content);
+    expect(collapsedHeight).toBe(initialCollapsedHeight);
 
-      await toggle.click();
-      const collapse = bubble.getByRole("button", { name: "Show less", exact: true });
-      expect(await collapse.getAttribute("aria-expanded")).toBe("true");
-      expect(await height(content)).toBeGreaterThan(collapsedHeight);
-      expect(
-        await content.evaluate((element) => element.scrollHeight - element.clientHeight),
-      ).toBeLessThanOrEqual(1);
-      const tail = markdown.locator("p").last();
-      await tail.scrollIntoViewIfNeeded();
-      expect(await tail.textContent()).toBe(paragraphs.at(-1));
-      await screenshot(page, `${viewport.name}-expanded-tail.png`);
-      await collapse.click();
-      expect(await toggle.getAttribute("aria-expanded")).toBe("false");
-      expect(await height(content)).toBe(initialCollapsedHeight);
-      const siblings = page.locator(".chat-group .chat-bubble");
-      expect(await siblings.nth(1).textContent()).toContain("Short follow-up request.");
-      expect(await siblings.nth(2).textContent()).toContain("The sample review is complete.");
-      const boxes = await siblings.evaluateAll((elements) =>
-        elements.map((element) => {
-          const rect = element.getBoundingClientRect();
-          return { top: rect.top, bottom: rect.bottom };
-        }),
-      );
-      expect(boxes).toHaveLength(3);
-      for (let index = 1; index < boxes.length; index++) {
-        expect(boxes[index - 1]!.bottom).toBeLessThanOrEqual(boxes[index]!.top + 1);
-      }
-    },
-  );
+    await toggle.click();
+    const collapse = bubble.getByRole("button", { name: "Show less", exact: true });
+    expect(await collapse.getAttribute("aria-expanded")).toBe("true");
+    expect(await height(content)).toBeGreaterThan(collapsedHeight);
+    expect(await overflow(content)).toBeLessThanOrEqual(1);
+    const tail = markdown.locator("p").last();
+    await tail.scrollIntoViewIfNeeded();
+    expect(await tail.textContent()).toBe(paragraphs.at(-1));
+    await collapse.click();
+    expect(await toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(await height(content)).toBe(initialCollapsedHeight);
+    const siblings = page.locator(".chat-group .chat-bubble");
+    expect(await siblings.nth(1).textContent()).toContain("Short follow-up request.");
+    expect(await siblings.nth(2).textContent()).toContain("The sample review is complete.");
+    const boxes = await siblings.evaluateAll((elements) =>
+      elements.map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom };
+      }),
+    );
+    expect(boxes).toHaveLength(3);
+    for (let index = 1; index < boxes.length; index++) {
+      expect(boxes[index - 1]!.bottom).toBeLessThanOrEqual(boxes[index]!.top + 1);
+    }
+  });
 });
