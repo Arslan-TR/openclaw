@@ -1,5 +1,6 @@
 import type { MessagePort, Worker } from "node:worker_threads";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
+import type { WorkerCleanup } from "./session-accessor.sqlite-reclamation-worker.types.js";
 
 export type SqliteMutationWorkerTransport =
   | { kind: "dedicated"; channel: Worker }
@@ -8,14 +9,14 @@ export type SqliteMutationWorkerTransport =
       channel: MessagePort;
       threadId: number;
       initialOperationId: number;
-      completion: Promise<void>;
+      completion: Promise<WorkerCleanup>;
       custodyReleased: () => boolean;
       terminate: () => Promise<void>;
     };
 
 export type SqliteMutationWorkerEnd =
   | { kind: "native-exit"; code: number }
-  | { kind: "task-complete" }
+  | { kind: "task-complete"; cleanup: WorkerCleanup }
   | { kind: "task-failed"; error: Error; custodyReleased: boolean };
 
 export function sqliteMutationWorkerThreadId(transport: SqliteMutationWorkerTransport): number {
@@ -44,7 +45,7 @@ export function observeSqliteMutationWorkerEnd(
   }
   let active = true;
   void transport.completion.then(
-    () => active && observe({ kind: "task-complete" }),
+    (cleanup) => active && observe({ kind: "task-complete", cleanup }),
     (error: unknown) =>
       active &&
       observe({

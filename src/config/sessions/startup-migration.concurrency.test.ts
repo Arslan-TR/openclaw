@@ -24,7 +24,7 @@ import { ensureSessionEntrySync } from "./session-accessor.sqlite-initial-entry.
 import { hasPendingCanonicalSessionValidation } from "./session-canonical-validation.js";
 import { runSessionStartupMigration } from "./startup-migration.js";
 
-type TaskObservation = { worker: Worker; port: MessagePort; agentId: string };
+type TaskObservation = { worker: Worker; port: MessagePort; agentId: string; taskId: number };
 const observer = vi.hoisted(() => ({
   workers: new Set<Worker>(),
   parents: new WeakMap<MessagePort, MessagePort>(),
@@ -57,11 +57,17 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         const post = this.postMessage.bind(this);
         this.postMessage = (message, transferList) => {
           const task = message as {
+            taskId: number;
             input: { databaseOptions: { agentId: string }; port: MessagePort };
           };
           const port = observer.parents.get(task.input.port);
           if (port) {
-            observer.onTask?.({ worker: this, port, agentId: task.input.databaseOptions.agentId });
+            observer.onTask?.({
+              worker: this,
+              port,
+              agentId: task.input.databaseOptions.agentId,
+              taskId: task.taskId,
+            });
           }
           post(message, transferList);
         };
@@ -119,14 +125,13 @@ function gateFirstCertificationPerTask() {
     exited: Deferred;
   }> = [];
   const held: HeldRequest[] = [];
-  const heldReleases: HeldRequest[] = [];
   let bypass = false;
   let requestHeld = createDeferredCore();
   const notifyHeld = () => {
     requestHeld.resolve();
     requestHeld = createDeferredCore();
   };
-  observer.onTask = ({ worker, port, agentId }) => {
+  observer.onTask = ({ worker, port, agentId, taskId }) => {
     const observed: (typeof tasks)[number] = {
       worker,
       agentId,
@@ -134,39 +139,25 @@ function gateFirstCertificationPerTask() {
       exited: createDeferredCore(),
     };
     tasks.push(observed);
-    worker.once("exit", () => {
-      observed.exited.resolve();
-    });
-    port.on("message", (message: { type: string; settled?: boolean }) => {
-      if (message.type === "closed") {
-        observed.closed = message.settled === true;
+    const completed = (message: {
+      status: string;
+      taskId: number;
+      value?: { status: string; settled?: boolean };
+    }) => {
+      if (message.status === "ok" && message.taskId === taskId) {
+        observed.closed = message.value?.status === "closed" && message.value.settled === true;
+        worker.off("message", completed);
       }
+    };
+    worker.on("message", completed);
+    worker.once("exit", () => {
+      worker.off("message", completed);
+      observed.exited.resolve();
     });
     const postMessage = port.postMessage.bind(port);
     let gated = false;
     port.postMessage = (message: unknown, transferList) => {
       const options = Array.isArray(transferList) ? { transfer: transferList } : transferList;
-      if (
-        !bypass &&
-        typeof message === "object" &&
-        message !== null &&
-        "type" in message &&
-        message.type === "release"
-      ) {
-        const release: HeldRequest = {
-          agentId,
-          release: () => {
-            const index = heldReleases.indexOf(release);
-            if (index !== -1) {
-              heldReleases.splice(index, 1);
-              postMessage(message, options);
-            }
-          },
-        };
-        heldReleases.push(release);
-        notifyHeld();
-        return;
-      }
       if (
         gated ||
         typeof message !== "object" ||
@@ -208,21 +199,15 @@ function gateFirstCertificationPerTask() {
   };
   return {
     held,
-    heldReleases,
     tasks,
-    waitFor: async (
-      kind: "certification" | "release",
-      count: number,
-      startup: Promise<unknown>,
-    ) => {
-      const requests = kind === "certification" ? held : heldReleases;
-      while (requests.length < count) {
+    waitFor: async (count: number, startup: Promise<unknown>) => {
+      while (held.length < count) {
         await Promise.race([
           requestHeld.promise,
           startup.then((result) => {
             throw result instanceof Error
               ? result
-              : new Error(`Startup settled before ${count} ${kind} requests were held`);
+              : new Error(`Startup settled before ${count} certification requests were held`);
           }),
         ]);
       }
@@ -231,9 +216,6 @@ function gateFirstCertificationPerTask() {
       bypass = true;
       while (held.length > 0) {
         held[0]!.release();
-      }
-      while (heldReleases.length > 0) {
-        heldReleases[0]!.release();
       }
     },
   };
@@ -296,7 +278,7 @@ it("reuses two workers while closing each database task before runtime handoff",
     try {
       let admitted = 0;
       for (const [waveIndex, waveSize] of [2, 2, 1].entries()) {
-        await gate.waitFor("certification", waveSize, startup);
+        await gate.waitFor(waveSize, startup);
         expect(gate.held).toHaveLength(waveSize);
         admitted += waveSize;
         expect(gate.tasks).toHaveLength(admitted);
@@ -312,14 +294,6 @@ it("reuses two workers while closing each database task before runtime handoff",
         }
         while (gate.held.length > 0) {
           gate.held[0]!.release();
-        }
-        await gate.waitFor("release", waveSize, startup);
-        expect(gate.heldReleases).toHaveLength(waveSize);
-        // Even a closed database cannot free the task until its parent releases the close owner.
-        expect(gate.tasks).toHaveLength(admitted);
-        expect(consumed).toHaveLength(admitted - waveSize);
-        while (gate.heldReleases.length > 0) {
-          gate.heldReleases[0]!.release();
         }
         const handoffWave = handoffWaves[waveIndex];
         if (handoffWave) {
@@ -366,12 +340,10 @@ it("drains sibling startup work and the worker pool before closing cold database
     });
     void startup.catch(() => {});
     try {
-      await gate.waitFor("certification", 2, startup);
+      await gate.waitFor(2, startup);
       gate.held.find(({ agentId }) => agentId === startupAgents[0])!.release();
-      await gate.waitFor("release", 1, startup);
-      gate.heldReleases[0]!.release();
       // The third task starts only after the first completes; its sibling is still held.
-      await gate.waitFor("certification", 2, startup);
+      await gate.waitFor(2, startup);
       expect(gate.tasks).toHaveLength(3);
       expect(coldCloses).toEqual([]);
 
@@ -424,7 +396,7 @@ it("stops fleet admission on refusal and drains an already-started sibling befor
       },
     );
     try {
-      await gate.waitFor("certification", 2, outcome);
+      await gate.waitFor(2, outcome);
       expect(gate.held).toHaveLength(2);
       const first = gate.held.find(({ agentId }) => agentId === agentIds[0]);
       const failedWorker = gate.tasks.find(({ agentId }) => agentId === agentIds[0]);

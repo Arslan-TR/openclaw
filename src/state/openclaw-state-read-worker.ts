@@ -67,7 +67,6 @@ type ReadRuntime = {
   pool?: ReadPool;
   awaitedPool?: ReadPool;
   closing?: Promise<void>;
-  stopping?: Promise<void>;
 };
 
 async function closeReadPool(state: ReadRuntime): Promise<void> {
@@ -168,9 +167,9 @@ export async function retireIdleOpenClawStateReadWorkers(
   return true;
 }
 
-function readPool(state: ReadRuntime, admitted: boolean, awaitedOnly: boolean) {
-  // Accepted owners may still need a final read while generation admission is sealed.
-  if ((state.sealed && !admitted) || state.closing) {
+function readPool(state: ReadRuntime, awaitedOnly: boolean) {
+  // Source ownership is admitted once; accepted readers may finish during source retirement.
+  if (state.closing) {
     throw new WorkerTaskError("Shared-state readers are closing", "unavailable");
   }
   // Reuse an existing serviceable worker; cold promise-only reads need no native supervisor.
@@ -198,49 +197,29 @@ export function captureOpenClawStateReadSource() {
       servicing: false,
       sealed: false,
     };
-    nativeSource.retain(created, () => {
+    nativeSource.retain(created, async () => {
       created.sealed = true;
-      if (!created.stopping) {
-        created.stopping = Promise.resolve()
-          .then(async () => {
-            const results = await Promise.allSettled(
-              [...created.operations].map((operation) =>
-                Promise.resolve().then(() => operation.close()),
-              ),
-            );
-            throwSqliteLifecycleErrors(
-              results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
-              "Shared-state reader source cleanup failed",
-            );
-            await closeReadPool(created);
-            sources.delete(nativeSource);
-          })
-          .finally(() => {
-            created.stopping = undefined;
-          });
-      }
-      return created.stopping;
+      const results = await Promise.allSettled(
+        [...created.operations].map(async (operation) => operation.close()),
+      );
+      throwSqliteLifecycleErrors(
+        results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
+        "Shared-state reader source cleanup failed",
+      );
+      await closeReadPool(created);
+      sources.delete(nativeSource);
     });
     sources.set(nativeSource, created);
     runtime = created;
   }
   const state = runtime;
-  const admitted = new Set<ReadOperation>();
   return {
     createTransport: (
       command: OpenClawStateReadCommand,
       onChunk?: OpenClawStateReadOptions["onChunk"],
       onChunkAsync?: OpenClawStateReadOptions["onChunkAsync"],
       awaitedOnly = false,
-    ) =>
-      createReadTransport(
-        command,
-        state,
-        () => admitted.size > 0,
-        onChunk,
-        onChunkAsync,
-        awaitedOnly,
-      ),
+    ) => createReadTransport(command, state, onChunk, onChunkAsync, awaitedOnly),
     own(service: () => void, close: () => Promise<void>): () => void {
       if (state.sealed || state.closing) {
         throw new WorkerTaskError("Shared-state readers are closing", "unavailable");
@@ -251,11 +230,9 @@ export function captureOpenClawStateReadSource() {
         close: () => inContext(close),
       };
       state.operations.add(operation);
-      admitted.add(operation);
       // A rejected result can still own failed cleanup. Only its owner releases it.
       return () => {
         state.operations.delete(operation);
-        admitted.delete(operation);
       };
     },
     service() {
@@ -287,7 +264,6 @@ export function captureOpenClawStateReadSource() {
 function createReadTransport(
   command: OpenClawStateReadCommand,
   state: ReadRuntime,
-  ownsAdmission: () => boolean,
   onChunk?: OpenClawStateReadOptions["onChunk"],
   onChunkAsync?: OpenClawStateReadOptions["onChunkAsync"],
   awaitedOnly = false,
@@ -374,7 +350,7 @@ function createReadTransport(
         snapshotRoot,
         command: { ...readCommand },
       };
-      const pool = readPool(state, ownsAdmission(), awaitedOnly);
+      const pool = readPool(state, awaitedOnly);
       // Maintenance reuses this reader; standalone inspection releases it before metadata loads.
       retireAfterRead = !pool.retained && !context.maintenanceScope && readCommand.type !== "admit";
       task = startReadTask(

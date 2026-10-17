@@ -8,7 +8,6 @@ import { publishSqliteWalCheckpointObservation } from "../../infra/sqlite-wal-ch
 import { recordWorkerMessage } from "../../infra/worker-message-metrics.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { getGatewayRestartDrainSignal } from "../../process/gateway-work-admission.js";
-import { createDeferredCore } from "../../shared/deferred.js";
 import type { OpenClawAgentDatabaseClaim } from "../../state/openclaw-agent-db-identity.js";
 import type { OpenClawAgentDatabaseWorkerLeaseReceipt } from "../../state/openclaw-agent-db-lease.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-lifecycle.js";
@@ -87,13 +86,8 @@ export class SqliteReclamationWorker {
   private transport?: SqliteMutationWorkerTransport;
   private workerThreadId?: number;
   private ended?: Promise<void>;
-  private nativeExitProven = false;
-  private taskCustodyReleased = false;
-  private closeRequested = false;
-  private healthyCloseAcknowledged = false;
   private failure?: Error;
   private cleanup?: WorkerCleanup;
-  private readonly closed = createDeferredCore();
   private lease?: OpenClawAgentDatabaseWorkerLeaseReceipt;
   private closing?: Promise<void>;
   private active?: Promise<unknown>;
@@ -441,8 +435,6 @@ export class SqliteReclamationWorker {
         publishSqliteWalCheckpointObservation(this.options.path, message.snapshot);
       } else if (message.type === "closed") {
         this.cleanup = message;
-        this.healthyCloseAcknowledged = this.closeRequested && message.settled;
-        this.closed.resolve();
       } else if (message.type === "lease") {
         try {
           // First creation binds the captured path admission; replacement still revokes it.
@@ -466,16 +458,9 @@ export class SqliteReclamationWorker {
     });
     this.ended = new Promise((resolve) => {
       observeSqliteMutationWorkerEnd(transport, (ending) => {
-        this.taskCustodyReleased =
-          ending.kind === "task-complete" ||
-          (ending.kind === "task-failed" && ending.custodyReleased);
-        // A healthy task can consume custody before a later failed termination. Its lease
-        // is already gone; only unconsumed failures need the pool's native-exit receipt.
-        this.nativeExitProven =
-          ending.kind === "native-exit" ||
-          (ending.kind === "task-failed" &&
-            ending.custodyReleased &&
-            !this.healthyCloseAcknowledged);
+        if (ending.kind === "task-complete") {
+          this.cleanup = ending.cleanup;
+        }
         if (ending.kind === "task-failed") {
           this.failure ??= ending.error;
         } else if (
@@ -536,7 +521,6 @@ export class SqliteReclamationWorker {
               operationId,
               async (coordination) => {
                 try {
-                  this.closeRequested = true;
                   worker.postMessage(
                     {
                       type: "close",
@@ -553,24 +537,10 @@ export class SqliteReclamationWorker {
                   throw error;
                 } finally {
                   // Checkpoint and native close retain admission even if dispatch fails.
-                  await (transport.kind === "pooled"
-                    ? Promise.race([this.closed.promise, this.ended])
-                    : this.ended);
+                  await this.ended;
                 }
               },
             );
-            if (transport.kind === "pooled") {
-              // The task cannot yield its slot until the parent's native close has settled.
-              try {
-                worker.postMessage({ type: "release", operationId }, []);
-                recordWorkerMessage("lifecycle", "to_worker");
-              } catch (error) {
-                await terminateSqliteMutationWorker(transport);
-                throw error;
-              } finally {
-                await this.ended;
-              }
-            }
           },
           undefined,
           undefined,
@@ -578,38 +548,36 @@ export class SqliteReclamationWorker {
           "session-reclamation.close",
         );
       }
-      if (transport?.kind === "pooled" && transport.custodyReleased()) {
-        // A later pool close can settle a previously failed retirement before this owner retries.
-        this.taskCustodyReleased = true;
-        this.nativeExitProven ||= !this.healthyCloseAcknowledged;
-      }
-      // A settled close released the lease even when the request failed.
-      // Only unsettled cleanup needs the parent's exact receipt after native exit.
-      if (this.lease && this.nativeExitProven && !this.cleanup?.settled) {
-        const lease = this.lease;
-        await cleanupRetiredAgentDatabaseLease({
-          context: this.stateContext,
-          stopped: this.ended!,
-          lease,
-          assertOwned: () => {
-            if (
-              !this.revoked ||
-              this.retired ||
-              !this.nativeExitProven ||
-              this.transport !== transport ||
-              this.lease !== lease
-            ) {
-              throw new Error("SQLite reclamation Worker no longer owns its retired lease");
-            }
-          },
-        });
-      } else if (
+      if (
         transport &&
-        (!this.cleanup?.settled || (transport.kind === "pooled" && !this.taskCustodyReleased))
+        (!this.cleanup?.settled || (transport.kind === "pooled" && !transport.custodyReleased()))
       ) {
-        throw new Error(
-          "SQLite reclamation Worker cleanup is uncertain; restart OpenClaw before deleting the owning agent",
-        );
+        // A rejected task does not prove native exit. Failed stops retain this owner for retry.
+        const stopped = terminateSqliteMutationWorker(transport);
+        await stopped;
+        if (!this.cleanup?.settled && !this.lease) {
+          throw new Error(
+            "SQLite reclamation Worker cleanup is uncertain; restart OpenClaw before deleting the owning agent",
+          );
+        }
+        if (this.lease && !this.cleanup?.settled) {
+          const lease = this.lease;
+          await cleanupRetiredAgentDatabaseLease({
+            context: this.stateContext,
+            stopped,
+            lease,
+            assertOwned: () => {
+              if (
+                !this.revoked ||
+                this.retired ||
+                this.transport !== transport ||
+                this.lease !== lease
+              ) {
+                throw new Error("SQLite reclamation Worker no longer owns its retired lease");
+              }
+            },
+          });
+        }
       }
       if (this.cleanup?.cleanupWarnings.length) {
         log.warn("SQLite session reclamation Worker recovered cleanup failures", {

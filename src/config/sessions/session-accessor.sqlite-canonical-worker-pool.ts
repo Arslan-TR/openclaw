@@ -11,6 +11,7 @@ import { AGENT_DATABASE_PREFLIGHT_CONCURRENCY } from "../../state/openclaw-agent
 import { registerOpenClawStateDatabaseAsyncResource } from "../../state/openclaw-state-db-cache.js";
 import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
 import type { SqliteSessionReclamationPlan } from "./session-accessor.sqlite-lifecycle-types.js";
+import type { WorkerCleanup } from "./session-accessor.sqlite-reclamation-worker.types.js";
 import type { SqliteMutationWorkerTransport } from "./session-accessor.sqlite-worker-transport.js";
 
 type DatabaseOptions = SqliteSessionReclamationPlan["databaseOptions"];
@@ -26,10 +27,14 @@ export type SqliteCanonicalValidationTaskMessage = {
   operationId: number;
 };
 export type SqliteCanonicalValidationTaskResult =
-  | { status: "closed" }
+  | ({ status: "closed" } & WorkerCleanup)
   | { status: "failed"; error: string };
+type ClosedCanonicalValidationTaskResult = Extract<
+  SqliteCanonicalValidationTaskResult,
+  { status: "closed" }
+>;
 export type CanonicalWorkerPool = {
-  pool: WorkerTaskPool<SqliteCanonicalValidationWorkerTask, SqliteCanonicalValidationTaskResult>;
+  pool: WorkerTaskPool<SqliteCanonicalValidationWorkerTask, ClosedCanonicalValidationTaskResult>;
   closed: boolean;
   failure?: Error;
   close: () => Promise<void>;
@@ -54,7 +59,7 @@ export async function withSqliteCanonicalValidationWorkerPool<T>(
   const execution: CanonicalWorkerPool = {
     pool: new WorkerTaskPool<
       SqliteCanonicalValidationWorkerTask,
-      SqliteCanonicalValidationTaskResult
+      ClosedCanonicalValidationTaskResult
     >({
       workerUrl: resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.sessionTranscriptArchive),
       workerOptions: {
@@ -67,7 +72,7 @@ export async function withSqliteCanonicalValidationWorkerPool<T>(
       maxWorkers: AGENT_DATABASE_PREFLIGHT_CONCURRENCY,
       // The startup scope joins native workers after its database tasks close.
       idleTimeoutMs: 0,
-      validateResult: (result) => {
+      validateResult: (result: SqliteCanonicalValidationTaskResult) => {
         // Failed mutation/close replies retire the native slot before rejecting its task.
         if (result.status !== "closed") {
           throw new Error(result.error);
@@ -143,7 +148,6 @@ export async function startCanonicalValidationTask(
         },
       },
     )
-    .then(() => undefined)
     .catch((error: unknown) => {
       execution.closed = true;
       execution.failure ??= toStringifiedError(error);
