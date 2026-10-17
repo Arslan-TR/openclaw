@@ -267,8 +267,11 @@ credential, lease, and external-effect authority stays with the execution owner.
 Cron retains a memory-only clock check for future jobs so forward clock changes
 can trigger overdue work without reloading SQL every minute.
 
-Cron history reads selection metadata in bounded keyset batches using the
-`created_at, task_id` indexes. Completion-time ordering, exact totals, search,
+Cron history streams selection metadata through one SQLite statement using the
+`created_at, task_id` indexes; that statement owns the read snapshot. The
+PostgreSQL bridge buffers query results, so its reader retains bounded keyset
+batches within one snapshot. Both readers retain only selection metadata after
+matching. Completion-time ordering, exact totals, search,
 and live session visibility still select the response page; only that page's
 response fields are hydrated. Summary pages exclude diagnostics and delivery
 traces in SQL, and neither view loads trigger or script recovery state.
@@ -438,6 +441,7 @@ row for session certification. Offline import, Doctor repair, and main-key
 policy changes explicitly queue validation and revoke the shared readiness cell
 and persisted receipt; rollback may conservatively leave readiness revoked.
 Those operations require exclusive offline or startup maintenance custody.
+Startup and Doctor reuse a valid canonical receipt without querying pending rows again.
 Physical integrity admission remains valid independently of session readiness.
 The schema 25 migration seeds every existing node before admission; see
 [session writer validation](/reference/database-schemas/agent-schema-history#canonical-writer-validation).
