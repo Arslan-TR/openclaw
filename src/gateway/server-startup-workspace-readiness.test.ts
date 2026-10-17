@@ -26,9 +26,14 @@ import { gatewayKernelLogs } from "./server-kernel.js";
 // Exercise the lifecycle owner; the minimal boot smoke owns lazy-entrypoint import timing.
 import { startGatewayServerCore as startGatewayServer } from "./server-start.js";
 import { connectGatewayClient, disconnectGatewayClient } from "./test-helpers.e2e.js";
+import { KERNEL_TEST_ENV } from "./test-helpers.env.js";
 
 describe("Gateway workspace migration readiness", () => {
   const gateway = { mode: "local", bind: "loopback", auth: { mode: "none" } } as const;
+  const config = (
+    entries: NonNullable<OpenClawConfig["agents"]>["entries"],
+    defaults?: NonNullable<OpenClawConfig["agents"]>["defaults"],
+  ) => ({ gateway, agents: { ownership: "explicit" as const, entries, defaults } });
   const legacyBytes = JSON.stringify({ version: 1, setupCompletedAt: "2026-07-15T00:00:00.000Z" });
   let state: Awaited<ReturnType<typeof createOpenClawTestState>>;
   let server: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
@@ -40,15 +45,8 @@ describe("Gateway workspace migration readiness", () => {
     state = await createOpenClawTestState({
       label: "ws-readiness",
       env: {
-        OPENCLAW_GATEWAY_TOKEN: undefined,
-        OPENCLAW_GATEWAY_PASSWORD: undefined,
-        OPENCLAW_TEST_MINIMAL_GATEWAY: "1",
-        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-        OPENCLAW_SKIP_CANVAS_HOST: "1",
-        OPENCLAW_SKIP_CHANNELS: "1",
-        OPENCLAW_SKIP_CRON: "1",
-        OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-        OPENCLAW_SKIP_PROVIDERS: "1",
+        ...KERNEL_TEST_ENV,
+        VITEST: process.env.VITEST,
         OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
       },
     });
@@ -121,9 +119,8 @@ describe("Gateway workspace migration readiness", () => {
       },
     };
     await state.writeConfig({
-      gateway,
+      ...config(agents),
       session: { store: storePath },
-      agents: { ownership: "explicit", entries: agents },
     } satisfies OpenClawConfig);
     const addLegacyWorkspace = async (agentId: keyof typeof agents, sessionKey: string) => {
       const agent = agents[agentId];
@@ -179,16 +176,10 @@ describe("Gateway workspace migration readiness", () => {
     async (source) => {
       const stateDir = state.stateDir;
       const workspaceDir = path.join(stateDir, "workspace-secondary");
-      const cfg: OpenClawConfig = {
-        gateway,
-        agents: {
-          ownership: "explicit",
-          entries: {
-            main: { workspace: path.join(stateDir, "workspace-main") },
-            secondary: { workspace: workspaceDir },
-          },
-        },
-      };
+      const cfg = config({
+        main: { workspace: path.join(stateDir, "workspace-main") },
+        secondary: { workspace: workspaceDir },
+      });
       await writeConfigFile(cfg);
       const sourcePath = await writeLegacyWorkspace(workspaceDir);
       const initialSnapshotRead =
@@ -196,16 +187,12 @@ describe("Gateway workspace migration readiness", () => {
           ? await readConfigFileSnapshotWithPluginMetadata({ observe: false })
           : undefined;
       if (initialSnapshotRead) {
-        await writeConfigFile({
-          ...cfg,
-          agents: {
-            ...cfg.agents,
-            entries: {
-              ...cfg.agents?.entries,
-              secondary: { workspace: path.join(stateDir, "workspace-clean") },
-            },
-          },
-        });
+        await writeConfigFile(
+          config({
+            ...cfg.agents.entries,
+            secondary: { workspace: path.join(stateDir, "workspace-clean") },
+          }),
+        );
       }
       const port = await getFreePort();
       const attempt = start(port, initialSnapshotRead);
@@ -232,13 +219,8 @@ describe("Gateway workspace migration readiness", () => {
       const nextWorkspace = state.path("retained", "workspace-".repeat(10));
       const reloadError = vi.spyOn(gatewayKernelLogs.logReload, "error");
       const cfg: OpenClawConfig = {
-        gateway,
+        ...config({ main: { workspace: oldWorkspace } }, { workspace: nextWorkspace }),
         logging: { level: "silent", consoleLevel: "silent" },
-        agents: {
-          ownership: "explicit",
-          defaults: { workspace: nextWorkspace },
-          entries: { main: { workspace: oldWorkspace } },
-        },
       };
       await state.writeConfig(cfg);
       const sourcePath = await writeLegacyWorkspace(nextWorkspace);

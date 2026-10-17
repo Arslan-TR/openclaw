@@ -57,8 +57,12 @@ afterEach(() => {
 
 it("bounds live projection over idle history through admission, progress, drain, and disposal", async (test) => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
-    const config = { agents: { entries: { main: {} } } };
-    const context = requestContext(config);
+    const context = requestContext({ agents: { entries: { main: {} } } });
+    const session = (sessionId: string) => ({
+      agentId: "main",
+      sessionId,
+      sessionKey: `agent:main:${sessionId}`,
+    });
     context.chatQueuedTurns = new Map();
     const names = ["chat", "reply", ...Array.from({ length: 512 }, (_, i) => `idle-${i}`)];
     const sessionKeys = names.map((name) => `agent:main:${name}`);
@@ -105,15 +109,11 @@ it("bounds live projection over idle history through admission, progress, drain,
     const chat = registerChatAbortController({
       chatAbortControllers: context.chatAbortControllers,
       runId: "chat-run",
-      sessionId: "chat",
-      sessionKey: "agent:main:chat",
-      agentId: "main",
+      ...session("chat"),
       timeoutMs: 60_000,
     });
     const reply = createReplyOperation({
-      sessionKey: "agent:main:reply",
-      sessionId: "reply",
-      agentId: "main",
+      ...session("reply"),
       resetTriggered: false,
     });
     const queued = new AbortController();
@@ -121,16 +121,12 @@ it("bounds live projection over idle history through admission, progress, drain,
       chatQueuedTurns: context.chatQueuedTurns,
       runId: "queued-turn",
       controller: queued,
-      sessionId: "reply",
-      sessionKey: "agent:main:reply",
-      agentId: "main",
+      ...session("reply"),
     });
     let claim = claimAgentRunContext(
       "agent-run",
       {
-        agentId: "main",
-        sessionKey: "agent:main:reply",
-        sessionId: "reply",
+        ...session("reply"),
         projectSessionActive: true,
       },
       { trackOwner: true, ownsContext: true },

@@ -4,6 +4,20 @@ import { createGatewayWorkerEnvironmentRuntime } from "./server-worker-environme
 import { hashWorkerCredential } from "./worker-environments/credential.js";
 
 type RuntimeParams = Parameters<typeof createGatewayWorkerEnvironmentRuntime>[0];
+type Startup = RuntimeParams["startup"];
+type Intent = Parameters<Startup["store"]["createIntent"]>[0];
+
+export async function provisionStartupWorker(
+  startup: Startup,
+  intent: Omit<Intent, "provisionOperationId"> & Partial<Pick<Intent, "provisionOperationId">>,
+  patch?: Parameters<Startup["store"]["transition"]>[0]["patch"],
+) {
+  const { environmentId } = await startup.store.createIntent({
+    provisionOperationId: `provision:${intent.environmentId}`,
+    ...intent,
+  });
+  return startup.store.transition({ environmentId, from: "requested", to: "provisioning", patch });
+}
 
 export function createWorkerStartupRuntime(
   startup: RuntimeParams["startup"],

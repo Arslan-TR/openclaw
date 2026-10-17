@@ -1,14 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { GATEWAY_CLIENT_IDS } from "../../packages/gateway-protocol/src/client-info.js";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resetConfigRuntimeState, setRuntimeConfigSnapshot } from "../config/config.js";
 import { setActiveNodeContexts } from "../infra/active-node-context.js";
-import {
-  NODE_WORKER_PORTAL_STREAM_VERSION,
-  NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
-} from "../infra/node-runner-inventory.js";
+import { NODE_WORKER_PORTAL_STREAM_VERSION } from "../infra/node-runner-inventory.js";
 import * as workspaceCommands from "../node-host/node-worker-workspace-commands.js";
 import { createPluginRecord } from "../plugins/loader-records.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
@@ -28,6 +24,7 @@ import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-enviro
 import { withPreparedNodeAcknowledgement } from "./server-worker-environment-startup.prepared.test-support.js";
 import {
   createWorkerStartupRuntime,
+  provisionStartupWorker,
   workerStartupCredential,
   workerStartupReceipt,
 } from "./server-worker-environment-startup.runtime.test-support.js";
@@ -37,6 +34,7 @@ import {
   reconcileDeviceWorker,
 } from "./worker-environments/device-provider.js";
 import { createWorkerInferenceStore } from "./worker-environments/inference-store.js";
+import { createNodeWorkerBundleTestNode } from "./worker-environments/node-worker-bundle.test-support.js";
 import * as workerServices from "./worker-environments/service.js";
 
 const DEVICE_ID = "revoked-device";
@@ -193,11 +191,9 @@ describe("gateway worker environment startup", () => {
       const startup = await loadGatewayWorkerEnvironmentStartupState();
       const runtime = await createWorkerStartupRuntime(startup, () => registry);
       const service = runtime.workerEnvironmentService;
-      if (!service) {
-        throw new Error("worker environment service was not created");
-      }
+      assert(service, "worker environment service was not created");
       let stopping: Promise<void> | undefined;
-      let stopped = false;
+      const stopped = vi.fn();
       try {
         expect(startup.store.list()).toEqual([]);
         const reconciliation = service.reconcileOnce();
@@ -205,17 +201,15 @@ describe("gateway worker environment startup", () => {
         await reconciliation;
         expect(maintain).toHaveBeenCalledOnce();
         expect(context.profiles).toEqual([{ location: "one" }]);
-        stopping = service.stop().then(() => {
-          stopped = true;
-        });
+        stopping = service.stop().then(stopped);
         await aborted.promise;
-        expect(stopped).toBe(false);
+        expect(stopped).not.toHaveBeenCalled();
         expect(() => context.assertCurrent()).toThrow();
       } finally {
         finish.resolve();
         await (stopping ?? service.stop());
       }
-      expect(stopped).toBe(true);
+      expect(stopped).toHaveBeenCalledOnce();
     });
   });
 
@@ -223,17 +217,11 @@ describe("gateway worker environment startup", () => {
     const stateDir = tempDirs.make("openclaw-worker-startup-");
     await withGatewayWorkerEnvironmentStartupState(stateDir, async () => {
       const startup = await loadGatewayWorkerEnvironmentStartupState();
-      await startup.store.createIntent({
+      await provisionStartupWorker(startup, {
         environmentId: "device-environment",
         providerId: DEVICE_WORKER_PROVIDER_ID,
         profileId: `device:${DEVICE_ID}`,
         profileSnapshot: { install: "bundle", settings: { device: DEVICE_ID } },
-        provisionOperationId: "provision:device-environment",
-      });
-      await startup.store.transition({
-        environmentId: "device-environment",
-        from: "requested",
-        to: "provisioning",
       });
       await startup.store.transition({
         environmentId: "device-environment",
@@ -252,9 +240,7 @@ describe("gateway worker environment startup", () => {
       const registry = createEmptyPluginRegistry();
       const runtime = await createWorkerStartupRuntime(startup, () => registry);
       const service = runtime.workerEnvironmentService;
-      if (!service) {
-        throw new Error("worker environment service was not created");
-      }
+      assert(service, "worker environment service was not created");
       try {
         await expect(reconcileDeviceWorker(service, DEVICE_ID)).resolves.toEqual([
           "device-environment",
@@ -280,17 +266,11 @@ describe("gateway worker environment startup", () => {
     await withGatewayWorkerEnvironmentStartupState(stateDir, async () => {
       setRuntimeConfigSnapshot({ cloudWorkers: { desktop: true } });
       const startup = await loadGatewayWorkerEnvironmentStartupState();
-      const intent = await startup.store.createIntent({
+      const provisioning = await provisionStartupWorker(startup, {
         environmentId: "node-desktop-environment",
         providerId: "fake-provider",
         profileId: "desktop-profile",
         profileSnapshot: { settings: { desktop: true } },
-        provisionOperationId: "provision:node-desktop-environment",
-      });
-      const provisioning = await startup.store.transition({
-        environmentId: intent.environmentId,
-        from: intent.state,
-        to: "provisioning",
       });
       const nodeId = "node-desktop-device";
       const app = { id: "terminal" as const, executablePath: "/usr/bin/true" };
@@ -309,15 +289,9 @@ describe("gateway worker environment startup", () => {
         },
       });
       const proof: NodeWorkerSupervisorNodeProof = {
+        ...createNodeWorkerBundleTestNode(),
         nodeId,
-        connId: "node-desktop-conn",
-        pairingIdentity: "node-desktop-pairing",
-        pairingGeneration: "node-desktop-generation",
-        clientId: GATEWAY_CLIENT_IDS.NODE_HOST,
-        clientMode: "node",
-        protocolFeature: NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
         workerHost: { enabled: true, capacity: { total: 1, available: 0 } },
-        commands: [],
       };
       const transport: NodeWorkerSupervisorTransport = {
         getCurrentNode: async (candidateNodeId) =>
@@ -336,25 +310,20 @@ describe("gateway worker environment startup", () => {
       });
       const service = runtime.workerEnvironmentService;
       try {
-        if (!service || !runtime.bindWorkerNodeDesktopControl) {
-          throw new Error("worker node desktop runtime was not composed");
-        }
+        assert(
+          service && runtime.bindWorkerNodeDesktopControl,
+          "worker node desktop runtime was not composed",
+        );
         runtime.bindWorkerNodeDesktopControl(transport);
-        await expect(
-          service.supportsNodePortal(record.environmentId, record.ownerEpoch),
-        ).resolves.toBe(false);
+        const portalSupported = () =>
+          service.supportsNodePortal(record.environmentId, record.ownerEpoch);
+        await expect(portalSupported()).resolves.toBe(false);
         runtime.bindDeviceNodeControl?.(transport);
-        await expect(
-          service.supportsNodePortal(record.environmentId, record.ownerEpoch),
-        ).resolves.toBe(false);
+        await expect(portalSupported()).resolves.toBe(false);
         proof.workerHost.portalStream = NODE_WORKER_PORTAL_STREAM_VERSION;
-        await expect(
-          service.supportsNodePortal(record.environmentId, record.ownerEpoch),
-        ).resolves.toBe(true);
+        await expect(portalSupported()).resolves.toBe(true);
         delete proof.workerHost.portalStream;
-        await expect(
-          service.supportsNodePortal(record.environmentId, record.ownerEpoch),
-        ).resolves.toBe(false);
+        await expect(portalSupported()).resolves.toBe(false);
         await expect(
           service.launchDesktopApp({ environmentId: record.environmentId, app: "terminal" }),
         ).resolves.toEqual({ app: "terminal", status: "ready" });

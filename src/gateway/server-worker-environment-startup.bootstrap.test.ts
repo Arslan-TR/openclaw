@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resetConfigRuntimeState, setRuntimeConfigSnapshot } from "../config/config.js";
 import * as packageRoot from "../infra/openclaw-root.js";
@@ -20,9 +20,11 @@ import {
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import * as version from "../version.js";
 import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
-import { createWorkerStartupRuntime } from "./server-worker-environment-startup.runtime.test-support.js";
+import {
+  createWorkerStartupRuntime,
+  provisionStartupWorker,
+} from "./server-worker-environment-startup.runtime.test-support.js";
 import { withGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.state.test-support.js";
-import type { NodeBootstrapArtifact } from "./worker-environments/node-bootstrap-artifact-contract.js";
 import * as artifactModule from "./worker-environments/node-bootstrap-artifact.js";
 import {
   buildId,
@@ -80,19 +82,16 @@ async function provision(
   startup: Awaited<ReturnType<typeof loadGatewayWorkerEnvironmentStartupState>>,
   environmentId: string,
 ) {
-  await startup.store.createIntent({
-    environmentId,
-    providerId: "fake-provider",
-    profileId: "test-profile",
-    profileSnapshot: { executionMode: "remote-exec", settings: {} },
-    provisionOperationId: `provision:${environmentId}`,
-  });
-  return startup.store.transition({
-    environmentId,
-    from: "requested",
-    to: "provisioning",
-    patch: { nodeDeviceId: `${environmentId}-node` },
-  });
+  return provisionStartupWorker(
+    startup,
+    {
+      environmentId,
+      providerId: "fake-provider",
+      profileId: "test-profile",
+      profileSnapshot: { executionMode: "remote-exec", settings: {} },
+    },
+    { nodeDeviceId: `${environmentId}-node` },
+  );
 }
 
 describe("cloud bootstrap plugin generations", () => {
@@ -147,9 +146,10 @@ describe("cloud bootstrap plugin generations", () => {
           try {
             const managerResult = enrollmentFactory.mock.results.at(-1);
             const transferResult = transferFactory.mock.results.at(-1);
-            if (managerResult?.type !== "return" || transferResult?.type !== "return") {
-              throw new Error("Gateway managers were not created");
-            }
+            assert(
+              managerResult?.type === "return" && transferResult?.type === "return",
+              "Gateway managers were not created",
+            );
             const record = await provision(startup, environmentId);
             const enrollment = await managerResult.value.begin(record);
             return { runtime, enrollment, transfer: transferResult.value };
@@ -185,15 +185,9 @@ describe("cloud bootstrap plugin generations", () => {
             token: second.enrollment.nodeBootstrap.token,
             artifactKey: retainedHash,
           });
-          expect(capability).toBeDefined();
-          if (!capability) {
-            throw new Error("fresh download grant missing");
-          }
+          assert(capability, "fresh download grant missing");
           const file = await second.transfer.openFile(capability);
-          expect(file).not.toBeNull();
-          if (!file) {
-            throw new Error("verified archive unavailable");
-          }
+          assert(file, "verified archive unavailable");
           try {
             expect(await file.handle.readFile()).toEqual(retainedBytes);
           } finally {
@@ -223,40 +217,40 @@ describe("cloud bootstrap plugin generations", () => {
       .mockReturnValue(metadata);
     vi.spyOn(version, "resolveRuntimeServiceBuildId").mockReturnValue("gateway-source-build");
     const enrollmentFactory = vi.spyOn(enrollmentModule, "createWorkerNodeEnrollmentManager");
-    const producers: Array<{
-      artifact: NodeBootstrapArtifact;
-      prepare: Mock<(signal?: AbortSignal) => Promise<NodeBootstrapArtifact>>;
-      close: Mock<() => Promise<void>>;
-      closing: Promise<void>;
-      release: () => void;
-    }> = [];
+    const makeProducer = (number: number, enabledPluginIds: string[]) => {
+      const closure = createDeferredCore();
+      const closing = createDeferredCore();
+      const artifact = {
+        tarballPath: path.join(stateDir, `runtime-${number}.tgz`),
+        tarballSha256: String(number).repeat(64),
+        tarballBytes: 1,
+        openclawVersion: "2026.8.1",
+        buildId: "gateway-source-build",
+        enabledPluginIds,
+      };
+      return {
+        artifact,
+        prepare: vi.fn(async (_signal?: AbortSignal) => {
+          await fs.writeFile(artifact.tarballPath, "x");
+          return artifact;
+        }),
+        close: vi.fn(async () => {
+          closing.resolve();
+          await closure.promise;
+          await fs.rm(artifact.tarballPath, { force: true });
+        }),
+        closing: closing.promise,
+        release: () => closure.resolve(),
+      };
+    };
+    const producers: ReturnType<typeof makeProducer>[] = [];
+    const releaseAll = () => producers.forEach((producer) => producer.release());
     vi.spyOn(artifactModule, "createNodeBootstrapArtifactProvider").mockImplementation(
       ({ plugins }) => {
-        const number = producers.length + 1;
-        const closure = createDeferredCore();
-        const closing = createDeferredCore();
-        const artifact = {
-          tarballPath: path.join(stateDir, `runtime-${number}.tgz`),
-          tarballSha256: String(number).repeat(64),
-          tarballBytes: 1,
-          openclawVersion: "2026.8.1",
-          buildId: "gateway-source-build",
-          enabledPluginIds: plugins.map(({ id }) => id),
-        };
-        const producer = {
-          artifact,
-          prepare: vi.fn(async (_signal?: AbortSignal) => {
-            await fs.writeFile(artifact.tarballPath, "x");
-            return artifact;
-          }),
-          close: vi.fn(async () => {
-            closing.resolve();
-            await closure.promise;
-            await fs.rm(artifact.tarballPath, { force: true });
-          }),
-          closing: closing.promise,
-          release: () => closure.resolve(),
-        };
+        const producer = makeProducer(
+          producers.length + 1,
+          plugins.map(({ id }) => id),
+        );
         producers.push(producer);
         return producer;
       },
@@ -268,9 +262,10 @@ describe("cloud bootstrap plugin generations", () => {
       const runtime = await createWorkerStartupRuntime(startup, () => registry);
       const enrollmentResult = enrollmentFactory.mock.results.at(-1);
       const service = runtime.workerEnvironmentService;
-      if (enrollmentResult?.type !== "return" || !service) {
-        throw new Error("worker environment runtime was not created");
-      }
+      assert(
+        enrollmentResult?.type === "return" && service,
+        "worker environment runtime was not created",
+      );
       const manager = enrollmentResult.value;
       const begin = async (id: string) => {
         const record = await provision(startup, id);
@@ -311,21 +306,19 @@ describe("cloud bootstrap plugin generations", () => {
         await expect(fs.stat(producers[0]!.artifact.tarballPath)).rejects.toMatchObject({
           code: "ENOENT",
         });
-        let stopped = false;
-        stopping = service.stop().then(() => {
-          stopped = true;
-        });
+        const stopped = vi.fn();
+        stopping = service.stop().then(stopped);
         await producers[2]!.closing;
-        expect(first.signal?.aborted).toBe(true);
-        expect(replacement.signal?.aborted).toBe(true);
-        expect(refreshed.signal?.aborted).toBe(true);
+        expect([first.signal, replacement.signal, refreshed.signal]).toMatchObject([
+          { aborted: true },
+          { aborted: true },
+          { aborted: true },
+        ]);
         producers[2]!.release();
         await producers[2]!.close.mock.results[0]!.value;
         await Promise.resolve();
-        expect(stopped).toBe(false);
-        for (const producer of producers) {
-          producer.release();
-        }
+        expect(stopped).not.toHaveBeenCalled();
+        releaseAll();
         await stopping;
         for (const producer of producers) {
           expect(producer.close).toHaveBeenCalledOnce();
@@ -334,9 +327,7 @@ describe("cloud bootstrap plugin generations", () => {
           });
         }
       } finally {
-        for (const producer of producers) {
-          producer.release();
-        }
+        releaseAll();
         await (stopping ?? service.stop());
       }
     });

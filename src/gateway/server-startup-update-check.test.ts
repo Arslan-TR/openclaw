@@ -8,10 +8,7 @@ import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-
 import { resetGatewayWorkAdmission } from "../process/gateway-work-admission.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
-import {
-  createOpenClawTestState,
-  type OpenClawTestState,
-} from "../test-utils/openclaw-test-state.js";
+import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createDeferredGatewayUpdateCheck } from "./server-startup-update-check.js";
 
 vi.mock("../agents/prepared-model-runtime.js", async (importOriginal) => ({
@@ -23,7 +20,7 @@ type UpdateCheckStartupParams = Parameters<typeof createDeferredGatewayUpdateChe
 type UpdateCheck = Awaited<ReturnType<UpdateCheckStartupParams["createUpdateCheck"]>>;
 
 describe("deferred Gateway update-check lifecycle", () => {
-  let state: OpenClawTestState;
+  let state: Awaited<ReturnType<typeof createOpenClawTestState>>;
   let defaultUpdateCheck: UpdateCheck;
   let scheduler: ReturnType<typeof createTestGatewayScheduler>;
   const owners = new Set<ReturnType<typeof createDeferredGatewayUpdateCheck>>();
@@ -94,19 +91,17 @@ describe("deferred Gateway update-check lifecycle", () => {
     await entered.promise;
 
     expect(scheduler.nextWakeAtMs).toBeNull();
-    let stopped = false;
-    const stopping = owner.stop().then(() => {
-      stopped = true;
-    });
+    const stopped = vi.fn();
+    const stopping = owner.stop().then(stopped);
     try {
       await cancelled.promise;
-      expect(stopped).toBe(false);
+      expect(stopped).not.toHaveBeenCalled();
       expect(createUpdateCheck).not.toHaveBeenCalled();
     } finally {
       cleanup.resolve();
       await Promise.all([work, stopping]);
     }
-    expect(stopped).toBe(true);
+    expect(stopped).toHaveBeenCalledOnce();
     expect(scheduler.nextWakeAtMs).toBeNull();
   });
 
@@ -195,68 +190,76 @@ describe("deferred Gateway update-check lifecycle", () => {
     },
   );
 
-  it("joins a late update-check factory and its cleanup when close wins startup", async () => {
-    const factory = createDeferred<UpdateCheck>();
-    const cleanup = createDeferred();
-    const updateCheck = {
-      initialize: vi.fn(defaultUpdateCheck.initialize),
-      start: vi.fn(),
-      stop: vi.fn(() => cleanup.promise),
-    };
-    const createGatewayUpdateCheck = vi.fn(() => factory.promise);
-
-    const result = await startUpdateCheck({ createUpdateCheck: createGatewayUpdateCheck });
-
-    let stopped = false;
-    let stopping: Promise<void> | undefined;
-    try {
-      await waitForGatewayTestState(() => {
-        expect(createGatewayUpdateCheck).toHaveBeenCalledTimes(1);
-      });
-      stopping = result.stop().then(() => {
-        stopped = true;
-      });
-      await Promise.resolve();
-      expect(stopped).toBe(false);
-      expect(updateCheck.stop).not.toHaveBeenCalled();
-      factory.resolve(updateCheck);
-      await waitForGatewayTestState(() => expect(updateCheck.stop).toHaveBeenCalledOnce());
-      expect(stopped).toBe(false);
-      expect(updateCheck.initialize).not.toHaveBeenCalled();
-      expect(updateCheck.start).not.toHaveBeenCalled();
-    } finally {
-      factory.resolve(updateCheck);
-      cleanup.resolve();
-      await (stopping ?? result.stop());
-    }
-    await result.stop();
-    expect(updateCheck.stop).toHaveBeenCalledOnce();
-  });
+  it.each(["factory", "initialization"])(
+    "fences and joins a pending %s on close",
+    async (phase) => {
+      const factory = createDeferred<UpdateCheck>();
+      const initialization = createDeferred<Awaited<ReturnType<UpdateCheck["initialize"]>>>();
+      const cleanup = createDeferred();
+      const updateCheck = {
+        initialize: vi.fn(() => initialization.promise),
+        start: vi.fn(),
+        stop: vi.fn(() => cleanup.promise),
+      };
+      const createGatewayUpdateCheck = vi.fn(() =>
+        phase === "factory" ? factory.promise : updateCheck,
+      );
+      const result = await startUpdateCheck({ createUpdateCheck: createGatewayUpdateCheck });
+      const stopped = vi.fn();
+      let stopping: Promise<void> | undefined;
+      try {
+        if (phase === "initialization") {
+          expect(updateCheck.initialize).toHaveBeenCalledOnce();
+        } else {
+          await waitForGatewayTestState(() =>
+            expect(createGatewayUpdateCheck).toHaveBeenCalledOnce(),
+          );
+        }
+        stopping = result.stop().then(stopped);
+        if (phase === "factory") {
+          await Promise.resolve();
+          expect(stopped).not.toHaveBeenCalled();
+          expect(updateCheck.stop).not.toHaveBeenCalled();
+          factory.resolve(updateCheck);
+          await waitForGatewayTestState(() => expect(updateCheck.stop).toHaveBeenCalledOnce());
+          expect(updateCheck.initialize).not.toHaveBeenCalled();
+        } else {
+          expect(updateCheck.stop).toHaveBeenCalledOnce();
+          cleanup.resolve();
+          await nextTurn();
+        }
+        expect(stopped).not.toHaveBeenCalled();
+        expect(updateCheck.start).not.toHaveBeenCalled();
+      } finally {
+        factory.resolve(updateCheck);
+        cleanup.resolve();
+        initialization.resolve(await defaultUpdateCheck.initialize());
+        await (stopping ?? result.stop());
+      }
+      await result.stop();
+      expect(updateCheck.stop).toHaveBeenCalledOnce();
+    },
+  );
 
   it("joins update notices before releasing the update-check shutdown owner", async () => {
     const notices = createDeferred();
     const stopWatcher = vi.fn(() => notices.promise);
     const watcherModule = await import("./update-run-watcher.js");
-    const startWatcher = vi
-      .spyOn(watcherModule, "startUpdateRunWatcher")
-      .mockReturnValue({ stop: stopWatcher });
+    vi.spyOn(watcherModule, "startUpdateRunWatcher").mockReturnValue({ stop: stopWatcher });
     const result = await startUpdateCheck();
-    let stopped = false;
-    const stopping = result.stop().then(() => {
-      stopped = true;
-    });
+    const stopped = vi.fn();
+    const stopping = result.stop().then(stopped);
     try {
       expect(stopWatcher).toHaveBeenCalledOnce();
       expect(defaultUpdateCheck.stop).toHaveBeenCalledOnce();
       await nextTurn();
-      expect(stopped).toBe(false);
+      expect(stopped).not.toHaveBeenCalled();
       notices.resolve();
       await stopping;
-      expect(stopped).toBe(true);
+      expect(stopped).toHaveBeenCalledOnce();
     } finally {
       notices.resolve();
       await stopping;
-      startWatcher.mockRestore();
     }
   });
 
@@ -279,34 +282,6 @@ describe("deferred Gateway update-check lifecycle", () => {
     expect(warn).toHaveBeenCalledExactlyOnceWith(
       "gateway update status failed to initialize: Error: Git discovery timed out",
     );
-  });
-
-  it("fences update discovery immediately and joins its pending initialization", async () => {
-    const initialization = createDeferred<Awaited<ReturnType<UpdateCheck["initialize"]>>>();
-    const cleanup = createDeferred();
-    const updateCheck = {
-      initialize: vi.fn(() => initialization.promise),
-      start: vi.fn(),
-      stop: vi.fn(() => cleanup.promise),
-    };
-    const result = await startUpdateCheck({ createUpdateCheck: () => updateCheck });
-    let stopped = false;
-    let stopping: Promise<void> | undefined;
-    try {
-      expect(updateCheck.initialize).toHaveBeenCalledOnce();
-      stopping = result.stop().then(() => {
-        stopped = true;
-      });
-      expect(updateCheck.stop).toHaveBeenCalledOnce();
-      cleanup.resolve();
-      await nextTurn();
-      expect(stopped).toBe(false);
-      expect(updateCheck.start).not.toHaveBeenCalled();
-    } finally {
-      cleanup.resolve();
-      initialization.resolve(await defaultUpdateCheck.initialize());
-      await (stopping ?? result.stop());
-    }
   });
 
   it("adopts scheduled remote catalogs inside the live Gateway registry scope", async () => {

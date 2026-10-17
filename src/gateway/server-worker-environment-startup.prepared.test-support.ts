@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
 import { Value } from "typebox/value";
-import { expect, vi } from "vitest";
+import { assert, expect, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { GATEWAY_CLIENT_IDS } from "../../packages/gateway-protocol/src/client-info.js";
 import { NodeInvokeResultParamsSchema } from "../../packages/gateway-protocol/src/schema/nodes.js";
@@ -103,13 +103,12 @@ async function createPreparedNodeAcknowledgement(root: string) {
     const runtime = await createWorkerStartupRuntime(startup, () => registry);
     owned.runtime = runtime;
     const options = factory.mock.calls.at(-1)?.[0];
-    if (
-      !options?.registerPreparedWorkspace ||
-      !options.bindPreparedWorkspace ||
-      !options.projectNamespace
-    ) {
-      throw new Error("Prepared workspace callbacks were not composed");
-    }
+    assert(
+      options?.registerPreparedWorkspace &&
+        options.bindPreparedWorkspace &&
+        options.projectNamespace,
+      "Prepared workspace callbacks were not composed",
+    );
     const namespace = options.projectNamespace;
     owned.namespace = namespace;
     const preparationKey = "a".repeat(64);
@@ -171,9 +170,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
       preparationKey,
       cacheKey,
     });
-    if (!prepared) {
-      throw new Error("Project setup did not produce a valid workspace");
-    }
+    assert(prepared, "Project setup did not produce a valid workspace");
     const env = { ...process.env, HOME: home, OPENCLAW_STATE_DIR: path.join(root, "node-state") };
     const workspace = new NodeWorkerWorkspaceRuntime({ env, ephemeral: true });
     owned.workspace = workspace;
@@ -197,9 +194,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
     owned.server = server;
     await once(server, "listening");
     const address = server.address();
-    if (!address || typeof address === "string") {
-      throw new Error("Expected loopback listener");
-    }
+    assert(address && typeof address !== "string", "Expected loopback listener");
     const connected = new Promise<WebSocket>((resolve) => {
       server.once("connection", resolve);
     });
@@ -250,19 +245,17 @@ async function createPreparedNodeAcknowledgement(root: string) {
       });
     setPreparedWorkspace(true);
     const received: Array<Parameters<NodeRegistry["handleInvokeResult"]>[0]> = [];
-    const accepted: boolean[] = [];
     const invoked: NodeInvokeRequestPayload[] = [];
-    let beforeReply: (() => Promise<void>) | undefined;
     // Node replies use the real handler serializer and registry result owner;
     // only the outbound invoke request traverses the loopback WebSocket.
     function request<T>(...args: Parameters<NodeHostClient["request"]>): Promise<T>;
     async function request(_method: string, params?: unknown): Promise<unknown> {
-      if (!Value.Check(NodeInvokeResultParamsSchema, params)) {
-        throw new Error("Node sent an invalid result envelope");
-      }
-      await beforeReply?.();
+      assert(
+        Value.Check(NodeInvokeResultParamsSchema, params),
+        "Node sent an invalid result envelope",
+      );
       received.push({ ...params, connId });
-      accepted.push(nodeRegistry.handleInvokeResult({ ...params, connId }));
+      nodeRegistry.handleInvokeResult({ ...params, connId });
       return null;
     }
     client.on("message", (data) => {
@@ -282,9 +275,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
         return;
       }
       const input = coerceNodeInvokePayload(frame.payload);
-      if (!input) {
-        throw new Error("Node received an invalid invoke frame");
-      }
+      assert(input, "Node received an invalid invoke frame");
       expect(input.command).toBe(NODE_WORKER_WORKSPACE_PREPARE_COMMAND);
       invoked.push(input);
       const controller = new AbortController();
@@ -413,7 +404,6 @@ async function createPreparedNodeAcknowledgement(root: string) {
       workspace,
       preparedStore,
       received,
-      accepted,
       invoked,
       cancelled,
       setPreparedWorkspace,
@@ -428,9 +418,6 @@ async function createPreparedNodeAcknowledgement(root: string) {
       },
       bind: (signal?: AbortSignal) => options.bindPreparedWorkspace!({ ...binding, signal }),
       binding,
-      holdReply: (gate: () => Promise<void>) => {
-        beforeReply = gate;
-      },
       settleInvokes: () => Promise.all(pending),
       close,
     };
