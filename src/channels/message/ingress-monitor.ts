@@ -543,7 +543,12 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
     onDurablyAdmitted: () => void;
   };
   const admitRawBatch = async (rawEvents: readonly TRaw[], admitOptions: AdmissionOptions) => {
-    const prepared = [];
+    const prepared: Array<{
+      raw: TRaw;
+      facts: ChannelIngressMonitorFacts;
+      payload: TStoredPayload;
+      index: number;
+    }> = [];
     const results: Array<
       { kind: "ignored" } | { kind: "durable"; queueResult: Awaited<ReturnType<Queue["enqueue"]>> }
     > = [];
