@@ -1,18 +1,19 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect, it, vi } from "vitest";
 import { heartbeatRunnerTelegramPlugin } from "../../test/helpers/infra/heartbeat-runner-channel-plugins.js";
+import * as promises from "../../test/helpers/promise.js";
 import { createHeartbeatToolResponsePayload } from "../auto-reply/heartbeat-tool-response.js";
 import { setReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
 import type { InternalGetReplyFromConfig } from "../auto-reply/reply/get-reply.types.js";
 import { finalizeInboundContext } from "../auto-reply/reply/inbound-context.js";
 import { initSessionState } from "../auto-reply/reply/session.js";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../config/config.js";
 import * as sessions from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import * as hooks from "../plugins/hook-runner-global.js";
 import { addTestHook } from "../plugins/hooks.test-helpers.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawAgentDatabasesAsync } from "../state/openclaw-agent-db.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../test-utils/channel-plugins.js";
 import * as speech from "../tts/tts-runtime.test-support.js";
@@ -50,25 +51,38 @@ function createCase({ tmpDir, storePath, replySpy }: Sandbox) {
     },
     session: { store: storePath },
   };
-  const sendTelegram = vi.fn().mockResolvedValue({ messageId: "m1" });
+  const send = vi.fn().mockResolvedValue({ messageId: "m1" });
+  const seed = (entry: Partial<Parameters<typeof seedMainSessionStore>[2]> = {}) =>
+    seedMainSessionStore(storePath, cfg, {
+      lastChannel: "telegram",
+      lastProvider: "telegram",
+      lastTo: TELEGRAM_GROUP,
+      ...entry,
+    });
   return {
     cfg,
     storePath,
-    replySpy,
-    sendTelegram,
-    seed: (entry: Partial<Parameters<typeof seedMainSessionStore>[2]> = {}) =>
-      seedMainSessionStore(storePath, cfg, {
-        lastChannel: "telegram",
-        lastProvider: "telegram",
-        lastTo: TELEGRAM_GROUP,
-        ...entry,
-      }),
+    reply: replySpy,
+    send,
+    seed,
+    silentOutcome: async (notify: boolean, summary: string) => {
+      cfg.agents!.defaults!.heartbeat!.target = "none";
+      const key = await seed();
+      replySpy.mockResolvedValue(
+        createHeartbeatToolResponsePayload({
+          outcome: notify ? "needs_attention" : "progress",
+          notify,
+          summary,
+        }),
+      );
+      return key;
+    },
     run: (options: RunOptions = {}, deps: Partial<HeartbeatDeps> = {}) =>
       runHeartbeatOnce({
         cfg,
         ...options,
         deps: {
-          telegram: sendTelegram,
+          telegram: send,
           getQueueSize: () => 0,
           nowMs: () => 0,
           getReplyFromConfig: replySpy,
@@ -104,14 +118,10 @@ const test = it.extend<{ heartbeat: ReturnType<typeof createCase> }>({
     }
   },
 });
-function telegramRegistry(heartbeat: typeof heartbeatRunnerTelegramPlugin.heartbeat) {
-  return createTestRegistry([
-    {
-      pluginId: "telegram",
-      source: "test",
-      plugin: { ...heartbeatRunnerTelegramPlugin, heartbeat },
-    },
-  ]);
+function usePlugin(plugin: ChannelPlugin) {
+  const registry = createTestRegistry([{ pluginId: "telegram", source: "test", plugin }]);
+  setActivePluginRegistry(registry);
+  return registry;
 }
 function buttons(label: string, value: string) {
   return { presentation: { blocks: [{ type: "buttons" as const, buttons: [{ label, value }] }] } };
@@ -119,7 +129,7 @@ function buttons(label: string, value: string) {
 
 test.for(["disconnected", "throws", "no-target"])(
   "checks readiness before the model and recovers: %s",
-  async (failure, { heartbeat: { cfg, seed, replySpy, sendTelegram, run } }) => {
+  async (failure, { heartbeat: { cfg, seed, reply, send, run } }) => {
     let ready = false;
     const checkReady = vi.fn(async () => {
       if (!ready && failure === "throws") {
@@ -127,28 +137,28 @@ test.for(["disconnected", "throws", "no-target"])(
       }
       return { ok: ready, reason: ready ? "ok" : "terminal-disconnect" };
     });
-    setActivePluginRegistry(telegramRegistry({ checkReady }));
+    usePlugin({ ...heartbeatRunnerTelegramPlugin, heartbeat: { checkReady } });
     if (failure === "no-target") {
       cfg.agents!.defaults!.heartbeat!.target = "none";
     }
     await seed();
-    replySpy.mockResolvedValue({ text: "Deployment needs attention." });
+    reply.mockResolvedValue({ text: "Deployment needs attention." });
     const result = await run();
     if (failure === "no-target") {
       expect(result.status).toBe("ran");
-      expect(replySpy).toHaveBeenCalledOnce();
+      expect(reply).toHaveBeenCalledOnce();
       expect(checkReady).not.toHaveBeenCalled();
     } else {
       expect(result).toEqual({ status: "skipped", reason: "channel-not-ready" });
-      expect(replySpy).not.toHaveBeenCalled();
+      expect(reply).not.toHaveBeenCalled();
       expect(checkReady).toHaveBeenCalledOnce();
     }
-    expect(sendTelegram).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
     if (failure !== "no-target") {
       ready = true;
       expect((await run()).status).toBe("ran");
-      expect(replySpy).toHaveBeenCalledOnce();
-      expect(sendTelegram).toHaveBeenCalledOnce();
+      expect(reply).toHaveBeenCalledOnce();
+      expect(send).toHaveBeenCalledOnce();
     }
   },
 );
@@ -160,23 +170,24 @@ test.for([
   { kind: "manual", source: "manual", intent: "manual" },
 ] as const)(
   "executes $kind work from $source before gating unavailable delivery",
-  async ({ kind, source, intent }, { heartbeat: { cfg, seed, replySpy, sendTelegram, run } }) => {
+  async ({ kind, source, intent }, { heartbeat: { cfg, seed, reply, send, run } }) => {
     const payload = "Check inbox for queued work.";
     const order: string[] = [];
-    setActivePluginRegistry(
-      telegramRegistry({
+    usePlugin({
+      ...heartbeatRunnerTelegramPlugin,
+      heartbeat: {
         checkReady: async () => {
           order.push("readiness");
           return { ok: false, reason: "terminal-disconnect" };
         },
-      }),
-    );
+      },
+    });
     cfg.agents!.defaults!.heartbeat!.prompt = kind === "manual" ? payload : "Ambient monitor only.";
     const sessionKey = await seed();
     if (kind === "event") {
       enqueueSystemEvent(`Reminder: ${payload}`, { sessionKey, contextKey: "cron:inbox" });
     }
-    replySpy.mockImplementation(async () => {
+    reply.mockImplementation(async () => {
       order.push("model");
       return { text: "Inbox needs attention." };
     });
@@ -187,48 +198,40 @@ test.for([
         ? { tasks: [{ jobId: "inbox", name: "Check inbox", prompt: payload }] }
         : {}),
     });
-    expect(replySpy).toHaveBeenCalledOnce();
-    expect(replySpy.mock.calls[0]?.[0].Body).toContain(payload);
+    expect(reply).toHaveBeenCalledOnce();
+    expect(reply.mock.calls[0]?.[0].Body).toContain(payload);
     expect(order).toEqual(["model", "readiness"]);
     expect(result).toMatchObject({ status: "skipped", reason: "channel-not-ready" });
-    expect(sendTelegram).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   },
 );
 
-test("synthesizes and delivers a speech-only heartbeat without placeholder text", async ({
-  heartbeat: { cfg, seed, replySpy, sendTelegram, run },
+test("delivers synthesized speech without placeholder text", async ({
+  heartbeat: { cfg, seed, reply, send, run },
 }) => {
   cfg.tts = { ...speech.createTtsConfig("heartbeat-speech-only").tts, auto: "tagged" };
   await seed();
-  replySpy.mockResolvedValue([
+  reply.mockResolvedValue([
     setReplyPayloadMetadata({ text: "" }, { tts: { tagged: true, text: "The build is ready." } }),
   ]);
   expect(await run()).toMatchObject({ status: "ran" });
   expect(speech.synthesizeMock).toHaveBeenCalledOnce();
   expect(speech.synthesizeMock.mock.calls[0]?.[0].text).toBe("The build is ready.");
-  expect(sendTelegram).toHaveBeenCalledOnce();
-  expect(sendTelegram.mock.calls[0]?.[1]).toBe("");
-  expect(sendTelegram.mock.calls[0]?.[2]).toMatchObject({
+  expect(send).toHaveBeenCalledOnce();
+  expect(send.mock.calls[0]?.[1]).toBe("");
+  expect(send.mock.calls[0]?.[2]).toMatchObject({
     mediaUrl: "https://example.test/heartbeat.ogg",
     audioAsVoice: true,
   });
 });
 
-test("persists the first silent heartbeat after boot for the next user run", async ({
-  heartbeat: { cfg, seed, replySpy, sendTelegram, run, claim },
+test("persists the first silent outcome after boot", async ({
+  heartbeat: { silentOutcome, send, run, claim },
 }) => {
-  cfg.agents!.defaults!.heartbeat!.target = "none";
-  const sessionKey = await seed();
+  const sessionKey = await silentOutcome(false, "First heartbeat after boot");
   await closeOpenClawAgentDatabasesAsync();
-  replySpy.mockResolvedValue(
-    createHeartbeatToolResponsePayload({
-      outcome: "progress",
-      notify: false,
-      summary: "First heartbeat after boot",
-    }),
-  );
   expect(await run()).toMatchObject({ status: "ran" });
-  expect(sendTelegram).not.toHaveBeenCalled();
+  expect(send).not.toHaveBeenCalled();
   await closeOpenClawAgentDatabasesAsync();
   expect(await claim(sessionKey)).toMatchObject({
     summary: "First heartbeat after boot",
@@ -238,18 +241,10 @@ test("persists the first silent heartbeat after boot for the next user run", asy
 
 test.for([false, true])(
   "awaits outcome persistence failures (notify=%s)",
-  async (notify, { heartbeat: { cfg, seed, replySpy, sendTelegram, run, claim } }) => {
-    cfg.agents!.defaults!.heartbeat!.target = "none";
-    const sessionKey = await seed();
-    replySpy.mockResolvedValue(
-      createHeartbeatToolResponsePayload({
-        outcome: notify ? "needs_attention" : "progress",
-        notify,
-        summary: "Synthetic outcome awaiting persistence",
-      }),
-    );
-    const entered = createDeferredCore();
-    const release = createDeferredCore();
+  async (notify, { heartbeat: { silentOutcome, send, run, claim } }) => {
+    const sessionKey = await silentOutcome(notify, "Pending outcome");
+    const entered = promises.createDeferred();
+    const release = promises.createDeferred();
     const persist = vi
       .spyOn(heartbeatOutcomeStore, "persistHeartbeatOutcome")
       .mockImplementationOnce(async () => {
@@ -258,15 +253,10 @@ test.for([false, true])(
       });
     const pending = run();
     try {
-      await Promise.race([
-        entered.promise,
-        pending.then(() => {
-          throw new Error("heartbeat completed without awaiting persistence");
-        }),
-      ]);
+      await promises.awaitGateBeforeSettlement(entered.promise, pending, "persistence bypassed");
       release.reject(new Error("outcome storage unavailable"));
       expect(await pending).toMatchObject({ status: "failed" });
-      expect(sendTelegram).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
       expect(await claim(sessionKey)).toBeUndefined();
     } finally {
       release.resolve();
@@ -278,7 +268,7 @@ test.for([false, true])(
 
 test.for(["none", "same-id"] as const)(
   "records the first delivery only for its initialized session: %s",
-  async (replacement, { heartbeat: { cfg, storePath, sendTelegram, run, read } }) => {
+  async (replacement, { heartbeat: { cfg, storePath, send, run, read } }) => {
     cfg.agents!.defaults!.heartbeat!.to = TELEGRAM_GROUP;
     const sessionKey = "agent:main:main";
     expect(readSessionStoreForTest(storePath)[sessionKey]).toBeUndefined();
@@ -296,7 +286,7 @@ test.for(["none", "same-id"] as const)(
       });
       return { text: "Deployment requires attention." };
     };
-    sendTelegram.mockImplementation(async () => {
+    send.mockImplementation(async () => {
       if (replacement !== "none") {
         sessions.replaceSessionEntrySync(
           { storePath, sessionKey },
@@ -310,7 +300,7 @@ test.for(["none", "same-id"] as const)(
       return { messageId: "first-alert" };
     });
     expect((await run({}, { getReplyFromConfig: replyResolver })).status).toBe("ran");
-    expect(sendTelegram).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
     const stored = read(sessionKey);
     if (replacement === "none") {
       expect(stored).toMatchObject({
@@ -318,7 +308,7 @@ test.for(["none", "same-id"] as const)(
         lastHeartbeatSentAt: 0,
       });
       await run({}, { getReplyFromConfig: replyResolver });
-      expect(sendTelegram).toHaveBeenCalledOnce();
+      expect(send).toHaveBeenCalledOnce();
     } else {
       expect(stored.lifecycleRevision).toBe("replacement-revision");
       expect(stored.lastHeartbeatText).toBeUndefined();
@@ -335,7 +325,7 @@ test.for([
   { failure: "send-failed", reason: "transport unavailable" },
 ])(
   "records a generated alert when $failure prevents confirmed delivery",
-  async ({ failure, reason }, { heartbeat: { cfg, seed, replySpy, sendTelegram, run, claim } }) => {
+  async ({ failure, reason }, { heartbeat: { cfg, seed, reply, send, run, claim } }) => {
     cfg.agents!.defaults!.heartbeat!.target = failure === "target-none" ? "none" : "telegram";
     if (failure === "alerts-disabled") {
       cfg.channels = {
@@ -343,15 +333,17 @@ test.for([
         defaults: { heartbeatVisibility: { showAlerts: false } },
       };
     }
-    const registry = telegramRegistry({
-      checkReady: async () => {
-        if (failure === "readiness-throws" && replySpy.mock.calls.length > 0) {
-          throw new Error(reason);
-        }
-        return { ok: failure !== "readiness", reason };
+    const registry = usePlugin({
+      ...heartbeatRunnerTelegramPlugin,
+      heartbeat: {
+        checkReady: async () => {
+          if (failure === "readiness-throws" && reply.mock.calls.length > 0) {
+            throw new Error(reason);
+          }
+          return { ok: failure !== "readiness", reason };
+        },
       },
     });
-    setActivePluginRegistry(registry);
     if (failure === "hook-cancelled") {
       addTestHook({
         registry,
@@ -362,7 +354,7 @@ test.for([
       hooks.initializeGlobalHookRunner(registry);
     }
     const sessionKey = await seed();
-    replySpy.mockResolvedValue(
+    reply.mockResolvedValue(
       createHeartbeatToolResponsePayload({
         outcome: "needs_attention",
         notify: true,
@@ -373,10 +365,10 @@ test.for([
       }),
     );
     if (failure === "send-failed") {
-      sendTelegram.mockRejectedValue(new Error(reason));
+      send.mockRejectedValue(new Error(reason));
     }
     const result = await run({ source: "manual", reason: "operator check" });
-    expect(replySpy).toHaveBeenCalledOnce();
+    expect(reply).toHaveBeenCalledOnce();
     expect(getLastHeartbeatEvent()?.indicatorType).toBe(
       failure === "send-failed" ? "error" : failure === "alerts-disabled" ? "alert" : undefined,
     );
@@ -399,15 +391,14 @@ test.for([
     });
     expect(stored?.responseReason).toContain(reason);
     expect(stored?.responseReason).toContain("notify:true");
-    await closeOpenClawAgentDatabasesAsync();
   },
 );
 
-test("delivers only the final non-reasoning answer after private blocks", async ({
-  heartbeat: { seed, replySpy, sendTelegram, run },
+test("delivers only the final non-reasoning answer", async ({
+  heartbeat: { seed, reply, send, run },
 }) => {
   await seed();
-  replySpy.mockImplementation(async (_ctx, options) => {
+  reply.mockImplementation(async (_ctx, options) => {
     await options?.onBlockReply?.({ text: "Intermediate finding" });
     return [
       { text: "Superseded draft" },
@@ -416,39 +407,39 @@ test("delivers only the final non-reasoning answer after private blocks", async 
     ];
   });
   expect((await run()).status).toBe("ran");
-  expect(sendTelegram).toHaveBeenCalledOnce();
-  expect(sendTelegram.mock.calls[0]?.[1]).toBe("Final monitoring result");
+  expect(send).toHaveBeenCalledOnce();
+  expect(send.mock.calls[0]?.[1]).toBe("Final monitoring result");
 });
 
-test("delivers changed heartbeat actions when their visible text matches the previous send", async ({
-  heartbeat: { seed, replySpy, sendTelegram, run },
+test("delivers changed actions with unchanged text", async ({
+  heartbeat: { seed, reply, send, run },
 }) => {
   await seed();
   const text = "Deployment approval required.";
-  replySpy
+  reply
     .mockResolvedValueOnce({ text, ...buttons("Review deployment", "review") })
     .mockResolvedValueOnce({ text, ...buttons("Approve deployment", "approve") });
   await run();
   await run();
-  expect(sendTelegram).toHaveBeenCalledTimes(2);
-  expect(sendTelegram.mock.calls[0]?.[1]).toContain("Review deployment");
-  expect(sendTelegram.mock.calls[1]?.[1]).toContain("Approve deployment");
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(send.mock.calls[0]?.[1]).toContain("Review deployment");
+  expect(send.mock.calls[1]?.[1]).toContain("Approve deployment");
 });
 
 test.for(["confirmed", "unknown"] as const)(
   "settles confirmed presentation delivery and retains unknown custody: %s",
-  async (mode, { heartbeat: { storePath, seed, replySpy, sendTelegram, run, read } }) => {
+  async (mode, { heartbeat: { storePath, seed, reply, send, run, read } }) => {
     const previous = {
       lastHeartbeatText: "Previous successful heartbeat",
       lastHeartbeatSentAt: 0,
     };
     const sessionKey = await seed(previous);
-    replySpy.mockImplementation(async () => {
-      const reply = buttons("Approve deployment", "approve");
+    reply.mockImplementation(async () => {
+      const payload = buttons("Approve deployment", "approve");
       await sessions.patchSessionEntryCore(
         { storePath, sessionKey },
         (current) => {
-          setReplyPayloadMetadata(reply, {
+          setReplyPayloadMetadata(payload, {
             pendingFinalDeliveryCompletion: {
               sessionKey,
               storePath,
@@ -468,15 +459,15 @@ test.for(["confirmed", "unknown"] as const)(
         },
         { preserveActivity: true },
       );
-      return reply;
+      return payload;
     });
-    sendTelegram.mockResolvedValue({
+    send.mockResolvedValue({
       messageId: mode === "confirmed" ? "presentation-1" : undefined,
     });
     expect((await run()).status).toBe("ran");
-    expect(sendTelegram).toHaveBeenCalledOnce();
-    expect(sendTelegram.mock.calls[0]?.[0]).toBe(TELEGRAM_GROUP);
-    expect(sendTelegram.mock.calls[0]?.[1]).toContain("Approve deployment");
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0]).toBe(TELEGRAM_GROUP);
+    expect(send.mock.calls[0]?.[1]).toContain("Approve deployment");
     const stored = read(sessionKey);
     expect(stored).toMatchObject(previous);
     if (mode === "confirmed") {
@@ -490,26 +481,20 @@ test.for(["confirmed", "unknown"] as const)(
   },
 );
 
-test("preserves heartbeat reply metadata, channel data, and voice delivery", async ({
-  heartbeat: { seed, replySpy, run },
+test("preserves reply metadata, channel data and voice", async ({
+  heartbeat: { seed, reply, run },
 }) => {
   await seed();
   const sendPayload = vi.fn().mockResolvedValue({ channel: "telegram", messageId: "metadata-1" });
-  setActivePluginRegistry(
-    createTestRegistry([
-      {
-        pluginId: "telegram",
-        source: "test",
-        plugin: createOutboundTestPlugin({
-          id: "telegram",
-          outbound: {
-            deliveryMode: "direct",
-            sendText: vi.fn().mockResolvedValue({ messageId: "text-1" }),
-            sendPayload,
-          },
-        }),
+  usePlugin(
+    createOutboundTestPlugin({
+      id: "telegram",
+      outbound: {
+        deliveryMode: "direct",
+        sendText: vi.fn().mockResolvedValue({ messageId: "text-1" }),
+        sendPayload,
       },
-    ]),
+    }),
   );
   const payload = {
     text: "Deployment update",
@@ -520,7 +505,7 @@ test("preserves heartbeat reply metadata, channel data, and voice delivery", asy
       telegram: { buttons: [[{ text: "Open deployment", callback_data: "open" }]] },
     },
   };
-  replySpy.mockResolvedValue(setReplyPayloadMetadata(payload, { replyToIdExplicit: true }));
+  reply.mockResolvedValue(setReplyPayloadMetadata(payload, { replyToIdExplicit: true }));
   expect((await run()).status).toBe("ran");
   expect(sendPayload).toHaveBeenCalledOnce();
   expect(sendPayload.mock.calls[0]?.[0]?.payload).toMatchObject(payload);
