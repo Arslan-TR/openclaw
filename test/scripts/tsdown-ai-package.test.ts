@@ -4,7 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { build } from "tsdown";
 import { expect, it } from "vitest";
-import manifest from "../../packages/ai/package.json";
+import manifest from "../../packages/ai/package.json" with { type: "json" };
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 import config from "../../tsdown.ai.config.ts";
 import { createScriptTestHarness } from "./test-helpers.js";
@@ -79,6 +79,6 @@ it("streams Mistral from the built AI package without installing the SDK", async
       timeout: 30_000,
     });
   } finally {
-    await Promise.all(bundles.map((bundle) => bundle.close()));
+    await Promise.all(bundles.map((bundle) => bundle[Symbol.asyncDispose]()));
   }
 });

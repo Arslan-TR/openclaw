@@ -278,6 +278,9 @@ importers:
       '@openclaw/proxyline':
         specifier: 0.4.0
         version: 0.4.0(undici@8.11.2)
+      '@opentelemetry/semantic-conventions':
+        specifier: 1.43.0
+        version: 1.43.0
       '@resvg/resvg-js':
         specifier: 2.6.2
         version: 2.6.2
@@ -425,6 +428,9 @@ importers:
       zod:
         specifier: 4.6.5
         version: 4.6.5
+      zod-to-json-schema:
+        specifier: 3.25.2
+        version: 3.25.2(zod@4.6.5)
     devDependencies:
       '@a2ui/lit':
         specifier: 0.12.0
