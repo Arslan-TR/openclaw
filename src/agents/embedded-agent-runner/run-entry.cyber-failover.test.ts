@@ -95,44 +95,26 @@ describe("runEmbeddedAgentEntry cyber failover", () => {
   afterEach(clearRuntimeConfigSnapshot);
 
   it("retries a replay-safe OpenAI cyber refusal once on Daybreak without changing selection", async () => {
-    const candidateCalls: Array<{
-      provider: string;
-      model: string;
-      isFallbackRetry: boolean;
-      routingStage: string;
-    }> = [];
-    const reconciled: Array<{ provider: string; model: string }> = [];
-    const result = await runEntry(
-      "run-cyber-escalation",
-      async (provider, model, options) => {
-        candidateCalls.push({
-          provider,
-          model,
-          isFallbackRetry: options.isFallbackRetry,
-          routingStage: options.modelRoutingProvenance.stage,
-        });
-        return model === "gpt-daybreak-blue-latest"
-          ? makeResult({ provider, model })
-          : makeRefusalResult(provider, model);
-      },
-      {
-        sessionOverride: {
-          kind: "reconcile-completed",
-          reconcile: async (candidate) => {
-            reconciled.push(candidate);
-          },
-        },
-      },
+    const reconcile = vi.fn(async () => {});
+    const runCandidate = vi.fn<EntryParams["runCandidate"]>(async (provider, model) =>
+      model === "gpt-daybreak-blue-latest"
+        ? makeResult({ provider, model })
+        : makeRefusalResult(provider, model),
     );
+    const result = await runEntry("run-cyber-escalation", runCandidate, {
+      sessionOverride: { kind: "reconcile-completed", reconcile },
+    });
 
-    expect(candidateCalls).toEqual([
-      { provider: "openai", model: "gpt-5.6", isFallbackRetry: false, routingStage: "initial" },
-      {
-        provider: "openai",
-        model: "gpt-daybreak-blue-latest",
-        isFallbackRetry: true,
-        routingStage: "fallback",
-      },
+    expect(
+      runCandidate.mock.calls.map(([provider, model, options]) => [
+        provider,
+        model,
+        options.isFallbackRetry,
+        options.modelRoutingProvenance.stage,
+      ]),
+    ).toEqual([
+      ["openai", "gpt-5.6", false, "initial"],
+      ["openai", "gpt-daybreak-blue-latest", true, "fallback"],
     ]);
     expect(result.provider).toBe("openai");
     expect(result.model).toBe("gpt-daybreak-blue-latest");
@@ -146,7 +128,7 @@ describe("runEmbeddedAgentEntry cyber failover", () => {
       model: "gpt-daybreak-blue-latest",
     });
     await result.settleSessionOverride();
-    expect(reconciled).toEqual([]);
+    expect(reconcile).not.toHaveBeenCalled();
   });
 
   it("preserves the original refusal and cools off an unauthorized Daybreak target", async () => {
