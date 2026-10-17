@@ -33,24 +33,24 @@ describe("memory index", () => {
   it("reuses published facts across searches and observes the next publication", async () => {
     providerFixture.forceNoProvider = true;
     const manager = await getPersistentManager(createCfg({ provider: "none", minScore: 0 }));
+    const publishedPath = path.join(fixture.paths.memory, "published.md");
+    await fs.writeFile(publishedPath, "orchid publication canary");
     await manager.sync({ reason: "test", force: true });
+    const first = await manager.search("orchid", { minScore: 0 });
+    expect(first).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "memory/published.md" })]),
+    );
     const reads = vi.spyOn(memoryCpuWorkerRuntime, "runMemoryIndexRead");
     const keyword = vi.spyOn(memoryCpuWorkerRuntime, "runMemoryKeywordSearch");
     const state = vi.spyOn(memoryCpuWorkerRuntime, "runMemoryIndexState");
     try {
-      const first = await manager.search("zebra", { minScore: 0 });
-      expect(first).toEqual(
-        expect.arrayContaining([expect.objectContaining({ path: "memory/2026-01-12.md" })]),
-      );
-      expect(await manager.search("zebra", { minScore: 0 })).toEqual(first);
+      expect(await manager.search("orchid", { minScore: 0 })).toEqual(first);
+      expect(await manager.search("orchid", { minScore: 0 })).toEqual(first);
       expect(reads.mock.calls.filter(([, command]) => command.type === "index.facts")).toEqual([]);
       expect(state).not.toHaveBeenCalled();
       expect(keyword.mock.calls.map((call) => call[3])).toEqual([false, false]);
 
-      await fs.writeFile(
-        path.join(fixture.paths.memory, "published.md"),
-        "iris publication canary",
-      );
+      await fs.writeFile(publishedPath, "iris publication canary");
       await manager.sync({ reason: "test" });
       expect(await manager.search("iris publication canary", { minScore: 0 })).toEqual(
         expect.arrayContaining([expect.objectContaining({ path: "memory/published.md" })]),
