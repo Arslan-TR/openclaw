@@ -31,6 +31,7 @@ import {
   summarizeCpuProfile,
 } from "./lib/control-ui-cold-load-trace.ts";
 import { probeColdLoadOverlays } from "./lib/control-ui-overlay-probe.ts";
+import { probeTranscriptFling } from "./lib/control-ui-transcript-fling.ts";
 import { warmReloadProbe } from "./lib/control-ui-warm-reload-probe.ts";
 
 function readRigProbeSnapshot() {
@@ -204,6 +205,7 @@ function summarizeSidebarWindows(
 
 const { values } = parseArgs({
   options: {
+    "transcript-fling": { type: "boolean", default: false },
     "warm-reload": { type: "boolean", default: false },
     "large-snapshot": { type: "boolean", default: false },
     "overlay-probe": { type: "boolean", default: false },
@@ -303,6 +305,7 @@ const fixture = createControlUiTeamScaleFixture({
   duplicateBootReads: values["duplicate-boot-reads"],
   closedMenuMembers: values["closed-menu-members"],
   largeSnapshot: values["large-snapshot"],
+  transcriptFling: values["transcript-fling"],
 });
 const streamingReply = values["streaming-reply"] ? createControlUiStreamingReply() : undefined;
 const extraInitScripts = await Promise.all(
@@ -323,6 +326,7 @@ try {
   browser = await chromium.launch({
     executablePath: resolvePlaywrightChromiumExecutablePath(chromium.executablePath()),
     headless: true,
+    ...(values["transcript-fling"] ? { ignoreDefaultArgs: ["--hide-scrollbars"] } : {}),
   });
   const context = await browser.newContext({
     viewport: { width: 1719, height: 1179 },
@@ -966,6 +970,9 @@ try {
         );
       }
     }
+    const fling = values["transcript-fling"]
+      ? await probeTranscriptFling(page, cdp, artifactDir, run, !values.untraced)
+      : undefined;
     const overlays = values["overlay-probe"]
       ? await probeColdLoadOverlays(
           page,
@@ -996,6 +1003,7 @@ try {
       warmReload,
       snapshotSave,
       overlays,
+      fling,
     };
     results.push(result);
     console.log(JSON.stringify(result));

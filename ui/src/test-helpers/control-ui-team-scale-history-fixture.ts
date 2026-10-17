@@ -5,6 +5,8 @@ export function createTeamScaleHistoryFixture(options: {
   inlineWidgets: number;
   now: number;
   largeSnapshot?: boolean;
+  transcriptFling?: boolean;
+  imageUrl?: string;
   attachments?: ReturnType<typeof createTeamScaleDuplicateReadFixture>["attachments"];
 }) {
   const messageIds = Array.from(
@@ -26,6 +28,16 @@ export function createTeamScaleHistoryFixture(options: {
       : {}),
     timestamp: options.now - (options.messageCount - index) * 60_000,
     content: [
+      ...(options.transcriptFling && index % 8 === 3
+        ? [
+            {
+              type: "toolCall",
+              id: `fling-tool-${index}`,
+              name: "exec",
+              arguments: { command: "printf synthetic", title: "Synthetic checkpoint" },
+            },
+          ]
+        : []),
       ...(options.attachments && index === options.messageCount - 1 ? options.attachments : []),
       {
         type: "text",
@@ -35,6 +47,12 @@ export function createTeamScaleHistoryFixture(options: {
           index % 2
             ? "The current implementation is ready for verification. Coverage includes the normal path, a recoverable failure, and the final user-visible result."
             : "Please check the current progress and keep the existing layout stable while the remaining results arrive.",
+          ...(options.transcriptFling
+            ? [
+                "```typescript\nexport function checkpoint(value: number) {\n  return value * 2;\n}\n```",
+                ...(index % 8 === 0 ? [`![Synthetic transcript image](${options.imageUrl})`] : []),
+              ]
+            : []),
           ...(options.largeSnapshot
             ? ["Synthetic transcript detail and tool output. ".repeat(40)]
             : []),

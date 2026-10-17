@@ -69,6 +69,7 @@ type FixtureOptions = {
   duplicateBootReads?: boolean;
   closedMenuMembers?: boolean;
   largeSnapshot?: boolean;
+  transcriptFling?: boolean;
 };
 
 function widgetHtml(index: number) {
@@ -82,7 +83,11 @@ function widgetHtml(index: number) {
 export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
   const counts = {
     ...TEAM_SCALE_COUNTS,
-    transcriptMessages: options.largeSnapshot ? 1_100 : TEAM_SCALE_COUNTS.transcriptMessages,
+    transcriptMessages: options.transcriptFling
+      ? 1_200
+      : options.largeSnapshot
+        ? 1_100
+        : TEAM_SCALE_COUNTS.transcriptMessages,
   };
   const now = options.now ?? Date.now();
   const baseUrl = options.baseUrl ?? "http://127.0.0.1:19626/";
@@ -225,18 +230,27 @@ export function createControlUiTeamScaleFixture(options: FixtureOptions = {}) {
     inlineWidgets: counts.inlineWidgets,
     now,
     largeSnapshot: options.largeSnapshot,
+    transcriptFling: options.transcriptFling,
+    imageUrl: new URL("__openclaw__/fling-image.svg", baseUrl).href,
     attachments: duplicateReads?.attachments,
   });
-  const largeHistory = options.largeSnapshot
-    ? {
-        messages: historyMessages,
-        sessionId: pinnedRows[0]!.sessionId,
-        sessionInfo: pinnedRows[0]!,
-        hasMore: false,
-        totalMessages: counts.transcriptMessages,
-        metadata: { models: [] },
-      }
-    : undefined;
+  if (options.transcriptFling) {
+    assets.set("/__openclaw__/fling-image.svg", {
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="180"><rect width="640" height="180" fill="#4682b4"/><text x="32" y="90" font-size="24">Synthetic transcript image</text></svg>',
+    });
+  }
+  const largeHistory =
+    options.largeSnapshot || options.transcriptFling
+      ? {
+          messages: historyMessages,
+          sessionId: pinnedRows[0]!.sessionId,
+          sessionInfo: pinnedRows[0]!,
+          hasMore: false,
+          totalMessages: counts.transcriptMessages,
+          metadata: { models: [] },
+        }
+      : undefined;
   const catalogs: SessionCatalog[] = ["codex", "claude"].map((id, catalogIndex) => ({
     id,
     label: id === "codex" ? "Codex" : "Claude Code",
