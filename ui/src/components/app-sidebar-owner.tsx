@@ -44,7 +44,7 @@ import {
   type SidebarRecentSession,
   type SidebarToolActivity,
 } from "./app-sidebar-session-types.ts";
-import { SessionOrganizerController } from "./session-organizer-controller.ts";
+import { SessionOrganizer } from "./session-organizer.ts";
 import { SidebarAgentRoster, renderSidebarPinnedSession } from "./sidebar-agent-roster.tsx";
 import type { createSidebarScroll } from "./sidebar-context-controller.ts";
 import { SidebarMenusController } from "./sidebar-menus-controller.tsx";
@@ -75,7 +75,7 @@ export class AppSidebarOwner extends AppSidebarSessionNavigationElement implemen
     return this.readNarration()?.observerDigests ?? this.emptyObserverDigests;
   }
 
-  override readonly sessionOrganizer = new SessionOrganizerController(this);
+  override readonly sessionOrganizer = new SessionOrganizer(this, () => this.requestUpdate());
   override readonly sidebarMenus = new SidebarMenusController(this);
   readonly people = new SidebarPeoplePreferences(() => this.requestUpdate());
   peopleView?: ReturnType<typeof createSidebarPeople>;

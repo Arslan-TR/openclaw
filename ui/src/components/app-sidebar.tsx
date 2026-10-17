@@ -167,13 +167,21 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     () => props.navigationVisible,
   );
   onSettled(() => context.gateway.subscribeEvents((event) => owner.narration?.handleEvent(event)));
-  const presentation = createParkedProjection(prepared, () => props.navigationVisible);
+  const presentationRevision = createParkedProjection(
+    () => {
+      Object.values(props);
+      snapshotPending();
+      snapshotModel();
+      return projection.revision();
+    },
+    () => props.navigationVisible,
+  );
   const observed = new WeakMap<object, object>();
   const observe = <T extends object>(target: T): T => {
     const proxy = new Proxy(target, {
       get(current, key, receiver) {
         if (getObserver()) {
-          presentation();
+          presentationRevision();
         }
         const value = Reflect.get(current, key, receiver);
         return value && typeof value === "object" ? (observed.get(value) ?? value) : value;
