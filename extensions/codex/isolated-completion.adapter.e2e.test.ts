@@ -1,28 +1,21 @@
-import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { createIsolatedCompletionBoundaryFixture } from "openclaw/plugin-sdk/plugin-test-runtime";
 import type { AuthProfileStore } from "openclaw/plugin-sdk/provider-auth";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { awaitGateBeforeSettlement } from "openclaw/plugin-sdk/test-fixtures";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { createCodexAppServerAgentHarness } from "./harness.js";
+import { createCodexTestBindingStore } from "./src/app-server/session-binding.test-helpers.js";
 import { CODEX_APP_SERVER_VERSION } from "./src/app-server/version.js";
 
-const repo = fileURLToPath(new URL("../../", import.meta.url));
+const appServer = fileURLToPath(
+  new URL("../../test/e2e/qa-lab/runtime/codex-isolated-app-server.fixture.mjs", import.meta.url),
+);
 const dirs = useAutoCleanupTempDirTracker(afterEach);
-let root: string;
-
-beforeEach(() => {
-  root = dirs.make("isolated-adapter-proof-");
-  for (const key of ["HOME", "CODEX_HOME", "OPENCLAW_STATE_DIR"]) {
-    vi.stubEnv(key, root);
-  }
-});
 afterEach(() => vi.unstubAllEnvs());
 
 function unexpectedSessionBinding(): never {
@@ -30,8 +23,12 @@ function unexpectedSessionBinding(): never {
 }
 
 it.each(["allowed", "forbidden", "revoked"] as const)(
-  "preserves account authority through the real Codex adapter: %s",
+  "Codex adapter auth: %s",
   async (scenario) => {
+    const root = dirs.make("isolated-adapter-proof-");
+    for (const key of ["HOME", "CODEX_HOME", "OPENCLAW_STATE_DIR"]) {
+      vi.stubEnv(key, root);
+    }
     vi.stubEnv("OPENCLAW_QA_CODEX_APP_SERVER_VERSION", CODEX_APP_SERVER_VERSION);
     const log = path.join(root, "messages.jsonl");
     fs.writeFileSync(log, "");
@@ -76,32 +73,15 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
         "openai:forbidden": credential("forbidden"),
       },
     };
-    const entered = createDeferred<void>();
-    const gate = createDeferred<void>();
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
     let current = true;
     const harness = createCodexAppServerAgentHarness({
-      bindingStore: {
-        read: unexpectedSessionBinding,
-        readAsync: unexpectedSessionBinding,
-        readMany: unexpectedSessionBinding,
-        readNativeSubagentSubmissions: unexpectedSessionBinding,
-        hasOtherThreadOwner: unexpectedSessionBinding,
-        mutate: unexpectedSessionBinding,
-        prepareSessionGenerationReclaim: unexpectedSessionBinding,
-        adoptSessionGeneration: unexpectedSessionBinding,
-        resetSessionGeneration: unexpectedSessionBinding,
-        retireSessionGeneration: unexpectedSessionBinding,
-        withSessionDeletion: unexpectedSessionBinding,
-        withThreadArchiveFence: unexpectedSessionBinding,
-        withLease: unexpectedSessionBinding,
-      },
+      bindingStore: new Proxy(createCodexTestBindingStore(), { get: unexpectedSessionBinding }),
       pluginConfig: {
         appServer: {
           command: process.execPath,
-          args: [
-            path.join(repo, "test/e2e/qa-lab/runtime/codex-isolated-app-server.fixture.mjs"),
-            "app-server",
-          ],
+          args: [appServer, "app-server"],
           transport: "stdio",
           homeScope: "agent",
         },
@@ -139,14 +119,9 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
         }
       },
     });
-    let outcome: unknown;
     try {
       if (scenario === "revoked") {
-        await awaitGateBeforeSettlement(
-          entered.promise,
-          pending,
-          "Completion skipped awaited preparation",
-        );
+        await awaitGateBeforeSettlement(entered.promise, pending, "Preparation gate not reached");
         delete store.profiles["openai:allowed"];
         current = false;
         gate.resolve();
@@ -154,14 +129,10 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
       if (scenario === "allowed") {
         const result = await pending;
         expect(result.text).toBe("Completed as synthetic-allowed-account");
-        outcome = { text: result.text, owner: result.owner };
       } else {
-        const error: unknown = await pending.catch((failure: unknown) => failure);
-        assert(error instanceof Error, "Expected rejection");
-        expect(error.message).toMatch(
+        await expect(pending).rejects.toThrow(
           scenario === "forbidden" ? /not configured/ : /authority revoked/,
         );
-        outcome = { rejected: true, error: error.message };
       }
     } finally {
       gate.resolve();
@@ -185,19 +156,6 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
       );
     } else {
       expect(messages).toEqual([]);
-    }
-    const proofDir = process.env.OPENCLAW_TEST_ADAPTER_PROOF_DIR;
-    if (proofDir) {
-      const sanitized = JSON.parse(
-        JSON.stringify(messages)
-          .replaceAll(root, "<isolated-state>")
-          .replaceAll("synthetic-allowed-access", "<synthetic-token:allowed>")
-          .replaceAll("synthetic-forbidden-access", "<synthetic-token:forbidden>"),
-      );
-      fs.writeFileSync(
-        path.join(proofDir, `${scenario}.json`),
-        JSON.stringify({ scenario, outcome, messages: sanitized }, null, 2) + "\n",
-      );
     }
   },
 );

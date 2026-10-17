@@ -69,8 +69,11 @@ async function expectArchived(sidecarPath: string) {
   await fs.access(`${sidecarPath}.migrated`);
 }
 
-function codexConfig<T extends Record<string, unknown>>(config: T) {
-  return { plugins: { entries: { codex: { enabled: true, config } } } };
+function codexConfig<T extends Record<string, unknown>>(
+  config: T,
+  siblings: Record<string, { enabled: boolean }> = {},
+) {
+  return { plugins: { entries: { ...siblings, codex: { enabled: true, config } } } };
 }
 
 async function bindingFixture(
@@ -166,81 +169,84 @@ afterEach(async () => {
 });
 
 describe("codex doctor contract", () => {
-  it.each([{ legacy: { turnCompletionIdleTimeoutMs: 123_456 }, defaults: { timeoutSeconds: 42 } }])(
-    "reports and removes retired turn idle settings $legacy without changing the run budget",
-    ({ legacy, defaults }) => {
-      const appServer = {
-        requestTimeoutMs: 120_000,
-        mode: "guardian",
-        headers: { "X-Test": "kept" },
-      };
-      const plugin = { codexDynamicToolsLoading: "direct", appServer: { ...appServer, ...legacy } };
-      const original = { ...codexConfig(plugin), agents: { defaults } };
-      const unrelated = { enabled: false };
-      const originalWithSibling = {
-        ...original,
-        plugins: { entries: { ...original.plugins.entries, unrelated } },
-      };
-      const before = structuredClone(originalWithSibling);
-      const rule = legacyConfigRules.find((candidate) =>
-        candidate.match(original.plugins.entries.codex.config.appServer),
-      );
-      expect(rule?.path).toEqual(["plugins", "entries", "codex", "config", "appServer"]);
-      expect(rule?.message).toContain("openclaw doctor --fix");
+  it("reports and removes retired turn idle settings without changing the run budget", () => {
+    const legacy = { turnCompletionIdleTimeoutMs: 123_456 };
+    const defaults = { timeoutSeconds: 42 };
+    const appServer = {
+      requestTimeoutMs: 120_000,
+      mode: "guardian",
+      headers: { "X-Test": "kept" },
+    };
+    const plugin = { codexDynamicToolsLoading: "direct", appServer: { ...appServer, ...legacy } };
+    const siblings = { unrelated: { enabled: false } };
+    const original = { ...codexConfig(plugin, siblings), agents: { defaults } };
+    const before = structuredClone(original);
+    const rule = legacyConfigRules.find((candidate) =>
+      candidate.match(original.plugins.entries.codex.config.appServer),
+    );
+    expect(rule?.path).toEqual(["plugins", "entries", "codex", "config", "appServer"]);
+    expect(rule?.message).toContain("openclaw doctor --fix");
 
-      const result = normalizeCompatibilityConfig({ cfg: originalWithSibling });
+    const result = normalizeCompatibilityConfig({ cfg: original });
 
-      expect(result.config).toEqual({
-        ...codexConfig({ ...plugin, appServer }),
-        agents: { defaults },
-        plugins: {
-          entries: { ...codexConfig({ ...plugin, appServer }).plugins.entries, unrelated },
+    expect(result.config).toEqual({
+      ...codexConfig({ ...plugin, appServer }, siblings),
+      agents: { defaults },
+    });
+    expect(result.changes).toEqual([
+      "Removed retired plugins.entries.codex.config.appServer.turnCompletionIdleTimeoutMs; native Codex owns provider liveness and turn completion. agents.defaults.timeoutSeconds was not changed.",
+    ]);
+    expect(original).toEqual(before);
+    expect(rule?.match(appServer)).toBe(false);
+    expect(normalizeCompatibilityConfig({ cfg: result.config })).toEqual({
+      config: result.config,
+      changes: [],
+    });
+  });
+
+  it.each([
+    {
+      name: "fixed-store-owner",
+      sessionKey: "legacy-fixed-store",
+      owner: "ops",
+      fixed: true,
+      defaults: { systemAgent: { agentId: "main" }, sessionStore: { agentId: "ops" } },
+      agents: ["main", "ops"],
+    },
+    {
+      name: "system-agent-owner",
+      sessionKey: "legacy",
+      owner: "main",
+      fixed: false,
+      defaults: { systemAgent: { agentId: "main" } },
+      agents: ["main", "blocker", "digest"],
+    },
+  ])(
+    "migrates $name to its configured session owner",
+    async ({ name, sessionKey, owner, fixed, defaults, agents }) => {
+      const fixture = await bindingFixture(name, {
+        session: [sessionKey, { updatedAt: 1 }],
+        storeRoot: fixed ? "fixed" : "agent",
+        legacySharedRoot: !fixed,
+      });
+      const result = await fixture.migrate({
+        config: {
+          ...(fixed ? { session: { store: fixture.storePath } } : {}),
+          agents: {
+            ownership: "explicit",
+            defaults,
+            entries: Object.fromEntries(agents.map((id) => [id, {}])),
+          },
         },
       });
-      expect(result.changes).toEqual(
-        Object.keys(legacy).map(
-          (key) =>
-            `Removed retired plugins.entries.codex.config.appServer.${key}; native Codex owns provider liveness and turn completion. agents.defaults.timeoutSeconds was not changed.`,
-        ),
-      );
-      expect(originalWithSibling).toEqual(before);
-      expect(rule?.match(appServer)).toBe(false);
-      expect(normalizeCompatibilityConfig({ cfg: result.config })).toEqual({
-        config: result.config,
-        changes: [],
-      });
+      expect(result).toMatchObject(migrated);
+      await expect(
+        openBindingStore(fixture.env).lookup(sessionBindingKey(name, sessionKey, owner)),
+      ).resolves.toMatchObject({ state: "active", sessionId: name });
+      expect(fixture.readSession(sessionKey, owner)).toMatchObject({ agentHarnessId: "codex" });
+      await fs.access(`${fixture.sidecarPath}.migrated`);
     },
   );
-
-  it("preserves the fixed-store owner when it differs from the system owner", async () => {
-    const sessionKey = "legacy-fixed-store";
-    const fixture = await bindingFixture("fixed-store-owner", {
-      session: [sessionKey, { updatedAt: 1 }],
-      storeRoot: "fixed",
-    });
-    const params = {
-      ...fixture.params,
-      config: {
-        session: { store: fixture.storePath },
-        agents: {
-          ownership: "explicit" as const,
-          defaults: {
-            systemAgent: { agentId: "main" },
-            sessionStore: { agentId: "ops" },
-          },
-          entries: { main: {}, ops: {} },
-        },
-      },
-    };
-
-    await expect(fixture.migrate(params)).resolves.toMatchObject(migrated);
-    await expect(
-      openBindingStore(fixture.env).lookup(
-        sessionBindingKey("fixed-store-owner", sessionKey, "ops"),
-      ),
-    ).resolves.toMatchObject({ state: "active", sessionId: "fixed-store-owner" });
-    expect(fixture.readSession(sessionKey, "ops")).toMatchObject({ agentHarnessId: "codex" });
-  });
 
   it("imports and archives shipped binding sidecars", async () => {
     const fixture = await bindingFixture("session-current", {
@@ -296,54 +302,27 @@ describe("codex doctor contract", () => {
     );
   });
 
-  it.each([["with a missing system agent", { systemAgent: { agentId: "missing" } }]] as const)(
-    "preserves ambiguous shared-root bindings %s",
-    async (_label, defaults) => {
-      const fixture = await bindingFixture("explicit-owner", {
-        legacySharedRoot: true,
-        session: ["legacy", { updatedAt: 1 }],
-      });
-      const params = {
-        ...fixture.params,
-        config: {
-          agents: { ownership: "explicit" as const, defaults, entries: { main: {}, ops: {} } },
-        },
-      };
-
-      await expect(fixture.migration.detectLegacyState(params)).resolves.toMatchObject({
-        preview: [expect.stringContaining("legacy sidecar")],
-      });
-      const result = await fixture.migration.migrateLegacyState(params);
-
-      expectWarning(result, "session ownership is indeterminate");
-      await expectRetained(fixture.sidecarPath);
-      await expect(openBindingStore(fixture.env).entries()).resolves.toEqual([]);
-    },
-  );
-
-  it("migrates a shared-root binding to the configured system agent", async () => {
-    const sessionKey = "legacy";
-    const fixture = await bindingFixture("system-agent-owner", {
+  it("preserves ambiguous shared-root bindings with a missing system agent", async () => {
+    const defaults = { systemAgent: { agentId: "missing" } };
+    const fixture = await bindingFixture("explicit-owner", {
       legacySharedRoot: true,
-      session: [sessionKey, { updatedAt: 1 }],
+      session: ["legacy", { updatedAt: 1 }],
     });
     const params = {
       ...fixture.params,
       config: {
-        agents: {
-          ownership: "explicit" as const,
-          defaults: { systemAgent: { agentId: "main" } },
-          entries: { main: {}, blocker: {}, digest: {} },
-        },
+        agents: { ownership: "explicit" as const, defaults, entries: { main: {}, ops: {} } },
       },
     };
 
-    await expect(fixture.migrate(params)).resolves.toMatchObject(migrated);
-    await expect(
-      openBindingStore(fixture.env).lookup(sessionBindingKey("system-agent-owner", sessionKey)),
-    ).resolves.toMatchObject({ sessionId: "system-agent-owner" });
-    expect(fixture.readSession(sessionKey)).toMatchObject({ agentHarnessId: "codex" });
-    await fs.access(`${fixture.sidecarPath}.migrated`);
+    await expect(fixture.migration.detectLegacyState(params)).resolves.toMatchObject({
+      preview: [expect.stringContaining("legacy sidecar")],
+    });
+    const result = await fixture.migration.migrateLegacyState(params);
+
+    expectWarning(result, "session ownership is indeterminate");
+    await expectRetained(fixture.sidecarPath);
+    await expect(openBindingStore(fixture.env).entries()).resolves.toEqual([]);
   });
 
   it("normalizes a partial raw conversation import before copying the session row", async () => {
@@ -353,7 +332,7 @@ describe("codex doctor contract", () => {
     const rawUserMcpServersFingerprint = JSON.stringify({
       mcp_servers: { legacy: { http_headers: { authorization: "Bearer legacy-secret" } } },
     });
-    const emptyConversation: StoredCodexAppServerBinding = {
+    const rawConversation: StoredCodexAppServerBinding = {
       version: 1,
       state: "active",
       binding: {
@@ -365,17 +344,12 @@ describe("codex doctor contract", () => {
     };
     const rawFingerprint = "dynamic-marker"
       .repeat(8_000)
-      .slice(0, 65_535 - Buffer.byteLength(JSON.stringify(emptyConversation)));
-    const rawConversation: StoredCodexAppServerBinding = {
-      ...emptyConversation,
-      binding: {
-        ...emptyConversation.binding,
-        dynamicToolsFingerprint: rawFingerprint,
-      },
-    };
-    const rawSession = { ...rawConversation, sessionId };
+      .slice(0, 65_535 - Buffer.byteLength(JSON.stringify(rawConversation)));
+    rawConversation.binding.dynamicToolsFingerprint = rawFingerprint;
     expect(Buffer.byteLength(JSON.stringify(rawConversation))).toBe(65_535);
-    expect(Buffer.byteLength(JSON.stringify(rawSession))).toBeGreaterThan(65_536);
+    expect(Buffer.byteLength(JSON.stringify({ ...rawConversation, sessionId }))).toBeGreaterThan(
+      65_536,
+    );
 
     const fixture = await bindingFixture(sessionId, {
       session: [sessionKey],
@@ -580,9 +554,7 @@ describe("codex doctor contract", () => {
   });
 
   it("archives zero-owner sidecars without changing cleared conversation state", async () => {
-    const fixture = await bindingFixture("orphan-cleared", {
-      threadId: "thread-orphan",
-    });
+    const fixture = await bindingFixture("orphan-cleared");
     const existing: StoredCodexAppServerBinding = { version: 1, state: "cleared", retired: true };
     const store = openBindingStore(fixture.env);
     await store.register(fixture.conversationKey, existing);
@@ -602,7 +574,6 @@ describe("codex doctor contract", () => {
           updatedAt: 1,
         },
       },
-      threadId: "thread-orphan",
     });
 
     await expect(fixture.migrate()).resolves.toEqual(migrated);
@@ -610,9 +581,7 @@ describe("codex doctor contract", () => {
   });
 
   it("retains a zero-owner sidecar when canonical plugin state is malformed", async () => {
-    const fixture = await bindingFixture("orphan-invalid-state", {
-      threadId: "thread-orphan",
-    });
+    const fixture = await bindingFixture("orphan-invalid-state");
     const store = openBindingStore<unknown>(fixture.env);
     const malformed = { version: 1, state: "active" };
     await store.register(fixture.conversationKey, malformed);
@@ -627,16 +596,14 @@ describe("codex doctor contract", () => {
   it("retains mixed Codex and foreign ambiguous binding owners", async () => {
     const fixture = await bindingFixture("shared", {
       sessionIndex: {
-        "agent:main:first": {
-          sessionId: "first",
+        "agent:main:first": legacySession("first", {
           sessionFile: "shared.jsonl",
           agentHarnessId: "codex",
-        },
-        "agent:main:second": {
-          sessionId: "second",
+        }),
+        "agent:main:second": legacySession("second", {
           sessionFile: "shared.jsonl",
           agentHarnessId: "pi",
-        },
+        }),
       },
     });
 

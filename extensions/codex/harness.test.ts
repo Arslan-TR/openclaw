@@ -230,53 +230,36 @@ describe("Codex agent harness supports()", () => {
   });
 
   it.each([
-    {
-      label: "automatic runtime selection",
-      requestedRuntime: "auto" as const,
-      modelProvider: { preparedAuth: { source: "harness" as const } },
-    },
-    {
-      label: "an authored endpoint",
-      requestedRuntime: "codex" as const,
-      modelProvider: {
+    ["automatic runtime", "auto", { preparedAuth: { source: "harness" } }],
+    [
+      "authored endpoint",
+      "codex",
+      {
         baseUrl: "https://relay.example.test/v1",
-        preparedAuth: { source: "harness" as const },
+        preparedAuth: { source: "harness" },
       },
-    },
-    {
-      label: "an owner-selected credential",
-      requestedRuntime: "codex" as const,
-      modelProvider: { preparedAuth: { source: "profile" as const, mode: "api-key" } },
-    },
-  ])("does not infer native model access for $label", ({ requestedRuntime, modelProvider }) => {
-    const result = harness.supports({
-      provider: "openai",
-      modelId: "gpt-future",
-      requestedRuntime,
-      modelProvider: { requestTransportOverrides: "none", ...modelProvider },
-    });
+    ],
+    ["selected credential", "codex", { preparedAuth: { source: "profile", mode: "api-key" } }],
+  ] as const)(
+    "does not infer native model access for %s",
+    (_label, requestedRuntime, modelProvider) => {
+      const result = harness.supports({
+        provider: "openai",
+        modelId: "gpt-future",
+        requestedRuntime,
+        modelProvider: { requestTransportOverrides: "none", ...modelProvider },
+      });
 
-    expect(result.supported).toBe(false);
-    expect(!result.supported ? result.reason : undefined).toContain("not declared");
-  });
+      expect(result.supported).toBe(false);
+      expect(!result.supported ? result.reason : undefined).toContain("not declared");
+    },
+  );
 
   it.each([
-    {
-      label: "forwarded OAuth subscription",
-      preparedAuth: { source: "profile", mode: "oauth", requirement: "subscription" } as const,
-      supported: true,
-    },
-    {
-      label: "forwarded Platform key profile",
-      preparedAuth: { source: "profile", mode: "api_key", requirement: "api-key" } as const,
-      supported: true,
-    },
-    {
-      label: "unvalidated harness-native subscription",
-      preparedAuth: { source: "harness", requirement: "subscription" } as const,
-      supported: false,
-    },
-  ])("reports $label reproducibility", ({ preparedAuth, supported }) => {
+    ["OAuth", { source: "profile", mode: "oauth", requirement: "subscription" }, true],
+    ["Platform key", { source: "profile", mode: "api_key", requirement: "api-key" }, true],
+    ["unvalidated subscription", { source: "harness", requirement: "subscription" }, false],
+  ] as const)("reports %s reproducibility", (_label, preparedAuth, supported) => {
     const result = harness.supports({
       provider: "openai",
       requestedRuntime: "codex",
@@ -570,11 +553,7 @@ describe("Codex session runtime ownership", () => {
   it.each<{
     name: string;
     binding: CodexAppServerThreadBinding;
-    expected?: {
-      model: "native";
-      auth: "native" | "host";
-      modelRef?: { provider: string; model: string };
-    };
+    expected?: Awaited<ReturnType<ReturnType<typeof createOwnershipFixture>["resolveOwnership"]>>;
   }>([
     { name: "ordinary binding with an observed native model", binding: observedBinding },
     {
@@ -694,49 +673,37 @@ describe("Codex session runtime ownership", () => {
     expect(await fixture.resolveOwnership()).toBeUndefined();
   });
 
-  it.each(["revoked", "disposed"] as const)(
-    "refuses %s admission before reading private state",
-    async (reason) => {
+  it.each([
+    ["before", "revoked"],
+    ["before", "disposed"],
+    ["during", "revoked"],
+    ["during", "disposed"],
+  ] as const)(
+    "rejects ownership %s the binding read when admission is %s",
+    async (timing, reason) => {
       const fixture = createOwnershipFixture();
-      const read = vi.spyOn(fixture.bindingStore, "readAsync");
-      if (reason === "disposed") {
-        await fixture.harness.dispose?.();
+      if (timing === "during") {
+        await fixture.bind({ ...observedBinding, preserveNativeModel: true });
       }
-      const assertCurrent = () => {
-        if (reason === "revoked") {
-          throw new Error("admission revoked");
-        }
-      };
-
-      await expect(fixture.resolveOwnership({ assertCurrent })).rejects.toThrow(
-        reason === "disposed" ? "harness is disposed" : "admission revoked",
-      );
-      expect(read).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["revoked", "disposed"] as const)(
-    "rejects ownership when admission becomes %s during the binding read",
-    async (reason) => {
-      const fixture = createOwnershipFixture();
-      await fixture.bind({ ...observedBinding, preserveNativeModel: true });
       const readBinding = fixture.bindingStore.readAsync.bind(fixture.bindingStore);
+      const read = vi.spyOn(fixture.bindingStore, "readAsync");
       let current = true;
-      const cleanup: { disposal?: Promise<void> } = {};
-      vi.spyOn(fixture.bindingStore, "readAsync").mockImplementationOnce(
-        async (requestedIdentity) => {
+      let disposal: Promise<void> | undefined;
+      const invalidate = () => {
+        if (reason === "disposed") {
+          return (disposal = fixture.harness.dispose?.());
+        }
+        current = false;
+      };
+      if (timing === "before") {
+        await invalidate();
+      } else {
+        read.mockImplementationOnce(async (requestedIdentity) => {
           const binding = await readBinding(requestedIdentity);
-          if (reason === "disposed") {
-            const disposal = fixture.harness.dispose?.();
-            if (disposal) {
-              cleanup.disposal = disposal;
-            }
-          } else {
-            current = false;
-          }
+          invalidate();
           return binding;
-        },
-      );
+        });
+      }
       try {
         await expect(
           fixture.resolveOwnership({
@@ -747,10 +714,11 @@ describe("Codex session runtime ownership", () => {
             },
           }),
         ).rejects.toThrow(reason === "disposed" ? "harness is disposed" : "admission revoked");
-      } finally {
-        if (cleanup.disposal) {
-          await cleanup.disposal;
+        if (timing === "before") {
+          expect(read).not.toHaveBeenCalled();
         }
+      } finally {
+        await disposal;
       }
     },
   );
