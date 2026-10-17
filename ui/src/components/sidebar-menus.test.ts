@@ -56,13 +56,13 @@ describe("sidebar menus session routes", () => {
       terminalAvailable: false,
     } as unknown as SidebarMenusOwner;
     const container = document.createElement("div");
-    const { menus, disposeMenus } = createRoot((disposeMenus) => ({
+    const { menus, disposeMenus } = createRoot((disposeRoot) => ({
       menus: createSidebarMenus({
         host,
         element: container,
         commit: () => Promise.resolve(true),
       }),
-      disposeMenus,
+      disposeMenus: disposeRoot,
     }));
 
     document.body.append(container);
@@ -164,10 +164,11 @@ describe("mounted sidebar menus", () => {
     sessions.publishList({
       result: {
         ...result,
-        sessions: result.sessions.map((row) => ({
-          ...row,
-          worktree: { id: "wt-1", branch: "main", repoRoot: "/synthetic/repo" },
-        })),
+        sessions: result.sessions.map((row) =>
+          Object.assign({}, row, {
+            worktree: { id: "wt-1", branch: "main", repoRoot: "/synthetic/repo" },
+          }),
+        ),
       },
     });
     const response: { worktrees: WorktreeRecord[] } = {

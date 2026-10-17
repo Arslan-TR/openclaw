@@ -18,7 +18,19 @@ import type {
   SessionOrganizerControllerHost,
 } from "./session-organizer-controller.ts";
 
-export interface SidebarMenusOwner {
+export interface SidebarRouteView {
+  readonly activeRouteId?: NavigationRouteId;
+  readonly basePath: string;
+  readonly enabledRouteIds?: readonly NavigationRouteId[];
+  readonly onNavigate?: (
+    routeId: NavigationRouteId,
+    options?: ApplicationNavigationOptions,
+  ) => void;
+  readonly sessionDataContext: ApplicationContext | undefined;
+  getRouteSessionKey(): string;
+}
+
+export interface SidebarMenusOwner extends SidebarRouteView {
   sessionsGrouping: SidebarSessionsGrouping;
   sessionsShowCron: boolean;
   sessionsShowPreview: boolean;
@@ -27,17 +39,10 @@ export interface SidebarMenusOwner {
   clearSessionSelection(): void;
   knownSessionGroups(): string[];
   readonly nativeGatewaySnapshot: NativeGatewaysSnapshot | null;
-  readonly activeRouteId?: NavigationRouteId;
-  readonly basePath: string;
   readonly canPairDevice: boolean;
   readonly connected: boolean;
   readonly connectionStatus: GatewayStatus | null;
-  readonly enabledRouteIds?: readonly NavigationRouteId[];
   readonly gatewayVersion: string | null;
-  readonly onNavigate?: (
-    routeId: NavigationRouteId,
-    options?: ApplicationNavigationOptions,
-  ) => void;
   readonly onPairMobile?: () => void;
   readonly onRetryConnect?: () => void;
   readonly onPreloadRoute?: (routeId: NavigationRouteId) => Promise<void>;
@@ -59,7 +64,6 @@ export interface SidebarMenusOwner {
       | "importSessionCatalog"
       | "sessionScopeGeneration"
     >;
-  readonly sessionDataContext: ApplicationContext | undefined;
   readonly sessionOrganizer: SessionOrganizerController;
   readonly people: import("./sidebar-people.ts").SidebarPeoplePreferences;
   readonly peopleView?: ReturnType<typeof import("./sidebar-people.ts").createSidebarPeople>;
@@ -96,15 +100,8 @@ export interface SidebarMenusOwner {
   agentUnreadCount(agentId: string): number;
   ensureAgentIdentities(agentIds: readonly string[]): void;
   askAgentCapabilities(agentId: string): void;
-  getRouteSessionKey(): string;
   findSidebarMenuSessionByKey(sessionKey: string): SidebarRecentSession | undefined;
   getSessionNavigationState(): { selectedAgentId: string };
   selectedVisibleSessions(): SidebarRecentSession[];
   switchChipAgent(agentId: string): void;
 }
-
-export type SidebarMenusDependencies = {
-  host: SidebarMenusOwner;
-  element: HTMLElement;
-  commit(): Promise<boolean>;
-};

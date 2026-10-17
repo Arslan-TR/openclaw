@@ -32,7 +32,7 @@ import type {
 import { fetchSessionMenuWork } from "./session-menu-work.ts";
 import type { SessionMenuWork } from "./session-menu.ts";
 import { SESSION_MENU_OPEN_EVENT } from "./session-progress-hovercard-target.ts";
-import type { SidebarMenusDependencies, SidebarMenusOwner } from "./sidebar-menus-types.ts";
+import type { SidebarMenusOwner, SidebarRouteView } from "./sidebar-menus-types.ts";
 import { Icon } from "./solid/icon.tsx";
 
 const AGENT_MENU_HOVER_OPEN_DELAY_MS = 300;
@@ -86,7 +86,11 @@ type SidebarMenusState = {
 export type SidebarMenus = ReturnType<typeof createSidebarMenus>;
 
 /** Presentation survives view replacement; attachment owns the external resources. */
-export function createSidebarMenus(deps: SidebarMenusDependencies) {
+export function createSidebarMenus(deps: {
+  host: SidebarMenusOwner;
+  element: HTMLElement;
+  commit: () => Promise<boolean>;
+}) {
   const { host, element, commit } = deps;
   const catalogMenu = createSidebarCatalogMenu(host, () => menus.dismissTransientMenus());
   const [state, setState] = createStore<SidebarMenusState>({
@@ -120,7 +124,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
   const menuRendererImport = createIdleImport(
     () => import("./sidebar-menus-render.tsx"),
     (renderer) => {
-      if (!disposed) setField("menuRenderer", renderer);
+      if (!disposed) {
+        setField("menuRenderer", renderer);
+      }
     },
   );
   onCleanup(() => {
@@ -159,7 +165,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
           }
         : null,
     );
-    if (!session.worktreeId || !context || !client) return;
+    if (!session.worktreeId || !context || !client) {
+      return;
+    }
     const { selectedAgentId } = host.getSessionNavigationState();
     const store = (sessionMenuWorkStore = sessionPullRequestsForGateway(context.gateway));
     const pullRequestKey = scopedSessionArtifactKey(
@@ -202,7 +210,6 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
   function openAgentMenu(trigger: HTMLElement, mode: "hover" | "click") {
     clearAgentMenuHoverTimers();
     loadMenuRenderer();
-    const menuWidth = AGENT_MENU_WIDTH_PX;
     const rect = trigger.getBoundingClientRect();
     menus.closeSessionMenu();
     menus.closeSessionGroupMenu();
@@ -220,7 +227,7 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
     // The agent card sits at the top of the sidebar, so the menu drops below it
     // and shares its left edge; anchoring above would cover the card you clicked.
     setField("agentMenuPosition", {
-      x: Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8)),
+      x: Math.max(8, Math.min(rect.left, window.innerWidth - AGENT_MENU_WIDTH_PX - 8)),
       top: Math.min(rect.bottom + 4, window.innerHeight - 8),
     });
   }
@@ -247,7 +254,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
   function releaseTrigger(menu: MenuTrigger, restoreFocus = false) {
     const trigger = triggers.get(menu);
     triggers.delete(menu);
-    if (restoreFocus) trigger?.focus();
+    if (restoreFocus) {
+      trigger?.focus();
+    }
   }
 
   function clearAgentMenuHoverTimers() {
@@ -266,7 +275,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
     bindCatalogMenuView(view: CatalogMenuView) {
       catalogMenuView = view;
       return () => {
-        if (catalogMenuView === view) catalogMenuView = undefined;
+        if (catalogMenuView === view) {
+          catalogMenuView = undefined;
+        }
       };
     },
     element,
@@ -279,7 +290,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
       agentMenuAvatars.connect();
       if (pluginActionLifetime.signal.aborted) {
         pluginActionLifetime = new AbortController();
-        if (state.sessionMenu) loadSessionMenuWork(state.sessionMenu.session);
+        if (state.sessionMenu) {
+          loadSessionMenuWork(state.sessionMenu.session);
+        }
       }
     },
 
@@ -289,7 +302,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
       menuRendererImport.dispose();
       releaseSessionMenuWork();
       clearAgentMenuHoverTimers();
-      for (const timer of routePreloadTimers.values()) globalThis.clearTimeout(timer);
+      for (const timer of routePreloadTimers.values()) {
+        globalThis.clearTimeout(timer);
+      }
       routePreloadTimers.clear();
     },
 
@@ -322,7 +337,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
         state.sessionGroupMenu ||
         state.agentMenuPosition,
       );
-      for (const menu of positionedMenus) menus.closePositionedMenu(menu);
+      for (const menu of positionedMenus) {
+        menus.closePositionedMenu(menu);
+      }
       menus.closeSessionMenu();
       catalogMenu.close();
       menus.closeSessionGroupMenu();
@@ -364,12 +381,7 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
       if (menu === "peopleFilter") {
         host.peopleView?.dismiss();
       }
-      const [width, height] = (
-        {
-          peopleFilter: [320, 160],
-          sessionSort: [200, 280],
-        } as const
-      )[menu];
+      const [width, height] = menu === "peopleFilter" ? [320, 160] : [200, 280];
       openPositionedMenu(menu, menuPosition(rect.right, rect.bottom + 4, width, height), trigger);
     },
 
@@ -459,7 +471,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
       }
       setField("filterMenuView", view);
       void commit().then((committed) => {
-        if (!committed) return;
+        if (!committed) {
+          return;
+        }
         const dropdown =
           triggers.get("catalogView") &&
           element.querySelector<HTMLElement>(".sidebar-catalog-view-menu");
@@ -482,7 +496,9 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
         setField("agentMenuMode", "click");
         // Promotion does not reopen the dropdown, so after-show will not move focus.
         void commit().then((committed) => {
-          if (!committed) return;
+          if (!committed) {
+            return;
+          }
           if (
             !state.agentMenuPosition ||
             state.agentMenuMode !== "click" ||
@@ -621,21 +637,10 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
       ];
     },
 
-    renderRoute(
-      routeId: NavigationRouteId,
-      host: Pick<
-        SidebarMenusOwner,
-        | "getRouteSessionKey"
-        | "sessionDataContext"
-        | "basePath"
-        | "activeRouteId"
-        | "onNavigate"
-        | "enabledRouteIds"
-      >,
-    ): JSX.Element {
+    renderRoute(routeId: NavigationRouteId, view: SidebarRouteView): JSX.Element {
       const sessionTarget = createMemo(() => {
-        const routeSessionKey = isSessionRouteId(routeId) ? host.getRouteSessionKey() : "";
-        const context = host.sessionDataContext;
+        const routeSessionKey = isSessionRouteId(routeId) ? view.getRouteSessionKey() : "";
+        const context = view.sessionDataContext;
         return isSessionRouteId(routeId) && routeSessionKey && context
           ? sessionNavigationTarget({ context, face: routeId, sessionKey: routeSessionKey })
           : null;
@@ -645,14 +650,14 @@ export function createSidebarMenus(deps: SidebarMenusDependencies) {
         <SidebarNavLink
           icon={<Icon name={navigationIconForRoute(routeId)} />}
           label={titleForRoute(routeId)}
-          href={sessionTarget()?.href ?? pathForRoute(routeId, host.basePath)}
-          active={isSidebarRouteActive(host.activeRouteId, routeId)}
-          onNavigate={() => host.onNavigate?.(routeId, sessionTarget()?.options)}
+          href={sessionTarget()?.href ?? pathForRoute(routeId, view.basePath)}
+          active={isSidebarRouteActive(view.activeRouteId, routeId)}
+          onNavigate={() => view.onNavigate?.(routeId, sessionTarget()?.options)}
           onPreload={(event, immediate) => menus.preloadRoute(routeId, event, immediate)}
           onCancelPreload={menus.cancelPreload}
         />
       );
-      return <Show when={host.enabledRouteIds?.includes(routeId) ?? true}>{link}</Show>;
+      return <Show when={view.enabledRouteIds?.includes(routeId) ?? true}>{link}</Show>;
     },
     cancelPreload: (event: Event) => cancelRoutePreload(routePreloadTimers, event),
   });

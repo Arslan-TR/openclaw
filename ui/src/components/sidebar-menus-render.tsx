@@ -104,11 +104,7 @@ export function renderSidebarAgentMenuForMenus(
   avatars: () => IdentityAvatars,
 ): JSX.Element {
   const trigger = menus.triggers.get("agent");
-  const chipAgent = createMemo(() => host.activeChipAgent()),
-    activeId = () => chipAgent().activeId,
-    agent = () => chipAgent().agent,
-    agents = () => chipAgent().agents,
-    identities = () => chipAgent().identities;
+  const chipAgent = createMemo(() => host.activeChipAgent());
   const activeName = createMemo(() => {
     const current = chipAgent();
     return current.agent ? normalizeAgentLabel(current.agent, current.identity) : "";
@@ -118,10 +114,10 @@ export function renderSidebarAgentMenuForMenus(
       {...{
         position,
         basePath: host.basePath,
-        activeId: agent() ? activeId() : "",
+        activeId: chipAgent().agent ? chipAgent().activeId : "",
         activeName: activeName(),
-        agents: agents(),
-        identities: identities(),
+        agents: chipAgent().agents,
+        identities: chipAgent().identities,
         pinnedAgentIds: host.pinnedAgentIds,
         onTogglePinnedAgent: async (agentId) => {
           if (host.sessionDataContext) {
@@ -137,7 +133,9 @@ export function renderSidebarAgentMenuForMenus(
           host.sessionDataContext?.navigation.update({ navCollapsed: false });
           patchSettings({ sidebarAgentsMode: "roster" });
           void menus.commit().then((committed) => {
-            if (!committed) return;
+            if (!committed) {
+              return;
+            }
             menus.element
               .querySelector<HTMLElement>(
                 ".sidebar-workspace-header__main, .sidebar-agent-card__main",
@@ -246,7 +244,6 @@ export function renderSidebarSessionMenuForMenus(
         .find((candidate) => candidate.key === menu.session.key);
     return row?.sessionId === menu.session.sessionId ? row : undefined;
   };
-  const pluginSession = () => currentPluginSession();
   // Appearance editing keeps this menu open. Refresh its row without adopting
   // a replacement session that happens to reuse the captured key.
   const session = createMemo(
@@ -367,8 +364,8 @@ export function renderSidebarSessionMenuForMenus(
       currentOwner={session().owner?.actor ?? null}
       work={batchRows() ? null : menus.sessionMenuWork}
       pluginActions={
-        !batchRows() && context()?.plugins && pluginSession()
-          ? pluginSessionMenuActions(context()!.plugins, pluginSession()!)
+        !batchRows() && context()?.plugins && currentPluginSession()
+          ? pluginSessionMenuActions(context()!.plugins, currentPluginSession()!)
           : []
       }
       onClose={() => {
