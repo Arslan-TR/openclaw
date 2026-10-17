@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => ({
   }),
 }));
 
+// mock-isolation: Supply deterministic update facts without starting health services.
 vi.mock("../health-state.js", () => ({
   buildGatewaySnapshot: mocks.snapshot,
   getHealthCache: vi.fn(() => null),
@@ -55,12 +56,14 @@ vi.mock("../../../state/user-profile-list.js", async (importOriginal) => ({
   hasMultipleResidentSessionSharingIdentities: vi.fn(() => false),
 }));
 
+// mock-isolation: Control plugin UI descriptors independently of the active registry.
 vi.mock("../../control-ui-plugin-tabs.js", () => ({
   listControlUiLinkReaders: vi.fn(() => []),
   listControlUiPluginTabs: mocks.tabs,
   listControlUiPluginWidgetKinds: mocks.widgets,
 }));
 
+// mock-isolation: Observe security events without publishing them outside the fixture.
 vi.mock("./connect-auth-security.js", () => ({
   emitGatewayAuthSecurityEvent: mocks.securityEvent,
 }));
