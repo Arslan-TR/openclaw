@@ -21,8 +21,12 @@ import {
   projectExistingAgentDatabaseTargets,
   resolveTargetSqlitePath,
 } from "../infra/session-sqlite-migration-readers.js";
-import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
+import {
+  hasOrphanedSqliteSidecars,
+  resolveSqliteDatabaseFilePaths,
+} from "../infra/sqlite-files.js";
 import { LEGACY_IMPLICIT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import type { HistoricalArchiveSources } from "./doctor-session-sqlite-discovery.js";
 import type {
   DoctorSessionSqliteMode,
@@ -43,8 +47,18 @@ export async function prepareDoctorSessionSqliteTargets(
     authority?: DoctorSqliteMaintenanceAuthority;
   },
 ) {
+  const destructive = isDestructiveDoctorSessionSqliteMode(params.mode);
+  if (destructive) {
+    const sharedPath = resolveOpenClawStateSqlitePath(params.env);
+    if (hasOrphanedSqliteSidecars(sharedPath)) {
+      throw new Error(
+        `OpenClaw state database ${sharedPath} is unavailable because its main file is missing. ` +
+          "Restore the matching main database and sidecars before retrying session SQLite maintenance.",
+      );
+    }
+  }
   const resolved = resolveDoctorSessionSqliteTargets(params);
-  if (isDestructiveDoctorSessionSqliteMode(params.mode)) {
+  if (destructive) {
     assertDoctorSqliteMaintenancePathsNotAliased(
       `session SQLite ${params.mode}`,
       resolveDoctorSessionSqliteMaintenancePaths(resolved.targets),
