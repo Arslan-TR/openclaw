@@ -101,6 +101,15 @@ function fixture(
   };
 }
 
+function withFixture(
+  run: (fixture: ReturnType<typeof fixture>) => Promise<void>,
+  credential?: AuthProfileCredential,
+) {
+  return withOpenClawTestState({ label: "personal-usage", scenario: "minimal" }, (state) =>
+    run(fixture(state, credential)),
+  );
+}
+
 function holdAdmittedWorkerOperation() {
   const entered = createDeferredCore();
   const release = createDeferredCore();
@@ -124,60 +133,46 @@ function holdAdmittedWorkerOperation() {
   return { entered: entered.promise, release: release.resolve, restore: () => spy.mockRestore() };
 }
 
-it("reduces embedded personal-account success and failover failure without caller-thread SQL", async () => {
-  await withOpenClawTestState(
-    { label: "personal-usage-worker", scenario: "minimal" },
-    async (state) => {
-      const { profileId, store, initial, agentDir, database, succeed, fail } = fixture(state);
-      const maintenance = createOpenClawDatabaseMaintenanceScope();
-      const sql = observeHostDataSql();
-      let queries: string[];
-      try {
-        database.db.prepare("SELECT 1").get();
-        expect(sql.queries.length).toBeGreaterThan(0);
-        sql.queries.length = 0;
-        expect(maintenance.run(succeed)).toBeUndefined();
-        const failure = maintenance.run(fail);
-        await failure;
-        await maintenance.close();
-        queries = [...sql.queries];
-      } finally {
-        sql.restore();
-        await maintenance.close();
-      }
-      const persisted = readUserModelAuthProfile(profileId);
-      expect(persisted?.usageStats).toMatchObject({
-        lastUsed: expect.any(Number),
-        errorCount: 1,
-        failureCounts: { timeout: 1 },
-        cooldownReason: "timeout",
-      });
-      expect(persisted?.credential).toEqual(initial?.credential);
-      expect(store.usageStats?.[profileId]).toEqual(persisted?.usageStats);
-      expect(store.lastGood?.[provider]).toBeUndefined();
-      expect(store.order?.[provider]).toBeUndefined();
-      const shared = loadPersistedAuthProfileStore(agentDir);
-      expect(shared?.profiles[profileId]).toBeUndefined();
-      expect(shared?.usageStats?.[profileId]).toBeUndefined();
-      expect(queries).toEqual([]);
-    },
-  );
-});
+it("reduces embedded personal-account success and failover failure without caller-thread SQL", () =>
+  withFixture(async ({ profileId, store, initial, agentDir, database, succeed, fail }) => {
+    const maintenance = createOpenClawDatabaseMaintenanceScope();
+    const sql = observeHostDataSql();
+    let queries: string[];
+    try {
+      database.db.prepare("SELECT 1").get();
+      expect(sql.queries.length).toBeGreaterThan(0);
+      sql.queries.length = 0;
+      expect(maintenance.run(succeed)).toBeUndefined();
+      await maintenance.run(fail);
+      await maintenance.close();
+      queries = [...sql.queries];
+    } finally {
+      sql.restore();
+      await maintenance.close();
+    }
+    const persisted = readUserModelAuthProfile(profileId);
+    expect(persisted?.usageStats).toMatchObject({
+      lastUsed: expect.any(Number),
+      errorCount: 1,
+      failureCounts: { timeout: 1 },
+      cooldownReason: "timeout",
+    });
+    expect(persisted?.credential).toEqual(initial?.credential);
+    expect(store.usageStats?.[profileId]).toEqual(persisted?.usageStats);
+    expect(store.lastGood?.[provider]).toBeUndefined();
+    expect(store.order?.[provider]).toBeUndefined();
+    const shared = loadPersistedAuthProfileStore(agentDir);
+    expect(shared?.profiles[profileId]).toBeUndefined();
+    expect(shared?.usageStats?.[profileId]).toBeUndefined();
+    expect(queries).toEqual([]);
+  }));
 
 it.each(["unchanged", "credential"] as const)(
   "binds the personal provider probe to its credential: %s",
   async (changed) => {
-    await withOpenClawTestState(
-      { label: "personal-usage-probe", scenario: "minimal" },
-      async (state) => {
-        const now = Date.now();
-        const { profileId, store, fail } = fixture(state, {
-          type: "oauth",
-          provider: "openai",
-          access: "synthetic-access",
-          refresh: "synthetic-refresh",
-          expires: now + 3_600_000,
-        });
+    const now = Date.now();
+    await withFixture(
+      async ({ profileId, store, fail }) => {
         updateUserModelAuthProfile(profileId, (profile) => {
           profile.usageStats = {
             blockedUntil: now + 600_000,
@@ -238,108 +233,98 @@ it.each(["unchanged", "credential"] as const)(
           await Promise.allSettled([failure]);
         }
       },
+      {
+        type: "oauth",
+        provider: "openai",
+        access: "synthetic-access",
+        refresh: "synthetic-refresh",
+        expires: now + 3_600_000,
+      },
     );
   },
 );
 
-it("refuses stale personal credential generations without overwriting current usage", async () => {
-  await withOpenClawTestState(
-    { label: "personal-usage-generation", scenario: "minimal" },
-    async (state) => {
-      const { profileId, store, succeed, fail } = fixture(state);
-      const callerBefore = structuredClone(store);
-      updateUserModelAuthProfile(profileId, (profile) => {
-        profile.credential = { type: "token", provider, token: "synthetic-replacement-token" };
-        profile.usageStats = { lastUsed: 17, errorCount: 6, failureCounts: { auth: 6 } };
-        return true;
-      });
-      const replacement = readUserModelAuthProfile(profileId);
-      const maintenance = createOpenClawDatabaseMaintenanceScope();
-      try {
-        maintenance.run(succeed);
-        await maintenance.run(fail);
-        await maintenance.close();
-        expect(readUserModelAuthProfile(profileId)).toEqual(replacement);
-        expect(store).toEqual(callerBefore);
-      } finally {
-        await maintenance.close();
-      }
-    },
-  );
-});
+it("refuses stale personal credential generations without overwriting current usage", () =>
+  withFixture(async ({ profileId, store, succeed, fail }) => {
+    const callerBefore = structuredClone(store);
+    updateUserModelAuthProfile(profileId, (profile) => {
+      profile.credential = { type: "token", provider, token: "synthetic-replacement-token" };
+      profile.usageStats = { lastUsed: 17, errorCount: 6, failureCounts: { auth: 6 } };
+      return true;
+    });
+    const replacement = readUserModelAuthProfile(profileId);
+    const maintenance = createOpenClawDatabaseMaintenanceScope();
+    try {
+      maintenance.run(succeed);
+      await maintenance.run(fail);
+      await maintenance.close();
+      expect(readUserModelAuthProfile(profileId)).toEqual(replacement);
+      expect(store).toEqual(callerBefore);
+    } finally {
+      await maintenance.close();
+    }
+  }));
 
-it("joins accepted nonblocking embedded bookkeeping before maintenance closes", async () => {
-  await withOpenClawTestState(
-    { label: "personal-usage-close", scenario: "minimal" },
-    async (state) => {
-      const { profileId, initial, succeed } = fixture(state);
-      const maintenance = createOpenClawDatabaseMaintenanceScope();
-      const gate = holdAdmittedWorkerOperation();
-      expect(maintenance.run(succeed)).toBeUndefined();
-      let closed = false;
-      const closing = maintenance.close().then(() => {
-        closed = true;
-      });
-      try {
-        await awaitGateBeforeSettlement(
-          gate.entered,
-          closing,
-          "Bookkeeping closed before worker admission",
-        );
-        expect(closed).toBe(false);
-        expect(readUserModelAuthProfile(profileId)).toEqual(initial);
-        gate.release();
-        await closing;
-        expect(readUserModelAuthProfile(profileId)?.usageStats?.lastUsed).toEqual(
-          expect.any(Number),
-        );
-        expect(closed).toBe(true);
-      } finally {
-        gate.release();
-        gate.restore();
-        await closing;
-      }
-    },
-  );
-});
+it("joins accepted nonblocking embedded bookkeeping before maintenance closes", () =>
+  withFixture(async ({ profileId, initial, succeed }) => {
+    const maintenance = createOpenClawDatabaseMaintenanceScope();
+    const gate = holdAdmittedWorkerOperation();
+    expect(maintenance.run(succeed)).toBeUndefined();
+    let closed = false;
+    const closing = maintenance.close().then(() => {
+      closed = true;
+    });
+    try {
+      await awaitGateBeforeSettlement(
+        gate.entered,
+        closing,
+        "Bookkeeping closed before worker admission",
+      );
+      expect(closed).toBe(false);
+      expect(readUserModelAuthProfile(profileId)).toEqual(initial);
+      gate.release();
+      await closing;
+      expect(readUserModelAuthProfile(profileId)?.usageStats?.lastUsed).toEqual(expect.any(Number));
+      expect(closed).toBe(true);
+    } finally {
+      gate.release();
+      gate.restore();
+      await closing;
+    }
+  }));
 
-it("preserves the authority error class and refuses a revoked personal-account write", async () => {
-  await withOpenClawTestState(
-    { label: "personal-usage-authority", scenario: "minimal" },
-    async (state) => {
-      const { profileId, store, initial, fail } = fixture(state);
-      const callerBefore = structuredClone(store);
-      const refused = new TypeError("Synthetic personal-account owner revoked");
-      let revoked = false;
-      const maintenance = createOpenClawDatabaseMaintenanceScope({
-        assertOwnerCurrent() {
-          if (revoked) {
-            throw refused;
-          }
-        },
-      });
-      const gate = holdAdmittedWorkerOperation();
-      const failure = maintenance.run(fail);
-      const rejection = expect(failure).rejects.toBeInstanceOf(TypeError);
-      try {
-        await awaitGateBeforeSettlement(
-          gate.entered,
-          failure,
-          "Failure settled before worker admission",
-        );
-        revoked = true;
-        gate.release();
-        await rejection;
-        await expect(failure).rejects.toThrow(refused.message);
-        expect(readUserModelAuthProfile(profileId)).toEqual(initial);
-        expect(store).toEqual(callerBefore);
-      } finally {
-        revoked = false;
-        gate.release();
-        gate.restore();
-        await Promise.allSettled([failure, rejection]);
-        await maintenance.close();
-      }
-    },
-  );
-});
+it("preserves the authority error class and refuses a revoked personal-account write", () =>
+  withFixture(async ({ profileId, store, initial, fail }) => {
+    const callerBefore = structuredClone(store);
+    const refused = new TypeError("Synthetic personal-account owner revoked");
+    let revoked = false;
+    const maintenance = createOpenClawDatabaseMaintenanceScope({
+      assertOwnerCurrent() {
+        if (revoked) {
+          throw refused;
+        }
+      },
+    });
+    const gate = holdAdmittedWorkerOperation();
+    const failure = maintenance.run(fail);
+    const rejection = expect(failure).rejects.toBeInstanceOf(TypeError);
+    try {
+      await awaitGateBeforeSettlement(
+        gate.entered,
+        failure,
+        "Failure settled before worker admission",
+      );
+      revoked = true;
+      gate.release();
+      await rejection;
+      await expect(failure).rejects.toThrow(refused.message);
+      expect(readUserModelAuthProfile(profileId)).toEqual(initial);
+      expect(store).toEqual(callerBefore);
+    } finally {
+      revoked = false;
+      gate.release();
+      gate.restore();
+      await Promise.allSettled([failure, rejection]);
+      await maintenance.close();
+    }
+  }));

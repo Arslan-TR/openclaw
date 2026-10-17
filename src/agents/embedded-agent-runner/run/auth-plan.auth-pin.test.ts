@@ -54,6 +54,46 @@ const openClawHarness: AgentHarness = {
 describe("embedded run auth plan provider pin", () => {
   let state: OpenClawTestState;
   let agentDir: string;
+  let stores: ReturnType<typeof modelRuntime.createEmptyAgentDiscoveryStores>;
+  type AuthParams = Parameters<typeof prepareEmbeddedRunAuthPlan>[0];
+
+  function prepare(
+    model: Model,
+    config: OpenClawConfig,
+    runParams: Partial<AuthParams["runParams"]> = {},
+    overrides: Partial<AuthParams> = {},
+  ) {
+    return withPluginRuntimeGenerationScope(
+      { metadataSnapshot: createPluginMetadataSnapshotFixture() },
+      () =>
+        prepareEmbeddedRunAuthPlan({
+          assertCurrent: () => {},
+          runParams: {
+            sessionId: "auth-session",
+            runId: "auth-run",
+            workspaceDir: state.workspaceDir,
+            prompt: "Auth preparation only",
+            timeoutMs: 5_000,
+            config,
+            ...runParams,
+          },
+          provider: model.provider,
+          modelId: model.id,
+          model,
+          agentDir,
+          workspaceDir: state.workspaceDir,
+          nativeModelOwned: false,
+          ...stores,
+          getAgentHarness: () => openClawHarness,
+          setAgentHarness: () => {},
+          getRuntimeModel: () => model,
+          getEffectiveModel: () => model,
+          applyResolvedRuntimeModel: () => {},
+          selectHarnessForPreparedAttempts: () => openClawHarness,
+          ...overrides,
+        }),
+    );
+  }
 
   beforeEach(async () => {
     state = await createOpenClawTestState({
@@ -61,6 +101,7 @@ describe("embedded run auth plan provider pin", () => {
       env: { OPENAI_API_KEY: "platform-api-key" },
     });
     agentDir = state.agentDir();
+    stores = modelRuntime.createEmptyAgentDiscoveryStores();
     await state.writeAuthProfiles({ version: 1, profiles: {} });
     readCodexCliCredentialsCachedMock.mockReset().mockReturnValue({
       type: "oauth",
@@ -102,40 +143,12 @@ describe("embedded run auth plan provider pin", () => {
         providers: { litellm: { baseUrl: model.baseUrl, apiKey: "litellm-key", models: [] } },
       },
     };
-    const stores = modelRuntime.createEmptyAgentDiscoveryStores();
     vi.spyOn(modelRuntime, "resolveModelAsync").mockResolvedValue({
       ...stores,
       model,
       logicalRef: { provider: model.provider, model: model.id },
     });
-    const prepared = await withPluginRuntimeGenerationScope(
-      { metadataSnapshot: createPluginMetadataSnapshotFixture() },
-      () =>
-        prepareEmbeddedRunAuthPlan({
-          assertCurrent: () => {},
-          runParams: {
-            sessionId: "migration-session",
-            runId: "migration-run",
-            workspaceDir: state.workspaceDir,
-            prompt: "Auth preparation only",
-            timeoutMs: 5_000,
-            config,
-          },
-          provider: "litellm",
-          modelId: model.id,
-          model,
-          agentDir,
-          workspaceDir: state.workspaceDir,
-          nativeModelOwned: false,
-          ...stores,
-          getAgentHarness: () => openClawHarness,
-          setAgentHarness: () => {},
-          getRuntimeModel: () => model,
-          getEffectiveModel: () => model,
-          applyResolvedRuntimeModel: () => {},
-          selectHarnessForPreparedAttempts: () => openClawHarness,
-        }),
-    );
+    const prepared = await prepare(model, config);
     expect(prepared.preparedAuthAttempts[0]).toMatchObject({
       kind: "direct",
       plan: { providerForAuth: "litellm", selectedAuthMode: "api-key" },
@@ -187,44 +200,17 @@ describe("embedded run auth plan provider pin", () => {
           },
         },
       };
-      const stores = modelRuntime.createEmptyAgentDiscoveryStores();
       const resolution = {
         ...stores,
         model,
         logicalRef: { provider: model.provider, model: model.id },
       };
       vi.spyOn(modelRuntime, "resolveModelAsync").mockResolvedValue(resolution);
-      const prepared = await withPluginRuntimeGenerationScope(
-        { metadataSnapshot: createPluginMetadataSnapshotFixture() },
-        () =>
-          prepareEmbeddedRunAuthPlan({
-            assertCurrent: () => {},
-            runParams: {
-              sessionId: "verify-session",
-              runId: "verify-run",
-              workspaceDir: state.workspaceDir,
-              prompt: "Verify the selected credential",
-              timeoutMs: 5_000,
-              config,
-              authProfileId: "openai:selected",
-              authProfileIdSource: "user",
-              allowAuthProfileFallback,
-            },
-            provider: "openai",
-            modelId: model.id,
-            model,
-            agentDir,
-            workspaceDir: state.workspaceDir,
-            nativeModelOwned: false,
-            ...stores,
-            getAgentHarness: () => openClawHarness,
-            setAgentHarness: () => {},
-            getRuntimeModel: () => model,
-            getEffectiveModel: () => model,
-            applyResolvedRuntimeModel: () => {},
-            selectHarnessForPreparedAttempts: () => openClawHarness,
-          }),
-      );
+      const prepared = await prepare(model, config, {
+        authProfileId: "openai:selected",
+        authProfileIdSource: "user",
+        allowAuthProfileFallback,
+      });
 
       expect(prepared.preparedAuthAttempts.map((attempt) => attempt.profileId)).toEqual(profileIds);
       expect(prepared.activePreparedAuthPlan.forwardedAuthProfileCandidateIds).toEqual(profileIds);
@@ -245,7 +231,6 @@ describe("embedded run auth plan provider pin", () => {
           },
         },
       };
-      const stores = modelRuntime.createEmptyAgentDiscoveryStores();
       // Catalog discovery is peripheral; store loading, ambient overlay, auth selection,
       // and materialization of the selected transport all run through their real owners.
       vi.spyOn(modelRuntime, "resolveModelAsync").mockImplementation(
@@ -260,38 +245,21 @@ describe("embedded run auth plan provider pin", () => {
       );
       let model = subscriptionModel;
       let harness = openClawHarness;
-      // A prepared generation owns plugin discovery; no provider runtime is needed here.
-      const prepared = await withPluginRuntimeGenerationScope(
-        { metadataSnapshot: createPluginMetadataSnapshotFixture() },
-        () =>
-          prepareEmbeddedRunAuthPlan({
-            assertCurrent: () => {},
-            runParams: {
-              sessionId: "auth-pin-session",
-              runId: "auth-pin-run",
-              workspaceDir: state.workspaceDir,
-              prompt: "Auth preparation only",
-              timeoutMs: 5_000,
-              config,
-            },
-            provider: "openai",
-            modelId: model.id,
-            model,
-            agentDir,
-            workspaceDir: state.workspaceDir,
-            nativeModelOwned: false,
-            ...stores,
-            getAgentHarness: () => harness,
-            setAgentHarness: (next) => {
-              harness = next;
-            },
-            getRuntimeModel: () => model,
-            getEffectiveModel: () => model,
-            applyResolvedRuntimeModel: (next) => {
-              model = next;
-            },
-            selectHarnessForPreparedAttempts: () => openClawHarness,
-          }),
+      const prepared = await prepare(
+        model,
+        config,
+        {},
+        {
+          getAgentHarness: () => harness,
+          setAgentHarness: (next) => {
+            harness = next;
+          },
+          getRuntimeModel: () => model,
+          getEffectiveModel: () => model,
+          applyResolvedRuntimeModel: (next) => {
+            model = next;
+          },
+        },
       );
 
       expect(prepared.preparedAuthAttempts[0]).toMatchObject({

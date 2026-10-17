@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,
@@ -16,6 +16,24 @@ import { prepareEmbeddedAttemptPromptExecution } from "./prompt-image-preparatio
 const harnessMocks = vi.hoisted(() => ({
   runAttempt: vi.fn(),
 }));
+const accepted = { runId: "child", childSessionKey: "agent:main:subagent:child" };
+
+function runBackend(
+  params: Record<string, unknown> = {},
+  runtime?: Parameters<typeof runEmbeddedAttemptWithBackend>[1],
+) {
+  return runEmbeddedAttemptWithBackend(
+    {
+      admittedRunContext: { operationalRunInstance: createOperationalRunInstanceRef("test") },
+      ...params,
+    } as never,
+    runtime,
+  );
+}
+
+beforeEach(() => {
+  harnessMocks.runAttempt.mockReset();
+});
 
 vi.mock("../../harness/selection.js", () => ({
   runAgentHarnessAttempt: harnessMocks.runAttempt,
@@ -23,33 +41,25 @@ vi.mock("../../harness/selection.js", () => ({
 }));
 
 describe("embedded attempt backend", () => {
-  beforeEach(() => {
-    harnessMocks.runAttempt.mockReset();
-  });
-
   it("carries child receipts across model candidates only for the same admitted instance", async () => {
     const instance = createOperationalRunInstanceRef("parent");
-    const accepted = {
-      runId: "child",
-      childSessionKey: "agent:main:subagent:child",
-      expectsCompletionMessage: true,
-    };
+    const receipt = { ...accepted, expectsCompletionMessage: true };
     harnessMocks.runAttempt
-      .mockResolvedValueOnce(makeEmbeddedRunnerAttempt({ acceptedSessionSpawns: [accepted] }))
+      .mockResolvedValueOnce(makeEmbeddedRunnerAttempt({ acceptedSessionSpawns: [receipt] }))
       .mockResolvedValueOnce(makeEmbeddedRunnerAttempt({}))
       .mockResolvedValueOnce(makeEmbeddedRunnerAttempt({}));
-    await runEmbeddedAttemptWithBackend({
+    await runBackend({
       modelId: "first-model",
       admittedRunContext: { operationalRunInstance: instance },
-    } as never);
-    const fallback = await runEmbeddedAttemptWithBackend({
+    });
+    const fallback = await runBackend({
       modelId: "second-model",
       admittedRunContext: { operationalRunInstance: instance },
-    } as never);
-    const replacement = await runEmbeddedAttemptWithBackend({
+    });
+    const replacement = await runBackend({
       admittedRunContext: { operationalRunInstance: createOperationalRunInstanceRef("parent") },
-    } as never);
-    expect(fallback.acceptedSessionSpawns).toEqual([accepted]);
+    });
+    expect(fallback.acceptedSessionSpawns).toEqual([receipt]);
     expect(replacement.acceptedSessionSpawns ?? []).toEqual([]);
   });
 
@@ -61,16 +71,12 @@ describe("embedded attempt backend", () => {
           agentHarnessId,
           yieldDetected: true,
           requesterContinuationSettled: true,
-          acceptedSessionSpawns: [{ runId: "child", childSessionKey: "agent:main:subagent:child" }],
+          acceptedSessionSpawns: [accepted],
         }),
       );
-      const result = await runEmbeddedAttemptWithBackend({
-        admittedRunContext: { operationalRunInstance: createOperationalRunInstanceRef("test") },
-      } as never);
+      const result = await runBackend();
       expect(result.requesterContinuationSettled).toBeUndefined();
-      expect(result.acceptedSessionSpawns).toEqual([
-        { runId: "child", childSessionKey: "agent:main:subagent:child" },
-      ]);
+      expect(result.acceptedSessionSpawns).toEqual([accepted]);
     },
   );
 
@@ -94,12 +100,7 @@ describe("embedded attempt backend", () => {
         auth: "native",
         assertCurrent: async () => {},
       };
-      const result = await runEmbeddedAttemptWithBackend(
-        {
-          admittedRunContext: { operationalRunInstance: createOperationalRunInstanceRef("test") },
-        } as never,
-        runtimeOwned ? nativeRuntime : undefined,
-      );
+      const result = await runBackend({}, runtimeOwned ? nativeRuntime : undefined);
       if (runtimeOwned) {
         expect(result).toMatchObject({ runtimeModelSelection: selection });
       } else {
@@ -120,9 +121,7 @@ describe("embedded attempt backend", () => {
     );
     harnessMocks.runAttempt.mockResolvedValueOnce(attempt);
 
-    const result = await runEmbeddedAttemptWithBackend({
-      admittedRunContext: { operationalRunInstance: createOperationalRunInstanceRef("test") },
-    } as never);
+    const result = await runBackend();
 
     expect(
       getCoreTtsAttemptResultMediaUrls(result, result.toolMediaUrls, operationalRunInstance),
@@ -142,13 +141,12 @@ describe("embedded attempt backend", () => {
       },
     });
 
-    const result = await runEmbeddedAttemptWithBackend({
-      admittedRunContext: { operationalRunInstance: createOperationalRunInstanceRef("test") },
+    const result = await runBackend({
       runtimePlan: {
         resolvedRef: { provider: "groq", modelId: "openai/gpt-oss-120b" },
         auth: credentialSource ? { credentialSource } : {},
       },
-    } as never);
+    });
 
     expect(result.modelAttempt).toEqual(
       credentialSource
@@ -180,6 +178,10 @@ describe("workspace inputs at harness dispatch", () => {
       },
       prepareTurnAttachments: prepare,
     });
+    onTestFinished(() => {
+      release();
+      admission.close();
+    });
     return {
       params: {
         workspaceDir,
@@ -190,16 +192,8 @@ describe("workspace inputs at harness dispatch", () => {
       },
       admission,
       release,
-      cleanup: () => {
-        release();
-        admission.close();
-      },
     };
   }
-
-  beforeEach(() => {
-    harnessMocks.runAttempt.mockReset();
-  });
 
   it("transfers canonical documents preserved by native image projection without a transcript recorder", async () => {
     const prepare = vi.fn<NonNullable<AgentWorkspaceAccess["prepareTurnAttachments"]>>(
@@ -212,31 +206,27 @@ describe("workspace inputs at harness dispatch", () => {
     const f = await fixture(prepare);
     const media = [{ path: "media://inbound/report.pdf", kind: "document" as const }];
     harnessMocks.runAttempt.mockResolvedValueOnce({ agentHarnessId: "codex" });
-    try {
-      const projected = await prepareEmbeddedAttemptPromptExecution({
-        attempt: { ...f.params, media, model: { input: ["text", "image"] } },
-        mediaOwnerAgentId: "main",
-        effectiveFsWorkspaceOnly: false,
-        effectiveWorkspace: f.params.workspaceDir,
-        prompt: "",
-        skipPromptSubmission: false,
-        pluginHarness: true,
-      });
-      expect(projected.media).toEqual(media);
-      const params = { ...f.params, ...projected };
-      await runEmbeddedAttemptWithBackend(params as never, undefined, media);
-      expect(prepare.mock.calls[0]?.[0].media).toBe(media);
-      const dispatched = harnessMocks.runAttempt.mock.calls[0]?.[0];
-      expect(dispatched).toMatchObject({
-        prompt: "Inspect attachment\n\nRead /remote/.inputs/report.pdf",
-        transcriptPrompt: "Inspect attachment",
-        media,
-      });
-      expect(dispatched.media).toBe(params.media);
-      expect(params.prompt).toBe("Inspect attachment");
-    } finally {
-      f.cleanup();
-    }
+    const projected = await prepareEmbeddedAttemptPromptExecution({
+      attempt: { ...f.params, media, model: { input: ["text", "image"] } },
+      mediaOwnerAgentId: "main",
+      effectiveFsWorkspaceOnly: false,
+      effectiveWorkspace: f.params.workspaceDir,
+      prompt: "",
+      skipPromptSubmission: false,
+      pluginHarness: true,
+    });
+    expect(projected.media).toEqual(media);
+    const params = { ...f.params, ...projected };
+    await runEmbeddedAttemptWithBackend(params as never, undefined, media);
+    expect(prepare.mock.calls[0]?.[0].media).toBe(media);
+    const dispatched = harnessMocks.runAttempt.mock.calls[0]?.[0];
+    expect(dispatched).toMatchObject({
+      prompt: "Inspect attachment\n\nRead /remote/.inputs/report.pdf",
+      transcriptPrompt: "Inspect attachment",
+      media,
+    });
+    expect(dispatched.media).toBe(params.media);
+    expect(params.prompt).toBe("Inspect attachment");
   });
 
   it.each(["failed", "revoked", "run-closed", "aborted"])(
@@ -257,17 +247,8 @@ describe("workspace inputs at harness dispatch", () => {
         expect(assertCurrent).toThrow();
         return "obsolete input directory";
       });
-      try {
-        await expect(
-          runEmbeddedAttemptWithBackend({
-            ...f.params,
-            abortSignal: controller.signal,
-          } as never),
-        ).rejects.toThrow();
-        expect(harnessMocks.runAttempt).not.toHaveBeenCalled();
-      } finally {
-        f.cleanup();
-      }
+      await expect(runBackend({ ...f.params, abortSignal: controller.signal })).rejects.toThrow();
+      expect(harnessMocks.runAttempt).not.toHaveBeenCalled();
     },
   );
 });

@@ -34,35 +34,43 @@ beforeEach(() => {
   }
 });
 
-describe("embedded Tool Search prompt parity", () => {
-  it("keeps explicit task creation discoverable in Code Mode and removes revoked capability guidance", async () => {
-    const fixture = createFixture({ pendingImageCount: 0 });
-    const config = {
-      agents: { defaults: { experimental: { localModelLean: false } } },
-      tools: { codeMode: true },
-    };
-    const runtime = createAgentHarnessToolSurfaceRuntimeCore({
-      config,
-      modelToolsEnabled: true,
-      executeTool: async () => ({ content: [], details: {} }),
-    });
-    const admission = prepareSystemAgentRunAdmission(
-      config,
-      fixture.input.attempt.runId,
-      "main",
-      "session-create-prompt-test",
-    );
-    try {
-      const surface = runtime.compactTools([createStubTool("sessions_create")]);
-      const capabilityToolNames = new Set(["sessions_create"]);
-      expect(surface.tools.map((tool) => tool.name)).not.toContain("sessions_create");
+function promptFixture(config: EmbeddedRunAttemptParams["config"], boundary: string) {
+  const fixture = createFixture({ pendingImageCount: 0 });
+  const runtime = createAgentHarnessToolSurfaceRuntimeCore({
+    config,
+    modelToolsEnabled: true,
+    executeTool: async () => ({ content: [], details: {} }),
+  });
+  const admission = prepareSystemAgentRunAdmission(
+    config,
+    fixture.input.attempt.runId,
+    "main",
+    boundary,
+  );
+  type Preparation = Parameters<typeof prepareEmbeddedAttemptSystemPrompt>[0];
+  return {
+    fixture,
+    runtime,
+    cleanup() {
+      admission.close();
+      runtime.cleanup();
+    },
+    async prepare(
+      effectiveTools: Preparation["effectiveTools"],
+      capabilityToolNames: Set<string>,
+      options: Pick<Preparation, "codeModeActive" | "toolSearchDirectoryEnabled"> & {
+        prompt: string;
+        sessionKey: string;
+      },
+    ) {
+      const { prompt, sessionKey, ...mode } = options;
       const attempt = {
         ...fixture.input.attempt,
         admittedRunContext: await admission.admit("embedded"),
         config,
-        prompt: "spin up a new task",
+        prompt,
+        sessionKey,
         promptMode: "full",
-        sessionKey: "agent:main:dashboard:task",
         workspaceDir: "/workspace",
         model: makeProviderModelFixture({
           provider: "openai",
@@ -92,14 +100,36 @@ describe("embedded Tool Search prompt parity", () => {
           }),
         }),
         capabilityToolNames,
-        effectiveTools: surface.tools,
+        effectiveTools,
         isRawModelRun: false,
         modelToolsEnabled: true,
         skillsPrompt: "",
-        codeModeActive: true,
-        toolSearchDirectoryEnabled: false,
+        ...mode,
         toolSearchRuntimeConfig: runtime.config,
         toolSearchCatalogRef: runtime.toolSearchCatalogRef,
+      });
+      return { attempt, prepared };
+    },
+  };
+}
+
+describe("embedded Tool Search prompt parity", () => {
+  it("keeps explicit task creation discoverable in Code Mode and removes revoked capability guidance", async () => {
+    const config = {
+      agents: { defaults: { experimental: { localModelLean: false } } },
+      tools: { codeMode: true },
+    };
+    const f = promptFixture(config, "session-create-prompt-test");
+    const { runtime } = f;
+    try {
+      const surface = runtime.compactTools([createStubTool("sessions_create")]);
+      const capabilityToolNames = new Set(["sessions_create"]);
+      expect(surface.tools.map((tool) => tool.name)).not.toContain("sessions_create");
+      const { prepared } = await f.prepare(surface.tools, capabilityToolNames, {
+        prompt: "spin up a new task",
+        sessionKey: "agent:main:dashboard:task",
+        codeModeActive: true,
+        toolSearchDirectoryEnabled: false,
       });
       expect(prepared.systemPromptText).toContain('"spin up a new task"');
       expect(prepared.systemPromptText).toContain("`sessions_create`");
@@ -115,8 +145,7 @@ describe("embedded Tool Search prompt parity", () => {
       const refreshPrompt = await prepared.prepareToolPrompt(restricted.tools);
       expect(refreshPrompt(prepared.systemPromptText)).not.toContain("`sessions_create`");
     } finally {
-      admission.close();
-      runtime.cleanup();
+      f.cleanup();
     }
   });
 
@@ -128,22 +157,12 @@ describe("embedded Tool Search prompt parity", () => {
   ])(
     "submits only the current $mode catalog after hook allowlist $toolsAllow",
     async ({ mode, toolsAllow }) => {
-      const fixture = createFixture({ pendingImageCount: 0 });
       const config = {
         agents: { defaults: { experimental: { localModelLean: false } } },
         tools: { codeMode: false, toolSearch: { enabled: true, mode } },
       };
-      const runtime = createAgentHarnessToolSurfaceRuntimeCore({
-        config,
-        modelToolsEnabled: true,
-        executeTool: async () => ({ content: [], details: {} }),
-      });
-      const admission = prepareSystemAgentRunAdmission(
-        config,
-        fixture.input.attempt.runId,
-        "main",
-        "tool-search-prompt-test",
-      );
+      const f = promptFixture(config, "tool-search-prompt-test");
+      const { fixture, runtime } = f;
       try {
         const sourceTools = ["fixture_allowed", "fixture_denied"].map(createStubTool);
         const surface = runtime.compactTools([
@@ -154,49 +173,10 @@ describe("embedded Tool Search prompt parity", () => {
           ...sourceTools,
         ]);
         const capabilityToolNames = new Set(sourceTools.map((tool) => tool.name));
-        const attempt = {
-          ...fixture.input.attempt,
-          admittedRunContext: await admission.admit("embedded"),
-          config,
+        const { attempt, prepared } = await f.prepare(surface.tools, capabilityToolNames, {
           prompt: "Use the allowed capability.",
-          promptMode: "full",
           sessionKey: "agent:main:prompt-parity",
-          workspaceDir: "/workspace",
-          model: makeProviderModelFixture({
-            provider: "openai",
-            id: "test-model",
-            api: "openai-responses",
-            baseUrl: "https://api.openai.com/v1",
-          }),
-        } as EmbeddedRunAttemptParams;
-        const prepared = await prepareEmbeddedAttemptSystemPrompt({
-          activeContextEngine: undefined,
-          attempt,
-          bootstrap: {
-            ...buildBootstrapBudgetState({ files: [] }),
-            bootstrapMode: "full",
-            contextFiles: [],
-            bootstrapInjectionStats: [],
-            shouldRecordCompletedBootstrapTurn: false,
-            workspaceNotes: [],
-          },
-          setup: createAttemptSetupFixture({
-            effectiveCwd: "/workspace",
-            effectiveWorkspace: "/workspace",
-            getProviderRuntimeHandle: () => ({
-              provider: attempt.provider,
-              modelId: attempt.modelId,
-              prepared: true,
-            }),
-          }),
-          capabilityToolNames,
-          effectiveTools: surface.tools,
-          isRawModelRun: false,
-          modelToolsEnabled: true,
-          skillsPrompt: "",
           toolSearchDirectoryEnabled: true,
-          toolSearchRuntimeConfig: runtime.config,
-          toolSearchCatalogRef: runtime.toolSearchCatalogRef,
         });
         const { sessionRuntime } = fixture.input.prepared;
         sessionRuntime.state.systemPromptText = prepared.systemPromptText;
@@ -266,8 +246,7 @@ describe("embedded Tool Search prompt parity", () => {
           expect(submittedPrompt).not.toContain("Call a unique deferred tool name directly");
         }
       } finally {
-        admission.close();
-        runtime.cleanup();
+        f.cleanup();
       }
     },
   );

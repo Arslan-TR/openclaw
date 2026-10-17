@@ -333,12 +333,9 @@ describe("admitted lazy session writer", () => {
     },
   );
 
-  it.each([
-    { existing: false, incognito: false },
-    { existing: true, incognito: false },
-  ])(
-    "commits actor appends without pre-reads and refuses a replaced writer (existing=$existing, incognito=$incognito)",
-    async ({ existing, incognito }) => {
+  it.each([false, true])(
+    "commits actor appends without pre-reads and refuses a replaced writer (existing=%s)",
+    async (existing) => {
       await withInitialWriter(
         async ({ manager, runParams, target, transcript }) => {
           const actor = transcript.ownedTranscriptWriteContext.sessionActor!.actor;
@@ -362,7 +359,7 @@ describe("admitted lazy session writer", () => {
                   storePath: target.storePath,
                   sessionKey: `${target.sessionKey}-other`,
                 },
-                { sessionId: otherSessionId, updatedAt: 2, ...(incognito && { incognito: true }) },
+                { sessionId: otherSessionId, updatedAt: 2 },
               ),
             );
             const thirdId = await manager.appendCustomEntryAsync("after-unrelated-write");
@@ -383,7 +380,7 @@ describe("admitted lazy session writer", () => {
             read.mockRestore();
           }
         },
-        { existing, incognito },
+        { existing },
       );
     },
   );
@@ -503,43 +500,40 @@ describe("admitted lazy session writer", () => {
     });
   });
 
-  it.each([false])(
-    "refuses an explicitly stale actor append without replay or persistence (incognito=%s)",
-    async (incognito) => {
-      await withInitialWriter(
-        async ({ manager, target, transcript }) => {
-          await manager.appendMessageAsync(userMessage);
-          const before = loadTranscriptEventsSync(target);
-          const actor = transcript.ownedTranscriptWriteContext.sessionActor!.actor;
-          const append = actor.appendTranscriptEvent.bind(actor);
-          const stale = vi
-            .spyOn(actor, "appendTranscriptEvent")
-            .mockImplementationOnce((command, authority, observer) =>
-              append(
-                { ...command, expected: { epoch: "superseded-test-epoch", sequence: 0 } },
-                authority,
-                observer,
-              ),
-            );
-          const read = vi.spyOn(actor, "read");
-          try {
-            await expect(
-              manager.appendCustomEntryAsync("after-stale-version"),
-            ).rejects.toMatchObject({
+  it("refuses an explicitly stale actor append without replay or persistence", async () => {
+    await withInitialWriter(
+      async ({ manager, target, transcript }) => {
+        await manager.appendMessageAsync(userMessage);
+        const before = loadTranscriptEventsSync(target);
+        const actor = transcript.ownedTranscriptWriteContext.sessionActor!.actor;
+        const append = actor.appendTranscriptEvent.bind(actor);
+        const stale = vi
+          .spyOn(actor, "appendTranscriptEvent")
+          .mockImplementationOnce((command, authority, observer) =>
+            append(
+              { ...command, expected: { epoch: "superseded-test-epoch", sequence: 0 } },
+              authority,
+              observer,
+            ),
+          );
+        const read = vi.spyOn(actor, "read");
+        try {
+          await expect(manager.appendCustomEntryAsync("after-stale-version")).rejects.toMatchObject(
+            {
               name: "SessionActorStaleVersionError",
-            });
-            expect(stale).toHaveBeenCalledOnce();
-            expect(read).not.toHaveBeenCalled();
-            expect(loadTranscriptEventsSync(target)).toEqual(before);
-          } finally {
-            stale.mockRestore();
-            read.mockRestore();
-          }
-        },
-        { existing: true, incognito },
-      );
-    },
-  );
+            },
+          );
+          expect(stale).toHaveBeenCalledOnce();
+          expect(read).not.toHaveBeenCalled();
+          expect(loadTranscriptEventsSync(target)).toEqual(before);
+        } finally {
+          stale.mockRestore();
+          read.mockRestore();
+        }
+      },
+      { existing: true },
+    );
+  });
 
   it("refuses a prepared target whose owner closes during lifecycle preparation", async () => {
     await withInitialWriter(
@@ -687,69 +681,53 @@ describe("admitted lazy session writer", () => {
     });
   });
 
-  it.each([false])(
-    "preserves one committed terminal error through attempt teardown (existing=%s)",
-    async (existing) => {
-      await withInitialWriter(
-        async ({ manager, promptState, target }) => {
-          manager.appendMessage(userMessage);
-          const owner = createAssistantErrorTranscript();
-          installSessionToolResultGuard(manager, { assistantErrorTranscript: owner });
-          manager.appendMessage(makeAgentAssistantMessage({ content: [], stopReason: "error" }));
-          expect(
-            SessionManager.open(target)
-              .getBranch()
-              .filter((entry) => entry.type === "message"),
-          ).toHaveLength(2);
-          return async () => {
-            await promptState[Symbol.asyncDispose]();
-            owner.settle(true);
-            expect(
-              SessionManager.open(target)
-                .getBranch()
-                .filter((entry) => entry.type === "message"),
-            ).toHaveLength(2);
-          };
-        },
-        { existing },
-      );
-    },
-  );
+  it("preserves one committed terminal error through attempt teardown", async () => {
+    await withInitialWriter(async ({ manager, promptState, target }) => {
+      manager.appendMessage(userMessage);
+      const owner = createAssistantErrorTranscript();
+      installSessionToolResultGuard(manager, { assistantErrorTranscript: owner });
+      manager.appendMessage(makeAgentAssistantMessage({ content: [], stopReason: "error" }));
+      const messages = () =>
+        SessionManager.open(target)
+          .getBranch()
+          .filter((entry) => entry.type === "message");
+      expect(messages()).toHaveLength(2);
+      return async () => {
+        await promptState[Symbol.asyncDispose]();
+        owner.settle(true);
+        expect(messages()).toHaveLength(2);
+      };
+    });
+  });
 
-  it.each([false])(
-    "prepares a fresh keyed turn before its first append (existing=%s)",
-    async (existing) => {
-      await withInitialWriter(
-        async ({ manager, runParams, target }) => {
-          const message = { ...userMessage, idempotencyKey: `${runParams.runId}:user` };
-          const recorder = createUserTurnTranscriptRecorder({
-            message,
-            target: { ...target, sessionEntry: undefined },
-          });
-          expect(Boolean(loadSessionEntry(target))).toBe(existing);
-          expect(
-            await preparePersistedCurrentUserTurn({
-              sessionManager: manager,
-              message,
-              recorder,
-              runId: runParams.runId,
-            }),
-          ).toBeUndefined();
-          manager.appendMessage(message);
-          expect(loadSessionEntry(target)).toMatchObject({
-            sessionId: target.sessionId,
-            activeWriterRunId: runParams.runId,
-          });
-          expect(
-            SessionManager.open(target)
-              .getBranch()
-              .filter((entry) => entry.type === "message" && entry.message.role === "user"),
-          ).toHaveLength(1);
-        },
-        { existing },
-      );
-    },
-  );
+  it("prepares a fresh keyed turn before its first append", async () => {
+    await withInitialWriter(async ({ manager, runParams, target }) => {
+      const message = { ...userMessage, idempotencyKey: `${runParams.runId}:user` };
+      const recorder = createUserTurnTranscriptRecorder({
+        message,
+        target: { ...target, sessionEntry: undefined },
+      });
+      expect(loadSessionEntry(target)).toBeUndefined();
+      expect(
+        await preparePersistedCurrentUserTurn({
+          sessionManager: manager,
+          message,
+          recorder,
+          runId: runParams.runId,
+        }),
+      ).toBeUndefined();
+      manager.appendMessage(message);
+      expect(loadSessionEntry(target)).toMatchObject({
+        sessionId: target.sessionId,
+        activeWriterRunId: runParams.runId,
+      });
+      expect(
+        SessionManager.open(target)
+          .getBranch()
+          .filter((entry) => entry.type === "message" && entry.message.role === "user"),
+      ).toHaveLength(1);
+    });
+  });
 
   it.each([
     { existing: false, kind: "message" },
@@ -917,9 +895,7 @@ describe("admitted lazy session writer", () => {
           } else {
             expect(events).toMatchObject([
               { type: "session" },
-              kind === "model"
-                ? { type: "model_change", provider: "test-provider", modelId: "test-model" }
-                : { type: "thinking_level_change", thinkingLevel: "high" },
+              { type: "model_change", provider: "test-provider", modelId: "test-model" },
             ]);
           }
         } finally {

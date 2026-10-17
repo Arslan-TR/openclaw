@@ -143,6 +143,15 @@ async function fixture(state: OpenClawTestState, owner: Owner = "shared") {
   };
 }
 
+function withFixture(
+  run: (fixture: Awaited<ReturnType<typeof fixture>>) => Promise<void>,
+  owner?: Owner,
+) {
+  return withOpenClawTestState({ label: "shared-usage", scenario: "minimal" }, async (state) =>
+    run(await fixture(state, owner)),
+  );
+}
+
 function interceptUsageCommand(intercept: (execute: () => Promise<unknown>) => Promise<unknown>) {
   const original = workerStore.runOpenClawStateWorkerOperation;
   return vi.spyOn(workerStore, "runOpenClawStateWorkerOperation").mockImplementation(
@@ -170,200 +179,169 @@ function interceptUsageCommand(intercept: (execute: () => Promise<unknown>) => P
 
 it.each<Owner>(["shared", "inherited", "agent"])(
   "records embedded success then failover failure in the %s owner without caller SQL",
-  async (owner) => {
-    await withOpenClawTestState(
-      { label: "shared-usage-worker", scenario: "minimal" },
-      async (state) => {
-        const f = await fixture(state, owner);
-        const maintenance = createOpenClawDatabaseMaintenanceScope();
-        const sql = observeHostDataSql();
-        try {
-          f.database.db.prepare("SELECT 1").get();
-          expect(sql.queries.length).toBeGreaterThan(0);
-          sql.queries.length = 0;
-          expect(maintenance.run(f.succeed)).toBeUndefined();
-          await maintenance.run(f.fail);
-          await maintenance.close();
-          expect(sql.queries).toEqual([]);
-        } finally {
-          sql.restore();
-          await maintenance.close();
-        }
-        const persisted = loadPersistedAuthProfileStore(f.ownerDir);
-        expect(persisted?.usageStats?.[profileId]).toMatchObject({
-          lastUsed: owner === "inherited" ? 17 : expect.any(Number),
-          errorCount: 1,
-          failureCounts: { timeout: 1 },
-          cooldownReason: "timeout",
-        });
-        expect(persisted?.usageStats?.[profileId]?.disabledUntil).toBeUndefined();
-        expect(persisted?.lastGood?.[provider]).toBe(owner === "inherited" ? siblingId : profileId);
-        expect(f.store.usageStats?.[profileId]).toEqual(persisted?.usageStats?.[profileId]);
-        expect(readAuthProfileJsonCellText(f.database.db, "store", f.kind)).toBe(f.credentials);
-        if (owner === "agent") {
-          expect(loadPersistedAuthProfileStore()).toEqual(f.sharedBefore);
-        } else if (owner === "inherited") {
-          expect(loadPersistedAuthProfileStore(f.agentDir)).toEqual(f.localBefore);
-          expect(f.store.lastGood?.[provider]).toBe(siblingId);
-        }
-      },
-    );
-  },
+  (owner) =>
+    withFixture(async (f) => {
+      const maintenance = createOpenClawDatabaseMaintenanceScope();
+      const sql = observeHostDataSql();
+      try {
+        f.database.db.prepare("SELECT 1").get();
+        expect(sql.queries.length).toBeGreaterThan(0);
+        sql.queries.length = 0;
+        expect(maintenance.run(f.succeed)).toBeUndefined();
+        await maintenance.run(f.fail);
+        await maintenance.close();
+        expect(sql.queries).toEqual([]);
+      } finally {
+        sql.restore();
+        await maintenance.close();
+      }
+      const persisted = loadPersistedAuthProfileStore(f.ownerDir);
+      expect(persisted?.usageStats?.[profileId]).toMatchObject({
+        lastUsed: owner === "inherited" ? 17 : expect.any(Number),
+        errorCount: 1,
+        failureCounts: { timeout: 1 },
+        cooldownReason: "timeout",
+      });
+      expect(persisted?.usageStats?.[profileId]?.disabledUntil).toBeUndefined();
+      expect(persisted?.lastGood?.[provider]).toBe(owner === "inherited" ? siblingId : profileId);
+      expect(f.store.usageStats?.[profileId]).toEqual(persisted?.usageStats?.[profileId]);
+      expect(readAuthProfileJsonCellText(f.database.db, "store", f.kind)).toBe(f.credentials);
+      if (owner === "agent") {
+        expect(loadPersistedAuthProfileStore()).toEqual(f.sharedBefore);
+      } else if (owner === "inherited") {
+        expect(loadPersistedAuthProfileStore(f.agentDir)).toEqual(f.localBefore);
+        expect(f.store.lastGood?.[provider]).toBe(siblingId);
+      }
+    }, owner),
 );
 
 it.each(["sibling rotation", "sibling addition", "selected rotation"] as const)(
   "keeps usage bound to the selected credential after %s",
-  async (mutation) => {
-    await withOpenClawTestState(
-      { label: "shared-usage-credential-scope", scenario: "minimal" },
-      async (state) => {
-        const f = await fixture(state);
-        const before = structuredClone(f.store);
-        const replacement = structuredClone(before);
-        const changedId =
-          mutation === "selected rotation"
-            ? profileId
-            : mutation === "sibling addition"
-              ? "anthropic:added"
-              : siblingId;
-        replacement.profiles[changedId] = {
-          type: "token",
-          provider,
-          token: "synthetic-replacement-token",
-        };
-        const entered = createDeferredCore();
-        const release = createDeferredCore();
-        interceptUsageCommand(async (execute) => {
-          entered.resolve();
-          await release.promise;
-          return execute();
-        });
-        const pending = f.fail();
-        try {
-          await awaitGateBeforeSettlement(
-            entered.promise,
-            pending,
-            "Usage settled before dispatch",
-          );
-          if (mutation === "selected rotation") {
-            // A foreign credential commit does not publish this process's mutation lineage.
-            writeAuthProfileJsonCell(
-              f.database.db,
-              "store",
-              f.kind,
-              buildPersistedAuthProfileSecretsStore(replacement),
-            );
-          } else {
-            saveAuthProfileStore(replacement, undefined, {
-              filterExternalAuthProfiles: false,
-              syncExternalCli: false,
-            });
-          }
-          release.resolve();
-          if (mutation === "selected rotation") {
-            await expect(pending).rejects.toThrow(
-              "Auth credentials changed during usage preparation",
-            );
-            expect(loadPersistedAuthProfileStore()?.usageStats).toEqual(before.usageStats);
-            expect(f.store).toEqual(before);
-          } else {
-            await pending;
-            const persisted = loadPersistedAuthProfileStore();
-            expect(persisted?.usageStats?.[profileId]).toMatchObject({
-              errorCount: 3,
-              failureCounts: { auth: 2, timeout: 1 },
-              cooldownReason: "timeout",
-            });
-            expect(f.store.usageStats?.[profileId]).toEqual(persisted?.usageStats?.[profileId]);
-          }
-          expect(loadPersistedAuthProfileStore()?.profiles).toEqual(replacement.profiles);
-        } finally {
-          release.resolve();
-          await Promise.allSettled([pending]);
-        }
-      },
-    );
-  },
-);
-
-it("preserves the live authority error class and refuses the worker write", async () => {
-  await withOpenClawTestState(
-    { label: "shared-usage-refusal", scenario: "minimal" },
-    async (state) => {
-      const f = await fixture(state);
+  (mutation) =>
+    withFixture(async (f) => {
       const before = structuredClone(f.store);
+      const replacement = structuredClone(before);
+      const changedId =
+        mutation === "selected rotation"
+          ? profileId
+          : mutation === "sibling addition"
+            ? "anthropic:added"
+            : siblingId;
+      replacement.profiles[changedId] = {
+        type: "token",
+        provider,
+        token: "synthetic-replacement-token",
+      };
       const entered = createDeferredCore();
       const release = createDeferredCore();
-      const refused = new TypeError("Synthetic shared auth owner revoked");
-      let revoked = false;
-      const maintenance = createOpenClawDatabaseMaintenanceScope({
-        assertOwnerCurrent() {
-          if (revoked) {
-            throw refused;
-          }
-        },
-      });
       interceptUsageCommand(async (execute) => {
         entered.resolve();
         await release.promise;
         return execute();
       });
-      const pending = maintenance.run(f.fail);
-      const rejection = expect(pending).rejects.toBeInstanceOf(TypeError);
+      const pending = f.fail();
       try {
         await awaitGateBeforeSettlement(entered.promise, pending, "Usage settled before dispatch");
-        revoked = true;
+        if (mutation === "selected rotation") {
+          // A foreign credential commit does not publish this process's mutation lineage.
+          writeAuthProfileJsonCell(
+            f.database.db,
+            "store",
+            f.kind,
+            buildPersistedAuthProfileSecretsStore(replacement),
+          );
+        } else {
+          saveAuthProfileStore(replacement, undefined, {
+            filterExternalAuthProfiles: false,
+            syncExternalCli: false,
+          });
+        }
         release.resolve();
-        await rejection;
-        await expect(pending).rejects.toThrow(refused.message);
-        expect(loadPersistedAuthProfileStore()).toEqual(f.sharedBefore);
-        expect(f.store).toEqual(before);
+        if (mutation === "selected rotation") {
+          await expect(pending).rejects.toThrow(
+            "Auth credentials changed during usage preparation",
+          );
+          expect(loadPersistedAuthProfileStore()?.usageStats).toEqual(before.usageStats);
+          expect(f.store).toEqual(before);
+        } else {
+          await pending;
+          const persisted = loadPersistedAuthProfileStore();
+          expect(persisted?.usageStats?.[profileId]).toMatchObject({
+            errorCount: 3,
+            failureCounts: { auth: 2, timeout: 1 },
+            cooldownReason: "timeout",
+          });
+          expect(f.store.usageStats?.[profileId]).toEqual(persisted?.usageStats?.[profileId]);
+        }
+        expect(loadPersistedAuthProfileStore()?.profiles).toEqual(replacement.profiles);
       } finally {
-        revoked = false;
         release.resolve();
-        await Promise.allSettled([pending, rejection]);
-        await maintenance.close();
+        await Promise.allSettled([pending]);
       }
-    },
-  );
-});
+    }),
+);
 
-it("does not replay or publish when transport loses a committed usage reply", async () => {
-  await withOpenClawTestState(
-    { label: "shared-usage-unknown", scenario: "minimal" },
-    async (state) => {
-      const f = await fixture(state);
-      const before = structuredClone(f.store);
-      let writes = 0;
-      interceptUsageCommand(async (execute) => {
-        writes += 1;
-        await execute();
-        throw new SqliteWorkerError("Synthetic lost usage reply", "outcome-unknown");
-      });
-      await expect(f.fail()).rejects.toMatchObject({ code: "outcome-unknown" });
-      expect(writes).toBe(1);
-      expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]).toMatchObject({
-        errorCount: 3,
-        failureCounts: { auth: 2, timeout: 1 },
-      });
+it("preserves the live authority error class and refuses the worker write", () =>
+  withFixture(async (f) => {
+    const before = structuredClone(f.store);
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const refused = new TypeError("Synthetic shared auth owner revoked");
+    let revoked = false;
+    const maintenance = createOpenClawDatabaseMaintenanceScope({
+      assertOwnerCurrent() {
+        if (revoked) {
+          throw refused;
+        }
+      },
+    });
+    interceptUsageCommand(async (execute) => {
+      entered.resolve();
+      await release.promise;
+      return execute();
+    });
+    const pending = maintenance.run(f.fail);
+    const rejection = expect(pending).rejects.toBeInstanceOf(TypeError);
+    try {
+      await awaitGateBeforeSettlement(entered.promise, pending, "Usage settled before dispatch");
+      revoked = true;
+      release.resolve();
+      await rejection;
+      await expect(pending).rejects.toThrow(refused.message);
+      expect(loadPersistedAuthProfileStore()).toEqual(f.sharedBefore);
       expect(f.store).toEqual(before);
-    },
-  );
-});
+    } finally {
+      revoked = false;
+      release.resolve();
+      await Promise.allSettled([pending, rejection]);
+      await maintenance.close();
+    }
+  }));
 
-it("preserves the unreadable-store error identity returned by the worker", async () => {
-  await withOpenClawTestState(
-    { label: "shared-usage-unreadable", scenario: "minimal" },
-    async (state) => {
-      const f = await fixture(state);
-      f.database.db
-        .prepare("UPDATE config_machine_state SET value_json = ? WHERE state_key = ?")
-        .run("{", "authProfiles.state");
-      await expect(f.fail()).rejects.toBeInstanceOf(AuthProfileStoreUnreadableError);
-      expect(readAuthProfileJsonCellText(f.database.db, "state", "shared-state")).toBe("{");
-      expect(readAuthProfileJsonCellText(f.database.db, "store", "shared-state")).toBe(
-        f.credentials,
-      );
-    },
-  );
-});
+it("does not replay or publish when transport loses a committed usage reply", () =>
+  withFixture(async (f) => {
+    const before = structuredClone(f.store);
+    let writes = 0;
+    interceptUsageCommand(async (execute) => {
+      writes += 1;
+      await execute();
+      throw new SqliteWorkerError("Synthetic lost usage reply", "outcome-unknown");
+    });
+    await expect(f.fail()).rejects.toMatchObject({ code: "outcome-unknown" });
+    expect(writes).toBe(1);
+    expect(loadPersistedAuthProfileStore()?.usageStats?.[profileId]).toMatchObject({
+      errorCount: 3,
+      failureCounts: { auth: 2, timeout: 1 },
+    });
+    expect(f.store).toEqual(before);
+  }));
+
+it("preserves the unreadable-store error identity returned by the worker", () =>
+  withFixture(async (f) => {
+    f.database.db
+      .prepare("UPDATE config_machine_state SET value_json = ? WHERE state_key = ?")
+      .run("{", "authProfiles.state");
+    await expect(f.fail()).rejects.toBeInstanceOf(AuthProfileStoreUnreadableError);
+    expect(readAuthProfileJsonCellText(f.database.db, "state", "shared-state")).toBe("{");
+    expect(readAuthProfileJsonCellText(f.database.db, "store", "shared-state")).toBe(f.credentials);
+  }));
