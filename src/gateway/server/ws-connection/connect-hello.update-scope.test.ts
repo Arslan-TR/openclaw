@@ -1,11 +1,13 @@
 import { EventEmitter, once } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
+import { GATEWAY_CLIENT_CAPS } from "../../../../packages/gateway-protocol/src/client-info.js";
 import type { HelloOk } from "../../../../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import * as systemPresence from "../../../infra/system-presence.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { resolveGatewayAuth } from "../../auth-resolve.js";
+import type { HealthSummary } from "../../health/types.js";
 import { startGatewayTailscaleExposure } from "../../server-tailscale.js";
 import { prepareTailscalePublishedOrigin } from "../../tailscale-published-origin.js";
 import type { GatewayWsClient } from "../ws-types.js";
@@ -14,11 +16,13 @@ import type { GatewayWsClient } from "../ws-types.js";
 
 const {
   buildGatewaySnapshotMock,
+  getHealthCacheMock,
   emitGatewayAuthSecurityEventMock,
   getSessionRowProjectionMock,
   listControlUiPluginTabsMock,
   listControlUiPluginWidgetKindsMock,
 } = vi.hoisted(() => ({
+  getHealthCacheMock: vi.fn<() => HealthSummary | null>(() => null),
   emitGatewayAuthSecurityEventMock: vi.fn(),
   getSessionRowProjectionMock: vi.fn(),
   listControlUiPluginTabsMock: vi.fn((_scopes: readonly string[]) => []),
@@ -65,7 +69,7 @@ const {
 
 vi.mock("../health-state.js", () => ({
   buildGatewaySnapshot: buildGatewaySnapshotMock,
-  getHealthCache: vi.fn(() => null),
+  getHealthCache: getHealthCacheMock,
   getHealthVersion: vi.fn(() => 1),
 }));
 
@@ -187,7 +191,44 @@ describe("sendGatewayHello update detail scope", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    getHealthCacheMock.mockReturnValue(null);
   });
+
+  it.each([false, true])(
+    "sends cached health unless the client opts out (%s)",
+    async (onDemand) => {
+      const health: HealthSummary = {
+        ok: true,
+        ts: 123,
+        durationMs: 1,
+        channels: {},
+        channelOrder: [],
+        channelLabels: {},
+        heartbeatSeconds: 0,
+        agents: [],
+        sessions: { path: "", count: 5000, recent: [] },
+      };
+      getHealthCacheMock.mockReturnValue(health);
+      const context = makeContext("operator", ["operator.read"]);
+      context.connectParams = {
+        ...context.connectParams,
+        ...(onDemand ? { caps: [GATEWAY_CLIENT_CAPS.HELLO_HEALTH_ON_DEMAND] } : {}),
+      };
+
+      await sendGatewayHello(
+        context as never,
+        makeState("operator", ["operator.read"]) as never,
+        {},
+      );
+
+      expect(helloSnapshot(context)).toMatchObject({
+        presence: [],
+        stateVersion: { presence: 1, health: 1 },
+        uptimeMs: 1,
+      });
+      expect(helloSnapshot(context)?.health).toEqual(onDemand ? {} : health);
+    },
+  );
 
   it.each([undefined, []])(
     "sends hello without membership reads for idle presence (%j)",
