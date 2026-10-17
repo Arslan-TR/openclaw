@@ -1,9 +1,8 @@
-// Browser tests cover pw tools core.screenshots element selector plugin behavior.
 import crypto from "node:crypto";
 import path from "node:path";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { CDPSession } from "playwright-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_UPLOAD_DIR } from "./paths.js";
 import type { PageState } from "./pw-session-contracts.js";
 import {
@@ -28,24 +27,9 @@ function screenshotElement(screenshot: () => Promise<Buffer>) {
   };
 }
 
-function createFileChooserPageMocks() {
-  const fileChooser = { setFiles: vi.fn(async () => {}) };
-  const press = vi.fn(async () => {});
-  const waitForEvent = vi.fn(async () => fileChooser);
-  setPwToolsCoreCurrentPage({
-    waitForEvent,
-    keyboard: { press },
-  });
-  return { fileChooser, press, waitForEvent };
-}
-
 const target = { cdpUrl: "http://127.0.0.1:18792", targetId: "T1" };
 
 describe("pw-tools-core", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("screenshots a ref locator", async () => {
     const refScreenshot = vi.fn(async () => Buffer.from("R"));
     setPwToolsCoreCurrentRefLocator(screenshotElement(refScreenshot));
@@ -92,29 +76,23 @@ describe("pw-tools-core", () => {
     ).rejects.toThrow(/fullPage is not supported/i);
   });
   it("does not start a queued screenshot after its timeout", async () => {
-    let release!: () => void;
-    const previous = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const previous = createDeferred<void>();
     const state = sessionMocks.ensurePageState() as unknown as PageState;
-    state.emulation = { transitionTail: previous };
+    state.emulation = { transitionTail: previous.promise };
     const screenshot = vi.fn(async () => Buffer.from("late"));
     setPwToolsCoreCurrentPage({ screenshot });
 
     try {
-      await expect(
-        mod.takeScreenshotViaPlaywright({
-          ...target,
-          timeoutMs: 10,
-        }),
-      ).rejects.toThrow("timed out");
+      await expect(mod.takeScreenshotViaPlaywright({ ...target, timeoutMs: 10 })).rejects.toThrow(
+        "timed out",
+      );
       const pending = state.emulation.transitionTail;
-      release();
+      previous.resolve();
       await pending;
       expect(screenshot).not.toHaveBeenCalled();
       expect(sessionMocks.restoreRoleRefsForTarget).not.toHaveBeenCalled();
     } finally {
-      release();
+      previous.resolve();
     }
   });
   it("skips a cancelled queued labeled screenshot", async () => {
@@ -125,8 +103,7 @@ describe("pw-tools-core", () => {
     setPwToolsCoreCurrentPage(page);
     const controller = new AbortController();
     const pending = mod.screenshotWithLabelsViaPlaywright({
-      cdpUrl: "http://127.0.0.1:18792",
-      targetId: "T1",
+      ...target,
       signal: controller.signal,
       refs: {},
     });
@@ -197,14 +174,14 @@ describe("pw-tools-core", () => {
       try {
         await started.promise;
         const outcomes: string[] = [];
-        mutations.push(
-          outcome(resizeViewportViaPlaywright({ ...target, width: 800, height: 600 })).then(
-            (value) => {
-              outcomes.push(value);
-              return value;
-            },
-          ),
-        );
+        const recordOutcome = (operation: Promise<unknown>) => {
+          const pending = outcome(operation).then((value) => {
+            outcomes.push(value);
+            return value;
+          });
+          mutations.push(pending);
+        };
+        recordOutcome(resizeViewportViaPlaywright({ ...target, width: 800, height: 600 }));
         if (blockedMethod === "Playwright.screenshot") {
           controller.abort(new Error("request closed"));
           await vi.advanceTimersByTimeAsync(25);
@@ -213,12 +190,7 @@ describe("pw-tools-core", () => {
           await vi.advanceTimersByTimeAsync(25);
           expect(await screenshot).toContain("timed out");
         }
-        mutations.push(
-          outcome(setDeviceViaPlaywright({ ...target, name: "Desktop Chrome" })).then((value) => {
-            outcomes.push(value);
-            return value;
-          }),
-        );
+        recordOutcome(setDeviceViaPlaywright({ ...target, name: "Desktop Chrome" }));
         await vi.advanceTimersByTimeAsync(0);
         expect([...outcomes]).toEqual([
           expect.stringContaining("close and reopen this tab"),
@@ -239,17 +211,17 @@ describe("pw-tools-core", () => {
   );
   it("revalidates file-chooser paths at use-time and cancels missing files", async () => {
     const missingPath = path.join(DEFAULT_UPLOAD_DIR, `vitest-missing-${crypto.randomUUID()}.txt`);
-    const { fileChooser, press } = createFileChooserPageMocks();
-
-    await downloads.armFileUploadViaPlaywright({
-      ...target,
-      paths: [missingPath],
+    const fileChooser = { setFiles: vi.fn(async () => {}) };
+    const press = vi.fn(async () => {});
+    setPwToolsCoreCurrentPage({
+      waitForEvent: vi.fn(async () => fileChooser),
+      keyboard: { press },
     });
+
+    await downloads.armFileUploadViaPlaywright({ ...target, paths: [missingPath] });
     await Promise.resolve();
 
-    await vi.waitFor(() => {
-      expect(press).toHaveBeenCalledWith("Escape");
-    });
+    await vi.waitFor(() => expect(press).toHaveBeenCalledWith("Escape"));
     expect(fileChooser.setFiles).not.toHaveBeenCalled();
   });
 });

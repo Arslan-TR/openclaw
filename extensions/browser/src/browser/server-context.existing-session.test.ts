@@ -72,30 +72,43 @@ function tab(targetId: string, url: string, title = "") {
 }
 
 function makeState(): BrowserServerState {
+  const settings = {
+    cdpPort: 18801,
+    color: "#0066CC",
+    driver: "existing-session" as const,
+    attachOnly: true,
+    userDataDir: braveProfileDir,
+  };
   return makeBrowserServerState({
-    profile: makeBrowserProfile({
-      name: "chrome-live",
-      cdpPort: 18801,
-      color: "#0066CC",
-      driver: "existing-session",
-      attachOnly: true,
-      userDataDir: braveProfileDir,
-    }),
+    profile: makeBrowserProfile({ name: "chrome-live", ...settings }),
     resolvedOverrides: {
       evaluateEnabled: true,
       headless: false,
       ssrfPolicy: { dangerouslyAllowPrivateNetwork: true },
-      profiles: {
-        "chrome-live": {
-          cdpPort: 18801,
-          color: "#0066CC",
-          driver: "existing-session",
-          attachOnly: true,
-          userDataDir: braveProfileDir,
-        },
-      },
+      profiles: { "chrome-live": settings },
     },
   });
+}
+
+function liveProfile(state = makeState()) {
+  return createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+}
+
+function mockCachedSessionClose() {
+  let cached = true;
+  const results: boolean[] = [];
+  chromeMcp.closeChromeMcpSession.mockReset().mockImplementation(async () => {
+    const closed = cached;
+    cached = false;
+    results.push(closed);
+    return closed;
+  });
+  return results;
+}
+
+function expectClosedSession(results: boolean[]) {
+  expect(chromeMcp.closeChromeMcpSession.mock.calls).toEqual([["chrome-live"], ["chrome-live"]]);
+  expect(results).toEqual([true, false]);
 }
 
 beforeEach(() => {
@@ -109,16 +122,9 @@ beforeEach(() => {
   ]) {
     vi.stubEnv(key, "");
   }
-  vi.mocked(chromeMcp.listChromeMcpTabs)
-    .mockReset()
-    .mockResolvedValue([{ targetId: "7", title: "", url: "https://example.com", type: "page" }]);
-  vi.mocked(chromeMcp.countChromeMcpTabs).mockReset().mockResolvedValue(1);
-  vi.mocked(chromeMcp.openChromeMcpTab).mockReset().mockResolvedValue({
-    targetId: "8",
-    title: "",
-    url: "about:blank",
-    type: "page",
-  });
+  chromeMcp.listChromeMcpTabs.mockReset().mockResolvedValue([tab("7", "https://example.com")]);
+  chromeMcp.countChromeMcpTabs.mockReset().mockResolvedValue(1);
+  chromeMcp.openChromeMcpTab.mockReset().mockResolvedValue(tab("8", "about:blank"));
   vi.clearAllMocks();
 });
 
@@ -135,7 +141,7 @@ describe("browser server-context existing-session profile", () => {
       ...state.resolved.profiles["chrome-live"],
       mcpArgs: ["--browserUrl", "http://127.0.0.1:9222"],
     };
-    const live = createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+    const live = liveProfile(state);
 
     await expect(live.listTabs()).rejects.toThrow(/Chrome MCP cannot carry that pinned transport/);
     await expect(live.openTab("https://example.com")).rejects.toThrow(
@@ -164,9 +170,11 @@ describe("browser server-context existing-session profile", () => {
     const profiles = await ctx.listProfiles();
 
     expect(profiles).toHaveLength(1);
-    expect(profiles[0]?.transport).toBe("chrome-mcp");
-    expect(profiles[0]?.cdpPort).toBeNull();
-    expect(profiles[0]?.cdpUrl).toBe("http://127.0.0.1:9222");
+    expect(profiles[0]).toMatchObject({
+      transport: "chrome-mcp",
+      cdpPort: null,
+      cdpUrl: "http://127.0.0.1:9222",
+    });
     expect(chromeMcp.ensureChromeMcpAvailable).toHaveBeenCalledWith(
       "chrome-live",
       expect.objectContaining({ cdpUrl: "http://openclaw:relay-token@127.0.0.1:9222" }),
@@ -177,22 +185,13 @@ describe("browser server-context existing-session profile", () => {
   it("eagerly closes MCP while attach readiness is pending and prevents retry", async () => {
     const readinessEntered = Promise.withResolvers<void>();
     const readiness = Promise.withResolvers<never>();
-    vi.mocked(chromeMcp.listChromeMcpTabs).mockImplementationOnce(async () => {
+    chromeMcp.listChromeMcpTabs.mockImplementationOnce(async () => {
       readinessEntered.resolve();
       return await readiness.promise;
     });
-    let mcpSessionCached = true;
-    const closeResults: boolean[] = [];
-    vi.mocked(chromeMcp.closeChromeMcpSession)
-      .mockReset()
-      .mockImplementation(async () => {
-        const closed = mcpSessionCached;
-        mcpSessionCached = false;
-        closeResults.push(closed);
-        return closed;
-      });
+    const closeResults = mockCachedSessionClose();
     const state = makeState();
-    const live = createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+    const live = liveProfile(state);
 
     const starting = live.ensureBrowserAvailable();
     await readinessEntered.promise;
@@ -204,37 +203,19 @@ describe("browser server-context existing-session profile", () => {
     await expect(stopping).resolves.toEqual({ stopped: true });
     expect(chromeMcp.ensureChromeMcpAvailable).toHaveBeenCalledTimes(1);
     expect(chromeMcp.listChromeMcpTabs).toHaveBeenCalledTimes(1);
-    expect(chromeMcp.closeChromeMcpSession).toHaveBeenCalledTimes(2);
-    expect(chromeMcp.closeChromeMcpSession).toHaveBeenNthCalledWith(1, "chrome-live");
-    expect(chromeMcp.closeChromeMcpSession).toHaveBeenNthCalledWith(2, "chrome-live");
-    expect(closeResults).toEqual([true, false]);
-    expect(mcpSessionCached).toBe(false);
+    expectClosedSession(closeResults);
   });
 
   it("drains an admitted MCP tab open before the final session sweep", async () => {
     const openEntered = Promise.withResolvers<void>();
-    const opened = Promise.withResolvers<{
-      targetId: string;
-      title: string;
-      url: string;
-      type: "page";
-    }>();
-    vi.mocked(chromeMcp.openChromeMcpTab).mockImplementationOnce(async () => {
+    const opened = Promise.withResolvers<ReturnType<typeof tab>>();
+    chromeMcp.openChromeMcpTab.mockImplementationOnce(async () => {
       openEntered.resolve();
       return await opened.promise;
     });
-    let mcpSessionCached = true;
-    const closeResults: boolean[] = [];
-    vi.mocked(chromeMcp.closeChromeMcpSession)
-      .mockReset()
-      .mockImplementation(async () => {
-        const closed = mcpSessionCached;
-        mcpSessionCached = false;
-        closeResults.push(closed);
-        return closed;
-      });
+    const closeResults = mockCachedSessionClose();
     const state = makeState();
-    const live = createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+    const live = liveProfile(state);
 
     await live.ensureTabAvailable();
     const aliasesBefore = structuredClone(state.profiles.get("chrome-live")?.tabAliases);
@@ -242,16 +223,12 @@ describe("browser server-context existing-session profile", () => {
     await openEntered.promise;
     const stopping = live.stopRunningBrowser();
     await vi.waitFor(() => expect(chromeMcp.closeChromeMcpSession).toHaveBeenCalledTimes(1));
-    opened.resolve({ targetId: "late", title: "", url: "about:blank", type: "page" });
+    opened.resolve(tab("late", "about:blank"));
 
     await expect(opening).rejects.toThrow(/lifecycle changed|superseded/i);
     await expect(stopping).resolves.toEqual({ stopped: true });
     expect(chromeMcp.openChromeMcpTab).toHaveBeenCalledTimes(1);
-    expect(chromeMcp.closeChromeMcpSession).toHaveBeenCalledTimes(2);
-    expect(chromeMcp.closeChromeMcpSession).toHaveBeenNthCalledWith(1, "chrome-live");
-    expect(chromeMcp.closeChromeMcpSession).toHaveBeenNthCalledWith(2, "chrome-live");
-    expect(closeResults).toEqual([true, false]);
-    expect(mcpSessionCached).toBe(false);
+    expectClosedSession(closeResults);
     expect(state.profiles.get("chrome-live")?.lastTargetId).toBe("7");
     expect(state.profiles.get("chrome-live")?.tabAliases).toEqual(aliasesBefore);
   });
@@ -260,9 +237,9 @@ describe("browser server-context existing-session profile", () => {
     const originalTab = tab("TARGET-A", "https://shop.example/checkout", "Checkout");
     const replacementTab = { ...originalTab, targetId: "TARGET-B" };
     let currentTabs = [originalTab];
-    vi.mocked(chromeMcp.listChromeMcpTabs).mockImplementation(async () => currentTabs);
+    chromeMcp.listChromeMcpTabs.mockImplementation(async () => currentTabs);
     const state = makeState();
-    const live = createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+    const live = liveProfile(state);
 
     await expect(live.listTabs()).resolves.toEqual([
       expect.objectContaining({ targetId: "TARGET-A", tabId: "t1" }),
@@ -289,24 +266,12 @@ describe("browser server-context existing-session profile", () => {
   it("does not sticky-adopt a Chrome MCP tab when the final URL is policy-blocked", async () => {
     const goodTab = tab("chrome-mcp:good:1", "https://example.com/", "Good");
     const blockedTargetId = "chrome-mcp:blocked:1";
-    vi.mocked(chromeMcp.openChromeMcpTab).mockResolvedValueOnce(goodTab).mockResolvedValueOnce({
-      targetId: blockedTargetId,
-      title: "Blocked",
-      url: "http://127.0.0.1:9/",
-      type: "page",
-    });
-    vi.mocked(chromeMcp.listChromeMcpTabs).mockResolvedValue([
-      goodTab,
-      {
-        targetId: blockedTargetId,
-        title: "Blocked",
-        url: "http://127.0.0.1:9/",
-        type: "page",
-      },
-    ]);
+    const blockedTab = tab(blockedTargetId, "http://127.0.0.1:9/", "Blocked");
+    chromeMcp.openChromeMcpTab.mockResolvedValueOnce(goodTab).mockResolvedValueOnce(blockedTab);
+    chromeMcp.listChromeMcpTabs.mockResolvedValue([goodTab, blockedTab]);
     const state = makeState();
     state.resolved.ssrfPolicy = {};
-    const live = createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+    const live = liveProfile(state);
 
     await expect(live.openTab("https://example.com", { label: "good" })).resolves.toEqual(
       expect.objectContaining({ targetId: goodTab.targetId }),
@@ -339,9 +304,9 @@ describe("browser server-context existing-session profile", () => {
     const tabA = tab("chrome-mcp:fresh:1", "https://a.example", "A");
     const tabB = tab("chrome-mcp:fresh:2", "https://b.example", "B");
     let currentTabs = [tabA, tabB];
-    vi.mocked(chromeMcp.listChromeMcpTabs).mockImplementation(async () => currentTabs);
+    chromeMcp.listChromeMcpTabs.mockImplementation(async () => currentTabs);
     const state = makeState();
-    const live = createBrowserRouteContext({ getState: () => state }).forProfile("chrome-live");
+    const live = liveProfile(state);
 
     await live.focusTab(tabA.targetId);
     expect(chromeMcp.focusChromeMcpTab).toHaveBeenCalledWith(
@@ -350,7 +315,7 @@ describe("browser server-context existing-session profile", () => {
       expect.objectContaining({ driver: "existing-session" }),
       { signal: expect.any(AbortSignal) },
     );
-    vi.mocked(chromeMcp.closeChromeMcpTab).mockRejectedValueOnce(new Error("close failed"));
+    chromeMcp.closeChromeMcpTab.mockRejectedValueOnce(new Error("close failed"));
     await expect(live.closeTab(tabA.targetId)).rejects.toThrow("close failed");
     expect(state.profiles.get("chrome-live")?.lastTargetId).toBe(tabA.targetId);
     await expect(live.ensureTabAvailable()).resolves.toMatchObject({ targetId: tabA.targetId });
@@ -385,7 +350,7 @@ describe("browser server-context existing-session profile", () => {
 
   it("surfaces DevToolsActivePort attach failures instead of a generic tab timeout", async () => {
     vi.useFakeTimers();
-    vi.mocked(chromeMcp.listChromeMcpTabs).mockRejectedValue(
+    chromeMcp.listChromeMcpTabs.mockRejectedValue(
       new Error(
         `Could not connect to Chrome. Check if Chrome is running. Cause: Could not find DevToolsActivePort for chrome at ${braveProfileDir}/DevToolsActivePort`,
       ),

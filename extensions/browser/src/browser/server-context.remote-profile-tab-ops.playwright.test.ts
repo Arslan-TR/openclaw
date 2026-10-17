@@ -9,24 +9,30 @@ import {
 const deps: RemoteProfileTestDeps = await loadRemoteProfileTestDeps();
 installRemoteProfileTestLifecycle(deps);
 
-function page(targetId: string, url = `https://${targetId.toLowerCase()}.example`) {
+function versionResponse() {
+  return Response.json({
+    webSocketDebuggerUrl: "wss://1.1.1.1:9222/devtools/browser/REMOTE-BROWSER?auth=fixture-value",
+  });
+}
+
+function page(
+  targetId: string,
+  url = `https://${targetId.toLowerCase()}.example`,
+  title = targetId === "T1" ? "Tab 1" : targetId,
+) {
   return {
     targetId,
-    title: targetId === "T1" ? "Tab 1" : targetId,
+    title,
     url,
     type: "page" as const,
   };
 }
 
 async function expectBlockedCdpEndpoint(promise: Promise<unknown>) {
-  try {
-    await promise;
-  } catch (error) {
-    expect((error as { name?: unknown }).name).toBe("BrowserCdpEndpointBlockedError");
-    expect((error as { status?: unknown }).status).toBe(400);
-    return;
-  }
-  throw new Error("expected blocked browser CDP endpoint");
+  await expect(promise).rejects.toMatchObject({
+    name: "BrowserCdpEndpointBlockedError",
+    status: 400,
+  });
 }
 
 const permissiveRemoteCdpPolicy = {
@@ -36,15 +42,8 @@ const permissiveRemoteCdpPolicy = {
 
 describe("browser remote profile tab ops via Playwright", () => {
   it("uses Playwright tab operations when available", async () => {
-    const listPagesViaPlaywright = vi.fn(async () => [
-      { targetId: "T1", title: "Tab 1", url: "https://example.com", type: "page" },
-    ]);
-    const createPageViaPlaywright = vi.fn(async () => ({
-      targetId: "T2",
-      title: "Tab 2",
-      url: "http://127.0.0.1:3000",
-      type: "page",
-    }));
+    const listPagesViaPlaywright = vi.fn(async () => [page("T1", "https://example.com")]);
+    const createPageViaPlaywright = vi.fn(async () => page("T2", "http://127.0.0.1:3000", "Tab 2"));
     const closePageByTargetIdViaPlaywright = vi.fn(async () => {});
 
     vi.spyOn(deps.pwAiModule, "getPwAiModule").mockResolvedValue({
@@ -55,13 +54,7 @@ describe("browser remote profile tab ops via Playwright", () => {
 
     const fetchMock = vi.fn(async (url: unknown) => {
       expect(String(url)).toContain("/json/version");
-      return {
-        ok: true,
-        json: async () => ({
-          webSocketDebuggerUrl:
-            "wss://1.1.1.1:9222/devtools/browser/REMOTE-BROWSER?auth=fixture-value",
-        }),
-      } as unknown as Response;
+      return versionResponse();
     });
     const { state, remote } = deps.createRemoteRouteHarness(fetchMock);
 
@@ -102,22 +95,11 @@ describe("browser remote profile tab ops via Playwright", () => {
   });
 
   it("forwards a caller-supplied enumeration deadline instead of the handshake timeout", async () => {
-    const listPagesViaPlaywright = vi.fn(async () => [
-      { targetId: "T1", title: "Tab 1", url: "https://example.com", type: "page" },
-    ]);
+    const listPagesViaPlaywright = vi.fn(async () => [page("T1", "https://example.com")]);
     vi.spyOn(deps.pwAiModule, "getPwAiModule").mockResolvedValue({
       listPagesViaPlaywright,
     } as unknown as Awaited<ReturnType<typeof deps.pwAiModule.getPwAiModule>>);
-    const fetchMock = vi.fn(
-      async () =>
-        ({
-          ok: true,
-          json: async () => ({
-            webSocketDebuggerUrl:
-              "wss://1.1.1.1:9222/devtools/browser/REMOTE-BROWSER?auth=fixture-value",
-          }),
-        }) as unknown as Response,
-    );
+    const fetchMock = vi.fn(async () => versionResponse());
     const { remote } = deps.createRemoteRouteHarness(fetchMock);
 
     await remote.listTabs({ timeoutMs: 45_000 });
@@ -134,16 +116,13 @@ describe("browser remote profile tab ops via Playwright", () => {
     vi.spyOn(deps.pwAiModule, "getPwAiModule").mockResolvedValue({
       createPageViaPlaywright: vi.fn(async () => ({ ...page("T2"), close })),
     } as unknown as Awaited<ReturnType<typeof deps.pwAiModule.getPwAiModule>>);
-    let markProbeStarted!: () => void;
-    const probeStarted = new Promise<void>((resolve) => {
-      markProbeStarted = resolve;
-    });
+    const probeStarted = Promise.withResolvers<void>();
     const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
       if (String(url).includes("/json/close/T2")) {
         return new Response(null, { status: 404 });
       }
       return await new Promise<Response>((_resolve, reject) => {
-        markProbeStarted();
+        probeStarted.resolve();
         init?.signal?.addEventListener(
           "abort",
           () =>
@@ -161,7 +140,7 @@ describe("browser remote profile tab ops via Playwright", () => {
     const abortError = new Error("caller aborted ownership probe");
 
     const opening = remote.openTab("https://t2.example", { signal: controller.signal });
-    await probeStarted;
+    await probeStarted.promise;
     controller.abort(abortError);
 
     await expect(opening).rejects.toBe(abortError);
@@ -260,18 +239,8 @@ describe("browser remote profile tab ops via Playwright", () => {
   });
 
   it("opens a real remote Playwright tab when only browser-internal targets are listed", async () => {
-    const internalTab = {
-      targetId: "OMNI",
-      title: "Omnibox Popup",
-      url: "chrome://omnibox-popup.top-chrome/",
-      type: "page" as const,
-    };
-    const realTab = {
-      targetId: "REAL",
-      title: "New Tab",
-      url: "about:blank",
-      type: "page" as const,
-    };
+    const internalTab = page("OMNI", "chrome://omnibox-popup.top-chrome/", "Omnibox Popup");
+    const realTab = page("REAL", "about:blank", "New Tab");
     const listPagesViaPlaywright = vi.fn(
       deps.createSequentialPageLister([[internalTab], [internalTab, realTab]]),
     );
@@ -332,9 +301,7 @@ describe("browser remote profile tab ops via Playwright", () => {
   });
 
   it("blocks remote Playwright tab operations when strict SSRF hostname allowlist rejects the cdpUrl", async () => {
-    const listPagesViaPlaywright = vi.fn(async () => [
-      { targetId: "T1", title: "Tab 1", url: "https://example.com", type: "page" },
-    ]);
+    const listPagesViaPlaywright = vi.fn(async () => [page("T1", "https://example.com")]);
     const focusPageByTargetIdViaPlaywright = vi.fn(async () => {});
     const closePageByTargetIdViaPlaywright = vi.fn(async () => {});
 
@@ -370,12 +337,7 @@ describe("browser remote profile tab ops via Playwright", () => {
 function mockExtensionPage(targetIds = ["TARGET-41"]): void {
   vi.spyOn(deps.pwAiModule, "getPwAiModule").mockResolvedValue({
     listPagesViaPlaywright: vi.fn(async () =>
-      targetIds.map((targetId) => ({
-        targetId,
-        title: "Extension test",
-        url: "https://example.com/login",
-        type: "page",
-      })),
+      targetIds.map((targetId) => page(targetId, "https://example.com/login", "Extension test")),
     ),
   } as unknown as Awaited<ReturnType<typeof deps.pwAiModule.getPwAiModule>>);
 }

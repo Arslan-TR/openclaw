@@ -55,6 +55,7 @@ function createPage() {
     setViewportSize,
     viewportSize: () => viewport,
   };
+  stateMocks.getPageForTargetId.mockResolvedValue(page);
   return { page, send, detach, newCDPSession, setViewportSize };
 }
 
@@ -68,16 +69,9 @@ describe("setDeviceViaPlaywright", () => {
 
   it("keeps one page-scoped CDP session attached for persistent emulation", async () => {
     const fixture = createPage();
-    stateMocks.getPageForTargetId.mockResolvedValue(fixture.page);
 
-    await setTimezoneViaPlaywright({
-      ...target,
-      timezoneId: "America/New_York",
-    });
-    await setLocaleViaPlaywright({
-      ...target,
-      locale: "en-GB",
-    });
+    await setTimezoneViaPlaywright({ ...target, timezoneId: "America/New_York" });
+    await setLocaleViaPlaywright({ ...target, locale: "en-GB" });
 
     expect(fixture.newCDPSession).toHaveBeenCalledTimes(1);
     expect(fixture.detach).not.toHaveBeenCalled();
@@ -91,7 +85,6 @@ describe("setDeviceViaPlaywright", () => {
     const fixture = createPage();
     const state: Partial<PageState> = {};
     stateMocks.ensurePageState.mockReturnValue(state);
-    stateMocks.getPageForTargetId.mockResolvedValue(fixture.page);
     await setDeviceViaPlaywright({ ...target, name: "iPhone 14" });
     fixture.send.mockImplementation(async (method) => {
       if (method === "Emulation.setDeviceMetricsOverride") {
@@ -110,37 +103,27 @@ describe("setDeviceViaPlaywright", () => {
   });
 
   it("serializes overlapping descriptor transitions on the same page", async () => {
-    let releaseFirstUserAgent!: () => void;
-    const firstUserAgentBlocked = new Promise<void>((resolve) => {
-      releaseFirstUserAgent = resolve;
-    });
+    const firstUserAgentBlocked = Promise.withResolvers<void>();
     const fixture = createPage();
     fixture.send.mockImplementation(async (method, params) => {
       if (
         method === "Emulation.setUserAgentOverride" &&
         params?.userAgent === "iphone-14-user-agent"
       ) {
-        await firstUserAgentBlocked;
+        await firstUserAgentBlocked.promise;
       }
       return {};
     });
-    stateMocks.getPageForTargetId.mockResolvedValue(fixture.page);
 
-    const phone = setDeviceViaPlaywright({
-      ...target,
-      name: "iPhone 14",
-    });
+    const phone = setDeviceViaPlaywright({ ...target, name: "iPhone 14" });
     await vi.waitFor(() => expect(fixture.send).toHaveBeenCalledTimes(1));
-    const desktop = setDeviceViaPlaywright({
-      ...target,
-      name: "Desktop Chrome",
-    });
+    const desktop = setDeviceViaPlaywright({ ...target, name: "Desktop Chrome" });
 
     await Promise.resolve();
     const viewportCallsWhileFirstDescriptorBlocked = fixture.setViewportSize.mock.calls.length;
     const cdpCallsWhileFirstDescriptorBlocked = fixture.send.mock.calls.length;
 
-    releaseFirstUserAgent();
+    firstUserAgentBlocked.resolve();
     await Promise.all([phone, desktop]);
     expect(viewportCallsWhileFirstDescriptorBlocked).toBe(1);
     expect(cdpCallsWhileFirstDescriptorBlocked).toBe(1);
@@ -148,47 +131,39 @@ describe("setDeviceViaPlaywright", () => {
       [{ width: 750, height: 340 }],
       [{ width: 1280, height: 720 }],
     ]);
-    expect(fixture.send).toHaveBeenNthCalledWith(1, "Emulation.setUserAgentOverride", {
-      userAgent: "iphone-14-user-agent",
-    });
-    expect(fixture.send).toHaveBeenNthCalledWith(3, "Emulation.setTouchEmulationEnabled", {
-      enabled: true,
-    });
-    expect(fixture.send).toHaveBeenNthCalledWith(5, "Emulation.setUserAgentOverride", {
-      userAgent: "desktop-chrome-user-agent",
-    });
-    expect(fixture.send).toHaveBeenNthCalledWith(2, "Emulation.setDeviceMetricsOverride", {
-      mobile: true,
-      width: 750,
-      height: 340,
-      deviceScaleFactor: 3,
-      screenWidth: 390,
-      screenHeight: 844,
-      screenOrientation: { angle: 0, type: "portraitPrimary" },
-    });
-    expect(fixture.send).toHaveBeenNthCalledWith(6, "Emulation.setDeviceMetricsOverride", {
-      mobile: false,
-      width: 1280,
-      height: 720,
-      deviceScaleFactor: 1,
-      screenWidth: 1920,
-      screenHeight: 1080,
-      screenOrientation: { angle: 0, type: "landscapePrimary" },
-    });
-    expect(fixture.send).toHaveBeenNthCalledWith(7, "Emulation.setTouchEmulationEnabled", {
-      enabled: false,
-    });
+    expect(fixture.send.mock.calls).toEqual([
+      ["Emulation.setUserAgentOverride", { userAgent: "iphone-14-user-agent" }],
+      [
+        "Emulation.setDeviceMetricsOverride",
+        {
+          mobile: true,
+          width: 750,
+          height: 340,
+          deviceScaleFactor: 3,
+          screenWidth: 390,
+          screenHeight: 844,
+          screenOrientation: { angle: 0, type: "portraitPrimary" },
+        },
+      ],
+      ["Emulation.setTouchEmulationEnabled", { enabled: true }],
+      ["Emulation.clearDeviceMetricsOverride"],
+      ["Emulation.setUserAgentOverride", { userAgent: "desktop-chrome-user-agent" }],
+      [
+        "Emulation.setDeviceMetricsOverride",
+        {
+          mobile: false,
+          width: 1280,
+          height: 720,
+          deviceScaleFactor: 1,
+          screenWidth: 1920,
+          screenHeight: 1080,
+          screenOrientation: { angle: 0, type: "landscapePrimary" },
+        },
+      ],
+      ["Emulation.setTouchEmulationEnabled", { enabled: false }],
+    ]);
     expect(fixture.newCDPSession).toHaveBeenCalledTimes(1);
     expect(fixture.detach).not.toHaveBeenCalled();
-    expect(fixture.send.mock.calls.map(([method]) => method)).toEqual([
-      "Emulation.setUserAgentOverride",
-      "Emulation.setDeviceMetricsOverride",
-      "Emulation.setTouchEmulationEnabled",
-      "Emulation.clearDeviceMetricsOverride",
-      "Emulation.setUserAgentOverride",
-      "Emulation.setDeviceMetricsOverride",
-      "Emulation.setTouchEmulationEnabled",
-    ]);
   });
 });
 
