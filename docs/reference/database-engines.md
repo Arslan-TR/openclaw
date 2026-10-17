@@ -154,6 +154,8 @@ those stores still use SQLite. The port preflight refuses pending declared
 legacy migrations and names the repairs required before retrying the port.
 This includes native Codex task assignments, Matrix inbound dedupe, and legacy
 memory index sidecars.
+Fresh Matrix account roots without legacy inbound-dedupe rows do not need a
+migration completion receipt before porting.
 
 These migrations are SQLite-only. On PostgreSQL, Doctor records that they are
 not applicable instead of opening the local engine anchor as an application
@@ -252,9 +254,9 @@ existing separate commits, compensation, and lock ordering.
 
 ## Search on PostgreSQL
 
-The experimental engine search contract supports native PostgreSQL full text,
-literal trigram contains, and exact cosine search. Agent transcript text search
-and memory search use this contract.
+The engine search contract supports native PostgreSQL full text, literal trigram
+contains, and exact cosine search. Memory body and path retrieval, agent
+transcript text search, and standing-intent matching use this contract.
 It does not enable PostgreSQL for an unported store.
 
 Owning components can register additional search definitions with
@@ -288,6 +290,17 @@ administrator. The runtime role needs `CREATE` in the store schema, or database
 `CREATE` privilege when bootstrapping a new schema, plus ownership/access to its
 tables, indexes, functions, and text-search configuration.
 
+| Search mode                                                     | PostgreSQL implementation                                           | Required extensions                                                         |
+| --------------------------------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Memory body keywords, transcript text, standing-intent keywords | Full text with literal terms, phrases, and supported prefix queries | `unaccent`                                                                  |
+| Memory trigram tokenizer                                        | Literal contains matching with native similarity ranking            | `unaccent`, `pg_trgm`                                                       |
+| Memory semantic or hybrid retrieval                             | Exact cosine over the admitted embedding model and eligible sources | `unaccent`, `vector`; also `pg_trgm` when the trigram tokenizer is selected |
+
+Missing `pg_trgm` refuses a declared trigram index; it does not silently change
+the tokenizer. Missing `unaccent` refuses full-text admission. In either case,
+run the extension SQL reported by the error in the selected database and reopen
+the store.
+
 The existing explicit keyword-only memory setting is `memory.search.provider: "none"`
 (or the corresponding agent-specific override). The engine's keyword-only schema
 requires no pgvector extension and exposes no vector capability. Memory status
@@ -306,8 +319,9 @@ per-request schema probes. PostgreSQL storage diagnostics report memory relation
 sizes; WAL and reusable-file bytes are zero because those are server-owned,
 not local SQLite files.
 
-The public memory search path uses the admitted PostgreSQL projections. Vector queries filter model aliases, sources, and any
-candidate IDs before exact cosine ordering and the result limit. Keyword queries
+The public memory search path uses the admitted PostgreSQL projections. Vector
+queries filter model aliases, sources, and any candidate IDs before exact cosine
+ordering and the result limit. Keyword queries
 use native full-text ranking, or literal contains predicates for the configured
 trigram tokenizer. Only bounded result payloads cross into JavaScript. Hybrid
 merging keeps the existing default weights of 0.7 vector and 0.3 text; PostgreSQL
@@ -337,6 +351,30 @@ triggers maintain the derived float32 projection. Exact vectors support up to
 16,000 dimensions. A dimension change requires a matching schema and a derived
 index rebuild. There is no ANN, HNSW, IVFFlat, half-precision storage, or transfer
 of the PostgreSQL corpus into JavaScript for per-query scoring.
+
+Search sees committed index inserts, updates, and deletes immediately. Memory
+files must first pass through normal indexing; changing a file alone does not
+write its search projection. Rebuilding derives the same eligible result set
+from the canonical rows. Transcript search applies session, agent, role, and
+active-branch scope before its result limit; memory search applies its selected
+agent and source scope before ranking candidates, plus model scope for vectors.
+Memory transcript recall retains the cross-engine 200-candidate window followed
+by session visibility checks; this is separate from transcript search's SQL filters.
+
+PostgreSQL memory queries accept at most 4,096 UTF-16 code units and 128 terms, return
+at most 200 hits, and bound snippets to 700 characters. Larger queries fail before
+retrieval with a message naming the limit.
+
+Transcript queries must contain text and cannot exceed 4,096 UTF-16 code units.
+Each search returns at most 25 transcript hits, with excerpts bounded to 500
+characters. Literal operator characters are treated as input text rather than
+SQL or PostgreSQL query syntax. Prefix matching is an explicit transcript search
+mode, not an interpretation of a trailing operator in user text.
+
+Standing-intent matching preserves its channel, sender, agent, expiry, and firing
+limits. It examines at most 256 eligible keyword candidates and injects at most
+three matching intents within a 1,200-character context budget. Long prompts
+use bound literal terms without expanding the SQL expression tree.
 
 Generated columns, GIN indexes, vector projection tables, trigger functions, and
 the named text-search mappings participate in the store's exact schema-drift
@@ -570,6 +608,25 @@ PostgreSQL into a fresh owned namespace and publishes its matched anchor; the
 migrated namespace remains available until recovery is confirmed. Changed state
 or uncertain custody prevents automatic restore and retains the captures for
 recovery. An update never silently ports a store or falls back to SQLite.
+
+Recovery generations include the live PostgreSQL catalog, exact rows, and sequence
+allocation state (`last_value` and `is_called`). The installed driver can fingerprint
+a candidate's newer schema without loading that schema's descriptor. Restore uses
+the captured version's descriptor and retains exact allocation state, including a
+sequence deliberately reset below retained row IDs. Maintenance checks the stable
+Gateway lease contract independently of the newer application schema.
+
+Update-run admission reads PostgreSQL through its existing schema connection and
+initializes only the update-history fragment; it does not copy the anchor as SQLite
+state or run candidate schema migrations before managed shutdown.
+
+Candidate Doctor state and agent schema migrations publish their before/after generations through
+the existing maintenance write receipt. PostgreSQL table and sequence locks retain
+native exclusion until the migration transaction commits; only that confirmed
+publication advances the expected generation. Independent writes before migration
+or after publication still prevent automatic rollback. Uncertain commit or custody
+outcomes keep the captures for recovery. SQLite update behavior and the update
+admission protocol are unchanged.
 
 Release packages declare supported engines in the optional
 `openclaw.databaseEngines` array in `package.json`, next to
