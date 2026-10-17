@@ -790,10 +790,9 @@ function findAssistantTranscriptUpdates() {
 }
 
 function findUserUpdate() {
-  return mockState.emittedTranscriptUpdates.find((update) => {
-    const message = update.message as { role?: unknown } | undefined;
-    return message?.role === "user";
-  });
+  return mockState.emittedTranscriptUpdates.find(
+    (update) => asOptionalRecord(update.message)?.role === "user",
+  );
 }
 
 function expectUserUpdateIdentity(update: ReturnType<typeof findUserUpdate>) {

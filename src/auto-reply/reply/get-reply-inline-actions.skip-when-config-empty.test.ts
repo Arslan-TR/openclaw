@@ -101,10 +101,7 @@ async function expectInlineActionSkipped(params: {
 const requireRecord = createRequireRecord("record", "expected-label-object");
 
 function mockObjectArg(mock: ReturnType<typeof vi.fn>, label: string, callIndex = 0, argIndex = 0) {
-  const call = mock.mock.calls[callIndex];
-  if (!call) {
-    throw new Error(`expected ${label} mock call ${callIndex}`);
-  }
+  const call = mockCallArgs(mock, label, callIndex);
   return requireRecord(call[argIndex], `${label} argument ${argIndex}`);
 }
 

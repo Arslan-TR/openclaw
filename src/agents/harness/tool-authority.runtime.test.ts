@@ -21,6 +21,7 @@ import {
 } from "../admitted-run-context.js";
 import {
   clearActiveEmbeddedRun,
+  queueEmbeddedAgentMessageWithOutcomeAsync,
   queueGuardedEmbeddedAgentMessageWithOutcomeAsync,
   resolveEmbeddedAgentSessionProgressState,
   setActiveEmbeddedRun,
@@ -41,25 +42,65 @@ import {
   runAgentHarnessGatewayQuestion,
 } from "./gateway-question.js";
 import { withPreparedEmbeddedRunToolAuthority } from "./tool-authority.runtime.js";
-import {
-  admitted,
-  attempt,
-  own,
-  published,
-  publishPreparedHandle,
+
+const sessionId = "authority-session";
+const sessionKey = "agent:main:main";
+const own: ReplyToolAuthorityOverlay = {
+  senderIsOwner: true,
+  disableTools: false,
+  traceAuthorized: false,
+  messageProvider: "webchat",
+  senderId: "authority-requester",
+};
+const attempt = {
   sessionId,
   sessionKey,
-  steer,
-} from "./tool-authority.runtime.test-support.js";
-
+  runId: "authority-run",
+  agentId: "main",
+  config: {},
+  sessionFile: "/tmp/authority-session.jsonl",
+  workspaceDir: "/tmp/authority-workspace",
+  provider: "openai",
+  modelId: "gpt-test",
+  sandboxSessionKey: sessionKey,
+  senderIsOwner: true,
+  messageProvider: "webchat",
+  senderId: "authority-requester",
+  traceAuthorized: false,
+};
 type AdmittedContext = Awaited<ReturnType<ReturnType<typeof prepareAgentRunAdmission>["admit"]>>;
 type Handle = ReturnType<typeof createEmbeddedRunHandle>;
 type Queue = ReturnType<typeof vi.fn<Handle["queueMessage"]>>;
+type OperatorAuthority = Parameters<typeof prepareAgentRunAdmission>[0]["operatorAuthority"];
 type ReplyOperation = Parameters<typeof withPreparedEmbeddedRunToolAuthority>[0]["replyOperation"];
 type AttemptOverrides = Partial<typeof attempt> & { toolAuthorityFingerprint?: string } & Pick<
     ReplyToolAuthorityOverlay,
     "toolsAllow" | "senderId" | "senderName" | "clientCaps" | "gatewayUiCommandTarget"
   >;
+
+async function admitted<T>(
+  run: (context: { admittedRunContext: AdmittedContext; close: () => void }) => Promise<T>,
+  operatorAuthority?: OperatorAuthority,
+) {
+  const admission = prepareAgentRunAdmission({
+    cfg: {},
+    operationalRunInstance: createOperationalRunInstanceRef(attempt.runId),
+    operatorAuthority,
+    facts: {
+      agentId: "main",
+      runId: attempt.runId,
+      ingress: { kind: "system", state: "present", boundary: "tool-authority-test" },
+    },
+  });
+  try {
+    return await run({
+      admittedRunContext: await admission.admit("embedded", "authority-test"),
+      close: admission.close,
+    });
+  } finally {
+    admission.close();
+  }
+}
 
 function withAuthority<T>(
   admittedRunContext: AdmittedContext,
@@ -127,6 +168,19 @@ function pendingQuestion(
   return question;
 }
 
+function publishPreparedHandle(
+  toolAuthorityFingerprint: string | undefined,
+  queueMessage: Handle["queueMessage"],
+) {
+  const handle = createEmbeddedRunHandle({
+    runId: attempt.runId,
+    toolAuthorityFingerprint,
+    queueMessage,
+  });
+  registerHandle(handle);
+  return handle;
+}
+
 function registerHandle(handle: Handle) {
   setActiveEmbeddedRun(sessionId, handle, sessionKey, attempt.sessionFile);
 }
@@ -144,6 +198,34 @@ function fingerprintFor(
       ...run,
     },
   });
+}
+
+async function published<T>(
+  run: (owner: { handle: Handle; queue: Queue; close: () => void }) => Promise<T>,
+  params: AttemptOverrides = {},
+  operatorAuthority?: OperatorAuthority,
+  replyOperation?: ReplyOperation,
+) {
+  return admitted(async ({ admittedRunContext, close }) => {
+    try {
+      return await withAuthority(
+        admittedRunContext,
+        async (prepared) => {
+          const queue = vi.fn<Handle["queueMessage"]>(async () => {});
+          const handle = publishPreparedHandle(prepared.toolAuthorityFingerprint, queue);
+          try {
+            return await run({ handle, queue, close });
+          } finally {
+            clearActiveEmbeddedRun(sessionId, handle, sessionKey);
+          }
+        },
+        params,
+        replyOperation,
+      );
+    } finally {
+      replyOperation?.complete();
+    }
+  }, operatorAuthority);
 }
 
 function inAuthority<T>(run: (context: AdmittedContext) => Promise<T>) {
@@ -166,6 +248,15 @@ function voiceControl(
   text = "Use the release branch",
 ) {
   return controlRealtimeVoiceAgentRun({ sessionKey, text, getToolAuthorityOverlay });
+}
+
+function steer(overlay: ReplyToolAuthorityOverlay, hash?: string) {
+  return queueEmbeddedAgentMessageWithOutcomeAsync(sessionId, "Use the release branch", {
+    isInboundUserMessage: true,
+    toolAuthorityOverlay: overlay,
+    toolAuthorityFingerprint: hash,
+    taskSuggestionDeliveryMode: undefined,
+  });
 }
 
 function inject(

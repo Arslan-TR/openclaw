@@ -128,6 +128,7 @@ export async function withPersonalToolTurn<T>(
     sessionKey?: string;
     sessionId?: string;
     runId?: string;
+    allowCollaborativeSteering?: boolean;
     admittedRunContext?: AdmittedRunContext;
     gatewayContextResolver?: GatewayContextResolver;
   },
@@ -174,6 +175,12 @@ export async function withPersonalToolTurn<T>(
     senderIsOwner: true,
     clientCaps: ["ui-commands"],
     gatewayUiCommandTarget: params.owner.gatewayUiCommandTarget,
+    ...(params.allowCollaborativeSteering
+      ? {
+          messageProvider: "webchat",
+          conversationId: params.sessionKey ?? "agent:main:personal-tools",
+        }
+      : {}),
   });
   const operation = createTestReplyOperation({
     sessionKey: run.run.sessionKey,
@@ -305,7 +312,14 @@ export async function withPersonalToolTurn<T>(
                 reject = options?.reject === true;
                 return await queueCurrentReplyRunMessage(run.run.sessionId, "Change my view", {
                   isInboundUserMessage: true,
+                  allowCollaborativeSteering: params.allowCollaborativeSteering,
                   toolAuthorityOverlay: {
+                    ...(params.allowCollaborativeSteering
+                      ? {
+                          messageProvider: run.run.messageProvider,
+                          conversationId: run.run.conversationId ?? undefined,
+                        }
+                      : {}),
                     operatorAuthority: authority(person, options?.scopes),
                     senderId: person.senderId,
                     senderName: person.name,

@@ -30,18 +30,22 @@ import {
   runWithMainSessionRecoveryAdmission,
   type MainSessionRecoveryAdmission,
 } from "./main-session-recovery-admission.js";
-import { repairMainSessionRecoveryMutation } from "./main-session-recovery-lifecycle.js";
-import { scheduleMainSessionRecoveryPendingTarget } from "./main-session-recovery-owner-release.js";
-import type {
-  MainSessionRecoveryObservation,
-  MainSessionRecoveryReservation,
-} from "./main-session-recovery-state.js";
-import { commitMainSessionRecovery } from "./main-session-recovery-store.js";
 import {
-  rollbackRestartRecoveryReservation,
-  scheduleRestartRecoveryReservationRollback,
-  settleAcceptedRestartRecovery,
-} from "./main-session-restart-dispatch-settlement.js";
+  repairMainSessionRecoveryMutation,
+  retryMainSessionRecoveryMutation,
+  scheduleMainSessionRecoveryMutation,
+} from "./main-session-recovery-lifecycle.js";
+import { scheduleMainSessionRecoveryPendingTarget } from "./main-session-recovery-owner-release.js";
+import {
+  isMainSessionRecoveryPending,
+  type MainSessionRecoveryObservation,
+  type MainSessionRecoveryReservation,
+} from "./main-session-recovery-state.js";
+import {
+  commitMainSessionRecovery,
+  type MainSessionRecoveryStoreTarget,
+} from "./main-session-recovery-store.js";
+import { settleAcceptedRestartRecovery } from "./main-session-restart-dispatch-settlement.js";
 import {
   dispatchRestartRecoveryUntilStarted,
   normalizeRestartRecoveryTerminalStatus,
@@ -86,6 +90,50 @@ function buildResumeMessage(
 }
 
 type MainSessionResumeResult = "started" | "settled" | "skipped" | "failed";
+
+async function rollbackRestartRecoveryReservation(
+  params: MainSessionRecoveryStoreTarget & {
+    kind: "abandon_reservation" | "cancel_reservation";
+    reservation: MainSessionRecoveryReservation;
+  },
+) {
+  return await retryMainSessionRecoveryMutation(async () =>
+    commitMainSessionRecovery({
+      command: { kind: params.kind, reservation: params.reservation },
+      requireWriteSuccess: true,
+      target: params,
+    }),
+  );
+}
+
+function scheduleRestartRecoveryReservationRollback(
+  params: Parameters<typeof rollbackRestartRecoveryReservation>[0],
+): void {
+  // Keep the exact reservation token alive after transient store outages.
+  // A Gateway restart safely retires the timer and its stale-generation slot.
+  scheduleMainSessionRecoveryMutation({
+    mutation: () => rollbackRestartRecoveryReservation(params),
+    onError: (error) => {
+      log.warn(
+        `failed delayed restart recovery reservation rollback ${params.sessionKey}: ${String(error)}`,
+      );
+    },
+    onSuccess: ({ entry, sessionKey }) => {
+      if (
+        entry?.sessionId === params.reservation.sessionId &&
+        sessionKey &&
+        isMainSessionRecoveryPending(entry, sessionKey)
+      ) {
+        scheduleMainSessionRecoveryPendingTarget({
+          agentId: params.agentId,
+          sessionId: entry.sessionId,
+          sessionKey,
+          storePath: params.storePath,
+        });
+      }
+    },
+  });
+}
 
 type ResumeMainSessionParams = {
   agentId: string;
