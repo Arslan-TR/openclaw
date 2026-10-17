@@ -16,7 +16,7 @@ vi.mock("../../lib/sessions/session-message-subscriptions.runtime.ts", async (im
 
 it("loads subscription code during route loading without waiting or opening an observer", async () => {
   const { context, request } = createSessionRouteContext();
-  const loads = pages.map((page) => {
+  const loads = pages.map(async (page) => {
     const location = { pathname: `/${page.id}/roboclaw/main`, search: "", hash: "" };
     return page.loader!(context, {
       location,
