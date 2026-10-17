@@ -3,8 +3,14 @@ import { accessSync, constants, statSync } from "node:fs";
 import path from "node:path";
 import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { hasErrnoCode } from "./errno.js";
+
+export type ChildRuntimeRecovery = {
+  status: "restart-requested" | "report-only";
+  reason: string;
+};
 
 export type ChildRuntimeViability = {
   execPath: string;
@@ -12,7 +18,14 @@ export type ChildRuntimeViability = {
 };
 const runtime = resolveGlobalSingleton(
   Symbol.for("openclaw.childRuntimeViability"),
-  (): { initialPath: string; initialIdentity?: string; execPath?: string; failure?: Error } => ({
+  (): {
+    initialPath: string;
+    initialIdentity?: string;
+    execPath?: string;
+    failure?: Error;
+    recoveryStarted?: boolean;
+    recover?: () => Promise<ChildRuntimeRecovery>;
+  } => ({
     initialPath: process.execPath,
     initialIdentity: executableIdentity(process.execPath),
   }),
@@ -51,6 +64,59 @@ export function readChildRuntimeViability(params?: {
     available = !(hasErrnoCode(error, "ENOENT") || hasErrnoCode(error, "ENOTDIR"));
   }
   return { execPath, available };
+}
+
+/** The run loop owns recovery; worker pools only publish the first diagnosis. */
+export function registerChildRuntimeRecovery(
+  recover: () => Promise<ChildRuntimeRecovery>,
+): () => void {
+  runtime.recover = recover;
+  recoverUnavailableRuntime();
+  return () => {
+    if (runtime.recover === recover) {
+      runtime.recover = undefined;
+    }
+  };
+}
+
+function recoverUnavailableRuntime(): void {
+  if (
+    runtime.execPath !== process.execPath ||
+    !runtime.failure ||
+    !runtime.recover ||
+    runtime.recoveryStarted
+  ) {
+    return;
+  }
+  runtime.recoveryStarted = true;
+  const recover = runtime.recover;
+  // Recovery must not inherit the failed worker's broker or cancellation scope.
+  void runInDetachedAsyncContext(() =>
+    Promise.resolve()
+      .then(recover)
+      .catch((): ChildRuntimeRecovery => ({
+        status: "report-only",
+        reason:
+          "Automatic runtime recovery is report-only: service or restart preparation failed. Inspect the service runtime and restart through its owner.",
+      }))
+      .then((recovery) => {
+        createSubsystemLogger("gateway/runtime").warn(`${recovery.status}: ${recovery.reason}`);
+      }),
+  );
+}
+
+/** A bounded bare-runtime probe, shared by diagnosis and restart target verification. */
+export function probeChildRuntimeExecutable(
+  execPath: string,
+  options: { env?: NodeJS.ProcessEnv; cwd?: string } = {},
+) {
+  return spawnSync(execPath, ["--version"], {
+    encoding: "utf8",
+    cwd: options.cwd ?? path.parse(process.execPath).root,
+    env: options.env ?? { ...process.env, NODE_OPTIONS: undefined },
+    timeout: 1_000,
+    maxBuffer: 8_192,
+  });
 }
 
 export function formatMissingChildRuntimeWarning(
@@ -100,13 +166,7 @@ export function classifyChildRuntimeFailure(params: {
     // A worker bug or memory pressure can abort too. Require a loader diagnostic
     // or an observed executable change before treating a bare abort as permanent.
     // These loader messages can also come from worker-only native modules.
-    const probe = spawnSync(execPath, ["--version"], {
-      encoding: "utf8",
-      cwd: path.parse(execPath).root,
-      env: { ...process.env, NODE_OPTIONS: undefined },
-      timeout: 1_000,
-      maxBuffer: 8_192,
-    });
+    const probe = probeChildRuntimeExecutable(execPath);
     const changed =
       execPath !== runtime.initialPath || executableIdentity(execPath) !== runtime.initialIdentity;
     unavailable =
@@ -131,6 +191,7 @@ export function classifyChildRuntimeFailure(params: {
     { code: "NODE_RUNTIME_UNAVAILABLE" },
   );
   createSubsystemLogger("gateway/runtime").error(runtime.failure.message);
+  recoverUnavailableRuntime();
   return runtime.failure;
 }
 

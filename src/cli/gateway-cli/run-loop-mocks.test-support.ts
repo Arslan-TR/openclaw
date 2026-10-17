@@ -223,6 +223,11 @@ vi.mock("../../infra/restart-intent.js", async (original) => ({
   ...(await original<typeof import("../../infra/restart-intent.js")>()),
   prepareGatewayRestartIntentConsumption: () => m.consumeGatewayRestartIntentPayload,
 }));
+// mock-isolation: Prior shutdown belongs to the fixture, never the operator's state database.
+vi.mock("../../infra/gateway-boot-lifecycle.js", async (original) => ({
+  ...(await original<typeof import("../../infra/gateway-boot-lifecycle.js")>()),
+  readGatewayLastShutdownAsync: async () => undefined,
+}));
 // mock-isolation: Fixtures own handoff claims without reading or mutating live update state.
 vi.mock("../../infra/update-managed-service-handoff.js", () => ({
   waitForSystemServiceUpdateHandoffs: () => m.waitForSystemServiceUpdateHandoffs(),

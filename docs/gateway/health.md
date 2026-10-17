@@ -130,8 +130,28 @@ still alive. A confirmed missing executable or runtime loader failure marks
 `503` with `failing: ["child-runtime"]`. Worker requests explain which runtime
 failed and ask you to restart the Gateway. The diagnosis is logged once and
 further worker launches fail immediately; ordinary worker crashes do not mark
-the runtime unavailable. The Gateway stays running for operator diagnosis;
-restart it with `openclaw gateway restart` after the Node upgrade completes.
+the runtime unavailable.
+
+For a service-managed Gateway, the lifecycle owner checks the effective service
+command's Node with a bounded `--version` probe. On macOS, the loaded launchd
+job must also match the service definition on disk. If the probe succeeds, the
+Gateway requests one graceful restart: new work is fenced, active work drains,
+and the supervisor starts a fresh process. An in-process restart cannot repair
+a missing runtime and is never used for this recovery.
+
+The Gateway stays up in report-only mode if the service Node is also unusable,
+the command or recent restart history cannot be verified, or runtime recovery
+was the most recent shutdown within five minutes. Unmanaged foreground and
+embedded Gateways, external supervisors without a verifiable native service
+command, and `OPENCLAW_NO_RESPAWN=1` also remain report-only. Repair the service
+runtime, then use `openclaw gateway restart` (or your process owner's restart).
+
+The existing `childRuntime.available: false` health field and `child-runtime`
+readiness reason remain visible. The runtime log records `restart-requested` or
+`report-only` with the decision reason. Repeated worker failures do not request
+another restart. If a prepared supervisor handoff later fails, the old
+Gateway completes shutdown instead of attempting an in-process restart; inspect
+the logs and restart through the service owner.
 
 A broken Telegram or other channel account can also make `/readyz` return `503` while `/startupz` remains started. Neither check replaces the other: startup completion alone does not certify agent or channel availability.
 
