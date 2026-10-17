@@ -15,19 +15,17 @@ import type { ProviderRuntimeModel } from "openclaw/plugin-sdk/plugin-entry";
 import { isNonSecretApiKeyMarker } from "openclaw/plugin-sdk/provider-auth-markers";
 import { readProviderResponseErrorText } from "openclaw/plugin-sdk/provider-http";
 import {
-  createPlainTextToolCallCompatWrapper,
-  notifyLlmRequestActivity,
-} from "openclaw/plugin-sdk/provider-stream-shared";
-import {
   buildAssistantMessage as buildStreamAssistantMessage,
   createEmptyTransportUsage,
+  createPlainTextToolCallCompatWrapper,
   createProviderWaitObserver,
   failTransportStream,
   MALFORMED_STREAMING_FRAGMENT_ERROR_MESSAGE,
+  notifyLlmRequestActivity,
   notifyProviderHttpResponse,
   parseTerminalToolCallArguments,
   sortPromptCacheToolsByName,
-} from "openclaw/plugin-sdk/provider-transport-runtime";
+} from "openclaw/plugin-sdk/provider-stream-shared";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import {
   isRecord,
