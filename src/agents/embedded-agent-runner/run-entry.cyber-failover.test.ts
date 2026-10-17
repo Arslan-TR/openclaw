@@ -69,7 +69,15 @@ function runEntry(
   overrides: Partial<Omit<EntryParams, "runCandidate" | "identity">> = {},
 ) {
   return runEmbeddedAgentEntry({
-    selection: { cfg: {}, provider: "openai", model: "gpt-5.6" },
+    selection: {
+      cfg: {
+        agents: {
+          defaults: { embeddedAgent: { cyberFailover: { model: `openai/${retryModel}` } } },
+        },
+      },
+      provider: "openai",
+      model: "gpt-5.6",
+    },
     identity: { runId, agentId: "main", sessionId: "session-1" },
     harness: createDirectHarness(),
     behavior: { kind: "command-rpc", hasCommittedSideEffect: () => false },
@@ -94,7 +102,7 @@ describe("runEmbeddedAgentEntry cyber failover", () => {
   });
   afterEach(clearRuntimeConfigSnapshot);
 
-  it("retries a replay-safe OpenAI cyber refusal once on Daybreak without changing selection", async () => {
+  it("retries a replay-safe OpenAI cyber refusal once on the configured target without changing selection", async () => {
     const reconcile = vi.fn(async () => {});
     const runCandidate = vi.fn<EntryParams["runCandidate"]>(async (provider, model) =>
       model === retryModel ? makeResult({ provider, model }) : makeRefusalResult(provider, model),
@@ -126,7 +134,7 @@ describe("runEmbeddedAgentEntry cyber failover", () => {
     expect(reconcile).not.toHaveBeenCalled();
   });
 
-  it("preserves the original refusal and cools off an unauthorized Daybreak target", async () => {
+  it("preserves the original refusal and cools off an unauthorized retry target", async () => {
     failRetry(Object.assign(new Error("401 unauthorized"), { status: 401 }));
     const first = await runEntry("run-cyber-cooloff");
     const second = await runEntry("run-cyber-cooloff");
@@ -196,14 +204,14 @@ describe("runEmbeddedAgentEntry cyber failover", () => {
     expect(result.result.payloads).toEqual([{ text: "policy refusal", isError: true }]);
   });
 
-  it("restores the original refusal display when Daybreak fails", async () => {
+  it("restores the original refusal display when the configured retry fails", async () => {
     const displayChanges: Array<{ text: string; visible: boolean }> = [];
     await runEntry("run-cyber-transcript", async (provider, model, options) => {
       const retry = model === retryModel;
       const message = makeAssistantMessageFixture({
         provider,
         model,
-        errorMessage: retry ? "Daybreak unauthorized" : "Original cyber refusal",
+        errorMessage: retry ? "Retry target unauthorized" : "Original cyber refusal",
         diagnostics: retry
           ? undefined
           : [{ type: "provider_refusal", timestamp: 1, details: { ...cyberRefusal } }],

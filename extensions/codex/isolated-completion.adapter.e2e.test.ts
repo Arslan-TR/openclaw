@@ -7,15 +7,20 @@ import { createIsolatedCompletionBoundaryFixture } from "openclaw/plugin-sdk/plu
 import type { AuthProfileStore } from "openclaw/plugin-sdk/provider-auth";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { awaitGateBeforeSettlement } from "openclaw/plugin-sdk/test-fixtures";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createCodexAppServerAgentHarness } from "./harness.js";
-import { createCodexTestBindingStore } from "./src/app-server/session-binding.test-helpers.js";
 import { CODEX_APP_SERVER_VERSION } from "./src/app-server/version.js";
 
-const appServer = fileURLToPath(
-  new URL("../../test/e2e/qa-lab/runtime/codex-isolated-app-server.fixture.mjs", import.meta.url),
-);
+const repo = fileURLToPath(new URL("../../", import.meta.url));
 const dirs = useAutoCleanupTempDirTracker(afterEach);
+let root: string;
+
+beforeEach(() => {
+  root = dirs.make("isolated-adapter-proof-");
+  for (const key of ["HOME", "CODEX_HOME", "OPENCLAW_STATE_DIR"]) {
+    vi.stubEnv(key, root);
+  }
+});
 afterEach(() => vi.unstubAllEnvs());
 
 function unexpectedSessionBinding(): never {
@@ -23,12 +28,8 @@ function unexpectedSessionBinding(): never {
 }
 
 it.each(["allowed", "forbidden", "revoked"] as const)(
-  "Codex adapter auth: %s",
+  "preserves account authority through the real Codex adapter: %s",
   async (scenario) => {
-    const root = dirs.make("isolated-adapter-proof-");
-    for (const key of ["HOME", "CODEX_HOME", "OPENCLAW_STATE_DIR"]) {
-      vi.stubEnv(key, root);
-    }
     vi.stubEnv("OPENCLAW_QA_CODEX_APP_SERVER_VERSION", CODEX_APP_SERVER_VERSION);
     const log = path.join(root, "messages.jsonl");
     fs.writeFileSync(log, "");
@@ -49,11 +50,15 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
       api: "openai-chatgpt-responses",
       baseUrl: "https://chatgpt.com/backend-api/codex",
     };
-    const profiles = {
-      "openai:allowed": { provider: "openai", mode: "oauth" as const },
-      "openai:forbidden": { provider: "openai", mode: "api_key" as const },
+    const config: OpenClawConfig = {
+      auth: {
+        profiles: {
+          "openai:allowed": { provider: "openai", mode: "oauth" },
+          "openai:forbidden": { provider: "openai", mode: "api_key" },
+        },
+        order: { openai: ["openai:allowed"] },
+      },
     };
-    const config: OpenClawConfig = { auth: { profiles, order: { openai: ["openai:allowed"] } } };
     const credential = (identity: string) => ({
       type: "oauth" as const,
       provider: "openai",
@@ -69,15 +74,38 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
         "openai:forbidden": credential("forbidden"),
       },
     };
-    const entered = Promise.withResolvers<void>();
-    const gate = Promise.withResolvers<void>();
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     let current = true;
     const harness = createCodexAppServerAgentHarness({
-      bindingStore: new Proxy(createCodexTestBindingStore(), { get: unexpectedSessionBinding }),
+      bindingStore: {
+        read: unexpectedSessionBinding,
+        readAsync: unexpectedSessionBinding,
+        readMany: unexpectedSessionBinding,
+        readNativeSubagentSubmissions: unexpectedSessionBinding,
+        hasOtherThreadOwner: unexpectedSessionBinding,
+        mutate: unexpectedSessionBinding,
+        prepareSessionGenerationReclaim: unexpectedSessionBinding,
+        adoptSessionGeneration: unexpectedSessionBinding,
+        resetSessionGeneration: unexpectedSessionBinding,
+        retireSessionGeneration: unexpectedSessionBinding,
+        withSessionDeletion: unexpectedSessionBinding,
+        withThreadArchiveFence: unexpectedSessionBinding,
+        withLease: unexpectedSessionBinding,
+      },
       pluginConfig: {
         appServer: {
           command: process.execPath,
-          args: [appServer, "app-server"],
+          args: [
+            path.join(repo, "test/e2e/qa-lab/runtime/codex-isolated-app-server.fixture.mjs"),
+            "app-server",
+          ],
           transport: "stdio",
           homeScope: "agent",
         },
@@ -92,8 +120,8 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
       async resolveModel(call) {
         // Hold the real materializePreparedRuntimeModel await after route/auth planning.
         if (scenario === "revoked" && call === 2) {
-          entered.resolve();
-          await gate.promise;
+          enter();
+          await gate;
         }
         return call === 1 ? platform : subscription;
       },
@@ -115,24 +143,34 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
         }
       },
     });
+    let outcome: unknown;
     try {
       if (scenario === "revoked") {
-        await awaitGateBeforeSettlement(entered.promise, pending, "Preparation gate not reached");
+        await awaitGateBeforeSettlement(entered, pending, "Completion skipped awaited preparation");
         delete store.profiles["openai:allowed"];
         current = false;
-        gate.resolve();
+        release();
       }
       if (scenario === "allowed") {
         const result = await pending;
         expect(result.text).toBe("Completed as synthetic-allowed-account");
+        outcome = { text: result.text, owner: result.owner };
       } else {
-        await expect(pending).rejects.toBeInstanceOf(Error);
-        await expect(pending).rejects.toThrow(
+        const error: unknown = await pending.then(
+          () => undefined,
+          (failure: unknown) => failure,
+        );
+        expect(error).toBeInstanceOf(Error);
+        if (!(error instanceof Error)) {
+          throw new Error("Expected rejection");
+        }
+        expect(error.message).toMatch(
           scenario === "forbidden" ? /not configured/ : /authority revoked/,
         );
+        outcome = { rejected: true, error: error.message };
       }
     } finally {
-      gate.resolve();
+      release();
       await harness.dispose?.();
     }
     const messages: Array<{ method?: string; params?: unknown }> = fs
@@ -141,18 +179,33 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
       .filter(Boolean)
       .map((line) => JSON.parse(line));
     if (scenario === "allowed") {
-      const logins = messages.filter((message) => message.method === "account/login/start");
-      expect(logins).toHaveLength(1);
-      expect(logins[0]?.params).toMatchObject({
+      const login = messages.find((message) => message.method === "account/login/start");
+      expect(login?.params).toMatchObject({
         type: "chatgptAuthTokens",
         accessToken: "synthetic-allowed-access",
         chatgptAccountId: "synthetic-allowed-account",
       });
+      expect(messages.filter((message) => message.method === "account/login/start")).toHaveLength(
+        1,
+      );
       expect(messages.findIndex((message) => message.method === "turn/start")).toBeGreaterThan(
         messages.findIndex((message) => message.method === "account/login/start"),
       );
     } else {
       expect(messages).toEqual([]);
+    }
+    const proofDir = process.env.OPENCLAW_TEST_ADAPTER_PROOF_DIR;
+    if (proofDir) {
+      const sanitized = JSON.parse(
+        JSON.stringify(messages)
+          .replaceAll(root, "<isolated-state>")
+          .replaceAll("synthetic-allowed-access", "<synthetic-token:allowed>")
+          .replaceAll("synthetic-forbidden-access", "<synthetic-token:forbidden>"),
+      );
+      fs.writeFileSync(
+        path.join(proofDir, `${scenario}.json`),
+        JSON.stringify({ scenario, outcome, messages: sanitized }, null, 2) + "\n",
+      );
     }
   },
 );

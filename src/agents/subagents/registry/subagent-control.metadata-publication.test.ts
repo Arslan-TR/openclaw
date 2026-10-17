@@ -124,7 +124,7 @@ function holdMetadataPublication(
     nativeHeld,
     state,
     release,
-    dispose() {
+    dispose: () => {
       signal.removeEventListener("abort", release);
       producerScope.disable();
       consumerScope.disable();

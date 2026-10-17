@@ -302,7 +302,7 @@ suite.define(() => {
     );
     await expectValue(thinkingSlider, "5");
     expect(
-      await thinkingSlider.evaluate((element: HTMLElement) => ({
+      await thinkingSlider.evaluate((element) => ({
         max: element.getAttribute("max"),
         label: element.getAttribute("aria-valuetext"),
         fill: Number.parseFloat(element.style.getPropertyValue("--reasoning-fill")),

@@ -1,10 +1,10 @@
-import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
 import { onTrustedMessageAuditEventForTest as onTrustedMessageAuditEvent } from "../../audit/message-audit-events.test-support.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
@@ -33,69 +33,24 @@ import { acceptedPreparedOutboundEntries } from "./prepared-batch.js";
 let deliverOutboundPayloads: typeof import("./deliver.js").deliverOutboundPayloads;
 
 type DeliveryParams = Parameters<typeof deliverOutboundPayloads>[0];
-type MatrixParams = Partial<Omit<DeliveryParams, "cfg" | "channel" | "to">>;
-type MatrixSender = NonNullable<NonNullable<DeliveryParams["deps"]>["matrix"]>;
+function matrixRequest(params: Omit<DeliveryParams, "cfg" | "channel" | "to">): DeliveryParams {
+  return { cfg: {}, channel: "matrix", to: "!room:example", ...params };
+}
+function deliverMatrix(params: Omit<DeliveryParams, "cfg" | "channel" | "to">) {
+  return deliverOutboundPayloads(matrixRequest(params));
+}
 
 describe("durable outbound queue delivery", () => {
   const fixtures = installDeliveryQueueTmpDirHooks();
-  const deliveryIntentId = "cron-direct-delivery:v1:test";
   let tmpDir: string;
-  let sendMatrix: Mock<MatrixSender>;
-
-  const queueStatus = (id = deliveryIntentId) =>
-    getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, id, tmpDir);
-  const pending = () => loadPendingDeliveries(tmpDir);
-  const pendingEntry = async () => (await pending())[0];
-  const matrixRequest = (params: MatrixParams = {}): DeliveryParams => ({
-    cfg: {},
-    channel: "matrix",
-    to: "!room:example",
-    payloads: [{ text: "hello" }],
-    deps: { matrix: sendMatrix },
-    queuePolicy: "required",
-    ...params,
-  });
-  const stableRequest = (params: MatrixParams = {}) =>
-    matrixRequest({
-      deliveryIntentId,
-      completionRetention: boundedCronCompletionRetention,
-      reusePendingDeliveryIntent: true,
-      ...params,
-    });
-  const deliverMatrix = (params: MatrixParams = {}) =>
-    deliverOutboundPayloads(matrixRequest(params));
-  const deliverStable = (params: MatrixParams = {}) =>
-    deliverOutboundPayloads(stableRequest(params));
-  const enqueueMatrix = (
-    params: Omit<Parameters<typeof enqueueDeliveryOnce>[0], "channel" | "to">,
-    id = deliveryIntentId,
-    mediaStageId?: string,
-  ) =>
-    enqueueDeliveryOnce(
-      {
-        channel: "matrix",
-        to: "!room:example",
-        queuePolicy: "required",
-        completionRetention: boundedCronCompletionRetention,
-        ...params,
-      },
-      id,
-      tmpDir,
-      mediaStageId,
-    );
-  const recoveryDelivery = () =>
-    vi.fn<DeliverFn>(async (params) =>
-      deliverOutboundPayloads({ ...params, deps: { matrix: sendMatrix } }),
-    );
-  const drain = (deliver: DeliverFn) => drainMatrixReconnect({ deliver, stateDir: tmpDir });
 
   beforeAll(async () => {
     ({ deliverOutboundPayloads } = await import("./deliver.js"));
   });
+
   beforeEach(() => {
     tmpDir = fixtures.tmpDir();
     process.env.OPENCLAW_STATE_DIR = tmpDir;
-    sendMatrix = vi.fn<MatrixSender>();
     setActivePluginRegistry(
       createTestRegistry([
         {
@@ -106,31 +61,44 @@ describe("durable outbound queue delivery", () => {
       ]),
     );
   });
+
   afterEach(() => {
     resetPluginRuntimeStateForTest();
     setActivePluginRegistry(createEmptyPluginRegistry());
   });
 
   it("never lets startup or reconnect impersonate a permanent live producer", async () => {
-    await enqueueMatrix({
-      payloads: [{ text: "the original permanent producer owns this send" }],
-      completionRetention: "permanent",
-      requiresProducerClaim: true,
-      maxRetries: 1,
-    });
+    const deliveryIntentId = "permanent-matrix-active-producer";
+    await enqueueDeliveryOnce(
+      {
+        channel: "matrix",
+        to: "!room:example",
+        payloads: [{ text: "the original permanent producer owns this send" }],
+        queuePolicy: "required",
+        completionRetention: "permanent",
+        requiresProducerClaim: true,
+        maxRetries: 1,
+      },
+      deliveryIntentId,
+      tmpDir,
+    );
     const producerClaimId = await claimDeliveryPlatformSendAttempt(deliveryIntentId, tmpDir);
-    assert.ok(producerClaimId, "permanent live producer must claim the stable row");
+    if (!producerClaimId) {
+      throw new Error("test invariant: permanent live producer must claim the stable row");
+    }
     await reserveDeliveryAttempt(deliveryIntentId, 1, tmpDir, producerClaimId);
     const deliver = vi.fn<DeliverFn>(async () => []);
-    await drain(deliver);
+
+    await drainMatrixReconnect({ deliver, stateDir: tmpDir });
     await recoverPendingDeliveries({
-      cfg: {},
+      cfg: {} as OpenClawConfig,
       deliver,
       log: createRecoveryLog(),
       stateDir: tmpDir,
     });
+
     expect(deliver).not.toHaveBeenCalled();
-    expect(await pendingEntry()).toMatchObject({
+    expect((await loadPendingDeliveries(tmpDir))[0]).toMatchObject({
       id: deliveryIntentId,
       recoveryState: "producer_claimed",
       producerClaimId,
@@ -139,61 +107,85 @@ describe("durable outbound queue delivery", () => {
   });
 
   it("retains permanent receipts when stable delivery is intentionally suppressed", async () => {
+    const sendMatrix = vi.fn();
+    const liveIntentId = "permanent-matrix-suppressed-live";
+
     await expect(
-      deliverStable({ payloads: [{ text: "" }], completionRetention: "permanent" }),
-    ).resolves.toEqual([]);
-    expect(queueStatus()).toBe("completed");
-    const recoveryIntentId = "permanent-matrix-suppressed-recovery";
-    await enqueueMatrix(
-      {
+      deliverMatrix({
         payloads: [{ text: "" }],
+        deps: { matrix: sendMatrix },
+        queuePolicy: "required",
+        deliveryIntentId: liveIntentId,
+        completionRetention: "permanent",
+        reusePendingDeliveryIntent: true,
+      }),
+    ).resolves.toEqual([]);
+    expect(getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, liveIntentId, tmpDir)).toBe(
+      "completed",
+    );
+
+    const recoveryIntentId = "permanent-matrix-suppressed-recovery";
+    await enqueueDeliveryOnce(
+      {
+        channel: "matrix",
+        to: "!room:example",
+        payloads: [{ text: "" }],
+        queuePolicy: "required",
         completionRetention: "permanent",
       },
       recoveryIntentId,
+      tmpDir,
     );
-    await drain(vi.fn<DeliverFn>(async () => []));
-    expect(queueStatus(recoveryIntentId)).toBe("completed");
+    await drainMatrixReconnect({ deliver: vi.fn<DeliverFn>(async () => []), stateDir: tmpDir });
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, recoveryIntentId, tmpDir),
+    ).toBe("completed");
     expect(sendMatrix).not.toHaveBeenCalled();
   });
 
-  it.each(["live", "recovered"] as const)(
-    "never completes %s Matrix batches when any platform send lacks an identity",
-    async (mode) => {
-      sendMatrix.mockResolvedValueOnce({ messageId: "confirmed" }).mockResolvedValueOnce({});
-      const payloads = [{ text: "confirmed recipient message" }, { text: "ambiguous message" }];
-      const params = stableRequest({ payloads });
-      const deliver = recoveryDelivery();
-      const attempt = () => (mode === "live" ? deliverOutboundPayloads(params) : drain(deliver));
-      if (mode === "recovered") {
-        await enqueueMatrix({ payloads });
-      }
-      const expectAttempt = async (replay: boolean) => {
-        if (mode === "recovered") {
-          await attempt();
-        } else {
-          await expect(attempt()).rejects.toThrow(
-            replay
-              ? `Stable delivery intent is already queued: ${deliveryIntentId}`
-              : "platform send returned no delivery identity for part of the delivery batch",
-          );
-        }
-      };
-      await expectAttempt(false);
-      expect(sendMatrix).toHaveBeenCalledTimes(2);
-      expect(await pendingEntry()).toMatchObject({
-        id: deliveryIntentId,
-        recoveryState: "unknown_after_send",
-        retryCount: 1,
-      });
-      expect(queueStatus()).toBe("pending");
-      await expectAttempt(true);
-      expect(sendMatrix).toHaveBeenCalledTimes(2);
-      expect(queueStatus()).not.toBe("completed");
-    },
-  );
+  it("never completes recovered Matrix batches when any platform send lacks an identity", async () => {
+    const deliveryIntentId = "cron-direct-delivery:v1:recovered-matrix-partial-no-identity";
+    await enqueueDeliveryOnce(
+      {
+        channel: "matrix",
+        to: "!room:example",
+        payloads: [{ text: "confirmed recipient message" }, { text: "ambiguous message" }],
+        queuePolicy: "required",
+        completionRetention: boundedCronCompletionRetention,
+      },
+      deliveryIntentId,
+      tmpDir,
+    );
+    const sendMatrix = vi
+      .fn()
+      .mockResolvedValueOnce({ messageId: "confirmed-recovered-message" })
+      .mockResolvedValueOnce({});
+    const deliver = vi.fn<DeliverFn>(async (params) =>
+      deliverOutboundPayloads({ ...params, deps: { matrix: sendMatrix } }),
+    );
+
+    await drainMatrixReconnect({ deliver, stateDir: tmpDir });
+
+    expect(sendMatrix).toHaveBeenCalledTimes(2);
+    expect((await loadPendingDeliveries(tmpDir))[0]).toMatchObject({
+      id: deliveryIntentId,
+      recoveryState: "unknown_after_send",
+      retryCount: 1,
+    });
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("pending");
+
+    await drainMatrixReconnect({ deliver, stateDir: tmpDir });
+    expect(sendMatrix).toHaveBeenCalledTimes(2);
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).not.toBe("completed");
+  });
 
   it("reuses durable Matrix media after regenerated producer files disappear", async () => {
-    const originalSource = path.join(tmpDir, "original.ogg");
+    const deliveryIntentId = "cron-direct-delivery:v1:immutable-staged-matrix-media";
+    const originalSource = path.join(tmpDir, "original-stable-media.ogg");
     const originalBytes = "original durable Matrix attachment";
     await fs.writeFile(originalSource, originalBytes);
     const staged = await stageQueuePayloadMedia({
@@ -202,41 +194,63 @@ describe("durable outbound queue delivery", () => {
       maxBytes: 1024 * 1024,
       stateDir: tmpDir,
     });
-    assert.ok(staged.status === "staged", "original media must be durably staged");
+    if (staged.status !== "staged") {
+      throw new Error("test invariant: original producer media must be durably staged");
+    }
     const spoolPath = staged.artifacts[0];
-    assert.ok(spoolPath, "original media must have a queue-owned spool artifact");
-    await enqueueMatrix({ payloads: staged.payloads }, deliveryIntentId, staged.mediaStageId);
-    const queuedEntry = await pendingEntry();
+    if (!spoolPath) {
+      throw new Error("test invariant: original media must have a queue-owned spool artifact");
+    }
+    await enqueueDeliveryOnce(
+      {
+        channel: "matrix",
+        to: "!room:example",
+        payloads: staged.payloads,
+        queuePolicy: "required",
+        completionRetention: boundedCronCompletionRetention,
+      },
+      deliveryIntentId,
+      tmpDir,
+      staged.mediaStageId,
+    );
+    const pending = (await loadPendingDeliveries(tmpDir))[0];
     expect(
       collectEntrySpoolPaths(
-        queuedEntry
-          ? acceptedPreparedOutboundEntries(queuedEntry.preparedBatch).map((entry) => entry.payload)
+        pending
+          ? acceptedPreparedOutboundEntries(pending.preparedBatch).map((entry) => entry.payload)
           : [],
         tmpDir,
       ),
     ).toEqual([spoolPath]);
     await fs.rm(originalSource);
+
     let deliveredBytes: string | undefined;
-    sendMatrix.mockImplementation(
+    const sendMatrix = vi.fn(
       async (_to: string, _text: string, options?: Record<string, unknown>) => {
-        assert.ok(
-          typeof options?.mediaUrl === "string",
-          "Matrix must receive the staged attachment",
-        );
+        if (typeof options?.mediaUrl !== "string") {
+          throw new Error("test invariant: Matrix must receive the original staged attachment");
+        }
         deliveredBytes = await fs.readFile(options.mediaUrl, "utf8");
-        return { messageId: "staged-media" };
+        return { messageId: "immutable-staged-matrix-message" };
       },
     );
+
     await expect(
-      deliverStable({
+      deliverMatrix({
         payloads: [
           {
             text: "regenerated caption must never replace queue custody",
-            mediaUrl: path.join(tmpDir, "missing-regenerated.ogg"),
+            mediaUrl: path.join(tmpDir, "missing-regenerated-producer-media.ogg"),
           },
         ],
+        deps: { matrix: sendMatrix },
+        queuePolicy: "required",
+        deliveryIntentId,
+        completionRetention: boundedCronCompletionRetention,
+        reusePendingDeliveryIntent: true,
       }),
-    ).resolves.toMatchObject([{ messageId: "staged-media" }]);
+    ).resolves.toMatchObject([{ messageId: "immutable-staged-matrix-message" }]);
+
     expect(sendMatrix).toHaveBeenCalledOnce();
     expect(sendMatrix).toHaveBeenCalledWith(
       "!room:example",
@@ -244,49 +258,88 @@ describe("durable outbound queue delivery", () => {
       expect.objectContaining({ mediaUrl: spoolPath }),
     );
     expect(deliveredBytes).toBe(originalBytes);
-    expect(queueStatus()).toBe("completed");
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("completed");
     await expect(fs.stat(spoolPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("retains a completed stable receipt after fully successful best-effort delivery", async () => {
-    sendMatrix.mockResolvedValue({ messageId: "stable-best-effort-message" });
-    const params = stableRequest({ bestEffort: true, queuePolicy: "best_effort" });
+    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "stable-best-effort-message" });
+    const deliveryIntentId = "cron-direct-delivery:v1:best-effort-stable-completion";
+    const params = matrixRequest({
+      payloads: [{ text: "best-effort send once" }],
+      deps: { matrix: sendMatrix },
+      bestEffort: true,
+      queuePolicy: "best_effort" as const,
+      deliveryIntentId,
+      completionRetention: boundedCronCompletionRetention,
+      reusePendingDeliveryIntent: true,
+    });
+
     await expect(deliverOutboundPayloads(params)).resolves.toMatchObject([
       { messageId: "stable-best-effort-message" },
     ]);
-    expect(queueStatus()).toBe("completed");
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("completed");
     await expect(deliverOutboundPayloads(params)).resolves.toEqual([]);
     expect(sendMatrix).toHaveBeenCalledOnce();
   });
 
   it("holds one live claim while concurrent producers reuse a stable pending intent", async () => {
-    const started = createDeferred();
-    const sent = createDeferred<{ messageId: string }>();
-    sendMatrix.mockImplementation(() => {
-      started.resolve();
-      return sent.promise;
+    let resolveSend!: (value: { messageId: string }) => void;
+    const { promise: sendStarted, resolve: notifySendStarted } = createDeferred();
+    const sendMatrix = vi.fn(
+      () =>
+        new Promise<{ messageId: string }>((resolve) => {
+          resolveSend = resolve;
+          notifySendStarted();
+        }),
+    );
+    const deliveryIntentId = "cron-direct-delivery:v1:concurrent-stable-completion";
+    const params = matrixRequest({
+      payloads: [{ text: "send exactly once" }],
+      deps: { matrix: sendMatrix },
+      queuePolicy: "required" as const,
+      deliveryIntentId,
+      completionRetention: boundedCronCompletionRetention,
+      reusePendingDeliveryIntent: true,
     });
-    const params = stableRequest();
+
     const first = deliverOutboundPayloads(params);
-    await started.promise;
+    await sendStarted;
     const recoveryDeliver = vi.fn<DeliverFn>(async () => []);
-    await drain(recoveryDeliver);
+    await drainMatrixReconnect({ deliver: recoveryDeliver, stateDir: tmpDir });
     expect(recoveryDeliver).not.toHaveBeenCalled();
     expect(sendMatrix).toHaveBeenCalledOnce();
     const concurrentReplay = deliverOutboundPayloads(params);
     expect(sendMatrix).toHaveBeenCalledOnce();
-    sent.resolve({ messageId: "concurrent-stable-message" });
+    resolveSend({ messageId: "concurrent-stable-message" });
     await expect(first).resolves.toMatchObject([{ messageId: "concurrent-stable-message" }]);
     await expect(concurrentReplay).resolves.toEqual([]);
-    expect(queueStatus()).toBe("completed");
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("completed");
   });
 
   it("never acknowledges route-only metadata as a platform message identity", async () => {
-    sendMatrix.mockResolvedValue({ messageId: "", toJid: "!route-only:example" });
-    const params = stableRequest();
+    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "", toJid: "!route-only:example" });
+    const deliveryIntentId = "cron-direct-delivery:v1:no-platform-identity";
+    const params = matrixRequest({
+      payloads: [{ text: "provider returned no message identity" }],
+      deps: { matrix: sendMatrix },
+      queuePolicy: "required" as const,
+      deliveryIntentId,
+      completionRetention: boundedCronCompletionRetention,
+      reusePendingDeliveryIntent: true,
+    });
+
     await expect(deliverOutboundPayloads(params)).resolves.toEqual([]);
-    expect(queueStatus()).toBe("pending");
-    expect(await pendingEntry()).toMatchObject({
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("pending");
+    expect((await loadPendingDeliveries(tmpDir))[0]).toMatchObject({
       id: deliveryIntentId,
       recoveryState: "unknown_after_send",
     });
@@ -296,54 +349,119 @@ describe("durable outbound queue delivery", () => {
     expect(sendMatrix).toHaveBeenCalledOnce();
   });
 
+  it("never completes live Matrix batches when any platform send lacks an identity", async () => {
+    const sendMatrix = vi
+      .fn()
+      .mockResolvedValueOnce({ messageId: "confirmed-live-message" })
+      .mockResolvedValueOnce({});
+    const deliveryIntentId = "cron-direct-delivery:v1:live-matrix-partial-no-identity";
+    const params = matrixRequest({
+      payloads: [{ text: "confirmed recipient message" }, { text: "ambiguous message" }],
+      deps: { matrix: sendMatrix },
+      queuePolicy: "required" as const,
+      deliveryIntentId,
+      completionRetention: boundedCronCompletionRetention,
+      reusePendingDeliveryIntent: true,
+    });
+
+    await expect(deliverOutboundPayloads(params)).rejects.toThrow(
+      "platform send returned no delivery identity for part of the delivery batch",
+    );
+    expect(sendMatrix).toHaveBeenCalledTimes(2);
+    expect((await loadPendingDeliveries(tmpDir))[0]).toMatchObject({
+      id: deliveryIntentId,
+      recoveryState: "unknown_after_send",
+      retryCount: 1,
+    });
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("pending");
+
+    await expect(deliverOutboundPayloads(params)).rejects.toThrow(
+      `Stable delivery intent is already queued: ${deliveryIntentId}`,
+    );
+    expect(sendMatrix).toHaveBeenCalledTimes(2);
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).not.toBe("completed");
+  });
+
   it("removes an unsent queue intent when the caller cancels after publication", async () => {
     const controller = new AbortController();
+    const sendMatrix = vi.fn();
+
     await expect(
       deliverMatrix({
+        payloads: [{ text: "cancel before provider dispatch" }],
+        deps: { matrix: sendMatrix },
+        queuePolicy: "required",
         abortSignal: controller.signal,
         onDeliveryIntent: () =>
           controller.abort(new DOMException("Operator cancelled delivery", "AbortError")),
       }),
     ).rejects.toMatchObject({ message: "Operation aborted", queueCustody: "released" });
+
     expect(sendMatrix).not.toHaveBeenCalled();
-    expect(await pending()).toEqual([]);
+    expect(await loadPendingDeliveries(tmpDir)).toEqual([]);
   });
 
   it("retries a stable delivery intent only after a proven pre-dispatch failure", async () => {
-    sendMatrix
-      .mockRejectedValueOnce(
-        new PlatformMessageNotDispatchedError("provider disconnected before dispatch", {
-          cause: new Error("connect ECONNREFUSED"),
-        }),
-      )
+    const notDispatchedError = new PlatformMessageNotDispatchedError(
+      "provider disconnected before dispatch",
+      { cause: new Error("connect ECONNREFUSED") },
+    );
+    const sendMatrix = vi
+      .fn()
+      .mockRejectedValueOnce(notDispatchedError)
       .mockResolvedValueOnce({ messageId: "recovered-stable-message" });
-    const params = stableRequest();
+    const deliveryIntentId = "cron-direct-delivery:v1:safe-retry";
+    const params = matrixRequest({
+      payloads: [{ text: "safe retry" }],
+      deps: { matrix: sendMatrix },
+      queuePolicy: "required" as const,
+      deliveryIntentId,
+      completionRetention: boundedCronCompletionRetention,
+      reusePendingDeliveryIntent: true,
+    });
+
     await expect(deliverOutboundPayloads(params)).rejects.toThrow(
       "provider disconnected before dispatch",
     );
-    const entry = await pendingEntry();
-    expect(entry).toMatchObject({ id: deliveryIntentId, retryCount: 1 });
-    expect(entry?.recoveryState).toBeUndefined();
+    expect((await loadPendingDeliveries(tmpDir))[0]).toMatchObject({
+      id: deliveryIntentId,
+      retryCount: 1,
+    });
+    expect((await loadPendingDeliveries(tmpDir))[0]?.recoveryState).toBeUndefined();
     await expect(deliverOutboundPayloads(params)).resolves.toMatchObject([
       { messageId: "recovered-stable-message" },
     ]);
-    expect(queueStatus()).toBe("completed");
+    expect(
+      getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, deliveryIntentId, tmpDir),
+    ).toBe("completed");
     expect(sendMatrix).toHaveBeenCalledTimes(2);
   });
 
   it("does not retain a pre-send suppression across an ambiguous crash boundary", async () => {
     const auditEvents: TrustedMessageAuditEvent[] = [];
     const unsubscribe = onTrustedMessageAuditEvent((event) => auditEvents.push(event));
-    sendMatrix.mockRejectedValueOnce(new Error("ambiguous provider failure"));
+    const sendMatrix = vi.fn().mockRejectedValueOnce(new Error("ambiguous provider failure"));
+
     await expect(
-      deliverMatrix({ payloads: [{ text: "NO_REPLY" }, { text: "visible" }] }),
+      deliverMatrix({
+        payloads: [{ text: "NO_REPLY" }, { text: "visible" }],
+        deps: { matrix: sendMatrix },
+        queuePolicy: "required",
+      }),
     ).rejects.toThrow("ambiguous provider failure");
-    const beforeDrain = await pending();
+
+    const beforeDrain = await loadPendingDeliveries(tmpDir);
     expect(beforeDrain).toHaveLength(1);
     expect(beforeDrain[0]?.recoveryState).toBe("unknown_after_send");
+
     const deliver = vi.fn<DeliverFn>(async () => {});
-    await drain(deliver);
+    await drainMatrixReconnect({ deliver, stateDir: tmpDir });
     unsubscribe();
+
     expect(deliver).not.toHaveBeenCalled();
     expect(auditEvents.map((event) => event.outcome)).toEqual([
       "queued",
@@ -355,38 +473,77 @@ describe("durable outbound queue delivery", () => {
     expect(auditEvents.slice(-2).map((event) => event.resultCount)).toEqual([0, 0]);
   });
 
-  it.each(["caller", undefined] as const)(
-    "keeps proven pre-connect retry custody with %s (#124279, #100979)",
-    async (deliveryRetryOwner) => {
-      sendMatrix.mockRejectedValueOnce(
-        Object.assign(new Error("connect ECONNREFUSED"), {
-          code: "ECONNREFUSED",
-          syscall: "connect",
-        }),
+  const attemptProvenNotSentSend = async (
+    error: Error,
+    thrown: string,
+    extra: Partial<Parameters<typeof deliverOutboundPayloads>[0]>,
+  ) => {
+    const failure = await deliverMatrix({
+      payloads: [{ text: "first" }],
+      deps: { matrix: vi.fn().mockRejectedValueOnce(error) },
+      queuePolicy: "required",
+      ...extra,
+    }).catch((caught: unknown) => caught);
+    expect(failure).toMatchObject({ message: expect.stringContaining(thrown) });
+    return failure;
+  };
+
+  const connectRefusedError = () =>
+    Object.assign(new Error("connect ECONNREFUSED"), {
+      code: "ECONNREFUSED",
+      syscall: "connect",
+    });
+
+  it.each([["a proven pre-connect failure", connectRefusedError(), "ECONNREFUSED"]])(
+    "dead-letters a caller-owned entry after %s",
+    async (_label, error, thrown) => {
+      const failure = await attemptProvenNotSentSend(error, thrown, {
+        deliveryRetryOwner: "caller",
+      });
+      expect(isOutboundDeliveryError(failure) && failure.queueCustody).toBe("released");
+
+      // The caller received the proven-not-sent error and owns the retry; a
+      // pending row here is what produced duplicate sends (#124279).
+      expect(await loadPendingDeliveries(tmpDir)).toHaveLength(0);
+
+      const recoverySendMatrix = vi.fn();
+      const deliver = vi.fn<DeliverFn>(async (params) =>
+        deliverOutboundPayloads({ ...params, deps: { matrix: recoverySendMatrix } }),
       );
-      const failure = await deliverMatrix({ deliveryRetryOwner }).catch(
-        (caught: unknown) => caught,
+      await drainMatrixReconnect({ deliver, stateDir: tmpDir });
+
+      expect(deliver).not.toHaveBeenCalled();
+      expect(recoverySendMatrix).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([["a caller that only reports the failure", {}]])(
+    "replays %s after a proven pre-connect failure clears send evidence",
+    async (_label, extra) => {
+      const failure = await attemptProvenNotSentSend(connectRefusedError(), "ECONNREFUSED", extra);
+      expect(isOutboundDeliveryError(failure) && failure.queueCustody).toBe("held");
+
+      // Neither entry has a caller that resends: reusable intents belong to the
+      // queue, and CLI/RPC callers only report the error. Both must stay pending
+      // with cleared send evidence so recovery can replay them (#100979).
+      const beforeDrain = await loadPendingDeliveries(tmpDir);
+      expect(beforeDrain).toHaveLength(1);
+      expect(beforeDrain[0]).toMatchObject({
+        retryCount: 1,
+        lastError: expect.stringContaining("ECONNREFUSED"),
+      });
+      expect(beforeDrain[0]?.recoveryState).toBeUndefined();
+      expect(beforeDrain[0]?.platformSendStartedAt).toBeUndefined();
+
+      const recoverySendMatrix = vi.fn().mockResolvedValueOnce({ messageId: "recovered" });
+      const deliver = vi.fn<DeliverFn>(async (params) =>
+        deliverOutboundPayloads({ ...params, deps: { matrix: recoverySendMatrix } }),
       );
-      expect(failure).toMatchObject({ message: expect.stringContaining("ECONNREFUSED") });
-      expect(isOutboundDeliveryError(failure) && failure.queueCustody).toBe(
-        deliveryRetryOwner === "caller" ? "released" : "held",
-      );
-      const beforeDrain = await pending();
-      expect(beforeDrain).toHaveLength(deliveryRetryOwner === "caller" ? 0 : 1);
-      if (deliveryRetryOwner !== "caller") {
-        expect(beforeDrain[0]).toMatchObject({
-          retryCount: 1,
-          lastError: expect.stringContaining("ECONNREFUSED"),
-        });
-        expect(beforeDrain[0]?.recoveryState).toBeUndefined();
-        expect(beforeDrain[0]?.platformSendStartedAt).toBeUndefined();
-      }
-      sendMatrix = vi.fn().mockResolvedValueOnce({ messageId: "recovered" });
-      const deliver = recoveryDelivery();
-      await drain(deliver);
-      expect(deliver).toHaveBeenCalledTimes(deliveryRetryOwner === "caller" ? 0 : 1);
-      expect(sendMatrix).toHaveBeenCalledTimes(deliveryRetryOwner === "caller" ? 0 : 1);
-      expect(await pending()).toHaveLength(0);
+      await drainMatrixReconnect({ deliver, stateDir: tmpDir });
+
+      expect(deliver).toHaveBeenCalledOnce();
+      expect(recoverySendMatrix).toHaveBeenCalledOnce();
+      expect(await loadPendingDeliveries(tmpDir)).toHaveLength(0);
     },
   );
 });
