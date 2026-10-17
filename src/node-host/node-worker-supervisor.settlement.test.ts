@@ -30,6 +30,16 @@ async function fixture(...args: Parameters<typeof settlementFixture>) {
       value.emitResult.resolve();
       await value.entered.promise;
     },
+    snapshot() {
+      return {
+        state: value.readTurn()?.state,
+        done: value.turnSettled(),
+        free: value.snapshots.at(-1),
+        send: mocks.send.mock.calls.length,
+        finish: mocks.launchFinish.mock.calls.length,
+        remove: mocks.remove.mock.calls.length,
+      };
+    },
   };
 }
 
@@ -273,8 +283,7 @@ describe("node worker persistence settlement lifetime", () => {
         }
         expect(vi.getTimerCount()).toBe(0);
         expect(mocks.turnFinish).not.toHaveBeenCalled();
-        expect(mocks.send).not.toHaveBeenCalled();
-        expect(f.snapshots.at(-1)).toBe(0);
+        expect(f.snapshot()).toMatchObject({ send: 0, free: 0 });
       } finally {
         await f.dispose();
         vi.useRealTimers();
@@ -386,8 +395,7 @@ describe("node worker persistence settlement lifetime", () => {
     expect(f.turnSettled()).toBe(false);
     releaseRead.resolve();
     expect(await cancellation).toMatchObject({ state: "cancelled" });
-    expect(f.turnSettled()).toBe(true);
-    expect(f.snapshots.at(-1)).toBe(1);
+    expect(f.snapshot()).toMatchObject({ done: true, free: 1 });
   });
 
   it("retains turn completion after physical cleanup until terminal persistence succeeds", async () => {
@@ -399,15 +407,12 @@ describe("node worker persistence settlement lifetime", () => {
     f.firstRemoval.resolve();
     f.retryRemoval.resolve();
     await nextTurn();
-    expect(mocks.launchFinish).toHaveBeenCalledOnce();
-    expect(f.turnSettled()).toBe(false);
-    expect(f.snapshots.at(-1)).toBe(0);
+    expect(f.snapshot()).toMatchObject({ finish: 1, done: false, free: 0 });
     mocks.launchFinish.mockRejectedValueOnce(failure);
     await expect(f.supervisor.cancel(f.identity)).rejects.toBe(failure);
     expect(f.turnSettled()).toBe(false);
     expect(await f.supervisor.status(f.identity.launchId)).toMatchObject({ state: "failed" });
-    expect(f.turnSettled()).toBe(true);
-    expect(f.snapshots.at(-1)).toBe(1);
+    expect(f.snapshot()).toMatchObject({ done: true, free: 1 });
   });
 
   it("retries owned container cleanup when cancellation starts during persistence", async () => {
@@ -424,19 +429,14 @@ describe("node worker persistence settlement lifetime", () => {
     f.firstRemoval.reject(cleanupFailure);
     await nextTurn();
     await expect(cancellation).rejects.toBe(cleanupFailure);
-    expect(f.readTurn()?.state).toBe("running");
-    expect(f.turnSettled()).toBe(false);
-    expect(mocks.launchFinish).not.toHaveBeenCalled();
-    expect(f.snapshots.at(-1)).toBe(0);
+    expect(f.snapshot()).toMatchObject({ state: "running", done: false, finish: 0, free: 0 });
     const retry = f.supervisor.cancel(f.identity);
     await nextTurn();
-    expect(mocks.remove).toHaveBeenCalledTimes(2);
-    expect(mocks.launchFinish).not.toHaveBeenCalled();
+    expect(f.snapshot()).toMatchObject({ remove: 2, finish: 0 });
     f.retryRemoval.resolve();
     expect(await retry).toMatchObject({ state: "cancelled" });
     expect(mocks.launchFinish.mock.lastCall?.[0].state).toBe("cancelled");
-    expect(f.turnSettled()).toBe(true);
-    expect(f.snapshots.at(-1)).toBe(1);
+    expect(f.snapshot()).toMatchObject({ done: true, free: 1 });
   });
 
   it("lets successful persistence win over a reentrant cancellation", async () => {
@@ -448,14 +448,10 @@ describe("node worker persistence settlement lifetime", () => {
     await f.beginSettlement();
     await nextTurn();
     expect(cancellation).toBeDefined();
-    expect(mocks.send).not.toHaveBeenCalled();
-    expect(mocks.remove).not.toHaveBeenCalled();
+    expect(f.snapshot()).toMatchObject({ send: 0, remove: 0 });
     f.persistence.resolve();
     expect(await cancellation).toMatchObject({ state: "completed" });
-    expect(f.turnSettled()).toBe(true);
-    expect(mocks.send).not.toHaveBeenCalled();
-    expect(mocks.remove).not.toHaveBeenCalled();
-    expect(f.snapshots.at(-1)).toBe(0);
+    expect(f.snapshot()).toMatchObject({ done: true, send: 0, remove: 0, free: 0 });
   });
 
   it("retains unknown-outcome refusal after rejected persistence", async () => {
@@ -476,10 +472,7 @@ describe("node worker persistence settlement lifetime", () => {
     expect(cancelled).toHaveBeenCalledOnce();
     await expect(cancellation).rejects.toBe(failure);
     expect(f.readTurn()?.state).toBe("running");
-    expect(f.turnSettled()).toBe(false);
-    expect(mocks.send).not.toHaveBeenCalled();
-    expect(mocks.launchFinish).not.toHaveBeenCalled();
-    expect(f.snapshots.at(-1)).toBe(0);
+    expect(f.snapshot()).toMatchObject({ done: false, send: 0, finish: 0, free: 0 });
     f.retryRemoval.resolve();
     await expect(f.supervisor.close()).rejects.toThrow();
     await expect(f.supervisor.status(f.identity.launchId)).rejects.toBe(failure);

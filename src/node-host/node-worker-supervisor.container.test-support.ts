@@ -88,6 +88,14 @@ const args = process.argv.slice(2);
 const command = args[0];
 const enginePath = (file) => path.join(engineRoot, file);
 const print = (value) => process.stdout.write(value + "\n");
+const fail = (message, code = 1) => {
+  process.stderr.write(message + "\n");
+  process.exit(code);
+};
+const reportError = (error) => {
+  process.stderr.write(error.message + "\n");
+  process.exitCode = 1;
+};
 const statePath = (id) => path.join(engineRoot, id + ".container.json");
 const load = (id) => JSON.parse(fs.readFileSync(statePath(id), "utf8"));
 // Separate CLI processes share one fake daemon. Serialize state transitions so
@@ -153,14 +161,15 @@ const releaseAfterMarker = (marker, operation) => {
     }
   }, 10);
 };
-const missing = (id) => {
-  process.stderr.write("Error: No such object: " + id + "\n");
-  process.exit(1);
-};
 const readContainer = (id) => {
-  if (!fs.existsSync(statePath(id))) missing(id);
+  if (!fs.existsSync(statePath(id))) fail("Error: No such object: " + id);
   return load(id);
 };
+const withRecordedContainer = (operation) => withContainerLock(args.at(-1), () => {
+  const container = readContainer(args.at(-1));
+  record({ argv: args, journal: journalState(launchIdFor(container)) });
+  return operation(container);
+});
 
 if (command === "version") {
   record({ argv: args });
@@ -200,8 +209,7 @@ if (command === "version") {
     const journal = await waitForRunningJournal(container);
     record({ argv: args, journal });
     if (!matchesJournal(journal, container)) {
-      process.stderr.write("container worker executed before its exact identity was journaled\n");
-      process.exit(67);
+      fail("container worker executed before its exact identity was journaled", 67);
     }
     // A real engine leaves the container "created" until its start request lands,
     // so the marker lets a test hold the launch inside that startup window.
@@ -222,10 +230,7 @@ if (command === "version") {
     child.stdin.on("error", (error) => {
       if (error.code !== "EPIPE") throw error;
     });
-    child.once("error", (error) => {
-      process.stderr.write(error.message + "\n");
-      process.exitCode = 1;
-    });
+    child.once("error", reportError);
     child.once("exit", (code, signal) => {
       withContainerLock(container.id, () => {
         if (fs.existsSync(statePath(container.id))) {
@@ -237,10 +242,7 @@ if (command === "version") {
       });
       process.exit(code ?? (signal ? 137 : 0));
     });
-  })().catch((error) => {
-    process.stderr.write(error.message + "\n");
-    process.exitCode = 1;
-  });
+  })().catch(reportError);
 } else if (command === "inspect") {
   const id = args.at(-1);
   record({ argv: args });
@@ -260,14 +262,8 @@ if (command === "version") {
   }
   print(columns.join("\t"));
 } else if (command === "kill") {
-  const id = args.at(-1);
-  withContainerLock(id, () => {
-    const container = readContainer(id);
-    record({ argv: args, journal: journalState(launchIdFor(container)) });
-    if (container.status !== "running") {
-      process.stderr.write("container is not running\n");
-      process.exit(1);
-    }
+  withRecordedContainer((container) => {
+    if (container.status !== "running") fail("container is not running");
     container.status = "exited";
     save(container);
     killWorker(container);
@@ -275,12 +271,8 @@ if (command === "version") {
   });
 } else if (command === "rm") {
   const id = args.at(-1);
-  const container = withContainerLock(id, () => readContainer(id));
-  record({ argv: args, journal: journalState(launchIdFor(container)) });
-  if (fs.existsSync(enginePath("fail-removal"))) {
-    process.stderr.write("injected container removal failure\n");
-    process.exit(1);
-  }
+  withRecordedContainer(() => undefined);
+  if (fs.existsSync(enginePath("fail-removal"))) fail("injected container removal failure");
   releaseAfterMarker("hold-removal", () => withContainerLock(id, () => {
     const current = readContainer(id);
     killWorker(current);
@@ -304,8 +296,7 @@ if (command === "version") {
   }
 } else {
   record({ argv: args });
-  process.stderr.write("unsupported fake engine command: " + command + "\n");
-  process.exit(2);
+  fail("unsupported fake engine command: " + command, 2);
 }
 `;
 

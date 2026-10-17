@@ -51,12 +51,18 @@ function fixture(options: Parameters<typeof createNodeWorkerSupervisor>[0] = {})
     onCapacityChanged: (capacity) => capacities.push(capacity),
     ...options,
   });
+  const { supervisor, env, workspaceDir } = value;
   return {
     ...value,
     capacities,
+    store: () => new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })),
     receipt: (id: string) =>
-      new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env: value.env })).get(id),
-    [Symbol.asyncDispose]: () => value.supervisor.close(),
+      new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(id),
+    launch: (input: ReturnType<typeof launchInput>, signal?: AbortSignal) =>
+      supervisor.launch(input, TEST_WORKER_ENDPOINT, signal),
+    terminal: (id: string) => waitForTerminal(supervisor, id),
+    file: (name: string) => path.join(workspaceDir, name),
+    [Symbol.asyncDispose]: () => supervisor.close(),
   };
 }
 
@@ -88,7 +94,7 @@ describe("node worker startup", () => {
     "preserves the $build worker's start envelope and process group",
     async ({ build, lineage }) => {
       await using f = fixture();
-      const { bundleRoot, supervisor, workspaceDir } = f;
+      const { bundleRoot, workspaceDir } = f;
       const input = launchInput(workspaceDir, `start-contract-${build}`);
       input.descriptor.admission.handshake.openclawVersion = "2026.9.4";
       input.descriptor.admission.handshake.protocolFeatures =
@@ -100,7 +106,7 @@ describe("node worker startup", () => {
                 feature !== WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE)),
         );
       const expectedKeys = lineage ? ["lineageFds", "type"] : ["type"];
-      const reportPath = path.join(workspaceDir, "start-contract.json");
+      const reportPath = f.file("start-contract.json");
       writeWorker(
         bundleRoot,
         input,
@@ -130,28 +136,21 @@ lines.once("line", line => {
 });`,
       );
       let adapterPid: number | undefined;
-      const captureAdapter = observeNodeWorkerAdapters((adapter) => {
+      observeNodeWorkerAdapters((adapter) => {
         adapterPid = adapter.pid;
       });
-      try {
-        await supervisor.launch(input, TEST_WORKER_ENDPOINT);
-        expect(await waitForTerminal(supervisor, input.launchId)).toMatchObject({
-          state: "completed",
-        });
-        const report = JSON.parse(fs.readFileSync(reportPath, "utf8")) as {
-          pid: number;
-          pgid: number;
-          keys: string[];
-        };
-        expect(report.keys).toEqual(expectedKeys);
-        expect(report.pgid).toBe(adapterPid);
-        if (lineage) {
-          expect(report.pid).not.toBe(adapterPid);
-        } else {
-          expect(report.pid).toBe(adapterPid);
-        }
-      } finally {
-        captureAdapter.mockRestore();
+      await f.launch(input);
+      expect(await f.terminal(input.launchId)).toMatchObject({ state: "completed" });
+      const report = JSON.parse(fs.readFileSync(reportPath, "utf8")) as {
+        pid: number;
+        pgid: number;
+        keys: string[];
+      };
+      expect(report).toMatchObject({ keys: expectedKeys, pgid: adapterPid });
+      if (lineage) {
+        expect(report.pid).not.toBe(adapterPid);
+      } else {
+        expect(report.pid).toBe(adapterPid);
       }
     },
   );
@@ -165,7 +164,7 @@ lines.once("line", line => {
     let childExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let cleanupSettled = false;
     let adapter: NodeWorkerChildAdapter | undefined;
-    const captureAdapter = observeNodeWorkerAdapters((child) => {
+    observeNodeWorkerAdapters((child) => {
       adapter = child;
       child.onExit((code, signal) => {
         childExit = { code, signal };
@@ -195,25 +194,18 @@ lines.once("line", line => {
       });
     });
 
-    try {
-      expect(await supervisor.launch(input, TEST_WORKER_ENDPOINT)).toMatchObject({
-        state: "completed",
-      });
-      // Capacity returns only after the real child exit and adapter settlement.
-      await vi.waitFor(() => expect(capacities.at(-1)).toEqual({ total: 1, available: 1 }), {
-        timeout: 5_000,
-      });
-      expect(childExit).toEqual({ code: 0, signal: null });
-      expect(cleanupSettled).toBe(true);
-      expect(adapter?.stdin?.destroyed).toBe(true);
-      expect(opened).not.toHaveBeenCalled();
-      expect(fs.existsSync(path.join(workspaceDir, "fast-terminal-marker"))).toBe(false);
-      expect((await f.receipt(input.launchId))?.state).toBe("completed");
-      await supervisor.close();
-      expect(signalled).not.toHaveBeenCalled();
-    } finally {
-      captureAdapter.mockRestore();
-    }
+    expect(await f.launch(input)).toMatchObject({ state: "completed" });
+    // Capacity returns only after the real child exit and adapter settlement.
+    await vi.waitFor(() => expect(capacities.at(-1)).toEqual({ total: 1, available: 1 }), {
+      timeout: 5_000,
+    });
+    expect(childExit).toEqual({ code: 0, signal: null });
+    expect([cleanupSettled, adapter?.stdin?.destroyed]).toEqual([true, true]);
+    expect(opened).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.file("fast-terminal-marker"))).toBe(false);
+    expect((await f.receipt(input.launchId))?.state).toBe("completed");
+    await supervisor.close();
+    expect(signalled).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -230,7 +222,7 @@ lines.once("line", line => {
       await using f = fixture();
       const { bundleRoot, supervisor, workspaceDir } = f;
       const input = launchInput(workspaceDir, "prestart-exit-launch");
-      const exitedPath = path.join(workspaceDir, "prestart-exited");
+      const exitedPath = f.file("prestart-exited");
       writeWorker(
         bundleRoot,
         input,
@@ -267,8 +259,8 @@ lines.once("line", line => {
       });
 
       try {
-        await supervisor.launch(input, TEST_WORKER_ENDPOINT, controller.signal);
-        const terminal = await waitForTerminal(supervisor, input.launchId);
+        await f.launch(input, controller.signal);
+        const terminal = await f.terminal(input.launchId);
 
         expect(fs.existsSync(exitedPath)).toBe(true);
         expect(childExit).toEqual({ code: 23, signal: null });
@@ -292,10 +284,8 @@ lines.once("line", line => {
       await using f = fixture();
       const { supervisor, workspaceDir } = f;
       const input = launchInput(workspaceDir, `${operation}-startup-launch`, "tree");
-      const originalMarkRunning = Object.getOwnPropertyDescriptor(
-        NodeWorkerLaunchStore.prototype,
-        "markRunning",
-      )?.value as NodeWorkerLaunchStore["markRunning"];
+      // oxlint-disable-next-line typescript/unbound-method -- called with the original store.
+      const originalMarkRunning = NodeWorkerLaunchStore.prototype.markRunning;
       let stopping: Promise<unknown> | undefined;
       vi.spyOn(NodeWorkerLaunchStore.prototype, "markRunning").mockImplementation(async function (
         this: NodeWorkerLaunchStore,
@@ -309,11 +299,11 @@ lines.once("line", line => {
         return receipt;
       });
 
-      await supervisor.launch(input, TEST_WORKER_ENDPOINT);
+      await f.launch(input);
       await stopping;
 
       expect((await supervisor.status(input.launchId))?.state).toBe(state);
-      expect(fs.existsSync(path.join(workspaceDir, "grandchild.pid"))).toBe(false);
+      expect(fs.existsSync(f.file("grandchild.pid"))).toBe(false);
     },
   );
 });
@@ -345,7 +335,7 @@ describe("node worker supervisor initialization", () => {
   it("retains Windows restart capacity when the recorded worker root is reused", async () => {
     await using f = fixture();
     const { bundleRoot, env, workspaceDir } = f;
-    const store = new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env }));
+    const store = f.store();
     const input = launchInput(workspaceDir, "windows-reused", "wait");
     const claim = {
       ...testNodeWorkerLaunchIdentity(input),
@@ -405,9 +395,9 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
   { timeout: 20_000 },
   async (cleanupStatus, { signal }) => {
     await using f = fixture({ capacity: 1, capacityWaitMs: 0 });
-    const { env, supervisor, workspaceDir, capacities } = f;
+    const { supervisor, workspaceDir, capacities } = f;
     const input = testWorkerLaunchInput(workspaceDir, "uncertain-owner");
-    const store = new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env }));
+    const store = f.store();
     const reported = createDeferred();
     vi.spyOn(workerTreeControl, "inspectOwnedNodeWorkerTree").mockReturnValue("unknown");
     let restoreConfirmation: (() => void) | undefined;
@@ -430,7 +420,7 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
       };
     });
     try {
-      await supervisor.launch(input, TEST_WORKER_ENDPOINT);
+      await f.launch(input);
       await withinTest(reported.promise, signal);
       const confirmed = cleanupStatus === "confirmed";
       const stopping = supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(input));
@@ -462,10 +452,11 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
 it.skipIf(process.platform === "win32")(
   "keeps physical capacity reserved after a committed turn reply becomes unknown",
   async ({ signal }) => {
-    const { env, supervisor, workspaceDir, capacities } = fixture({
+    const f = fixture({
       capacity: 1,
       capacityWaitMs: 0,
     });
+    const { env, supervisor, workspaceDir, capacities } = f;
     const input = testWorkerLaunchInput(workspaceDir, "unknown-turn");
     const committed = createDeferred<unknown>();
     let target: { worker: Worker; id: number } | undefined;
@@ -510,7 +501,7 @@ it.skipIf(process.platform === "win32")(
     });
     const reader = new NodeWorkerJournalWorker({ env });
     try {
-      await supervisor.launch(input, TEST_WORKER_ENDPOINT);
+      await f.launch(input);
       expect(await withinTest(committed.promise, signal)).toMatchObject({
         launchId: input.launchId,
         state: "completed",
@@ -545,9 +536,7 @@ it.skipIf(process.platform === "win32")(
       expect(capacities.at(-1)).toEqual({ total: 1, available: 0 });
       expect(turnWrites).toBe(1);
       expect(
-        JSON.parse(
-          fs.readFileSync(path.join(workspaceDir, `${input.launchId}.started.json`), "utf8"),
-        ),
+        JSON.parse(fs.readFileSync(f.file(`${input.launchId}.started.json`), "utf8")),
       ).toMatchObject({ starts: 1 });
     } finally {
       replies.mockRestore();

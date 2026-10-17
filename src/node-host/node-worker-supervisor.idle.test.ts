@@ -255,6 +255,11 @@ function fixture(capacity = 1, container = false) {
       assert(owner, "Missing newly admitted child");
       return { ...owner, receipt };
     },
+    async retained(value: ReturnType<typeof input>, retention: "idle" | "background" = "idle") {
+      const owner = await this.launch(value);
+      await owner.complete(value.launchId, retention);
+      return owner;
+    },
   };
 }
 
@@ -262,8 +267,7 @@ describe("node worker idle retention", () => {
   it("routes process observations after turn settlement and fences stale or retired owners", async () => {
     await using f = fixture();
     const value = input("process-owner");
-    const owner = await f.launch(value);
-    await owner.complete(value.launchId, "background");
+    const owner = await f.retained(value, "background");
     const target = {
       ...testNodeWorkerEnvironmentIdentity(value),
       placementGeneration: value.placementGeneration,
@@ -367,8 +371,7 @@ describe("node worker idle retention", () => {
   it("reuses the physical child with fresh turn authority and clears its old expiry", async () => {
     await using f = fixture();
     const first = input("first");
-    const owner = await f.launch(first);
-    await owner.complete(first.launchId, "idle");
+    const owner = await f.retained(first);
     f.expectCapacity(0, 1);
     expect(await f.supervisor.hasActiveWork()).toBe(false);
     await vi.advanceTimersByTimeAsync(119_999);
@@ -433,8 +436,7 @@ describe("node worker idle retention", () => {
       await using f = fixture();
       using cleanup = barrier();
       const old = input("old", "old-environment");
-      const owner = await f.launch(old);
-      await owner.complete(old.launchId, "idle");
+      const owner = await f.retained(old);
       if (timing === "before") {
         await vi.advanceTimersByTimeAsync(119_999);
       }
@@ -488,8 +490,7 @@ describe("node worker idle retention", () => {
       let admitted: Promise<void> | undefined;
       let closing: Promise<void> | undefined;
       try {
-        const owner = await f.launch(input("old", "old-environment"));
-        await owner.complete("old", "idle");
+        const owner = await f.retained(input("old", "old-environment"));
         owner.holdCleanup(cleanup.promise);
         admitted = settle(
           f.supervisor.launch(
@@ -550,8 +551,7 @@ describe("node worker idle retention", () => {
   it("rejects reuse when idle expiry revokes the owner during turn admission", async () => {
     await using f = fixture();
     using release = barrier();
-    const owner = await f.launch(input("first"));
-    await owner.complete("first", "idle");
+    const owner = await f.retained(input("first"));
     mocks.send.mockClear();
     await vi.advanceTimersByTimeAsync(119_999);
     const claim = mocks.turnClaim.getMockImplementation()!;
@@ -576,19 +576,15 @@ describe("node worker idle retention", () => {
 
   it("retains at most two idle children and reclaims the least recently used, never background", async () => {
     await using f = fixture(4);
-    const background = await f.launch(input("background", "background-env"));
-    await background.complete("background", "background");
-    const a = await f.launch(input("a", "a-env"));
-    await a.complete("a", "idle");
+    const background = await f.retained(input("background", "background-env"), "background");
+    const a = await f.retained(input("a", "a-env"));
     await vi.advanceTimersByTimeAsync(1);
-    const b = await f.launch(input("b", "b-env"));
-    await b.complete("b", "idle");
+    const b = await f.retained(input("b", "b-env"));
     await vi.advanceTimersByTimeAsync(1);
     await f.supervisor.launch(input("a-next", "a-env"), TEST_WORKER_ENDPOINT);
     await a.complete("a-next", "idle");
     await vi.advanceTimersByTimeAsync(1);
-    const c = await f.launch(input("c", "c-env"));
-    await c.complete("c", "idle");
+    const c = await f.retained(input("c", "c-env"));
     await vi.advanceTimersByTimeAsync(0);
     expect(b.adapter.dispose).toHaveBeenCalledOnce();
     expect(a.adapter.kill).not.toHaveBeenCalled();
@@ -602,8 +598,7 @@ describe("node worker idle retention", () => {
     async (operation) => {
       await using f = fixture();
       const value = input("completed");
-      const owner = await f.launch(value);
-      await owner.complete(value.launchId, "idle");
+      const owner = await f.retained(value);
       const identity = testNodeWorkerEnvironmentIdentity(value);
       await f.supervisor.stopEnvironment({ ...identity, ownerEpoch: identity.ownerEpoch - 1 });
       expect(owner.adapter.kill).not.toHaveBeenCalled();
@@ -623,10 +618,8 @@ describe("node worker idle retention", () => {
     async (trigger) => {
       const capacity = trigger === "limit" ? 4 : 2;
       await using f = fixture(capacity, true);
-      const background = await f.launch(input("background", "background-env"));
-      await background.complete("background", "background");
-      const idle = await f.launch(input("idle", "idle-env"));
-      await idle.complete("idle", "idle");
+      const background = await f.retained(input("background", "background-env"), "background");
+      const idle = await f.retained(input("idle", "idle-env"));
       mocks.remove.mockRejectedValueOnce(new Error("Synthetic container removal failure"));
 
       if (trigger === "explicit") {
@@ -635,8 +628,7 @@ describe("node worker idle retention", () => {
         await vi.advanceTimersByTimeAsync(120_000);
       } else {
         for (const turnId of ["second-idle", "third-idle"]) {
-          const child = await f.launch(input(turnId, turnId));
-          await child.complete(turnId, "idle");
+          await f.retained(input(turnId, turnId));
         }
         await vi.advanceTimersByTimeAsync(0);
       }

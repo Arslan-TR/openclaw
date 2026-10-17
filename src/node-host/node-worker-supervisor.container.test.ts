@@ -51,6 +51,11 @@ function containerFixture(options: Parameters<typeof createNodeWorkerContainerFi
     ...fixture,
     store,
     input: (id: string, prompt?: string) => testWorkerLaunchInput(fixture.workspaceDir, id, prompt),
+    identity: (containerId: string) => ({
+      engine: "docker",
+      engineTarget: fixture.containerEngine.target,
+      containerId,
+    }),
     expectCapacity: (available: number) =>
       expect(capacitySnapshots.at(-1)).toEqual({ total: options.capacity, available }),
     hold(name: string) {
@@ -59,8 +64,10 @@ function containerFixture(options: Parameters<typeof createNodeWorkerContainerFi
       fs.writeFileSync(marker, "hold");
       return () => fs.rmSync(marker, { force: true });
     },
-    eventsFor(command: string) {
-      return fixture.events().filter((event) => event.argv[0] === command);
+    eventsFor(...commands: string[]) {
+      return fixture
+        .events()
+        .filter((event) => commands.some((command) => command === event.argv[0]));
     },
     async waitForCommand(command: string, count?: number) {
       await vi.waitFor(
@@ -194,11 +201,7 @@ describe("node worker supervisor container isolation", () => {
       const running = await fixture.supervisor.launch(input, endpoint);
       expect(running).toMatchObject({
         state: "running",
-        container: {
-          engine: "docker",
-          engineTarget: fixture.containerEngine.target,
-          containerId: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        },
+        container: fixture.identity(expect.stringMatching(/^[a-f0-9]{64}$/u)),
       });
       const completed = await waitForTerminal(fixture.supervisor, input.launchId);
       expect(completed).toMatchObject({ state: "completed" });
@@ -215,33 +218,36 @@ describe("node worker supervisor container isolation", () => {
       });
 
       const create = fixture.eventsFor("create")[0];
-      expect(create?.container?.labels).toEqual({
-        [hostLabel]: fixture.owner,
-        [gatewayLabel]: "gateway-1",
-        [launchLabel]: Buffer.from(input.launchId).toString("base64url"),
-      });
       const bundleDir = path.dirname(fixture.bundleEntry);
-      expect(create?.container?.mounts).toEqual([
-        `type=bind,source=${bundleDir},target=${bundleDir},readonly`,
-        `type=bind,source=${fixture.workspaceDir},target=${fixture.workspaceDir}`,
-      ]);
       expect(create?.argv).toEqual(
         expect.arrayContaining(["--interactive", "--workdir", fixture.workspaceDir]),
       );
-      expect(create?.container?.image).toBe("node:24-slim@sha256:" + "f".repeat(64));
-      expect(create?.container?.env).toMatchObject({
-        HOME: fixture.workspaceDir,
-        LANG: "en_US.UTF-8",
-        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        TMPDIR: "/tmp",
-        NODE_COMPILE_CACHE: "/tmp/openclaw-node-worker-compile-cache",
-        OPENCLAW_NO_RESPAWN: "1",
-      });
+      expect(create?.container).toEqual(
+        expect.objectContaining({
+          labels: {
+            [hostLabel]: fixture.owner,
+            [gatewayLabel]: "gateway-1",
+            [launchLabel]: Buffer.from(input.launchId).toString("base64url"),
+          },
+          mounts: [
+            `type=bind,source=${bundleDir},target=${bundleDir},readonly`,
+            `type=bind,source=${fixture.workspaceDir},target=${fixture.workspaceDir}`,
+          ],
+          image: "node:24-slim@sha256:" + "f".repeat(64),
+          env: expect.objectContaining({
+            HOME: fixture.workspaceDir,
+            LANG: "en_US.UTF-8",
+            PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            TMPDIR: "/tmp",
+            NODE_COMPILE_CACHE: "/tmp/openclaw-node-worker-compile-cache",
+            OPENCLAW_NO_RESPAWN: "1",
+          }),
+        }),
+      );
       expect(create?.container?.env).not.toHaveProperty("NODE_OPTIONS");
       expect(create?.container?.env).not.toHaveProperty("SUPPLIED_SECRET");
       expect(create?.container?.env).not.toHaveProperty("OPENCLAW_STATE_DIR");
-      const started = fixture.eventsFor("start")[0];
-      expect(started?.argv).toEqual([
+      expect(fixture.eventsFor("start")[0]?.argv).toEqual([
         "start",
         "--attach",
         "--interactive",
@@ -328,9 +334,7 @@ describe("node worker supervisor container isolation", () => {
         state: "failed",
         errorText: failed.errorText,
       });
-      expect(
-        fixture.events().filter((event) => event.argv[0] === "create" || event.argv[0] === "start"),
-      ).toEqual([]);
+      expect(fixture.eventsFor("create", "start")).toEqual([]);
     },
   );
 
@@ -407,9 +411,7 @@ describe("node worker supervisor container isolation", () => {
     expect(fixture.exists(orphan.id)).toBe(false);
     expect(fixture.exists(foreign.id)).toBe(true);
     expect(await fixture.supervisor.status(launchId)).toMatchObject({ state: "interrupted" });
-    const orphanKill = fixture
-      .events()
-      .find((event) => event.argv[0] === "kill" && event.argv[1] === orphan.id);
+    const orphanKill = fixture.eventsFor("kill").find((event) => event.argv[1] === orphan.id);
     expect(orphanKill?.journal?.state).toBe("pending");
     expect(fixture.events().some((event) => event.argv.includes(foreign.id))).toBe(false);
   });
@@ -455,21 +457,13 @@ describe("node worker supervisor container isolation", () => {
 
     expect(await fixture.supervisor.status(launchId)).toMatchObject({
       state: "interrupted",
-      container: {
-        engine: "docker",
-        engineTarget: fixture.containerEngine.target,
-        containerId: container.id,
-      },
+      container: fixture.identity(container.id),
     });
     expect(fixture.exists(container.id)).toBe(false);
-    expect(
-      fixture
-        .events()
-        .some((event) => event.argv[0] === "inspect" && event.argv.at(-1) === container.id),
-    ).toBe(true);
-    expect(fixture.events().find((event) => event.argv[0] === "rm")?.journal?.state).toBe(
-      "running",
+    expect(fixture.eventsFor("inspect").some((event) => event.argv.at(-1) === container.id)).toBe(
+      true,
     );
+    expect(fixture.eventsFor("rm")[0]?.journal?.state).toBe("running");
   });
 
   it.each([
@@ -572,12 +566,8 @@ describe("node worker supervisor container isolation", () => {
         () =>
           expect(
             fixture
-              .events()
-              .some(
-                (event) =>
-                  event.argv[0] === "rm" &&
-                  event.argv.at(-1) === siblingWorker.container!.containerId,
-              ),
+              .eventsFor("rm")
+              .some((event) => event.argv.at(-1) === siblingWorker.container!.containerId),
           ).toBe(true),
         { timeout: 5_000 },
       );
@@ -616,7 +606,7 @@ describe("node worker supervisor container isolation", () => {
       const create = fixture.eventsFor("create")[0];
       expect(create?.container?.id).toMatch(/^[a-f0-9]{64}$/u);
       expect(writes).toEqual([]);
-      expect(fixture.events().some((event) => event.argv[0] === "rm")).toBe(true);
+      expect(fixture.eventsFor("rm")).not.toHaveLength(0);
       expect(fixture.exists(create!.container!.id)).toBe(false);
     } finally {
       vi.restoreAllMocks();
