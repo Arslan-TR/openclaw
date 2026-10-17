@@ -496,7 +496,7 @@ describe("Gateway catalog worker pool", () => {
       const renewal = work.track(fixture.snapshots[0]!.loadFullModelCatalog!({ refresh: true }));
       await entered(renewal, signal);
       const queued = work.track(fixture.snapshots[1]!.loadFullModelCatalog!({ refresh: true }));
-      const closing = work.track(
+      const closing = work.track<unknown>(
         reason === "shutdown"
           ? closePreparedModelRuntimeSnapshots()
           : retirePluginCache(
