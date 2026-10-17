@@ -483,7 +483,9 @@ it.each(
   [
     { receipt: "native commit", publicationFails: true },
     { receipt: "failed commit delivery", publicationFails: false },
-  ].flatMap((test) => [false, true].map((captured) => ({ ...test, captured }))),
+  ].flatMap(({ receipt, publicationFails }) =>
+    [false, true].map((captured) => ({ receipt, publicationFails, captured })),
+  ),
 )(
   "installs $receipt before reply acknowledgement (publication failure: $publicationFails, captured: $captured)",
   ({ receipt, publicationFails, captured }) => {
