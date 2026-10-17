@@ -157,8 +157,14 @@ describe("hooks workspace", () => {
     const { hooksRoot } = makeHooksWorkspace();
     const hookDir = writePlainHook(hooksRoot, "unreadable-hook");
     const hookMdPath = path.join(hookDir, "HOOK.md");
-    const read = vi.spyOn(fs, "readSync").mockImplementationOnce(() => {
-      throw Object.assign(new Error("private metadata contents"), { code });
+    const metadataIdentity = fs.statSync(hookMdPath);
+    const readSync = fs.readSync;
+    const read = vi.spyOn(fs, "readSync").mockImplementation((...args) => {
+      const identity = fs.fstatSync(args[0]);
+      if (identity.dev === metadataIdentity.dev && identity.ino === metadataIdentity.ino) {
+        throw Object.assign(new Error("private metadata contents"), { code });
+      }
+      return readSync(...args);
     });
     try {
       expect(loadWorkspaceEntriesFromHooksRoot(hooksRoot)).toEqual([]);
