@@ -392,7 +392,7 @@ export function normalizeAssistantReplayContent(messages: AgentMessage[]): Agent
 }
 
 function normalizeAssistantUsageSnapshot(usage: unknown) {
-  const normalized = normalizeUsage((usage ?? undefined) as UsageLike | undefined);
+  const normalized = normalizeUsage(usage as UsageLike | undefined);
   if (!normalized) {
     return makeZeroUsageSnapshot();
   }

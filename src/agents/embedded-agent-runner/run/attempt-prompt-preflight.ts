@@ -193,9 +193,7 @@ export async function prepareEmbeddedAttemptPromptPreflight(input: {
       contextTokenBudget: input.contextTokenBudget,
       reserveTokens: input.reserveTokens,
       toolResultMaxChars: input.toolResultMaxChars,
-      ...(typeof input.toolSchemaTokens === "number"
-        ? { toolSchemaTokens: input.toolSchemaTokens }
-        : {}),
+      ...(input.toolSchemaTokens !== undefined ? { toolSchemaTokens: input.toolSchemaTokens } : {}),
       replay: {
         model: attempt.model,
         sessionId: attempt.sessionId,

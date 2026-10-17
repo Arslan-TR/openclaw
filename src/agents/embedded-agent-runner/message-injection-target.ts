@@ -165,7 +165,7 @@ export function captureDirectEmbeddedMessageInjectionTarget(
         const blocker = resolveActiveEmbeddedRunRecoveryBlocker(sessionId, handle);
         const activity = getDiagnosticSessionActivitySnapshot({ sessionId });
         if (
-          typeof activity.lastProgressAgeMs === "number" &&
+          activity.lastProgressAgeMs !== undefined &&
           activity.lastProgressAgeMs > resolveRunStaleThresholdMs(activity) &&
           !blocker
         ) {

@@ -182,11 +182,6 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
       leasedSteering = { leaseId, runIds: leased.runIds, isCurrent: leased.isCurrent };
       // Transfer cleanup ownership before any prompt mutation can throw.
       input.setLeasedSteering(leasedSteering);
-      if (!leased.isCurrent()) {
-        throw new Error(
-          "The queued child results lost authority before requester prompt injection.",
-        );
-      }
       leasedSteeringPrompt = leased.prompt;
     }
   }

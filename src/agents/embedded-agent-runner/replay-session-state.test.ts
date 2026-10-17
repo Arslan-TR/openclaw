@@ -6,6 +6,34 @@ import {
 import { SessionManager } from "../sessions/session-manager.js";
 import { createProviderReplaySessionState } from "./replay-session-state.js";
 
+describe("awaited provider replay session state", () => {
+  it("returns a receipt for its completed append", async () => {
+    const manager = SessionManager.inMemory();
+    const replay = createProviderReplaySessionState(manager);
+
+    const id = await replay.state.appendCustomEntryAsync("fixture", { retained: true });
+
+    expect(manager.getEntry(id)).toMatchObject({
+      id,
+      type: "custom",
+      customType: "fixture",
+      data: { retained: true },
+    });
+    replay.close();
+  });
+
+  it("rejects a closed adapter before writing", async () => {
+    const manager = SessionManager.inMemory();
+    const replay = createProviderReplaySessionState(manager);
+    replay.close();
+
+    await expect(replay.state.appendCustomEntryAsync("fixture", {})).rejects.toThrow(
+      "Provider replay session state is no longer active",
+    );
+    expect(manager.getEntries()).toEqual([]);
+  });
+});
+
 describe("legacy provider replay session state", () => {
   it.each([
     new IncognitoSessionSyncAccessError("appendCustomEntry", "appendCustomEntryAsync"),

@@ -80,10 +80,10 @@ export function buildContextEnginePromptCacheInfo(params: {
     // results; runtime-only diagnostic objects stay out of persisted metadata.
     promptCache.observation = {
       broke: params.observation.broke,
-      ...(typeof params.observation.previousCacheRead === "number"
+      ...(params.observation.previousCacheRead !== undefined
         ? { previousCacheRead: params.observation.previousCacheRead }
         : {}),
-      ...(typeof params.observation.cacheRead === "number"
+      ...(params.observation.cacheRead !== undefined
         ? { cacheRead: params.observation.cacheRead }
         : {}),
       ...(params.observation.changes && params.observation.changes.length > 0
@@ -96,7 +96,7 @@ export function buildContextEnginePromptCacheInfo(params: {
         : {}),
     };
   }
-  if (typeof params.lastCacheTouchAt === "number" && Number.isFinite(params.lastCacheTouchAt)) {
+  if (params.lastCacheTouchAt != null) {
     promptCache.lastCacheTouchAt = params.lastCacheTouchAt;
   }
   return Object.keys(promptCache).length > 0 ? promptCache : undefined;

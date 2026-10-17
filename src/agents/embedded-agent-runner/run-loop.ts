@@ -125,7 +125,7 @@ export async function runPreparedEmbeddedLoop(
   // Same-model retry diagnostics inform exhaustion, not model-routing authority.
   const resolveRuntimeFallbackReason = (): string | null =>
     traceAttempts.findLast(
-      (attempt) => attempt.result === "fallback_model" && typeof attempt.reason === "string",
+      (attempt) => attempt.result === "fallback_model" && attempt.reason !== undefined,
     )?.reason ??
     (params.modelRoutingProvenance?.stage === "fallback"
       ? (params.modelRoutingProvenance.fallbackReason ?? null)

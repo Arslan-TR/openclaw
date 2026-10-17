@@ -146,7 +146,7 @@ export function scopeAssistantMessageToStreamBlock(
   itemId: string | undefined,
 ): AssistantMessage {
   const index = resolveAssistantStreamBlockIndex(message, contentIndex, itemId);
-  if (index === undefined || !Array.isArray(message.content)) {
+  if (index === undefined) {
     return message;
   }
   const block = message.content[index];

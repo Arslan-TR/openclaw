@@ -56,7 +56,7 @@ export function sanitizeCompactionReplayState(
   if (!value || typeof value !== "object" || !helpers.isPlainTranscriptObject(value)) {
     return undefined;
   }
-  const replayType = typeof value.type === "string" ? value.type : "";
+  const replayType = value.type;
   const openAISuppression = replayType === "openai-responses-compaction-suppression";
   const anthropicSuppression = replayType === "anthropic-compaction-suppression";
   const isOpenAI =

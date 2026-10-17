@@ -77,7 +77,7 @@ export function dedupeDuplicateUserMessagesForCompaction<T extends MessageLike>(
     const newestTimestamp = Math.max(lastSeenAt ?? signature.timestamp, signature.timestamp);
     lastSeenAtByKey.set(signature.key, newestTimestamp);
     if (
-      typeof lastSeenAt === "number" &&
+      lastSeenAt !== undefined &&
       signature.timestamp >= lastSeenAt &&
       signature.timestamp - lastSeenAt <= DUPLICATE_USER_MESSAGE_WINDOW_MS
     ) {

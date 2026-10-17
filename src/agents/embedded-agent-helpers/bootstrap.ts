@@ -138,7 +138,7 @@ function resolveBootstrapCharLimit(
     cfg && agentId
       ? (resolveAgentConfig(cfg, agentId)?.[key] ?? cfg.agents?.defaults?.[key])
       : cfg?.agents?.defaults?.[key];
-  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+  if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
     return Math.floor(raw);
   }
   return fallback;

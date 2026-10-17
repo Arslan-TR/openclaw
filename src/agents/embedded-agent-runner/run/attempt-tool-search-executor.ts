@@ -99,9 +99,6 @@ export function createSubscribedToolSearchExecutor(params: {
                 const target = manager.getSessionTarget();
                 const sessionId = manager.getSessionId();
                 const entryId = await manager.appendMessageAsync(message);
-                if (!params.isCurrent()) {
-                  return;
-                }
                 const activity = params.nestedToolActivityState;
                 if (!terminal.isError) {
                   activity.successfulToolNames.add(toolParams.toolName);

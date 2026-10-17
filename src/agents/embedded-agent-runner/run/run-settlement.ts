@@ -52,39 +52,43 @@ export async function settleEmbeddedRun(input: {
   };
   // Native runtimes can return usage without ordered context events. Carry their
   // claimed writer without inventing a context observation that would override it.
-  const fact: CompactionAccountingFact | undefined =
+  let fact: CompactionAccountingFact | undefined;
+  if (
     compaction.durable &&
     (committed || originalWriter) &&
     target.agentId &&
     target.sessionId &&
     target.sessionKey &&
     target.storePath
-      ? {
-          kind: "durable",
-          ...counts,
-          ...(committed?.previousSessionId !== undefined
-            ? { previousSessionId: committed.previousSessionId }
-            : {}),
-          ...(committed ? { hostCompactionCommitted: true } : {}),
-          ...(compaction.session.committedCompactionTransitions.length
-            ? { admissionTransitions: compaction.session.committedCompactionTransitions }
-            : {}),
-          target: {
-            agentId: target.agentId,
-            sessionId: committed?.entry.sessionId ?? target.sessionId,
-            sessionKey: target.sessionKey,
-            storePath: target.storePath,
-            lifecycleRevision: committed
-              ? committed.entry.lifecycleRevision
-              : originalWriter?.expectedLifecycleRevision,
-            activeWriterRunId: committed
-              ? committed.entry.activeWriterRunId
-              : originalWriter?.expectedWriterRunId,
-          },
-        }
-      : counts.count > 0 || counts.currentContextSnapshot
+  ) {
+    const admissionTransitions = compaction.session.committedCompactionTransitions;
+    fact = {
+      kind: "durable",
+      ...counts,
+      ...(committed?.previousSessionId !== undefined
+        ? { previousSessionId: committed.previousSessionId }
+        : {}),
+      ...(committed ? { hostCompactionCommitted: true } : {}),
+      ...(admissionTransitions.length ? { admissionTransitions } : {}),
+      target: {
+        agentId: target.agentId,
+        sessionId: committed?.entry.sessionId ?? target.sessionId,
+        sessionKey: target.sessionKey,
+        storePath: target.storePath,
+        lifecycleRevision: committed
+          ? committed.entry.lifecycleRevision
+          : originalWriter?.expectedLifecycleRevision,
+        activeWriterRunId: committed
+          ? committed.entry.activeWriterRunId
+          : originalWriter?.expectedWriterRunId,
+      },
+    };
+  } else {
+    fact =
+      counts.count > 0 || counts.currentContextSnapshot
         ? { kind: "presentation-only", ...counts }
         : undefined;
+  }
   if (params.onCompactionAccounting) {
     params.onCompactionAccounting(fact);
   } else if (fact?.kind === "durable" && fact.count > 0) {

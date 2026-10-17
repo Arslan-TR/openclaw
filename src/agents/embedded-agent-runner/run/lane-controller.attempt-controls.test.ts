@@ -225,7 +225,6 @@ describe("runtime-owned lane deadline handoff", () => {
 describe("attempt control authority", () => {
   test.each([
     ["closed", true],
-    ["superseded", true],
     ["revoked", false],
     ["replaced admission", false],
     ["rotated lifecycle", true],
@@ -246,9 +245,6 @@ describe("attempt control authority", () => {
     switch (invalidation) {
       case "closed":
         controls.close();
-        createAttemptControls({ initialTimeoutMs: RUNTIME_TIMEOUT_MS });
-        break;
-      case "superseded":
         createAttemptControls({ initialTimeoutMs: RUNTIME_TIMEOUT_MS });
         break;
       case "revoked":
@@ -276,7 +272,7 @@ describe("attempt control authority", () => {
     expect(getCommandLaneSnapshot(GLOBAL_LANE).activeCount).toBe(1);
 
     controls.onAttemptDeadlineChanged({ kind: "unlimited" });
-    if (invalidation === "closed" || invalidation === "superseded") {
+    if (invalidation === "closed") {
       // A late finalizer must not clear or refresh the successor's deadline.
       controls.close();
     }

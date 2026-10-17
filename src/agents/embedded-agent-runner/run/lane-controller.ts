@@ -123,7 +123,6 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
     laneTaskProgressAtMs = Date.now();
   };
   let assertPlacementCurrent: (() => void) | undefined;
-  let activeAttemptOwner: object | undefined;
   const createAttemptControls = (input: {
     admittedRunContext: NonNullable<RunEmbeddedAgentParams["admittedRunContext"]>;
     abortSignal?: AbortSignal;
@@ -132,8 +131,6 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
   }) => {
     // Awaited preflight may finish after recovery has released this lane's claim.
     assertPlacementCurrent?.();
-    const owner = {};
-    activeAttemptOwner = owner;
     const lifecycleGeneration = options.getLifecycleGeneration();
     const authority = getAdmittedRunDelegatedAuthority(input.admittedRunContext);
     const signal = input.abortSignal
@@ -144,7 +141,6 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
     let timeoutReleaseTimer: ReturnType<typeof setTimeout> | undefined;
     const isCurrent = () =>
       state === "active" &&
-      activeAttemptOwner === owner &&
       !signal.aborted &&
       isAgentEventLifecycleGenerationCurrent(lifecycleGeneration) &&
       authority !== undefined &&
@@ -194,12 +190,9 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
         // never change the next attempt's deadline or cancellation state.
         state = "closed";
         clearTimeout(timeoutReleaseTimer);
-        if (activeAttemptOwner === owner) {
-          activeAttemptOwner = undefined;
-          noteLaneTaskProgress();
-          if (deadlineOwned) {
-            setLaneTaskDeadline(undefined);
-          }
+        noteLaneTaskProgress();
+        if (deadlineOwned) {
+          setLaneTaskDeadline(undefined);
         }
       },
     };

@@ -349,14 +349,7 @@ export function resolveActiveEmbeddedRunRecoveryBlocker(
     return undefined;
   }
   for (const isPending of registration.humanInputWaits ?? []) {
-    // Question validation can synchronously close authority or replace the run.
     const pending = isPending() && !handle.isAborted?.();
-    if (
-      ACTIVE_EMBEDDED_RUNS.get(sessionId) !== handle ||
-      !registration.humanInputWaits?.has(isPending)
-    ) {
-      return "stale_session_state";
-    }
     if (pending && validateAgentRunDelegatedAuthority(authority)) {
       return "human_input_wait";
     }
@@ -367,13 +360,6 @@ export function resolveActiveEmbeddedRunRecoveryBlocker(
       handle.ownsLiveness?.() === true && !handle.isAborted?.() && !handle.isStopped?.();
   } catch {
     // A failed runtime probe cannot exempt work from recovery.
-  }
-  // Runtime probes may synchronously replace a handle or close its admission.
-  if (
-    ACTIVE_EMBEDDED_RUNS.get(sessionId) !== handle ||
-    ACTIVE_EMBEDDED_RUN_REGISTRATIONS.get(handle) !== registration
-  ) {
-    return "stale_session_state";
   }
   return ownsLiveness &&
     ACTIVE_EMBEDDED_RUNS_BY_RUN_ID.get(authority.operationalRunInstance.runId) === handle &&

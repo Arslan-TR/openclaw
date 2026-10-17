@@ -15,8 +15,8 @@ export type ContextWindowInfo = {
   source: ContextWindowSource;
 };
 
-function normalizePositiveInt(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
+function normalizePositiveInt(value: number | undefined): number | null {
+  if (value === undefined || !Number.isFinite(value)) {
     return null;
   }
   const int = Math.floor(value);
@@ -76,8 +76,7 @@ type ContextWindowGuardResult = ContextWindowInfo & {
 };
 
 /** Derive warning/block floors from the resolved model context window. */
-function resolveContextWindowGuardThresholds(contextWindowTokens: number) {
-  const tokens = normalizePositiveInt(contextWindowTokens) ?? 0;
+function resolveContextWindowGuardThresholds(tokens: number) {
   return {
     hardMinTokens: Math.max(
       CONTEXT_WINDOW_HARD_MIN_TOKENS,
