@@ -23,21 +23,13 @@ function ownerFor(host: Host) {
   for (const key of ["hostedTabs", "activeHostedTabId"] as const) {
     Object.defineProperty(host, key, { configurable: true, get: () => owner[key] });
   }
-  let prototype = Object.getPrototypeOf(host);
-  let bridgeCompletion: PropertyDescriptor["get"];
-  while (prototype && !bridgeCompletion) {
-    bridgeCompletion = Object.getOwnPropertyDescriptor(prototype, "updateComplete")?.get?.bind(
-      host,
-    );
-    prototype = Object.getPrototypeOf(prototype);
-  }
-  if (!bridgeCompletion) {
-    throw new Error("Browser panel requires the bridge commit fence");
-  }
-  const readBridgeCompletion = bridgeCompletion;
+  const bridgePrototype = Object.getPrototypeOf(host);
   Object.defineProperty(host, "updateComplete", {
     configurable: true,
-    get: () => Promise.resolve(readBridgeCompletion()).then(() => owner.updateComplete),
+    get: () =>
+      Promise.resolve(Reflect.get(bridgePrototype, "updateComplete", host)).then(
+        () => owner.updateComplete,
+      ),
   });
   return owner;
 }
