@@ -7,6 +7,12 @@ import type { SessionActorHotState } from "./session-actor-contract.js";
 import { createSessionActorCommittedOutcome } from "./session-actor-receipt.js";
 import { withActor, type Mutation } from "./session-actor-worker.test-support.js";
 
+// mock-isolation: Count real receipt encodings separately from residency/transport work.
+vi.mock("node:v8", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:v8")>();
+  return { ...actual, serialize: vi.fn(actual.serialize) };
+});
+
 // mock-isolation: The fixture owns its database lifetime without background maintenance.
 vi.mock("./session-accessor.sqlite-maintenance-kick.js", () => ({
   kickSessionEntryMaintenanceAfterWrite() {},
@@ -161,7 +167,15 @@ it("keeps append receipts independent of retained transcript length", async () =
         },
       };
       await f.prepare(command);
+      vi.mocked(serialize).mockClear();
       const outcome = f.mutate(command);
+      const fullReceiptEncodings = vi
+        .mocked(serialize)
+        .mock.calls.filter(
+          ([value]) =>
+            value?.kind === "committed" && value.receipt?.kind === "session-actor-committed",
+        );
+      expect(fullReceiptEncodings).toHaveLength(1);
       if (outcome.kind !== "committed") {
         throw new Error("Expected append commit");
       }
