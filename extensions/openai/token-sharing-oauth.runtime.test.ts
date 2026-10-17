@@ -63,12 +63,9 @@ let jwks: { keys: Awaited<ReturnType<typeof exportJWK>>[] };
 let authorization: URL;
 let callbackResponse: Promise<Response> | undefined;
 let grantScope: string;
-let idTokenAudience: string;
 let callbackError: string | undefined;
-let identityNonce: string | undefined;
 let callbackClientIds: string[];
-let identitySubject: string;
-let identityEmail: string | undefined;
+let identity: { aud: string; sub: string; nonce?: string; email?: string };
 
 beforeAll(async () => {
   keys = await generateKeyPair("RS256");
@@ -77,13 +74,11 @@ beforeAll(async () => {
 
 async function identityToken() {
   return new SignJWT({
-    nonce: identityNonce ?? authorization.searchParams.get("nonce"),
-    email: identityEmail,
+    ...identity,
+    nonce: identity.nonce ?? authorization.searchParams.get("nonce"),
   })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(TOKEN_SHARING_ISSUER)
-    .setAudience(idTokenAudience)
-    .setSubject(identitySubject)
     .setIssuedAt()
     .setExpirationTime("1h")
     .sign(keys.privateKey);
@@ -147,23 +142,25 @@ async function loginCredential() {
   return oauthCredential(await loginTokenSharing(context()));
 }
 
-async function expectRejected(ctx: ProviderAuthContext, message?: string, status?: number) {
+async function expectRejected(ctx: ProviderAuthContext, message?: string) {
   await expect(loginTokenSharing(ctx)).rejects.toThrow(message);
-  if (status !== undefined) {
-    expect(await callbackStatus()).toBe(status);
-  }
+  expect(await callbackStatus()).toBe(400);
+}
+
+function cancellableContext() {
+  const controller = new AbortController();
+  const ctx = context();
+  ctx.signal = AbortSignal.any([ctx.signal!, controller.signal]);
+  return { controller, ctx };
 }
 
 beforeEach(() => {
   request.mockReset();
   grantScope = TOKEN_SHARING_SCOPE;
-  idTokenAudience = clientId;
-  identityNonce = undefined;
+  identity = { aud: clientId, sub: "user-1" };
   callbackError = undefined;
   callbackResponse = undefined;
   callbackClientIds = [];
-  identitySubject = "user-1";
-  identityEmail = undefined;
   request.mockImplementation(async (params) => {
     params.beforeRequest?.();
     const body = params.url.endsWith("jwks.json")
@@ -242,10 +239,8 @@ describe("ChatGPT token-sharing authorization", () => {
   });
 
   it("restarts a cancelled login without accepting its stale callback", async () => {
-    const controller = new AbortController();
+    const { controller, ctx } = cancellableContext();
     const opened = createDeferred<URL>();
-    const ctx = context();
-    ctx.signal = AbortSignal.any([ctx.signal!, controller.signal]);
     ctx.openUrl = async (url) => {
       opened.resolve(new URL(url));
     };
@@ -300,9 +295,7 @@ describe("ChatGPT token-sharing authorization", () => {
         },
       };
     });
-    const controller = new AbortController();
-    const ctx = context();
-    ctx.signal = AbortSignal.any([ctx.signal!, controller.signal]);
+    const { controller, ctx } = cancellableContext();
     const login = loginTokenSharing(ctx);
     const settled = vi.fn();
     void login.then(settled, settled);
@@ -331,7 +324,7 @@ describe("ChatGPT token-sharing authorization", () => {
       const ctx = context({ existingProfiles: [] });
       const registeredId = "oaiapp_testregistered";
       callbackClientIds = [registeredId];
-      idTokenAudience = registeredId;
+      identity.aud = registeredId;
       grantScope = "openid resource.invoke chatgpt.tokens.use.direct offline_access";
       const registered = await method.run(ctx);
       expect(Object.fromEntries(authorization.searchParams)).toMatchObject({
@@ -356,18 +349,18 @@ describe("ChatGPT token-sharing authorization", () => {
       expect(request.mock.calls[0]![0].init.body.get("client_id")).toBe(registeredId);
       expect(refreshed.clientId).toBe(registeredId);
 
-      const reconnect = context();
-      // Named CLI profiles must keep their identity when reconnecting, too.
-      reconnect.existingProfiles = [
-        reconnectProfile(
-          {
-            ...credential,
-            authorizationScope:
-              "openid email profile resource.invoke chatpass.enable.request.direct offline_access",
-          },
-          state,
-        ),
-      ];
+      const reconnect = context({
+        existingProfiles: [
+          reconnectProfile(
+            {
+              ...credential,
+              authorizationScope:
+                "openid email profile resource.invoke chatpass.enable.request.direct offline_access",
+            },
+            state,
+          ),
+        ],
+      });
       callbackClientIds = [];
       const reconnected = await method.run(reconnect);
       expect(Object.fromEntries(authorization.searchParams)).toMatchObject({
@@ -383,18 +376,16 @@ describe("ChatGPT token-sharing authorization", () => {
   );
 
   it.each([
-    { ids: [] },
-    { ids: ["dynamic_agent_client"] },
-    { ids: ["oaiapp_first", "oaiapp_second"] },
-  ])("rejects registration callback client IDs $ids before exchange", async ({ ids }) => {
-    callbackClientIds = ids;
-    await expectRejected(context({ existingProfiles: [] }), "invalid OAuth client ID", 400);
-    expect(request).not.toHaveBeenCalled();
-  });
-
-  it("rejects replacement of an existing client ID in an ordinary login callback", async () => {
-    callbackClientIds = ["oaiapp_substituted"];
-    await expectRejected(context(), "invalid OAuth client ID");
+    ["missing registration ID", true, []],
+    ["entry-marker registration ID", true, ["dynamic_agent_client"]],
+    ["multiple registration IDs", true, ["oaiapp_first", "oaiapp_second"]],
+    ["replacement of an existing ID", false, ["oaiapp_substituted"]],
+  ] as const)("rejects %s before exchange", async (_name, registering, ids) => {
+    callbackClientIds = [...ids];
+    await expectRejected(
+      context(registering ? { existingProfiles: [] } : {}),
+      "invalid OAuth client ID",
+    );
     expect(request).not.toHaveBeenCalled();
   });
 
@@ -404,19 +395,24 @@ describe("ChatGPT token-sharing authorization", () => {
       const credential = await loginCredential();
       await (await callbackResponse!).text();
       const ctx = context({ existingProfiles: [reconnectProfile(credential, state)] });
-      identitySubject = state === "unbound" ? "user-1" : "another-user";
-      await expectRejected(ctx, "ChatGPT account changed", 400);
+      identity.sub = state === "unbound" ? "user-1" : "another-user";
+      await expectRejected(ctx, "ChatGPT account changed");
     },
   );
 
-  it("rejects a registration ID with an ID token addressed to the entry marker", async () => {
-    callbackClientIds = ["oaiapp_testregistered"];
-    idTokenAudience = TOKEN_SHARING_CLIENT_ID;
-    await expectRejected(context({ existingProfiles: [] }), undefined, 400);
+  it.each(["wrong nonce", "entry-marker audience"])("rejects ID token with %s", async (failure) => {
+    const registering = failure === "entry-marker audience";
+    if (registering) {
+      callbackClientIds = ["oaiapp_testregistered"];
+      identity.aud = TOKEN_SHARING_CLIENT_ID;
+    } else {
+      identity.nonce = "another-login";
+    }
+    await expectRejected(context(registering ? { existingProfiles: [] } : {}));
   });
 
   it("uses public PKCE/resource parameters, verifies identity, and returns a distinct renewable profile", async () => {
-    identityEmail = "owner@example.test";
+    identity.email = "owner@example.test";
     const result = await loginTokenSharing(context());
     const form = exchangeForm();
     expect(authorization.origin + authorization.pathname).toBe(
@@ -449,7 +445,7 @@ describe("ChatGPT token-sharing authorization", () => {
       grantedScope: grantScope,
       authorizationScope: TOKEN_SHARING_LEGACY_SCOPE,
     });
-    expect(result.profiles[0]?.credential).toHaveProperty("accountId", accountId(identitySubject));
+    expect(result.profiles[0]?.credential).toHaveProperty("accountId", accountId(identity.sub));
     expect(await (await callbackResponse!).text()).toContain("token sharing is connected");
     expect(result.notes?.[0]).toContain("Eligible Responses requests use your Codex allowance.");
   });
@@ -474,18 +470,13 @@ describe("ChatGPT token-sharing authorization", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("rejects an ID token with the wrong nonce", async () => {
-    identityNonce = "another-login";
-    await expectRejected(context(), undefined, 400);
-  });
-
   it.each([
     { replacement: undefined, scope: undefined },
     { replacement: "rotated-refresh", scope: "openid offline_access" },
   ])(
     "refreshes with the original client/resource, refresh token $replacement, and granted scope $scope",
     async ({ replacement, scope }) => {
-      identityEmail = "owner@example.test";
+      identity.email = "owner@example.test";
       const credential = await loginCredential();
       request.mockClear();
       request.mockResolvedValue(
@@ -521,9 +512,9 @@ describe("ChatGPT token-sharing authorization", () => {
   it.each(["updated@example.test", undefined])(
     "uses the renewed ID token's email %s without changing the account binding",
     async (email) => {
-      identityEmail = "owner@example.test";
+      identity.email = "owner@example.test";
       const credential = await loginCredential();
-      identityEmail = email;
+      identity.email = email;
       const refreshed = await refreshTokenSharingCredential(credential);
       expect(refreshed.email).toBe(email);
       expect(refreshed.accountId).toBe(credential.accountId);
@@ -531,15 +522,12 @@ describe("ChatGPT token-sharing authorization", () => {
   );
 
   it.each([
-    { metadata: { accountId: undefined }, expectedError: "Sign in again" },
-    {
-      metadata: { tokenEndpoint: "https://example.com/token" },
-      expectedError: "registration is missing",
-    },
-    { metadata: { clientId: "dynamic_agent_client" }, expectedError: "registration is missing" },
-  ])(
-    "rejects invalid refresh registration metadata $metadata before sending credentials",
-    async ({ metadata, expectedError }) => {
+    [{ accountId: undefined }, "Sign in again"],
+    [{ tokenEndpoint: "https://example.com/token" }, "registration is missing"],
+    [{ clientId: "dynamic_agent_client" }, "registration is missing"],
+  ] as const)(
+    "rejects invalid refresh registration metadata %j before sending credentials",
+    async (metadata, expectedError) => {
       const credential = await loginCredential();
       request.mockClear();
       await expect(refreshTokenSharingCredential({ ...credential, ...metadata })).rejects.toThrow(

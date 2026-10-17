@@ -1,22 +1,15 @@
-// Openai tests cover speech provider plugin behavior.
 import "openclaw/plugin-sdk/compiled-subprocess-testing";
 import type { SpeechSynthesisRequest } from "openclaw/plugin-sdk/speech-core";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { withServer } from "openclaw/plugin-sdk/test-env";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildOpenAISpeechProvider } from "./speech-provider.js";
 
 const OPENAI_TTS_SNAPSHOT = "gpt-4o-mini-tts-2025-12-15";
 
 vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
-  fetchWithSsrFGuard: async ({
-    url,
-    init,
-  }: {
-    url: string;
-    init?: RequestInit;
-  }): Promise<{ response: Response; release: () => Promise<void> }> => ({
-    response: await globalThis.fetch(url, init),
+  fetchWithSsrFGuard: async (params: { url: string; init?: RequestInit }) => ({
+    response: await globalThis.fetch(params.url, params.init),
     release: vi.fn(async () => {}),
   }),
   ssrfPolicyFromHttpBaseUrlAllowedHostname: () => undefined,
@@ -33,13 +26,15 @@ function parseRequestBody(init: RequestInit | undefined): Record<string, unknown
   return body;
 }
 
-function mockSpeechFetchExpectingFormat(responseFormat: string) {
+function mockSpeechFetch(
+  expectedBody: Record<string, unknown> = {},
+  audio = new Uint8Array([1, 2, 3]),
+) {
   const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-    const body = parseRequestBody(init);
-    expect(body.response_format).toBe(responseFormat);
-    return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+    expect(parseRequestBody(init)).toMatchObject(expectedBody);
+    return new Response(audio, { status: 200 });
   });
-  globalThis.fetch = fetchMock as unknown as typeof fetch;
+  vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
 
@@ -73,10 +68,13 @@ function speechRequest(overrides: Partial<SpeechSynthesisRequest> = {}): SpeechS
 }
 
 describe("buildOpenAISpeechProvider", () => {
-  const originalFetch = globalThis.fetch;
+  let provider: ReturnType<typeof buildOpenAISpeechProvider>;
+  beforeEach(() => {
+    provider = buildOpenAISpeechProvider();
+  });
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    vi.unstubAllGlobals();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
@@ -126,7 +124,6 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("drops malformed speech speed values", () => {
-    const provider = buildOpenAISpeechProvider();
     const resolved = provider.resolveConfig?.({
       cfg: {} as never,
       timeoutMs: 30_000,
@@ -155,8 +152,6 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("uses talk base url overrides when validating speech speed", () => {
-    const provider = buildOpenAISpeechProvider();
-
     const resolvedConfig = provider.resolveTalkConfig?.({
       cfg: {} as never,
       timeoutMs: 30_000,
@@ -185,7 +180,6 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("sends dated speech snapshots through a real loopback HTTP request", async () => {
-    const provider = buildOpenAISpeechProvider();
     let receivedRequest:
       | {
           method: string | undefined;
@@ -304,9 +298,7 @@ describe("buildOpenAISpeechProvider", () => {
 
   it("treats a blank environment API key as missing across speech entry points", async () => {
     vi.stubEnv("OPENAI_API_KEY", "   ");
-    const provider = buildOpenAISpeechProvider();
-    const fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const fetchMock = mockSpeechFetch();
     const providerConfig = {
       model: "gpt-4o-mini-tts",
       voice: "alloy",
@@ -324,12 +316,14 @@ describe("buildOpenAISpeechProvider", () => {
 
   it("trims a valid environment API key for normal and telephony synthesis", async () => {
     vi.stubEnv("OPENAI_API_KEY", "  sk-env  ");
-    const provider = buildOpenAISpeechProvider();
     const authorizationHeaders: Array<string | null> = [];
-    globalThis.fetch = vi.fn(async (_url: string, init?: RequestInit) => {
-      authorizationHeaders.push(new Headers(init?.headers).get("authorization"));
-      return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
-    }) as unknown as typeof fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        authorizationHeaders.push(new Headers(init?.headers).get("authorization"));
+        return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      }),
+    );
     const providerConfig = {
       model: "gpt-4o-mini-tts",
       voice: "alloy",
@@ -343,8 +337,6 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("preserves talk responseFormat overrides", () => {
-    const provider = buildOpenAISpeechProvider();
-
     const resolvedConfig = provider.resolveTalkConfig?.({
       cfg: {} as never,
       timeoutMs: 30_000,
@@ -358,8 +350,6 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("maps Talk speak params onto OpenAI speech overrides", () => {
-    const provider = buildOpenAISpeechProvider();
-
     expect(
       provider.resolveTalkOverrides?.({
         talkProviderConfig: {},
@@ -378,8 +368,7 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("uses wav for Groq-compatible OpenAI TTS endpoints", async () => {
-    const provider = buildOpenAISpeechProvider();
-    mockSpeechFetchExpectingFormat("wav");
+    mockSpeechFetch({ response_format: "wav" });
 
     const result = await provider.synthesize(
       speechRequest({
@@ -400,10 +389,7 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("applies the configured media byte cap to synthesized audio", async () => {
-    const provider = buildOpenAISpeechProvider();
-    globalThis.fetch = vi.fn(
-      async () => new Response(new Uint8Array(2048), { status: 200 }),
-    ) as unknown as typeof fetch;
+    mockSpeechFetch({}, new Uint8Array(2048));
 
     await expect(
       provider.synthesize(speechRequest({ cfg: { agents: { defaults: { mediaMaxMb: 0.001 } } } })),
@@ -411,18 +397,12 @@ describe("buildOpenAISpeechProvider", () => {
   });
 
   it("applies provider overrides to telephony synthesis", async () => {
-    const provider = buildOpenAISpeechProvider();
-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-      const body = parseRequestBody(init);
-      expect(body).toMatchObject({
-        model: "tts-1",
-        voice: "nova",
-        speed: 1.25,
-        response_format: "pcm",
-      });
-      return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+    const fetchMock = mockSpeechFetch({
+      model: "tts-1",
+      voice: "nova",
+      speed: 1.25,
+      response_format: "pcm",
     });
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const result = await provider.synthesizeTelephony?.(
       speechRequest({
@@ -446,8 +426,7 @@ describe("buildOpenAISpeechProvider", () => {
   ])(
     "marks configured $responseFormat voice-note compatibility as $voiceCompatible",
     async ({ responseFormat, voiceCompatible }) => {
-      const provider = buildOpenAISpeechProvider();
-      mockSpeechFetchExpectingFormat(responseFormat);
+      mockSpeechFetch({ response_format: responseFormat });
 
       const result = await provider.synthesize(
         speechRequest({
@@ -470,18 +449,12 @@ describe("buildOpenAISpeechProvider", () => {
   );
 
   it("passes extra_body config through to OpenAI-compatible speech requests", async () => {
-    const provider = buildOpenAISpeechProvider();
-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-      const body = parseRequestBody(init);
-      expect(body).toMatchObject({
-        model: "custom-tts",
-        voice: "custom-voice",
-        lang: "en-US",
-        response_format: "mp3",
-      });
-      return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+    const fetchMock = mockSpeechFetch({
+      model: "custom-tts",
+      voice: "custom-voice",
+      lang: "en-US",
+      response_format: "mp3",
     });
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const result = await provider.synthesize(
       speechRequest({
