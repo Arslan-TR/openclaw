@@ -402,8 +402,10 @@ suite.define(() => {
 
       await modelSelect.waitFor({ state: "visible", timeout: 10_000 });
       const defaultOption = activePane.locator('[data-chat-model-default="true"]');
+      await modelSelect.click();
       await expect.poll(() => defaultOption.getAttribute("aria-selected")).toBe("true");
       expect(await defaultOption.getAttribute("data-chat-model-option")).toBe("openai/gpt-5.5");
+      await modelSelect.click();
 
       await selectModel("bedrock/claude-opus-4.5");
       const patchRequest = await gateway.waitForRequest("sessions.patch");
@@ -428,7 +430,9 @@ suite.define(() => {
         .poll(() => activePane.evaluate((pane) => (pane as ChatPaneElement).sessionKey))
         .toBe("agent:main:session-b");
       await modelSelect.waitFor({ state: "visible", timeout: 10_000 });
+      await modelSelect.click();
       await expect.poll(() => defaultOption.getAttribute("aria-selected")).toBe("true");
+      await modelSelect.click();
 
       await page
         .locator(
