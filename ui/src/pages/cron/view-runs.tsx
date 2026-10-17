@@ -146,7 +146,10 @@ function FilterDropdown<T extends string>(props: {
         id={`cron-runs-filter-${props.id}`}
         label={`${props.title} ${accessibleSummary()}`}
         class="cron-filter-dropdown__details"
-        triggerClass={`btn btn--sm cron-filter-dropdown__trigger${props.selected.length > 0 ? " active" : ""}`}
+        triggerClass={[
+          "btn btn--sm cron-filter-dropdown__trigger",
+          { active: props.selected.length > 0 },
+        ]}
         triggerAttributes={{ title: props.title }}
         trigger={
           <>
@@ -440,6 +443,7 @@ function Run(props: {
       : null,
   );
   let row!: HTMLDivElement;
+  // Register the highlighted DOM row with the cron owner until this selection changes.
   createEffect(highlighted, (selected) =>
     selected ? props.onHighlightedRun?.(row, selected) : undefined,
   );

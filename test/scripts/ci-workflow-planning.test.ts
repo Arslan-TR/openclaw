@@ -102,6 +102,9 @@ describe("PostgreSQL conformance selection", () => {
     [["extensions/workboard/README.md", "extensions/workboard/src/store.ts"], true],
     [["extensions/workboard/test/fixtures/README.md", "src/utils/absolute-deadline.test.ts"], true],
     [["src/infra/database-engine/open.ts"], true],
+    [["src/commands/doctor-database-port-migrations.ts"], true],
+    [["src/infra/database-engine/matrix-roots.postgres.test.ts"], true],
+    [["src/transcripts/meeting-chronology.postgres.test.ts"], true],
     [["src/infra/postgres-sync/locks.test.ts"], true],
     [["src/infra/sql-connection.ts"], true],
     [["src/infra/sql-query-compiler.ts"], true],
@@ -1382,7 +1385,7 @@ describe("ci workflow guards", () => {
         lintCoreStripes: [1, 2],
         lintExtensionStripes: [],
         lintCentralScripts: true,
-        graphs: ["core-test-agents-root", "test-root"],
+        graphs: ["core-test-agents-root", "test-root-tooling"],
       },
       {
         path: "ui/src/styles/chat.css",
@@ -1423,7 +1426,7 @@ describe("ci workflow guards", () => {
         lintCoreStripes: [],
         lintExtensionStripes: [3],
         lintCentralScripts: false,
-        graphs: ["extensions", "extensions-test", "test-root"],
+        graphs: ["extensions", "extensions-test", "test-root-tooling"],
       },
       {
         path: "src/wizard/i18n/locales/en.ts",
@@ -1728,7 +1731,7 @@ describe("ci workflow guards", () => {
           runnerProfile: "hybrid",
           changedPaths: paths,
           ciTypeGraphNames: paths[0]?.startsWith("extensions/")
-            ? ["extensions", "extensions-test", "test-root"]
+            ? ["extensions", "extensions-test", "test-root-tooling"]
             : undefined,
           changedPlannerSource: changedPlannerSource(),
         });
@@ -2049,7 +2052,7 @@ describe("ci workflow guards", () => {
           "core-test-gateway-root",
           "extensions-test",
           "scripts",
-          "test-root",
+          "test-root-tooling",
         ];
         const paths = ["src/shared/runtime.ts"];
         const manifest = runCiManifestFixture({
@@ -2095,8 +2098,8 @@ describe("ci workflow guards", () => {
         expect(JSON.parse(production.type_graph_names_json)).toEqual(["core", "ui", "extensions"]);
         expect(JSON.parse(central.type_graph_names_json)).toEqual(
           profile === "blacksmith" && !centralCorePaths
-            ? ["extensions-test", "test-root", "scripts"]
-            : ["extensions-test", "scripts", "test-root"],
+            ? ["extensions-test", "test-root-tooling", "scripts"]
+            : ["extensions-test", "scripts", "test-root-tooling"],
         );
         const hosted = profile === "hybrid";
         const coreNames = ["core-test-agents-root", "core-test-gateway-root"];
@@ -8337,19 +8340,23 @@ describe("ci workflow guards", () => {
     expect(ratchetRun.run).not.toContain("ci-ratchet-target^");
     expect(ratchetRun.run).not.toContain("resolve_manual_merge_base");
     expect(ratchetRun.run).not.toContain("+${merge_base}:refs/remotes/origin/ci-ratchet-base");
-    expect(ratchetRun.run).toContain('pnpm check:max-lines-ratchet --base "$base_ref"');
+    expect(ratchetRun.run).toContain('prepare_ratchet_base_args "$base_ref"');
+    expect(ratchetRun.run).toContain('pnpm check:max-lines-ratchet "${ratchet_base_args[@]}"');
     expect(ratchetRun.run).toMatch(
-      /if \[\[ -n "\$\{RATCHET_PR_HEAD_SHA:-\}" \]\]; then\s+run_check line-cap pnpm check:line-cap-ratchet --base "\$base_ref"\s+fi/u,
+      /if \[\[ -n "\$\{RATCHET_PR_HEAD_SHA:-\}" \]\]; then\s+run_check line-cap pnpm check:line-cap-ratchet "\$\{ratchet_base_args\[@\]\}"\s+fi/u,
     );
-    expect(ratchetRun.run).toContain('pnpm check:assertion-safety --base "$base_ref"');
-    expect(ratchetRun.run).toContain('pnpm check:test-timeout-race-ratchet --base "$base_ref"');
-    expect(ratchetRun.run).toContain('pnpm check:test-mock-exports --base "$base_ref"');
+    expect(ratchetRun.run).toContain('pnpm check:assertion-safety "${ratchet_base_args[@]}"');
+    expect(ratchetRun.run).toContain(
+      'pnpm check:test-timeout-race-ratchet "${ratchet_base_args[@]}"',
+    );
+    expect(ratchetRun.run).toContain('pnpm check:test-mock-exports "${ratchet_base_args[@]}"');
     const mainPushRatchets = workflow.jobs["security-fast"].steps.find(
       (step: WorkflowStep) => step.name === "Check main push ratchets and protocol additions",
     );
     expect(mainPushRatchets.env.BASE_SHA).toBe("${{ steps.diff_base.outputs.sha }}");
+    expect(mainPushRatchets.run).toContain('prepare_ratchet_base_args "$BASE_SHA"');
     expect(mainPushRatchets.run).toContain(
-      'pnpm check:test-timeout-race-ratchet --base "$BASE_SHA"',
+      'pnpm check:test-timeout-race-ratchet "${ratchet_base_args[@]}"',
     );
     expect(ratchetRun.run).toContain("pnpm config:docs:check");
     expect(ratchetRun.run).toContain("pnpm plugins:inventory:check");

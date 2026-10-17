@@ -8,6 +8,7 @@ import {
   CONFLICT_METHOD,
   matchDialect,
   SQLITE_PRIMITIVE_OWNERS,
+  SQLITE_PHYSICAL_LAYOUT_OWNERS,
   type DialectMatch,
 } from "./lib/sqlite-dialect-constructs.mts";
 
@@ -66,12 +67,20 @@ export function changedProductionFiles(root: string, base: string, staged: boole
 
 function findSites(file: string, source: ts.SourceFile): DialectSite[] {
   const sites: DialectSite[] = [];
+  const physicalLayoutOwner = SQLITE_PHYSICAL_LAYOUT_OWNERS.includes(file);
   const add = (match: DialectMatch, position: number) => {
     // These engine owners define/call PostgreSQL functions, not SQLite connection UDFs.
     if (
       match.construct === "custom-function" &&
       (file === "src/infra/database-engine/postgres-search-schema.ts" ||
         file === "src/infra/database-engine/postgres-vector.ts")
+    ) {
+      return;
+    }
+    // This PostgreSQL-only worker owns a connection-local spool, not SQLite temp-schema debt.
+    if (
+      match.construct === "temp-schema" &&
+      file === "extensions/memory-core/src/memory/manager-publication-postgres.ts"
     ) {
       return;
     }
@@ -84,7 +93,7 @@ function findSites(file: string, source: ts.SourceFile): DialectSite[] {
     });
   };
   const literal = (node: ts.StringLiteral | ts.TemplateLiteralToken, owner: boolean) => {
-    for (const match of matchDialect(node.text, owner)) {
+    for (const match of matchDialect(node.text, owner, false, physicalLayoutOwner)) {
       // Locations identify the containing literal, independent of cooked escape widths.
       add(match, node.getStart(source));
     }
@@ -105,7 +114,7 @@ function findSites(file: string, source: ts.SourceFile): DialectSite[] {
       text += part.text + "\0";
       return { part, start };
     });
-    const matches = matchDialect(text, owner);
+    const matches = matchDialect(text, owner, false, physicalLayoutOwner);
     for (const { part, start } of spans) {
       for (const match of matches) {
         if (match.index >= start && match.index < start + part.text.length) {
@@ -211,7 +220,12 @@ export function inventory(
   }
   for (const file of changed.filter((name) => name.endsWith(".sql"))) {
     const text = texts.get(file)!;
-    const matches = matchDialect(text, false, true).map((match) => {
+    const matches = matchDialect(
+      text,
+      false,
+      true,
+      SQLITE_PHYSICAL_LAYOUT_OWNERS.includes(file),
+    ).map((match) => {
       const prefix = text.slice(0, match.index);
       return Object.assign(match, {
         line: prefix.split("\n").length,

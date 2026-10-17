@@ -205,6 +205,10 @@ suite.define(() => {
         await gateway.resolveDeferred("sessions.patch");
         // Request capture precedes settlement; Playwright does not gate native
         // summary clicks on aria-disabled, so wait for the model owner.
+        await expect
+          .poll(() => model.getAttribute("data-chat-select-value"))
+          .toBe("openai/model-b");
+        await expect.poll(() => model.getAttribute("aria-disabled")).toBe("false");
         await expect.poll(() => effort.getAttribute("aria-disabled")).toBe("false");
         await effort.click();
         const slider = pane.locator("[data-chat-thinking-slider]");

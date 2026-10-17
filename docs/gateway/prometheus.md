@@ -31,7 +31,7 @@ For traces, logs, OTLP push, and OpenTelemetry GenAI semantic attributes, see [O
 <Steps>
   <Step title="Install the plugin">
     ```bash
-    openclaw plugins install clawhub:@openclaw/diagnostics-prometheus
+    openclaw plugins install @openclaw/diagnostics-prometheus
     ```
   </Step>
   <Step title="Enable the plugin">
@@ -181,6 +181,7 @@ For traces, logs, OTLP push, and OpenTelemetry GenAI semantic attributes, see [O
 | `openclaw_worker_request_seconds`                         | histogram | `kind`, `request_class`                                                                   |
 | `openclaw_worker_heap_sampled_count`                      | gauge     | none (aggregate), `script`                                                                |
 | `openclaw_worker_heap_used_bytes`                         | gauge     | `script`                                                                                  |
+| `openclaw_worker_heap_space_used_bytes`                   | gauge     | `script`, `space`                                                                         |
 | `openclaw_worker_external_bytes`                          | gauge     | `script`                                                                                  |
 | `openclaw_worker_array_buffers_bytes`                     | gauge     | `script`                                                                                  |
 | `openclaw_code_mode_worker_memory_bytes`                  | gauge     | `slot`, `kind` (`external`, `array_buffers`)                                              |
@@ -531,7 +532,7 @@ retain `open`, `close`, `transcript_read`, `sessions`, `transcripts`,
 `domain_execute`, `plugin_state`, `auth_profiles`, and `cron`. Other commands use a
 fixed operation family, such as `workerInference`, `capture`, or `diagnostic`.
 Audit writer, database lifecycle, and state lease commands have finer labels such
-as `audit.writer.process`, `database.inspectIdle`, and `stateLease.renew`.
+as `audit.writer.process`, `database.walMaintenance`, and `stateLease.renew`.
 Unknown commands retain `execute`; unknown request classes become `other`.
 The allowlists bound cardinality without publishing session IDs, database paths,
 command suffixes, or caller-provided names. The exporter's shared series cap still
@@ -603,6 +604,14 @@ ArrayBuffer bytes are included in external memory; do not add them together.
 Native-only heap samples provide external memory but no ArrayBuffer count, so
 ArrayBuffer totals can cover fewer Workers than the heap sample count. Missing
 counters are omitted, while measured zero bytes are exported as zero.
+On Node, `openclaw_worker_heap_space_used_bytes{script="...",space="..."}` sums
+used bytes by V8 heap space for Workers serving the private memory channel. It
+shares the existing heartbeat, sample expiration, and exit cleanup. Space names
+come from V8's finite native set; labels contain no paths, account details, or
+catalog contents. Compare old, large-object, and code spaces to locate worker
+heap growth without a snapshot. Native-only fallback samples and Bun omit these
+space counters, so their coverage can be smaller than the heap sample count.
+`openclaw_heap_space_bytes` remains the main isolate's separate space breakdown.
 Labels use a fixed allowlist of runtime-entrypoint, pooled, and bundled plugin Worker basenames, normalized to
 `.js` in source and packaged runs; unknown, eval, and unwrapped third-party Workers
 use `other`. Full paths and eval source are never recorded. A script's series

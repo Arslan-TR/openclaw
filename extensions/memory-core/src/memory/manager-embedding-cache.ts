@@ -1,7 +1,8 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { EngineConnection } from "openclaw/plugin-sdk/database-engine-worker-runtime";
 import {
   decodeMemoryEmbedding,
   encodeMemoryEmbedding,
+  isPostgresSqlConnection,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
   executeSqliteQuerySync,
@@ -36,7 +37,7 @@ export function isValidMemoryEmbedding(embedding: number[], dimensions?: number)
 }
 
 export function loadMemoryEmbeddingCache(params: {
-  db: DatabaseSync;
+  db: EngineConnection;
   providerIdentities: MemoryIndexProviderIdentity[];
   hashes: string[];
 }): Map<string, number[]> {
@@ -88,7 +89,43 @@ export function loadMemoryEmbeddingCache(params: {
   return out;
 }
 
-export function countMemoryEmbeddingCache(database: DatabaseSync): number {
+/** Preserve canonical entries and move the remaining legacy rows without copying vectors. */
+export function rekeyMemoryEmbeddingCache(
+  database: EngineConnection,
+  identity: MemoryIndexProviderIdentity,
+  providerKey: string,
+): void {
+  const db = getNodeSqliteKysely<EmbeddingCacheDatabase>(database);
+  executeSqliteQuerySync(
+    database,
+    db
+      .deleteFrom("memory_embedding_cache")
+      .where("provider", "=", identity.provider)
+      .where("model", "=", identity.model)
+      .where("provider_key", "=", identity.providerKey)
+      .where(
+        "hash",
+        "in",
+        db
+          .selectFrom("memory_embedding_cache")
+          .select("hash")
+          .where("provider", "=", identity.provider)
+          .where("model", "=", identity.model)
+          .where("provider_key", "=", providerKey),
+      ),
+  );
+  executeSqliteQuerySync(
+    database,
+    db
+      .updateTable("memory_embedding_cache")
+      .set({ provider_key: providerKey })
+      .where("provider", "=", identity.provider)
+      .where("model", "=", identity.model)
+      .where("provider_key", "=", identity.providerKey),
+  );
+}
+
+export function countMemoryEmbeddingCache(database: EngineConnection): number {
   const db = getNodeSqliteKysely<EmbeddingCacheDatabase>(database);
   const result = executeSqliteQuerySync(
     database,
@@ -99,7 +136,7 @@ export function countMemoryEmbeddingCache(database: DatabaseSync): number {
 
 /** The publication owner supplies its retained count and holds the write transaction. */
 export function pruneMemoryEmbeddingCache(
-  database: DatabaseSync,
+  database: EngineConnection,
   cacheSize: number,
   maxEntries: number,
 ): number {
@@ -112,8 +149,26 @@ export function pruneMemoryEmbeddingCache(
   return removed < limit ? 0 : cacheSize - removed;
 }
 
-function deleteOldestMemoryEmbeddingCacheRows(database: DatabaseSync, limit: number): number {
+function deleteOldestMemoryEmbeddingCacheRows(database: EngineConnection, limit: number): number {
   const db = getNodeSqliteKysely<EmbeddingCacheDatabase>(database);
+  if (isPostgresSqlConnection(database)) {
+    const keys = ["provider", "model", "provider_key", "hash"] as const;
+    const oldest = db
+      .selectFrom("memory_embedding_cache")
+      .select(keys)
+      .orderBy("updated_at", "asc")
+      .orderBy("provider", "asc")
+      .orderBy("model", "asc")
+      .orderBy("provider_key", "asc")
+      .orderBy("hash", "asc")
+      .limit(limit)
+      .$asTuple(...keys);
+    const result = executeSqliteQuerySync(
+      database,
+      db.deleteFrom("memory_embedding_cache").where((eb) => eb(eb.refTuple(...keys), "in", oldest)),
+    );
+    return Number(result.numAffectedRows);
+  }
   // SQLite performs eviction without materializing the full cache in JavaScript.
   const result = executeSqliteQuerySync(
     database,
@@ -135,7 +190,7 @@ function deleteOldestMemoryEmbeddingCacheRows(database: DatabaseSync, limit: num
 
 /** Discard ambiguous vector spaces without removing unrelated provider caches or index rows. */
 export function clearMemoryEmbeddingCacheIdentities(
-  database: DatabaseSync,
+  database: EngineConnection,
   identities: MemoryIndexProviderIdentity[],
 ): number {
   const db = getNodeSqliteKysely<EmbeddingCacheDatabase>(database);
@@ -155,7 +210,7 @@ export function clearMemoryEmbeddingCacheIdentities(
 }
 
 export function upsertMemoryEmbeddingCache(params: {
-  db: DatabaseSync;
+  db: EngineConnection;
   cacheSize: number;
   provider: { id: string; model: string };
   providerKey: string;
