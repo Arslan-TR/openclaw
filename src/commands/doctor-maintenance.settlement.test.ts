@@ -46,47 +46,94 @@ function expectOrder(first: BoundaryMock, second: BoundaryMock) {
   );
 }
 
-function beginOffline(databaseGenerations?: Record<string, string | null>) {
+function beginWithGenerations(
+  databaseGenerations?: Record<string, string | null>,
+  installRoot: string | null = null,
+) {
   return beginDoctorMaintenance({
-    root: null,
+    root: installRoot,
     options: { repair: true, nonInteractive: true },
     runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
     databaseGenerations,
   });
 }
 
-function seedEvidence(pathname: string) {
+function executeEvidence(pathname: string, sql: string) {
   const db = new DatabaseSync(pathname);
-  db.exec("CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)");
+  db.exec(sql);
   db.close();
 }
 
-async function waitForCleanup(
-  work: Promise<unknown>,
-  barrier: ReturnType<typeof cleanupBarrier>,
-  message: string,
-) {
-  await Promise.race([
-    barrier.joining,
-    work.then(() => {
-      throw new Error(message);
-    }),
-  ]);
-}
-
-it("refuses rollback attribution for writes preceding Doctor admission", async () => {
+function fingerprintReads() {
   vi.spyOn(updateState, "readUpdateDatabaseGenerationsIsolated").mockImplementation(async (paths) =>
     readUpdateDatabaseGenerations(paths),
   );
+}
+
+function fail(name: "readLeases" | "lease" | "gatewayAcquire" | "ownerAssert", error: Error) {
+  boundary[name].mockImplementation(() => {
+    throw error;
+  });
+}
+
+function processOwner(release: () => void) {
+  return {
+    release,
+    assertCurrent: (assertPolicy?: () => void) => {
+      boundary.ownerAssert();
+      assertPolicy?.();
+    },
+    run<T>(operation: () => T): T {
+      boundary.ownerAssert();
+      return operation();
+    },
+  };
+}
+
+function afterStop(effect: () => void) {
+  const stop = boundary.stop.getMockImplementation()!;
+  boundary.stop.mockImplementation(async (params) => {
+    const result = await stop(params);
+    if (params.phase !== "inspect") {
+      effect();
+    }
+    return result;
+  });
+}
+
+async function settleCleanup(
+  work: Promise<unknown>,
+  barrier: ReturnType<typeof cleanupBarrier>,
+  cleanup: "forced" | "uncertain",
+  checkPending: () => void,
+) {
+  try {
+    await Promise.race([
+      barrier.joining,
+      work.then(() => {
+        throw new Error("Maintenance advanced before physical cleanup joined");
+      }),
+    ]);
+    checkPending();
+  } finally {
+    barrier.cleanup.resolve(cleanup);
+    await work;
+  }
+  return await work;
+}
+
+it("refuses rollback attribution for writes preceding Doctor admission", async () => {
+  fingerprintReads();
   const pathname = path.join(settlement.tempDirs.make("doctor-write-receipt-"), "agent.sqlite");
   const missing = `${pathname}.missing`;
-  seedEvidence(pathname);
+  executeEvidence(
+    pathname,
+    "CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)",
+  );
   const databaseGenerations = readUpdateDatabaseGenerations([pathname, missing]);
-  const foreign = new DatabaseSync(pathname);
-  foreign.exec("INSERT INTO evidence VALUES (99)");
-  foreign.close();
+  executeEvidence(pathname, "INSERT INTO evidence VALUES (99)");
   const admitted = readUpdateDatabaseGenerations([pathname, missing]);
-  const maintenance = await beginOffline(databaseGenerations);
+  const maintenance = await beginWithGenerations(databaseGenerations);
   expect(maintenance?.databaseWrites).toBeUndefined();
   await maintenance!.releaseState();
   const receipt = maintenance!.databaseWrites;
@@ -96,9 +143,7 @@ it("refuses rollback attribution for writes preceding Doctor admission", async (
     generations: readUpdateDatabaseGenerations([pathname, missing]),
   });
   expect(receipt?.generations[pathname]).not.toBe(databaseGenerations[pathname]);
-  const later = new DatabaseSync(pathname);
-  later.exec("INSERT INTO evidence VALUES (100)");
-  later.close();
+  executeEvidence(pathname, "INSERT INTO evidence VALUES (100)");
   await maintenance!.release();
   expect(maintenance!.databaseWrites).toEqual(receipt);
   expect(readUpdateDatabaseGenerations([pathname])[pathname]).not.toBe(
@@ -107,11 +152,12 @@ it("refuses rollback attribution for writes preceding Doctor admission", async (
 });
 
 it("refuses automatic restore after a NOCOW physical replacement during Doctor maintenance", async () => {
-  vi.spyOn(updateState, "readUpdateDatabaseGenerationsIsolated").mockImplementation(async (paths) =>
-    readUpdateDatabaseGenerations(paths),
-  );
+  fingerprintReads();
   const pathname = path.join(settlement.tempDirs.make("doctor-nocow-receipt-"), "agent.sqlite");
-  seedEvidence(pathname);
+  executeEvidence(
+    pathname,
+    "CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)",
+  );
   const generations = readUpdateDatabaseGenerations([pathname]);
   const rewrite = vi.spyOn(nocow, "repairDoctorSqliteNoCow").mockImplementation(async () => {
     expect(boundary.close).toHaveBeenCalled();
@@ -119,7 +165,7 @@ it("refuses automatic restore after a NOCOW physical replacement during Doctor m
     fs.renameSync(`${pathname}.new`, pathname);
     return { changes: ["NOCOW rewrite complete"], warnings: [] };
   });
-  const maintenance = await beginOffline(generations);
+  const maintenance = await beginWithGenerations(generations);
   await maintenance!.repairSqliteNoCow([pathname]);
   await maintenance!.release();
   expect(rewrite).toHaveBeenCalledOnce();
@@ -138,12 +184,10 @@ it("refuses automatic restore after a NOCOW physical replacement during Doctor m
 });
 
 it("keeps fingerprint failures advisory and publishes no database write proof", async () => {
-  vi.spyOn(updateState, "readUpdateDatabaseGenerationsIsolated").mockImplementation(async (paths) =>
-    readUpdateDatabaseGenerations(paths),
-  );
+  fingerprintReads();
   const pathname = path.join(settlement.tempDirs.make("doctor-write-proof-unavailable-"), "db");
   fs.mkdirSync(pathname);
-  const maintenance = await beginOffline({ [pathname]: null });
+  const maintenance = await beginWithGenerations({ [pathname]: null });
   await expect(maintenance!.finish({})).resolves.toBeUndefined();
   expect(maintenance!.databaseWrites).toBeUndefined();
   expect(maintenance!.warnings).toContainEqual(
@@ -171,31 +215,17 @@ it.each([
     });
     let maintenance: Awaited<ReturnType<typeof beginDoctorMaintenance>>;
     const work = (async () => {
-      maintenance = await beginDoctorMaintenance({
-        root,
-        options: { repair: true, nonInteractive: true },
-        runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
-        databaseGenerations,
-      });
+      maintenance = await beginWithGenerations(databaseGenerations, root);
       await maintenance!.finish({});
     })().catch((error: unknown) => error);
-    try {
-      await waitForCleanup(
-        work,
-        barrier,
-        "Database custody ended before fingerprint worker cleanup joined",
-      );
+    const error = await settleCleanup(work, barrier, cleanup, () => {
       expect(boundary.release).not.toHaveBeenCalled();
       if (phase === "admission") {
         expect(boundary.stop).toHaveBeenCalledTimes(1);
       }
       expectCalls(0, "resume", "restart");
       expect(maintenance?.databaseWrites).toBeUndefined();
-    } finally {
-      barrier.cleanup.resolve(cleanup);
-      await work;
-    }
-    const error = await work;
+    });
     if (cleanup === "forced") {
       expect(error).toBeUndefined();
       expectCalls(1, "release", "restart");
@@ -227,35 +257,36 @@ it("restores the stopped Gateway before reporting a settled state-owner release 
 
 it("reports a settled state-release failure without a managed Gateway", async () => {
   const failure = new Error("settled state release failed");
-  const maintenance = await beginOffline();
+  const maintenance = await beginWithGenerations();
   boundary.release.mockRejectedValueOnce(failure);
   await expect(maintenance!.finish(undefined)).rejects.toBe(failure);
   expectCalls(1, "close");
   expectCalls(0, "restart");
 });
 
-it("retains state custody when the resource scope cannot close", async () => {
-  const cleanupFailure = new Error("persistent resource cleanup failure");
-  boundary.close.mockRejectedValue(cleanupFailure);
-  const maintenance = await begin();
-
-  await expect(maintenance!.finish({})).rejects.toThrow(
-    "Doctor maintenance resource cleanup failed",
-  );
-  expectCalls(2, "close");
-  expectCalls(0, "release", "restart", "health");
-  expect(maintenance!.databaseWrites).toBeUndefined();
-});
-
-it("restores the Gateway after a transient resource close failure settles on retry", async () => {
-  const transient = new Error("transient resource close failure");
-  boundary.close.mockRejectedValueOnce(transient);
-  const maintenance = await begin();
-
-  await expect(maintenance!.finish({})).rejects.toBe(transient);
-  expectCalls(2, "close");
-  expectCalls(1, "release", "restart", "health");
-});
+it.each(["persistent", "transient"] as const)(
+  "settles %s resource close failure before restoration",
+  async (mode) => {
+    const failure = new Error(`${mode} resource close failure`);
+    if (mode === "persistent") {
+      boundary.close.mockRejectedValue(failure);
+    } else {
+      boundary.close.mockRejectedValueOnce(failure);
+    }
+    const maintenance = await begin();
+    const finish = expect(maintenance!.finish({})).rejects;
+    if (mode === "transient") {
+      await finish.toBe(failure);
+    } else {
+      await finish.toThrow("Doctor maintenance resource cleanup failed");
+    }
+    expectCalls(2, "close");
+    expectCalls(mode === "transient" ? 1 : 0, "release", "restart", "health");
+    if (mode === "persistent") {
+      expect(maintenance!.databaseWrites).toBeUndefined();
+    }
+  },
+);
 
 it("does not restart a Gateway already activated by config repair", async () => {
   const events: string[] = [];
@@ -335,24 +366,14 @@ it.each(["forced", "uncertain"] as const)(
   async (cleanup) => {
     const barrier = cleanupBarrier();
     const original = new Error("service stop failed after parking the Gateway");
-    const stop = boundary.stop.getMockImplementation()!;
-    boundary.stop.mockImplementation(async (params) => {
-      const result = await stop(params);
-      if (params.phase !== "inspect") {
-        barrier.retain();
-        throw original;
-      }
-      return result;
+    afterStop(() => {
+      barrier.retain();
+      throw original;
     });
     const work = begin().catch((error: unknown) => error);
-    try {
-      await waitForCleanup(work, barrier, "Admission compensated before physical cleanup joined");
+    const error = await settleCleanup(work, barrier, cleanup, () => {
       expectCalls(0, "resume", "complete", "restart", "release");
-    } finally {
-      barrier.cleanup.resolve(cleanup);
-      await work;
-    }
-    const error = await work;
+    });
     expect(collectNestedErrorCandidates(error)).toContain(original);
     expect(hasCommandProcessCleanupError(error)).toBe(cleanup === "uncertain");
     expectCalls(cleanup === "forced" ? 1 : 0, "restart", "resume", "complete");
@@ -401,8 +422,7 @@ it.each([
       });
     }
     const work = maintenance.finish({}).catch((error: unknown) => error);
-    try {
-      await waitForCleanup(work, barrier, "Restoration advanced before physical cleanup joined");
+    const error = await settleCleanup(work, barrier, cleanup, () => {
       expectCalls(0, "restart", "health", "unlock");
       if (phase === "autostart") {
         expectCalls(0, "complete", "read");
@@ -411,11 +431,7 @@ it.each([
         expectCalls(0, "resume");
         expect(boundary.complete).toHaveBeenCalledExactlyOnceWith(false);
       }
-    } finally {
-      barrier.cleanup.resolve(cleanup);
-      await work;
-    }
-    const error = await work;
+    });
     if (cleanup === "forced") {
       expect(error).toBeUndefined();
       expectCalls(0, "restart");
@@ -468,13 +484,8 @@ it("waits for the stopped Gateway to release lifecycle ownership", async () => {
     elapsed += ms;
     ticks++;
   });
-  const stop = boundary.stop.getMockImplementation()!;
-  boundary.stop.mockImplementation(async (params) => {
-    const result = await stop(params);
-    if (params.phase !== "inspect") {
-      loaded = false;
-    }
-    return result;
+  afterStop(() => {
+    loaded = false;
   });
   boundary.restart.mockImplementation(async () => {
     loaded = true;
@@ -494,19 +505,9 @@ it("restores a service after state ownership fails without retaining a partial m
   boundary.gatewayAcquire
     .mockImplementation(() => {
       heldLeases++;
-      return {
-        release: () => {
-          heldLeases--;
-        },
-        assertCurrent: (assertPolicy?: () => void) => {
-          boundary.ownerAssert();
-          assertPolicy?.();
-        },
-        run<T>(operation: () => T): T {
-          boundary.ownerAssert();
-          return operation();
-        },
-      };
+      return processOwner(() => {
+        heldLeases--;
+      });
     })
     .mockImplementationOnce(() => {
       throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
@@ -546,19 +547,9 @@ it.each(["acquired", "native-revoked", "install-drift"] as const)(
         throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
       }
       gatewayHeld = true;
-      return {
-        release: () => {
-          gatewayHeld = false;
-        },
-        assertCurrent: (assertPolicy?: () => void) => {
-          boundary.ownerAssert();
-          assertPolicy?.();
-        },
-        run<T>(operation: () => T): T {
-          boundary.ownerAssert();
-          return operation();
-        },
-      };
+      return processOwner(() => {
+        gatewayHeld = false;
+      });
     });
     boundary.ownerAssert.mockImplementation(() => {
       expect(gatewayHeld).toBe(true);
@@ -628,18 +619,13 @@ it.each([false, true])(
       expect(boundary.restart).not.toHaveBeenCalled();
       elapsed += ms;
     });
-    const stop = boundary.stop.getMockImplementation()!;
     const stopError = new Error("service stop failed after parking");
-    boundary.stop.mockImplementation(async (params) => {
-      const result = await stop(params);
-      if (params.phase !== "inspect") {
-        parked = true;
-        elapsed = GATEWAY_SERVICE_STOP_TIMEOUT_MS - 1_250;
-        if (stopFailed) {
-          throw stopError;
-        }
+    afterStop(() => {
+      parked = true;
+      elapsed = GATEWAY_SERVICE_STOP_TIMEOUT_MS - 1_250;
+      if (stopFailed) {
+        throw stopError;
       }
-      return result;
     });
     const refusal = await begin(() => {}).catch((error: unknown) => error);
 
@@ -705,9 +691,7 @@ it("refuses an external active agent lease before serving-Gateway coordinator co
 it("does not use an empty external lease observation to bypass coordinator contention", async () => {
   boundary.external.mockReturnValue(true);
   const contention = new Error("another OpenClaw process owns gateway-lifecycle");
-  boundary.gatewayAcquire.mockImplementation(() => {
-    throw contention;
-  });
+  fail("gatewayAcquire", contention);
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toMatchObject({ cause: contention });
   expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([]);
@@ -733,66 +717,57 @@ it("rechecks external leases under the process owner after an empty observation"
   expectOrder("close", "release");
 });
 
-it("fails closed on an unknown external lease observation without exposing private details", async () => {
-  boundary.external.mockReturnValue(true);
-  const cause = Object.assign(new Error(privateCause), {
-    name: "OpenClawAgentDatabaseLeaseActiveError",
-    code: leaseCode,
-  });
-  boundary.readLeases.mockImplementation(() => {
-    throw cause;
-  });
-  boundary.lease.mockImplementation(() => {
-    throw cause;
-  });
-  const refusal: unknown = await begin().catch((error: unknown) => error);
-  expect(refusal).toMatchObject({ cause });
-  expect(refusal).toBeInstanceOf(DoctorMaintenanceRefusalError);
-  expect(refusal).toMatchObject({ refusal: { kind: "deferred", reason: "admission-unavailable" } });
-  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([]);
-  expect(
-    redactPublicSupportDiagnosticLine(String(refusal), {
-      env: {},
-      stateDir: "/synthetic/private-state",
-    }),
-  ).toBe("DoctorMaintenanceRefusalError: Doctor could not enter maintenance.");
-  expectCalls(1, "gatewayAcquire", "ownerAssert", "lease", "release");
-  expectCalls(0, "stop");
-  expectCalls(1, "close");
-  expectOrder("close", "release");
-});
-
-it("preserves held-owner unreadable-state guidance after an external diagnostic read fails", async () => {
-  boundary.external.mockReturnValue(true);
-  const failure = new Error("synthetic unreadable schema");
-  boundary.readLeases.mockImplementation(() => {
-    throw failure;
-  });
-  boundary.lease.mockImplementation(() => {
-    throw failure;
-  });
-  boundary.schemas.mockResolvedValue({
-    indeterminate: [
-      {
-        kind: "state",
-        path: "/synthetic/doctor-state/state/openclaw.sqlite",
-        reason: "not a database",
-      },
-    ],
-  });
-  const refusal: unknown = await begin().catch((error: unknown) => error);
-  expect(refusal).toBeInstanceOf(DoctorUnreadableStateDatabaseError);
-  expect(String(refusal)).toContain("restore this file from a verified backup");
-  expectCalls(1, "gatewayAcquire", "ownerAssert", "lease", "release", "close");
-  expectOrder("close", "release");
-  expect(boundary.stop).not.toHaveBeenCalled();
-});
+it.each(["unknown", "unreadable"] as const)(
+  "preserves %s-state refusal after an external diagnostic read fails",
+  async (schema) => {
+    boundary.external.mockReturnValue(true);
+    const cause =
+      schema === "unknown"
+        ? Object.assign(new Error(privateCause), {
+            name: "OpenClawAgentDatabaseLeaseActiveError",
+            code: leaseCode,
+          })
+        : new Error("synthetic unreadable schema");
+    fail("readLeases", cause);
+    fail("lease", cause);
+    if (schema === "unreadable") {
+      boundary.schemas.mockResolvedValue({
+        indeterminate: [
+          {
+            kind: "state",
+            path: "/synthetic/doctor-state/state/openclaw.sqlite",
+            reason: "not a database",
+          },
+        ],
+      });
+    }
+    const refusal: unknown = await begin().catch((error: unknown) => error);
+    if (schema === "unreadable") {
+      expect(refusal).toBeInstanceOf(DoctorUnreadableStateDatabaseError);
+      expect(String(refusal)).toContain("restore this file from a verified backup");
+    } else {
+      expect(refusal).toBeInstanceOf(DoctorMaintenanceRefusalError);
+      expect(refusal).toMatchObject({
+        cause,
+        refusal: { kind: "deferred", reason: "admission-unavailable" },
+      });
+      expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([]);
+      expect(
+        redactPublicSupportDiagnosticLine(String(refusal), {
+          env: {},
+          stateDir: "/synthetic/private-state",
+        }),
+      ).toBe("DoctorMaintenanceRefusalError: Doctor could not enter maintenance.");
+    }
+    expectCalls(1, "gatewayAcquire", "ownerAssert", "lease", "release", "close");
+    expectCalls(0, "stop");
+    expectOrder("close", "release");
+  },
+);
 
 it("carries an actual typed lease refusal through Doctor IPC, finalization and public projection", async () => {
   const cause = new OpenClawAgentDatabaseLeaseActiveError(privateCause);
-  boundary.lease.mockImplementation(() => {
-    throw cause;
-  });
+  fail("lease", cause);
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toBeInstanceOf(UpdateDoctorError);
   expect(refusal).toMatchObject({ cause, message: leaseGuidance });
@@ -859,9 +834,7 @@ it("carries an actual typed lease refusal through Doctor IPC, finalization and p
 it("retains the typed refusal and restoration failure in the aggregate", async () => {
   const cause = new OpenClawAgentDatabaseLeaseActiveError(privateCause);
   const restore = new Error("synthetic restoration failure");
-  boundary.lease.mockImplementation(() => {
-    throw cause;
-  });
+  fail("lease", cause);
   boundary.resume.mockRejectedValue(restore);
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toBeInstanceOf(AggregateError);
@@ -885,14 +858,9 @@ it("does not settle a typed refusal while command cleanup remains uncertain", as
     throw cause;
   });
   const work = begin().catch((error: unknown) => error);
-  try {
-    await waitForCleanup(work, barrier, "Admission settled before command cleanup");
+  const refusal = await settleCleanup(work, barrier, "uncertain", () => {
     expect(boundary.release).not.toHaveBeenCalled();
-  } finally {
-    barrier.cleanup.resolve("uncertain");
-    await work;
-  }
-  const refusal = await work;
+  });
   expect(hasCommandProcessCleanupError(refusal)).toBe(true);
   expect(collectNestedErrorCandidates(refusal)).toContain(cause);
   expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([

@@ -3,7 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { runCommandWithRuntime } from "../cli/cli-utils.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runDoctorHealthFlow } from "../flows/doctor-health.js";
@@ -26,8 +25,13 @@ import {
 import { claimOpenClawStateOwnership } from "../state/openclaw-state-ownership-operations.js";
 import { STATE_SUPERVISION_KEY } from "../state/openclaw-state-ownership.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../state/openclaw-state-schema.js";
-import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
 
+const withState = (run: (state: OpenClawTestState) => Promise<void>) =>
+  withOpenClawTestState({ scenario: "minimal" }, run);
 const { mocks } = await import("../flows/doctor-health.test-support.js");
 beforeEach(() => {
   mocks.config.mockReturnValue({});
@@ -36,7 +40,6 @@ beforeEach(() => {
   mocks.runContributions.mockReset();
 });
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.unstubAllEnvs());
 
 const auditRows = "SELECT * FROM audit_events NOT INDEXED";
@@ -58,41 +61,19 @@ function inspectDatabase<T>(pathname: string, inspect: (db: DatabaseSync) => T):
     db.close();
   }
 }
+const readRows = (pathname: string, sql: string) =>
+  inspectDatabase(pathname, (db) => db.prepare(sql).all());
 
-function createLegacyRegistryFixture() {
-  const root = tempDirs.make("openclaw-doctor-legacy-registry-");
-  const stateDir = path.join(root, "state");
-  const configPath = path.join(root, "openclaw.json");
-  const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
-  for (const [key, value] of Object.entries({
-    HOME: root,
-    USERPROFILE: root,
-    OPENCLAW_STATE_DIR: stateDir,
-    OPENCLAW_CONFIG_PATH: configPath,
-  })) {
-    vi.stubEnv(key, value);
-  }
-  vi.stubEnv("OPENCLAW_HOME", undefined);
-  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+function writeDatabase(pathname: string, sql: string) {
+  fs.mkdirSync(path.dirname(pathname), { recursive: true });
   const { DatabaseSync } = requireNodeSqlite();
-  const database = new DatabaseSync(databasePath);
-  database.exec(`
-    PRAGMA user_version = 8;
-    CREATE TABLE agent_databases (
-      agent_id TEXT NOT NULL, path TEXT NOT NULL, schema_version INTEGER NOT NULL,
-      last_seen_at INTEGER NOT NULL, size_bytes INTEGER,
-      PRIMARY KEY (agent_id, path)
-    );
-  `);
+  const database = new DatabaseSync(pathname);
+  database.exec(sql);
   database.close();
-  const config: OpenClawConfig = {
-    agents: { ownership: "explicit", entries: { main: {} } },
-  };
-  return { root, stateDir, configPath, databasePath, config };
 }
 
-it("fails repair when a configured agentDir database remains on an older schema", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+it("fails repair for an old configured agentDir schema", async () => {
+  await withState(async (state) => {
     const agentDir = state.statePath(".openclaw", "agents", "worker", "agent");
     const config: OpenClawConfig = {
       agents: { ownership: "explicit", entries: { worker: { agentDir } } },
@@ -119,42 +100,50 @@ it("fails repair when a configured agentDir database remains on an older schema"
     expect(errors).toContain(databasePath);
     expect(errors).toContain("uses schema version 19");
     expect(mocks.outro).not.toHaveBeenCalledWith("Doctor complete.");
-    expect(inspectDatabase(databasePath, (db) => db.prepare("PRAGMA user_version").get())).toEqual({
-      user_version: 19,
-    });
+    expect(readRows(databasePath, "PRAGMA user_version")).toEqual([{ user_version: 19 }]);
   });
 });
 
-it("refuses a newer shared SQLite database before repairing an old registry", async () => {
-  const fixture = createLegacyRegistryFixture();
-  const customDir = path.join(fixture.root, "custom");
-  const agentPath = path.join(customDir, "sessions.sqlite");
-  fixture.config.session = { store: agentPath };
-  fs.mkdirSync(path.dirname(agentPath), { recursive: true });
-  const { DatabaseSync } = requireNodeSqlite();
-  const registry = new DatabaseSync(fixture.databasePath);
-  registry.exec(extractSqliteTableSchema(OPENCLAW_STATE_SCHEMA_SQL, "agent_deletion_journal"));
-  registry.exec(extractSqliteTableSchema(OPENCLAW_STATE_SCHEMA_SQL, "migration_sources"));
-  registry.close();
-  const agent = new DatabaseSync(agentPath);
-  agent.exec(`
+it("refuses newer agent schemas before repairing the registry", async () => {
+  await withState(async (state) => {
+    const agentPath = state.path("custom", "sessions.sqlite");
+    const databasePath = state.statePath("state", "openclaw.sqlite");
+    await state.writeConfig({
+      agents: { ownership: "explicit", entries: { main: {} } },
+      session: { store: agentPath },
+    });
+    writeDatabase(
+      databasePath,
+      `
+      PRAGMA user_version = 8;
+      CREATE TABLE agent_databases (
+        agent_id TEXT NOT NULL, path TEXT NOT NULL, schema_version INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL, size_bytes INTEGER, PRIMARY KEY (agent_id, path)
+      );
+      ${extractSqliteTableSchema(OPENCLAW_STATE_SCHEMA_SQL, "agent_deletion_journal")}
+      ${extractSqliteTableSchema(OPENCLAW_STATE_SCHEMA_SQL, "migration_sources")}
+    `,
+    );
+    writeDatabase(
+      agentPath,
+      `
       PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION + 1};
       CREATE TABLE schema_meta (meta_key TEXT PRIMARY KEY, agent_id TEXT);
       INSERT INTO schema_meta VALUES ('primary', 'main');
-    `);
-  agent.close();
-  fs.writeFileSync(fixture.configPath, JSON.stringify(fixture.config));
-  const paths = [fixture.configPath, fixture.databasePath, agentPath];
-  const before = paths.map((pathname) => fs.readFileSync(pathname));
+    `,
+    );
+    const paths = [state.configPath, databasePath, agentPath];
+    const before = paths.map((pathname) => fs.readFileSync(pathname));
 
-  await expect(
-    runDoctorHealthFlow(runtimeMock(), { repair: true, nonInteractive: true }),
-  ).rejects.toThrow("newer than this build");
-  expect(paths.map((pathname) => fs.readFileSync(pathname))).toEqual(before);
+    await expect(
+      runDoctorHealthFlow(runtimeMock(), { repair: true, nonInteractive: true }),
+    ).rejects.toThrow("newer than this build");
+    expect(paths.map((pathname) => fs.readFileSync(pathname))).toEqual(before);
+  });
 });
 
-it("lets the schema repair owner replace a missing shared-state index", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+it("repairs a missing shared-state index", async () => {
+  await withState(async (state) => {
     const initial = openOpenClawStateDatabase({ env: state.env });
     initial.db.exec("DROP INDEX idx_task_runs_runtime_run");
     closeOpenClawStateDatabaseForTest();
@@ -170,17 +159,15 @@ it("lets the schema repair owner replace a missing shared-state index", async ()
     expect(runtime.exit, output).not.toHaveBeenCalled();
     expect(mocks.outro).toHaveBeenCalledWith("Doctor complete.");
     expect(
-      inspectDatabase(initial.path, (db) =>
-        db.prepare("SELECT name FROM pragma_index_info('idx_task_runs_runtime_run')").all(),
-      ),
+      readRows(initial.path, "SELECT name FROM pragma_index_info('idx_task_runs_runtime_run')"),
     ).toEqual(
       ["runtime", "run_id", "source_id", "created_at", "task_id"].map((name) => ({ name })),
     );
   });
 });
 
-it("explicit Doctor repair preserves a quarantined audit index with missing deletion history", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+it("preserves audit rows and missing deletion history through index repair", async () => {
+  await withState(async (state) => {
     const heldPath = createLegacyDatabaseFixture({
       agentId: "retained",
       env: state.env,
@@ -200,10 +187,8 @@ it("explicit Doctor repair preserves a quarantined audit index with missing dele
     closeOpenClawStateDatabaseForTest();
     const index = "sqlite_autoindex_audit_events_1";
     corruptSqliteIndexKey(initial.path, index, "index-original", "index-damaged!");
-    const findings = inspectDatabase(initial.path, (db) => {
-      expect(db.prepare(auditRows).all()).toEqual(rows);
-      return db.prepare(integrity).all();
-    });
+    expect(readRows(initial.path, auditRows)).toEqual(rows);
+    const findings = readRows(initial.path, integrity);
     expect(findings).toContainEqual({ integrity_check: `row 1 missing from index ${index}` });
     const quarantine = () =>
       seedOpenClawDatabaseQuarantine({
@@ -268,15 +253,14 @@ it("explicit Doctor repair preserves a quarantined audit index with missing dele
       }),
     });
     expect(output).toContain(`Warning: Rebuilt corrupt shared-state SQLite indexes: ${index}`);
+    const backupPrefix = "Saved pre-repair SQLite backup: ";
     const backupLine = runtime.log.mock.calls
       .flat()
-      .find((line) => String(line).startsWith("Saved pre-repair SQLite backup: "));
+      .find((line) => String(line).startsWith(backupPrefix));
     expect(backupLine).toBeTypeOf("string");
-    const backupPath = String(backupLine).slice("Saved pre-repair SQLite backup: ".length);
-    inspectDatabase(backupPath, (db) => {
-      expect(db.prepare(integrity).all()).toEqual(findings);
-      expect(db.prepare(auditRows).all()).toEqual(rows);
-    });
+    const backupPath = String(backupLine).slice(backupPrefix.length);
+    expect(readRows(backupPath, integrity)).toEqual(findings);
+    expect(readRows(backupPath, auditRows)).toEqual(rows);
     const repaired = openOpenClawStateDatabase({ env: state.env });
     expect(repaired.db.prepare(integrity).all()).toEqual([{ integrity_check: "ok" }]);
     const expectRetained = () => {
@@ -312,22 +296,17 @@ it("Doctor refuses to rebuild an index that hides the external state owner", asy
       const index = "sqlite_autoindex_config_machine_state_1";
       corruptSqliteIndexKey(databasePath, index, STATE_SUPERVISION_KEY, "gateway.supervisioX");
       const before = fs.readFileSync(databasePath);
-      const findings = inspectDatabase(databasePath, (damaged) => {
-        expect(
+      inspectDatabase(databasePath, (damaged) => {
+        const readOwner = (scan: string) =>
           damaged
-            .prepare("SELECT value_json FROM config_machine_state WHERE state_key = ?")
-            .get(STATE_SUPERVISION_KEY),
-        ).toBeUndefined();
-        expect(
-          damaged
-            .prepare("SELECT value_json FROM config_machine_state NOT INDEXED WHERE state_key = ?")
-            .get(STATE_SUPERVISION_KEY),
-        ).toEqual({ value_json: JSON.stringify(ownership) });
-        const rows = damaged.prepare(integrity).all();
-        expect(rows).toContainEqual({
-          integrity_check: expect.stringContaining(`missing from index ${index}`),
-        });
-        return rows;
+            .prepare(`SELECT value_json FROM config_machine_state ${scan} WHERE state_key = ?`)
+            .get(STATE_SUPERVISION_KEY);
+        expect(readOwner("")).toBeUndefined();
+        expect(readOwner("NOT INDEXED")).toEqual({ value_json: JSON.stringify(ownership) });
+      });
+      const findings = readRows(databasePath, integrity);
+      expect(findings).toContainEqual({
+        integrity_check: expect.stringContaining(`missing from index ${index}`),
       });
       const runtime = runtimeMock();
       await runRepair(runtime);
@@ -345,7 +324,7 @@ it("Doctor refuses to rebuild an index that hides the external state owner", asy
           .readdirSync(path.dirname(databasePath))
           .filter((name) => name.startsWith("openclaw-index-recovery-")),
       ).toEqual([]);
-      expect(inspectDatabase(databasePath, (db) => db.prepare(integrity).all())).toEqual(findings);
+      expect(readRows(databasePath, integrity)).toEqual(findings);
     },
   );
 });

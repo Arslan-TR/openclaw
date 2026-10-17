@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
@@ -197,6 +196,9 @@ async function runDoctorFinishForStoppedUnit(
     },
     async () => {
       const boundedInspection = scenario === "slow-loadunit-admission";
+      const gatewayContended =
+        scenario === "gateway-lifecycle-contended" ||
+        scenario === "legacy-gateway-lifecycle-contended";
       if (boundedInspection) {
         openOpenClawStateDatabase();
         closeOpenClawStateDatabaseForTest();
@@ -280,14 +282,11 @@ async function runDoctorFinishForStoppedUnit(
           db.close();
         }
         const readArtifacts = () =>
-          [pathname, `${pathname}-wal`, `${pathname}-shm`].map((file) =>
-            fs.existsSync(file)
-              ? {
-                  hash: createHash("sha256").update(fs.readFileSync(file)).digest("hex"),
-                  mtimeNs: fs.statSync(file, { bigint: true }).mtimeNs,
-                }
-              : undefined,
-          );
+          snapshotSourceFamily(pathname).files.map(({ pathname: file, bytes, mtimeNs }) => ({
+            file,
+            bytes,
+            mtimeNs,
+          }));
         const beforeArtifacts = readArtifacts();
         let beforeCatalog = fs.readFileSync(pathname);
         if (scenario === "gateway-lifecycle-contended") {
@@ -459,10 +458,7 @@ async function runDoctorFinishForStoppedUnit(
             mocks.stops += 1;
             running = false;
             stopObserved = true;
-            if (
-              scenario === "gateway-lifecycle-contended" ||
-              scenario === "legacy-gateway-lifecycle-contended"
-            ) {
+            if (gatewayContended) {
               releaseServingLease();
               otherOwner?.release();
               otherOwner = undefined;
@@ -481,9 +477,7 @@ async function runDoctorFinishForStoppedUnit(
       const logs: string[] = [];
       const databasePath = path.join(home, ".openclaw", "state", "openclaw.sqlite");
       otherOwner =
-        scenario === "lifecycle-contended" ||
-        scenario === "gateway-lifecycle-contended" ||
-        scenario === "legacy-gateway-lifecycle-contended"
+        scenario === "lifecycle-contended" || gatewayContended
           ? acquireGatewayStateOwner({
               databasePath,
               ...(scenario === "lifecycle-contended"
