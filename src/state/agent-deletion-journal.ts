@@ -1,6 +1,6 @@
 import path from "node:path";
 import { isMainThread } from "node:worker_threads";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { isRecord, isStringArray } from "@openclaw/normalization-core/record-coerce";
 import type { Selectable } from "kysely";
 import { normalizeAgentDirRegistryPath } from "../agents/agent-dir-registry.js";
 import {
@@ -295,8 +295,7 @@ export function parseCleanupPaths(value: string): AgentDeletionJournalCleanupPat
         typeof entry.coversDescendants === "boolean" &&
         typeof entry.done === "boolean" &&
         (entry.note === undefined || typeof entry.note === "string") &&
-        Array.isArray(entry.sourcePaths) &&
-        entry.sourcePaths.every((sourcePath) => typeof sourcePath === "string"),
+        isStringArray(entry.sourcePaths),
     )
   ) {
     throw new Error("Invalid agent deletion cleanup path journal.");
