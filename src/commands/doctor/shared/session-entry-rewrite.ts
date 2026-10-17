@@ -24,7 +24,9 @@ import { deriveSessionPredicateColumns } from "../../../config/sessions/session-
 import { stripRuntimeOnlySessionSkillsFields } from "../../../config/sessions/store-entry-shape.js";
 import { assertSupportedSessionStoreEntry } from "../../../config/sessions/supported-session-store.js";
 import type { SessionEntry } from "../../../config/sessions/types.js";
+import { jsonRemovePaths, jsonSetPath } from "../../../infra/database-engine/json-values.js";
 import { executeSqliteQuerySync, iterateSqliteQuerySync } from "../../../infra/kysely-sync.js";
+import { isPostgresSqlConnection } from "../../../infra/sql-connection.js";
 import {
   assertExistingDatabaseIdentity,
   readDatabasePathIdentitySync,
@@ -63,15 +65,18 @@ export function scanDoctorSessionEntryRecords(
       getSessionKysely(database.db)
         .selectFrom("session_nodes")
         .select(["session_key", "entry_json"])
-        .where(
-          /* kysely-allow-raw: coarse key filtering bounds parsing; JSON.parse owns duplicate-key precedence. */
-          sql<boolean>`CASE WHEN json_valid(entry_json) THEN EXISTS (
+        // PostgreSQL streams raw rows to the tolerant parser without SQL JSON coercion.
+        .$if(!isPostgresSqlConnection(database.db), (query) =>
+          query.where(
+            /* kysely-allow-raw: coarse key filtering bounds parsing; JSON.parse owns duplicate-key precedence. */
+            sql<boolean>`CASE WHEN json_valid(entry_json) THEN EXISTS (
             SELECT 1 FROM json_each(entry_json)
             WHERE key IN (${sql.join(LEGACY_SESSION_ENTRY_STATE_FIELDS)})
               OR key IN ('provider', 'lastProvider', 'room')
               OR (key = 'pendingFinalDelivery' AND type IN ('true', 'false'))
               OR (key = 'status' AND value IN ('running', 'queued'))
           ) ELSE 1 END`,
+          ),
         ),
     )) {
       const entry = safeParseJsonRecord(row.entry_json);
@@ -162,6 +167,7 @@ export function rewriteDoctorSessionEntries(
         };
         assertRepairCurrent();
         const db = getSessionKysely(database.db);
+        const postgres = isPostgresSqlConnection(database.db);
         let batchRewritten = 0;
         for (const sessionKey of batch) {
           const row = executeSqliteQuerySync(
@@ -211,12 +217,21 @@ export function rewriteDoctorSessionEntries(
               if (value === previousFields.get(key)) {
                 continue;
               }
-              const jsonPath = `$.${JSON.stringify(key)}`;
-              // SQLite preserves untouched numeric tokens and opaque values outside this repair.
-              patched =
-                value === undefined
-                  ? /* kysely-allow-raw: migration removes only changed top-level JSON fields. */ sql<string>`json_remove(${patched}, ${jsonPath})`
-                  : /* kysely-allow-raw: migration changes only owned top-level JSON fields. */ sql<string>`json_set(${patched}, ${jsonPath}, json(${value}))`;
+              if (postgres) {
+                // Doctor transforms own fixed top-level fields; untouched numbers stay in SQL.
+                const jsonPath = sql.val(`$.${key}`);
+                patched =
+                  value === undefined
+                    ? jsonRemovePaths(database.db, patched, [jsonPath])
+                    : jsonSetPath(database.db, patched, jsonPath, sql.val(value), true);
+              } else {
+                const jsonPath = `$.${JSON.stringify(key)}`;
+                // SQLite preserves untouched numeric tokens and opaque values outside this repair.
+                patched =
+                  value === undefined
+                    ? /* kysely-allow-raw: migration removes only changed top-level JSON fields. */ sql<string>`json_remove(${patched}, ${jsonPath})`
+                    : /* kysely-allow-raw: migration changes only owned top-level JSON fields. */ sql<string>`json_set(${patched}, ${jsonPath}, json(${value}))`;
+              }
             }
             entryJson = executeSqliteQuerySync(
               database.db,
