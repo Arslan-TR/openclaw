@@ -3,9 +3,10 @@ import { onSettled } from "solid-js";
 import type { ApplicationContext } from "../../app/context.ts";
 import { terminalFontFamily } from "../../app/terminal-font.ts";
 import { renderSolidSnapshot } from "../../lib/dom/solid-snapshot.ts";
+import { formatUiError } from "../../lib/format-error.ts";
 import { openExternalUrlSafe } from "../../lib/open-external-url.ts";
 import { listen } from "../../lib/reactive/listener.ts";
-import { DockLayoutController } from "../dock-layout-controller.ts";
+import { createDockLayout } from "../dock-layout.ts";
 import { terminalPanelLayout, type DockPanelPlacement } from "../dock-panel-layout.ts";
 import { notifyPanelHostedTabsChanged } from "../panel-hosted-tabs.ts";
 import {
@@ -13,7 +14,7 @@ import {
   TERMINAL_PANEL_TOGGLE_EVENT,
   type TerminalPanelToggleDetail,
 } from "../panel-toggle-contract.ts";
-import { SolidPanelController } from "../solid-panel-controller.ts";
+import { SolidPanelOwner } from "../solid-panel-owner.ts";
 import type { TerminalGatewayClient } from "./terminal-connection.ts";
 import { updateTerminalFont } from "./terminal-fonts.ts";
 import { TerminalPanelSessionController } from "./terminal-panel-session-controller.ts";
@@ -25,7 +26,7 @@ import type {
   TerminalPanelSessionTab,
   TerminalRouteTarget,
 } from "./terminal-panel-session-types.ts";
-import { terminalPanelTabIcon, terminalPanelHostedTabs } from "./terminal-panel-tabs.ts";
+import { terminalPanelTabIcon, terminalPanelHostedTabs } from "./terminal-panel-tabs.tsx";
 import { createTerminalPanelUpload, type TerminalPanelUpload } from "./terminal-panel-upload.ts";
 import type { TerminalPanelViewState } from "./terminal-panel-view.tsx";
 import { createIsolatedGhosttyTerminal } from "./terminal-runtime.ts";
@@ -38,7 +39,7 @@ type TerminalDock = Exclude<DockPanelPlacement, "left">;
 
 export const CATALOG_TERMINAL_READY_TIMEOUT_MS = 30_000;
 
-export class TerminalPanelController extends SolidPanelController {
+export class TerminalPanelController extends SolidPanelOwner {
   context?: ApplicationContext;
 
   /** Gateway client used for terminal.* RPCs; null until connected. */
@@ -96,6 +97,7 @@ export class TerminalPanelController extends SolidPanelController {
       currentSessionIds: () =>
         new Set(this.terminalSessions.tabs.map((tab) => tab.gatewaySessionId).filter(Boolean)),
       list: () => this.terminalSessions.listSessions(),
+      showError: (error) => this.terminalSessions.setError(formatUiError(error)),
       attach: (id, agentOwned) => this.terminalSessions.attachSessionById(id, agentOwned),
     });
     onSettled(() => {
@@ -138,7 +140,9 @@ export class TerminalPanelController extends SolidPanelController {
   createTerminalController = createIsolatedGhosttyTerminal;
   catalogReadyTimeoutMs = CATALOG_TERMINAL_READY_TIMEOUT_MS;
   private readonly terminalSessions = new TerminalPanelSessionController(this);
-  private readonly dockLayout = new DockLayoutController(this, {
+  private readonly dockLayout = createDockLayout({
+    notify: () => this.invalidate(),
+    isEmbedded: () => this.embedded,
     layout: terminalPanelLayout,
     reservationPrefix: "terminal",
     isAvailable: () => this.isDockLayoutAvailable(),
@@ -154,6 +158,7 @@ export class TerminalPanelController extends SolidPanelController {
   }
 
   override connectedCallback(): void {
+    this.dockLayout.connect();
     this.terminalSessions.connectHost();
     // A settings takeover can already own the viewport when the panel mounts.
     // Suppress before the restored open state boots a session nobody can see.
@@ -165,6 +170,7 @@ export class TerminalPanelController extends SolidPanelController {
 
   override disconnectedCallback(): void {
     this.terminalSessions.disconnectHost();
+    this.dockLayout.dispose();
   }
 
   override updated(changed: Map<PropertyKey, unknown>): void {
@@ -444,7 +450,7 @@ export type OpenClawTerminalPanel = HTMLElement &
     | "selectHostedTab"
     | "closeHostedTab"
     | "handleToggleRequest"
-    | "requestUpdate"
+    | "invalidate"
     | "renderRoot"
     | "hasUpdated"
     | "hostedTabs"

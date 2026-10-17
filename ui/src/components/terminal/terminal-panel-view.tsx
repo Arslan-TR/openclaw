@@ -2,8 +2,8 @@ import { For, Show, createEffect, createMemo, untrack } from "solid-js";
 import { t } from "../../lib/reactive/i18n.ts";
 import { nativeListener } from "../../lib/solid-native-listener.ts";
 import { generateUUID } from "../../lib/uuid.ts";
-import type { DockLayoutController } from "../dock-layout-controller.ts";
 import { DockResizer } from "../dock-layout-solid.tsx";
+import type { DockLayout } from "../dock-layout.ts";
 import { PanelTabStrip } from "../panel-tab-strip-solid.tsx";
 import { Icon } from "../solid/icon.tsx";
 import type { PanelEmptyStateElement, PanelEmptyStateProps } from "../solid/panel-empty-state.tsx";
@@ -15,7 +15,7 @@ import {
   terminalPanelTabIcon,
   terminalPanelHostedTabs,
   type TerminalPanelTab,
-} from "./terminal-panel-tabs.ts";
+} from "./terminal-panel-tabs.tsx";
 import type { TerminalPanelUpload } from "./terminal-panel-upload.ts";
 import type { createTerminalSessionPicker } from "./terminal-session-picker.ts";
 
@@ -39,7 +39,7 @@ export type TerminalPanelViewState = {
   hosted: boolean;
   mode: string;
   style: string | undefined;
-  dockLayout: DockLayoutController<"bottom" | "right" | "main">;
+  dockLayout: DockLayout<"bottom" | "right" | "main">;
   tabs: TerminalPanelTab[];
   activeId: string | null;
   booting: boolean;

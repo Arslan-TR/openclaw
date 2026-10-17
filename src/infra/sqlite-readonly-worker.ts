@@ -498,6 +498,7 @@ export function runOneShotSqliteInspection<T>(params: {
       params.argv,
       {
         encoding: "utf8",
+        windowsHide: true,
         env: params.env ?? resolveNodeCompileCacheEnv(),
         cwd: params.cwd,
         maxBuffer: SQLITE_READONLY_WORKER_MAX_BUFFER,
@@ -590,6 +591,8 @@ export function runSqliteReadOnlyWorkerSync(
     sqliteReadOnlyWorkerArgv(pathname, { mode, stagingRoot }).argv,
     {
       encoding: "utf8",
+      windowsHide: true,
+      stdio: "pipe",
       env: resolveNodeCompileCacheEnv(),
       maxBuffer: SQLITE_READONLY_WORKER_MAX_BUFFER,
       timeout: timeoutMs,
