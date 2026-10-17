@@ -570,7 +570,9 @@ describe("TelegramPollingSession", () => {
           advancedOffset.resolve(offset ?? -1);
         });
       });
-      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      await new Promise<void>((resolve) => {
+        server.listen(0, "127.0.0.1", resolve);
+      });
       const address = server.address();
       if (!address || typeof address === "string") {
         throw new Error("Expected a loopback Bot API listener");
@@ -611,10 +613,10 @@ describe("TelegramPollingSession", () => {
             return () => worker.off("message", listener);
           },
           ackSpooledUpdate(requestId, result) {
-            worker.postMessage({ type: "spool-ack", requestId, result });
+            worker.postMessage({ type: "spool-ack", requestId, result }, []);
           },
           async stop() {
-            worker.postMessage({ type: "stop" });
+            worker.postMessage({ type: "stop" }, []);
             await task;
           },
           task: () => task,
@@ -637,7 +639,9 @@ describe("TelegramPollingSession", () => {
           await runPromise;
         } finally {
           server.closeAllConnections();
-          await new Promise<void>((resolve) => server.close(() => resolve()));
+          await new Promise<void>((resolve) => {
+            server.close(() => resolve());
+          });
         }
       });
       try {
