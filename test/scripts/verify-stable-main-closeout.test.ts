@@ -1,4 +1,3 @@
-// Verify Stable Main Closeout tests cover stable closeout CLI behavior.
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -18,6 +17,50 @@ import { verifyStableMainCloseout } from "../../scripts/lib/stable-release-close
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const sha = "a".repeat(40);
+const cliArgs = (options: Record<string, string>) =>
+  Object.entries(options).flatMap(([name, value]) => [`--${name}`, value]);
+function closeoutArgs(tag: string, dir: string, date = new Date().toISOString().slice(0, 10)) {
+  return cliArgs({
+    tag,
+    "main-dir": path.join(dir, "main"),
+    "tag-dir": path.join(dir, "tag"),
+    "release-json": path.join(dir, "release.json"),
+    "full-release-validation-run-id": "11",
+    "full-release-validation-run-attempt": "2",
+    "release-publish-run-id": "12",
+    "rollback-drill-id": "synthetic-drill",
+    "rollback-drill-date": date,
+    output: path.join(dir, "closeout.json"),
+  });
+}
+
+function macAssets(version: string) {
+  return ["", "-arm64", "-x86_64"]
+    .flatMap((suffix) =>
+      ["zip", "dmg", "dSYM.zip"].map((ext) => `OpenClaw-${version}${suffix}.${ext}`),
+    )
+    .map((name) => ({ name, digest: `sha256:${"c".repeat(64)}` }));
+}
+
+function saveReceipt(fixture: {
+  run(): ReturnType<typeof runCli>;
+  outputPath: string;
+  originalPath: string;
+}) {
+  const result = fixture.run();
+  expect(result.status, result.stderr).toBe(0);
+  const bytes = readFileSync(fixture.outputPath, "utf8");
+  writeFileSync(fixture.originalPath, bytes);
+  return bytes;
+}
+
+function assetNamed(assets: LinuxAsset[], name: string) {
+  return expectDefined(
+    assets.find((asset) => asset.name === name),
+    name,
+  );
+}
 
 function runCli(...args: string[]) {
   return spawnSync(process.execPath, ["scripts/verify-stable-main-closeout.mjs", ...args], {
@@ -48,26 +91,7 @@ function closeoutFixture(
   const assets: Array<{ name: string; digest: string }> = [];
   const release = { tagName: tag, isDraft: false, isPrerelease: false, assets };
   const args = [
-    "--tag",
-    tag,
-    "--main-dir",
-    path.join(dir, "main"),
-    "--tag-dir",
-    path.join(dir, "tag"),
-    "--release-json",
-    releasePath,
-    "--full-release-validation-run-id",
-    "11",
-    "--full-release-validation-run-attempt",
-    "2",
-    "--release-publish-run-id",
-    "12",
-    "--rollback-drill-id",
-    "synthetic-drill",
-    "--rollback-drill-date",
-    new Date().toISOString().slice(0, 10),
-    "--output",
-    outputPath,
+    ...closeoutArgs(tag, dir),
     ...(recovery ? ["--allow-failed-publish-recovery", "true"] : []),
   ];
   return {
@@ -188,12 +212,7 @@ function linuxCloseoutFixture(carried = false, tag = "v2026.9.4") {
     assets: [evidence],
   };
   if (carried) {
-    carrier.assets.push(
-      expectDefined(
-        original.assets.find((asset) => asset.name === "latest.json"),
-        "original Linux selector",
-      ),
-    );
+    carrier.assets.push(assetNamed(original.assets, "latest.json"));
   }
   const releasePath = path.join(dir, "release.json");
   const remotePath = path.join(dir, "remote.json");
@@ -247,28 +266,7 @@ if (args[1] === 'view') {
     ...carrier,
     assets: carrier.assets.map(({ bytes: _bytes, ...asset }) => asset),
   });
-  const args = [
-    "--tag",
-    tag,
-    "--main-dir",
-    path.join(dir, "main"),
-    "--tag-dir",
-    path.join(dir, "tag"),
-    "--release-json",
-    releasePath,
-    "--full-release-validation-run-id",
-    "11",
-    "--full-release-validation-run-attempt",
-    "2",
-    "--release-publish-run-id",
-    "12",
-    "--rollback-drill-id",
-    "synthetic-drill",
-    "--rollback-drill-date",
-    date,
-    "--output",
-    outputPath,
-  ];
+  const args = closeoutArgs(tag, dir, date);
   return {
     carrier,
     evidence,
@@ -279,10 +277,7 @@ if (args[1] === 'view') {
     },
     publishImmutable() {
       const publication = linuxPublication(version);
-      const selector = expectDefined(
-        publication.assets.find((asset) => asset.name === "latest.json"),
-        "selector",
-      );
+      const selector = assetNamed(publication.assets, "latest.json");
       const value = JSON.parse(expectDefined(selector.bytes, "selector bytes"));
       value.linuxPublication = {
         schemaVersion: 1,
@@ -335,8 +330,7 @@ describe("stable closeout Linux publication", () => {
     "refuses historical %s replay without rewriting the published receipt",
     (field) => {
       const fixture = linuxCloseoutFixture();
-      expect(fixture.run().status).toBe(0);
-      const receipt = JSON.parse(readFileSync(fixture.outputPath, "utf8"));
+      const receipt = JSON.parse(saveReceipt(fixture));
       const original = JSON.stringify({ ...receipt, [field]: "historical published authority" });
       writeFileSync(fixture.originalPath, original);
       const result = fixture.run(true);
@@ -353,14 +347,12 @@ describe("stable closeout Linux publication", () => {
 
   it("accepts only the validated exact late immutable Linux manifest", () => {
     const fixture = linuxCloseoutFixture();
-    expect(fixture.run().status).toBe(0);
-    const original = readFileSync(fixture.outputPath);
-    writeFileSync(fixture.originalPath, original);
+    const original = saveReceipt(fixture);
     fixture.publishLinux();
     fixture.publishImmutable();
     const replay = fixture.run(true);
     expect(replay.status, replay.stderr).toBe(0);
-    expect(readFileSync(fixture.outputPath)).toEqual(original);
+    expect(readFileSync(fixture.outputPath)).toEqual(Buffer.from(original));
     const immutable = expectDefined(
       fixture.carrier.assets.find((asset) => asset.name.endsWith("-linux.json")),
       "immutable manifest",
@@ -377,10 +369,7 @@ describe("stable closeout Linux publication", () => {
     "preserves receipt bytes after late Linux assets and selector (carried=$carried, $tag)",
     ({ carried, tag }) => {
       const fixture = linuxCloseoutFixture(carried, tag);
-      const initial = fixture.run();
-      expect(initial.status, initial.stderr).toBe(0);
-      const bytes = readFileSync(fixture.outputPath, "utf8");
-      writeFileSync(fixture.originalPath, bytes);
+      const bytes = saveReceipt(fixture);
       expect(JSON.parse(bytes).appPlatforms).toEqual({
         macos: "pending",
         android: "pending",
@@ -402,9 +391,7 @@ describe("stable closeout Linux publication", () => {
   it("does not treat recorded Linux bundles as mutable updater selectors", () => {
     const fixture = linuxCloseoutFixture();
     fixture.publishLinux();
-    const initial = fixture.run();
-    expect(initial.status, initial.stderr).toBe(0);
-    writeFileSync(fixture.originalPath, readFileSync(fixture.outputPath));
+    saveReceipt(fixture);
     const bundle = expectDefined(
       fixture.carrier.assets.find((asset) => asset.name.endsWith(".AppImage")),
       "published AppImage",
@@ -419,14 +406,9 @@ describe("stable closeout Linux publication", () => {
 
   it("requires source checksum proof and a matching current selector digest", () => {
     const fixture = linuxCloseoutFixture();
-    const initial = fixture.run();
-    expect(initial.status, initial.stderr).toBe(0);
-    writeFileSync(fixture.originalPath, readFileSync(fixture.outputPath));
+    saveReceipt(fixture);
     fixture.publishLinux();
-    const selector = expectDefined(
-      fixture.carrier.assets.find((asset) => asset.name === "latest.json"),
-      "current selector",
-    );
+    const selector = assetNamed(fixture.carrier.assets, "latest.json");
     const digest = selector.digest;
     selector.digest = `sha256:${"d".repeat(64)}`;
     const wrongDigest = fixture.run(true);
@@ -443,15 +425,10 @@ describe("stable closeout Linux publication", () => {
 
   it("rejects missing or mismatched validated selector observations without rewriting a receipt", () => {
     const fixture = linuxCloseoutFixture();
-    const initial = fixture.run();
-    expect(initial.status, initial.stderr).toBe(0);
-    const bytes = readFileSync(fixture.outputPath, "utf8");
+    const bytes = saveReceipt(fixture);
     const existingManifest = JSON.parse(bytes);
     fixture.publishLinux();
-    const selector = expectDefined(
-      fixture.carrier.assets.find((asset) => asset.name === "latest.json"),
-      "current selector",
-    );
+    const selector = assetNamed(fixture.carrier.assets, "latest.json");
     const observation = {
       carrierTag: "v2026.9.4",
       manifestSha256: selector.digest.slice(7),
@@ -501,15 +478,12 @@ describe("verify-stable-main-closeout", () => {
       digest: `sha256:${"b".repeat(64)}`,
     };
     release.assets.push(evidence);
-    const initial = fixture.run();
-    expect(initial.status, initial.stderr).toBe(0);
-    const initialBytes = readFileSync(outputPath, "utf8");
+    const initialBytes = saveReceipt(fixture);
     expect(JSON.parse(initialBytes)).toMatchObject({
       apps: "pending",
       appcast: "pending",
       releasePublishRecovery: { npmDockerVerified: true },
     });
-    writeFileSync(originalPath, initialBytes);
     mkdirSync(path.join(dir, "main", "CHANGELOG"));
     writeFileSync(
       path.join(dir, "main", "CHANGELOG.md"),
@@ -567,19 +541,12 @@ describe("verify-stable-main-closeout", () => {
     const fixture = closeoutFixture(version);
     const { dir, release, outputPath, originalPath } = fixture;
 
-    const initial = fixture.run();
-    expect(initial.status, initial.stderr).toBe(0);
-    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toMatchObject({
+    expect(JSON.parse(saveReceipt(fixture))).toMatchObject({
       appcast: "pending",
       appPlatforms: { macos: "pending" },
     });
-    writeFileSync(originalPath, readFileSync(outputPath));
 
-    release.assets = ["", "-arm64", "-x86_64"]
-      .flatMap((suffix) =>
-        ["zip", "dmg", "dSYM.zip"].map((extension) => `OpenClaw-${version}${suffix}.${extension}`),
-      )
-      .map((name) => ({ name, digest: `sha256:${"c".repeat(64)}` }));
+    release.assets = macAssets(version);
     const publishedFeedSpecs: Array<[string, string, string]> = [
       ["--published-appcast", "appcast.xml", `OpenClaw-${version}.zip`],
       ["--published-appcast-arm64", "appcast-arm64.xml", `OpenClaw-${version}-arm64.zip`],
@@ -601,12 +568,9 @@ describe("verify-stable-main-closeout", () => {
   it("rejects removed waiver flags while preserving strict closeout replay", () => {
     const fixture = closeoutFixture();
     const { outputPath, originalPath } = fixture;
-    const initial = fixture.run();
-    expect(initial.status, initial.stderr).toBe(0);
-    const recorded = JSON.parse(readFileSync(outputPath, "utf8"));
+    const recorded = JSON.parse(saveReceipt(fixture));
     expect(recorded).not.toHaveProperty("stableSoakWaiver");
     expect(recorded).not.toHaveProperty("laneWaiver");
-    writeFileSync(originalPath, readFileSync(outputPath));
 
     const replay = fixture.run(["--existing-manifest", originalPath]);
     expect(replay.status, replay.stderr).toBe(0);
@@ -644,11 +608,7 @@ process.stdout.write(JSON.stringify([
 `,
       { mode: 0o755 },
     );
-    release.assets = ["", "-arm64", "-x86_64"]
-      .flatMap((suffix) =>
-        ["zip", "dmg", "dSYM.zip"].map((extension) => `OpenClaw-${version}${suffix}.${extension}`),
-      )
-      .map((name) => ({ name, digest: `sha256:${"c".repeat(64)}` }));
+    release.assets = macAssets(version);
     const run = (lookups: "allowed" | "forbidden", ...extra: string[]) =>
       fixture.run(extra, {
         ...process.env,
@@ -715,100 +675,45 @@ describe("stable closeout workflow keyed runs and tag-only replay", () => {
 });
 
 describe("stable closeout workflow publication routing", () => {
+  const routingScenario = (
+    name: string,
+    patch: {
+      manual?: boolean;
+      conclusion?: string;
+      npm?: string;
+      docker?: string;
+      recovery?: { reason?: string; npmPublishRunId?: string };
+      code?: number;
+      checksum?: string;
+    } = {},
+  ) => ({
+    name,
+    manual: true,
+    conclusion: "failure",
+    npm: "success",
+    docker: "success",
+    recovery: undefined,
+    code: 1,
+    ...patch,
+  });
   it.each([
-    {
-      name: "ordinary successful parent",
+    routingScenario("ordinary successful parent", {
       manual: false,
       conclusion: "success",
-      npm: "success",
-      docker: "success",
-      recovery: undefined,
       code: 0,
-    },
-    {
-      name: "failed parent without manual recovery",
-      manual: false,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
-      recovery: undefined,
-      code: 1,
-    },
-    {
-      name: "legacy same-parent recovery",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
-      recovery: undefined,
-      code: 0,
-    },
-    {
-      name: "unrelated operator metadata",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
+    }),
+    routingScenario("failed parent without manual recovery", { manual: false }),
+    routingScenario("legacy same-parent recovery", { code: 0 }),
+    routingScenario("unrelated operator metadata", {
       recovery: { reason: "App assets are pending" },
       code: 0,
-    },
-    {
-      name: "failed legacy npm publication",
-      manual: true,
-      conclusion: "failure",
-      npm: "failure",
-      docker: "success",
-      recovery: undefined,
-      code: 1,
-    },
-    {
-      name: "failed legacy Docker publication",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "failure",
-      recovery: undefined,
-      code: 1,
-    },
-    {
-      name: "incomplete split selectors",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
-      recovery: { npmPublishRunId: "13" },
-      code: 1,
-    },
-    {
-      name: "rejects wrong-file checksum",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
-      recovery: undefined,
-      code: 1,
-      checksum: "wrong-file",
-    },
-    {
-      name: "rejects duplicate checksum",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
-      recovery: undefined,
-      code: 1,
-      checksum: "duplicate",
-    },
-    {
-      name: "rejects mismatch checksum",
-      manual: true,
-      conclusion: "failure",
-      npm: "success",
-      docker: "success",
-      recovery: undefined,
-      code: 1,
-      checksum: "mismatch",
-    },
+    }),
+    routingScenario("failed legacy npm publication", { npm: "failure" }),
+    routingScenario("failed legacy Docker publication", { docker: "failure" }),
+    routingScenario("incomplete split selectors", { recovery: { npmPublishRunId: "13" } }),
+    routingScenario("rejects wrong-file checksum", { checksum: "wrong-file" }),
+    routingScenario("rejects duplicate checksum", { checksum: "duplicate" }),
+    routingScenario("rejects mismatch checksum", { checksum: "mismatch" }),
   ])("preserves $name", (scenario) => {
     const workflow = readFileSync(".github/workflows/openclaw-stable-main-closeout.yml", "utf8");
     const block = workflow.match(
@@ -931,7 +836,6 @@ describe("stable closeout Full Release Validation checksum", () => {
   );
 });
 
-const sha = "a".repeat(40);
 const workflow = ".github/workflows/openclaw-npm-release.yml";
 const run = {
   id: 101,

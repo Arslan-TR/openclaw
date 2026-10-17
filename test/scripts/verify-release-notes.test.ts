@@ -37,25 +37,16 @@ import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-function createReleaseNotesFixtureLines(): string[] {
+function createReleaseNotesFixtureLines(
+  highlights = ["One", "Two", "Three", "Four", "Five"],
+): string[] {
   return [
-    "# Changelog",
-    "",
-    "## 2026.7.1",
-    "",
-    "### Highlights",
-    "",
-    "- One.",
-    "- Two.",
-    "- Three.",
-    "- Four.",
-    "- Five.",
-    "",
-    "### Changes",
-    "",
-    "### Fixes",
-    "",
-  ];
+    "# Changelog\n\n## 2026.7.1\n\n### Highlights\n",
+    ...highlights.map((word) => `- ${word}.`),
+    "\n### Changes\n\n### Fixes\n",
+  ]
+    .join("\n")
+    .split("\n");
 }
 
 const verifier = resolve(
@@ -75,6 +66,47 @@ function git(cwd: string, args: string[], extraEnv: Record<string, string> = {})
       ...extraEnv,
     },
   }).trim();
+}
+
+function releaseFixture(
+  prefix: string,
+  branch?: string,
+  changelog = createReleaseNotesFixtureLines().join("\n"),
+) {
+  const cwd = tempDirs.make(prefix);
+  git(cwd, ["init", "-q", ...(branch ? ["-b", branch] : [])]);
+  writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
+  return cwd;
+}
+
+function commitFixture(
+  cwd: string,
+  message: string,
+  files: Record<string, string | Uint8Array> = {},
+) {
+  for (const [file, contents] of Object.entries(files)) {
+    writeFileSync(join(cwd, file), contents);
+  }
+  git(cwd, ["add", "."]);
+  git(cwd, ["commit", "-qm", message]);
+  return git(cwd, ["rev-parse", "HEAD"]);
+}
+
+function mockGithub(cwd: string, script: string) {
+  const file = join(cwd, "gh");
+  writeFileSync(file, `#!${process.execPath}\n${script}`);
+  chmodSync(file, 0o755);
+}
+
+const paragraphs = (...parts: string[]) => parts.join("\n\n");
+function contributionRecord(version: string, summary: string, ...entries: string[]) {
+  return paragraphs(
+    `## ${version}`,
+    "### Complete contribution record",
+    summary,
+    "#### Pull requests",
+    entries.join("\n"),
+  );
 }
 
 function runVerifier(
@@ -253,28 +285,18 @@ describe("release-note verification", () => {
     const target = "a".repeat(40);
     expect(
       contributionRecordTarget({
-        source: [
-          "## 2026.7.2",
-          "",
-          "### Complete contribution record",
-          "",
+        source: contributionRecord(
+          "2026.7.2",
           `This audited record covers the complete base..${target} history: 1 in-range PR + 0 retained seed-only PRs = 1 unique PR.`,
-          "",
-          "#### Pull requests",
-          "",
           "- **PR #123** fix: example.",
-        ].join("\n"),
+        ),
       }),
     ).toBe(target);
   });
 
   it("reports deleted contextual references without rendering or crediting them", () => {
-    const cwd = tempDirs.make("openclaw-release-notes-deleted-ref-");
-    git(cwd, ["init", "-q", "-b", "main"]);
-    writeFileSync(join(cwd, "CHANGELOG.md"), createReleaseNotesFixtureLines().join("\n"));
-    git(cwd, ["add", "CHANGELOG.md"]);
-    git(cwd, ["commit", "-qm", "chore: baseline"]);
-    const base = git(cwd, ["rev-parse", "HEAD"]);
+    const cwd = releaseFixture("openclaw-release-notes-deleted-ref-", "main");
+    const base = commitFixture(cwd, "chore: baseline");
     git(cwd, [
       "commit",
       "--allow-empty",
@@ -284,10 +306,9 @@ describe("release-note verification", () => {
       "#155121 took a similar approach and was closed by its author.",
     ]);
     const target = git(cwd, ["rev-parse", "HEAD"]);
-    const gh = join(cwd, "gh");
-    writeFileSync(
-      gh,
-      `#!${process.execPath}
+    mockGithub(
+      cwd,
+      `
 const query = process.argv.find((arg) => arg.startsWith("query="))?.slice(6) ?? "";
 const data = {};
 const errors = [];
@@ -309,7 +330,6 @@ console.log(JSON.stringify({ data, errors }));
 process.exitCode = errors.length ? 1 : 0;
 `,
     );
-    chmodSync(gh, 0o755);
     splitChangelog({ rootDir: cwd });
     const manifestPath = join(cwd, "manifest.json");
     const result = runVerifier(cwd, {
@@ -631,35 +651,24 @@ process.exitCode = errors.length ? 1 : 0;
       mergedAt: "2026-07-12T00:00:00Z",
     };
 
-    expect(() =>
+    const validate = (
+      node: Omit<typeof validNode, "mergedAt"> & { mergedAt: string | null } = validNode,
+      isAncestor = () => true,
+    ) =>
       validateReleaseProvenanceOverrides(
         overrides,
-        new Map([[104905, validNode]]),
+        new Map([[104905, node]]),
         mainCommit,
-        () => true,
-      ),
-    ).not.toThrow();
+        isAncestor,
+      );
+    expect(() => validate()).not.toThrow();
     for (const node of [
       { ...validNode, baseRefName: "release/2026.7.1" },
       { ...validNode, mergedAt: null },
     ]) {
-      expect(() =>
-        validateReleaseProvenanceOverrides(
-          overrides,
-          new Map([[104905, node]]),
-          mainCommit,
-          () => true,
-        ),
-      ).toThrow("references non-main PR #104905");
+      expect(() => validate(node)).toThrow("references non-main PR #104905");
     }
-    expect(() =>
-      validateReleaseProvenanceOverrides(
-        overrides,
-        new Map([[104905, validNode]]),
-        mainCommit,
-        () => false,
-      ),
-    ).toThrow("references non-main PR #104905");
+    expect(() => validate(validNode, () => false)).toThrow("references non-main PR #104905");
   });
 
   it("validates release provenance PRs that shipped-ref subtraction left unresolved", () => {
@@ -678,26 +687,18 @@ process.exitCode = errors.length ? 1 : 0;
       return new Map(node ? [[104905, node]] : []);
     };
 
-    expect(() =>
+    const validate = (node?: unknown) =>
       validateReleaseProvenanceOverrides(
         overrides,
         new Map(),
         mainCommit,
         () => true,
-        resolveWith(mainNode),
-      ),
-    ).not.toThrow();
+        resolveWith(node),
+      );
+    expect(() => validate(mainNode)).not.toThrow();
     expect(requested).toEqual([[104905]]);
     for (const node of [{ ...mainNode, baseRefName: "release/2026.7.1" }, undefined]) {
-      expect(() =>
-        validateReleaseProvenanceOverrides(
-          overrides,
-          new Map(),
-          mainCommit,
-          () => true,
-          resolveWith(node),
-        ),
-      ).toThrow("references non-main PR #104905");
+      expect(() => validate(node)).toThrow("references non-main PR #104905");
     }
   });
 
@@ -913,45 +914,33 @@ process.exitCode = errors.length ? 1 : 0;
   );
 
   it("ignores nested revert markers in squash-merge bodies", () => {
-    const nestedRevert = [
+    const nestedRevert = paragraphs(
       "feat(android): render display math (#101435)",
-      "",
       "* feat(android): render display math",
-      "",
       ' * Revert "docs(changelog): note display math"',
-      "",
       `This reverts commit ${"a".repeat(40)}.`,
-    ].join("\n");
-    const topLevelRevert = [
+    );
+    const topLevelRevert = paragraphs(
       'Revert "fix(qa): keep smoke profile on one channel (#101173)" (#101184)',
-      "",
       `This reverts commit ${"b".repeat(40)}.`,
-    ].join("\n");
-    const squashRevert = [
+    );
+    const squashRevert = paragraphs(
       "Revert chat session picker inline search (#85527)",
-      "",
       '* Revert "fix(ui): keep chat session search inline (#85490)"',
-      "",
       `This reverts commit ${"c".repeat(40)}.`,
-      "",
       "* fix(ui): clear applied chat picker search on empty input",
-    ].join("\n");
-    const conventionalSquashRevert = [
+    );
+    const conventionalSquashRevert = paragraphs(
       "chore: revert dependency guard backfill machinery (#87867)",
-      "",
       '* Revert "ci: isolate dependency guard backfill label (#87882)"',
-      "",
       `This reverts commit ${"d".repeat(40)}.`,
-      "",
       "* ci: preserve clawsweeper bot label filter",
-    ].join("\n");
-    const explainedTopLevelRevert = [
+    );
+    const explainedTopLevelRevert = paragraphs(
       "revert: restore a provider default",
-      "",
       "The replacement broke non-native endpoints.",
-      "",
       `This reverts commit ${"e".repeat(40)}.`,
-    ].join("\n");
+    );
 
     expect(standardRevertedHash(nestedRevert)).toBeUndefined();
     expect(standardRevertedHash(topLevelRevert)).toBe("b".repeat(40));
@@ -1024,29 +1013,19 @@ process.exitCode = errors.length ? 1 : 0;
   });
 
   it("excludes Unreleased records from a cumulative shipped tag boundary", () => {
-    const changelog = [
+    const changelog = paragraphs(
       "# Changelog",
-      "",
-      "## Unreleased",
-      "",
-      "### Complete contribution record",
-      "",
-      `This audited record covers the complete base..${"a".repeat(40)} history: 1 merged PR.`,
-      "",
-      "#### Pull requests",
-      "",
-      "- **PR #1** fix: not shipped.",
-      "",
-      "## 2026.6.11",
-      "",
-      "### Complete contribution record",
-      "",
-      "This audited record covers the complete base..HEAD history: 0 merged PRs.",
-      "",
-      "#### Pull requests",
-      "",
-      "- **PR #2** fix: shipped.",
-    ].join("\n");
+      contributionRecord(
+        "Unreleased",
+        `This audited record covers the complete base..${"a".repeat(40)} history: 1 merged PR.`,
+        "- **PR #1** fix: not shipped.",
+      ),
+      contributionRecord(
+        "2026.6.11",
+        "This audited record covers the complete base..HEAD history: 0 merged PRs.",
+        "- **PR #2** fix: shipped.",
+      ),
+    );
 
     expect([...cumulativeShippedPullRequests(changelog, "test baseline")]).toEqual([2]);
   });
@@ -1095,17 +1074,13 @@ process.exitCode = errors.length ? 1 : 0;
 
   it("does not treat the shipped baseline inventory as current release-note references", () => {
     const baselines = [{ ref: "v2026.6.11", count: 2, pullRequests: [1, 2] }];
-    const section = [
+    const section = paragraphs(
       "## 2026.7.1",
-      "",
       "- Fixes #1 in the current range.",
-      "",
       "### Complete contribution record",
-      "",
       "Shipped baseline exclusions: v2026.6.11 (2 PRs: #1, #2).",
-      "",
       "- **PR #3** fix: current work.",
-    ].join("\n");
+    );
 
     expect(releaseNoteReferences(section, baselines)).toEqual([1, 3]);
   });
@@ -1202,29 +1177,21 @@ process.exitCode = errors.length ? 1 : 0;
   it.each([0, 1, 2])(
     "accounts for merged side ancestry with %i reversals without duplicating shipped PRs",
     (reversals) => {
-      const cwd = tempDirs.make("openclaw-release-notes-ancestry-");
-      git(cwd, ["init", "-q", "-b", "main"]);
-      const changelog = createReleaseNotesFixtureLines().join("\n");
-      writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
-      const commit = (subject: string, file: string) => {
-        writeFileSync(join(cwd, file), subject);
-        git(cwd, ["add", file]);
-        git(cwd, ["commit", "-qm", subject]);
-        return git(cwd, ["rev-parse", "HEAD"]);
-      };
-      git(cwd, ["add", "CHANGELOG.md"]);
-      const base = commit("chore: existing work (#9)", "base.txt");
+      const cwd = releaseFixture("openclaw-release-notes-ancestry-", "main");
+      const addCommit = (subject: string, file: string) =>
+        commitFixture(cwd, subject, { [file]: subject });
+      const base = addCommit("chore: existing work (#9)", "base.txt");
       git(cwd, ["checkout", "-qb", "side"]);
-      const first = commit("fix: side contribution", "first.txt");
+      const first = addCommit("fix: side contribution", "first.txt");
       git(cwd, ["checkout", "-qb", "nested-side"]);
-      const second = commit("fix: same contribution follow-up", "second.txt");
+      const second = addCommit("fix: same contribution follow-up", "second.txt");
       git(cwd, ["checkout", "-q", "side"]);
       git(cwd, ["merge", "--no-ff", "-qm", "merge: nested side work", "nested-side"]);
       const nestedMerge = git(cwd, ["rev-parse", "HEAD"]);
-      const withdrawn = commit("fix: withdrawable contribution", "withdrawn.txt");
-      const shipped = commit("fix: separately shipped contribution", "shipped.txt");
+      const withdrawn = addCommit("fix: withdrawable contribution", "withdrawn.txt");
+      const shipped = addCommit("fix: separately shipped contribution", "shipped.txt");
       git(cwd, ["checkout", "-q", "main"]);
-      commit("chore: main work", "main.txt");
+      addCommit("chore: main work", "main.txt");
       git(cwd, ["merge", "--no-ff", "-qm", "merge: side work", "side"]);
       let reversed = withdrawn;
       for (let index = 0; index < reversals; index += 1) {
@@ -1238,18 +1205,11 @@ process.exitCode = errors.length ? 1 : 0;
       git(cwd, ["checkout", "-qb", "shipped-release", base]);
       writeFileSync(
         join(cwd, "CHANGELOG.md"),
-        [
-          "## 2026.6.1",
-          "",
-          "### Complete contribution record",
-          "",
+        contributionRecord(
+          "2026.6.1",
           `This audited record covers the complete ${base}..${base} history: 1 in-range PR + 0 retained seed-only PRs = 1 unique PR.`,
-          "",
-          "#### Pull requests",
-          "",
-          "- **PR #12** Thanks @contributor.",
-          "",
-        ].join("\n"),
+          "- **PR #12** Thanks @contributor.\n",
+        ),
       );
       git(cwd, ["add", "CHANGELOG.md"]);
       git(cwd, ["commit", "-qm", "docs: shipped record"]);
@@ -1265,10 +1225,9 @@ process.exitCode = errors.length ? 1 : 0;
         [shipped]: 12,
         [nestedMerge]: 13,
       };
-      const gh = join(cwd, "gh");
-      writeFileSync(
-        gh,
-        `#!${process.execPath}\n
+      mockGithub(
+        cwd,
+        `
 const associations = ${JSON.stringify(associations)};
 const query = process.argv.find((arg) => arg.startsWith("query="))?.slice(6) ?? "";
 const data = {};
@@ -1285,7 +1244,6 @@ for (const [, alias, rawNumber] of query.matchAll(/(n\\d+): repository[\\s\\S]*?
 console.log(JSON.stringify({ data }));
 `,
       );
-      chmodSync(gh, 0o755);
       const manifestPath = join(cwd, "manifest.json");
       splitChangelog({ rootDir: cwd });
       const result = runVerifier(cwd, {
@@ -1336,15 +1294,12 @@ console.log(JSON.stringify({ data }));
     { message: "CI #34244092230 passed.", identity: "wrong-repo", accepted: false },
   ])("classifies active workflow references without losing issue accounting: %j", (scenario) => {
     const referenceNumber = Number(scenario.message.match(/#(\d+)/)?.[1]);
-    const cwd = tempDirs.make("openclaw-release-notes-runs-");
-    git(cwd, ["init", "-q", "-b", "main"]);
-    writeFileSync(
-      join(cwd, "CHANGELOG.md"),
+    const cwd = releaseFixture(
+      "openclaw-release-notes-runs-",
+      "main",
       [...createReleaseNotesFixtureLines(), scenario.note ?? "", ""].join("\n"),
     );
-    git(cwd, ["add", "CHANGELOG.md"]);
-    git(cwd, ["commit", "-qm", "chore: base"]);
-    const base = git(cwd, ["rev-parse", "HEAD"]);
+    const base = commitFixture(cwd, "chore: base");
     writeFileSync(join(cwd, "validation.txt"), scenario.message);
     git(cwd, ["add", "validation.txt"]);
     git(cwd, ["commit", "-qm", "chore: validation", "-m", scenario.message]);
@@ -1355,10 +1310,9 @@ console.log(JSON.stringify({ data }));
       git(cwd, ["commit", "--allow-empty", "-qm", "chore: follow-up", "-m", scenario.other]);
     }
     const target = git(cwd, ["rev-parse", "HEAD"]);
-    const gh = join(cwd, "gh");
-    writeFileSync(
-      gh,
-      `#!${process.execPath}\n
+    mockGithub(
+      cwd,
+      `
 const scenario = ${JSON.stringify(scenario)};
 const referenceNumber = ${referenceNumber};
 if (process.argv[3] === "repos/openclaw/openclaw/actions/runs/" + referenceNumber) {
@@ -1390,7 +1344,6 @@ for (const [, alias] of query.matchAll(/(n\\d+): repository/g)) {
 console.log(JSON.stringify({ data }));
 `,
     );
-    chmodSync(gh, 0o755);
     const manifestPath = join(cwd, "manifest.json");
     splitChangelog({ rootDir: cwd });
     const result = runVerifier(cwd, {
@@ -1443,43 +1396,37 @@ console.log(JSON.stringify({ data }));
     "prose",
     "non-revert-subject",
   ])("proves explicit multi-commit reversal accounting: %s", (mode) => {
-    const cwd = tempDirs.make("openclaw-release-notes-multi-revert-");
-    git(cwd, ["init", "-q", "-b", "main"]);
     const prose = createReleaseNotesFixtureLines().join("\n");
-    writeFileSync(join(cwd, "CHANGELOG.md"), prose);
+    const cwd = releaseFixture("openclaw-release-notes-multi-revert-", "main", prose);
     writeFileSync(join(cwd, "alpha.txt"), "original\n");
     writeFileSync(join(cwd, "beta.bin"), Buffer.from([0, 255, 1]));
-    const commit = (subject: string) => {
-      git(cwd, ["add", "."]);
-      git(cwd, ["commit", "-qm", subject]);
-      return git(cwd, ["rev-parse", "HEAD"]);
-    };
-    const originalBase = commit("chore: baseline");
+    const addCommit = (subject: string) => commitFixture(cwd, subject);
+    const originalBase = addCommit("chore: baseline");
     writeFileSync(
       join(cwd, "alpha.txt"),
       mode === "non-utf8" ? Buffer.from([97, 255, 10]) : "first\n",
     );
-    const first = commit("chore: first source (#21)");
+    const first = addCommit("chore: first source (#21)");
     writeFileSync(join(cwd, "beta.bin"), Buffer.from([0, 254, 2]));
     if (mode === "overlapping") {
       writeFileSync(join(cwd, "alpha.txt"), "second\n");
     }
-    const second = commit("chore: second source (#22)");
+    const second = addCommit("chore: second source (#22)");
     let third: string | undefined;
     if (mode === "three-targets") {
       writeFileSync(join(cwd, "third.txt"), "third\n");
-      third = commit("chore: third source (#23)");
+      third = addCommit("chore: third source (#23)");
     }
     writeFileSync(
       join(cwd, "CHANGELOG.md"),
       `${prose}\n### Complete contribution record\n\nThis audited record covers the complete ${originalBase}..${second} history: 2 in-range PRs + 0 retained seed-only PRs = 2 unique PRs.\n\n#### Pull requests\n\n- **PR #21** chore: first source.\n- **PR #22** chore: second source.\n`,
     );
-    const seed = commit("docs: preserve source ledger");
+    const seed = addCommit("docs: preserve source ledger");
     let declaredSecond = second;
     if (mode === "nonancestor" || mode === "merge-target") {
       git(cwd, ["checkout", "-qb", "side", originalBase]);
       writeFileSync(join(cwd, "side.txt"), "side\n");
-      declaredSecond = commit("chore: side source");
+      declaredSecond = addCommit("chore: side source");
       git(cwd, ["checkout", "-q", "main"]);
       if (mode === "merge-target") {
         git(cwd, ["merge", "--no-ff", "-qm", "merge side", "side"]);
@@ -1534,10 +1481,9 @@ console.log(JSON.stringify({ data }));
     }
     const target = git(cwd, ["rev-parse", "HEAD"]);
     const associations = { [first]: 21, [second]: 22, ...(third ? { [third]: 23 } : {}) };
-    const gh = join(cwd, "gh");
-    writeFileSync(
-      gh,
-      `#!${process.execPath}\n
+    mockGithub(
+      cwd,
+      `
 const associations = ${JSON.stringify(associations)};
 const query = process.argv.find((arg) => arg.startsWith("query="))?.slice(6) ?? "";
 const data = {};
@@ -1551,7 +1497,6 @@ for (const [, alias, number] of query.matchAll(/(n\\d+): repository[\\s\\S]*?iss
 console.log(JSON.stringify({ data }));
 `,
     );
-    chmodSync(gh, 0o755);
     const privateTmp = join(cwd, "private-proof-tmp");
     mkdirSync(privateTmp);
     const index = join(cwd, git(cwd, ["rev-parse", "--git-path", "index"]));
@@ -1613,10 +1558,8 @@ console.log(JSON.stringify({ data }));
     "provenance-carrier",
     "unresolved-body",
   ])("bounds contribution membership to the frozen source graph: %s", (mode) => {
-    const cwd = tempDirs.make("openclaw-release-notes-membership-");
-    git(cwd, ["init", "-q", "-b", "release"]);
     const prose = createReleaseNotesFixtureLines().join("\n");
-    writeFileSync(join(cwd, "CHANGELOG.md"), prose);
+    const cwd = releaseFixture("openclaw-release-notes-membership-", "release", prose);
     const commitAt = (message: string, day: number) => {
       git(cwd, ["add", "."]);
       const date = `2026-07-0${day}T12:00:00Z`;
@@ -1680,10 +1623,9 @@ console.log(JSON.stringify({ data }));
         `${prose}\n### Complete contribution record\n\nThis audited record covers the complete ${base}..${target} history: 2 in-range PRs + 0 retained seed-only PRs = 2 unique PRs.\n\n#### Pull requests\n\n- **PR #21** chore: supporting repair.\n- **PR #22** chore: performance work.\n`,
       );
     }
-    const gh = join(cwd, "gh");
-    writeFileSync(
-      gh,
-      `#!${process.execPath}\n
+    mockGithub(
+      cwd,
+      `
 const mode = ${JSON.stringify(mode)};
 const source = ${JSON.stringify(source)};
 const future = ${JSON.stringify(future)};
@@ -1701,7 +1643,6 @@ for (const [, alias, rawNumber] of query.matchAll(/(n\\d+): repository[\\s\\S]*?
 console.log(JSON.stringify({ data }));
 `,
     );
-    chmodSync(gh, 0o755);
     const manifestPath = join(cwd, "manifest.json");
     splitChangelog({ rootDir: cwd });
     const run = (write: boolean) =>
@@ -1758,19 +1699,14 @@ console.log(JSON.stringify({ data }));
     { mode: "missing-data", attempts: 1, error: "did not include data", waits: [] },
     { mode: "schema", attempts: 1, error: "Field unknownField does not exist", waits: [] },
   ])("handles GraphQL transport failure at the CLI boundary: $mode", (scenario) => {
-    const cwd = tempDirs.make("openclaw-release-notes-transport-");
-    git(cwd, ["init", "-q", "-b", "main"]);
     const changelog = createReleaseNotesFixtureLines().join("\n");
-    writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
-    git(cwd, ["add", "CHANGELOG.md"]);
-    git(cwd, ["commit", "-qm", "chore: baseline"]);
-    const base = git(cwd, ["rev-parse", "HEAD"]);
+    const cwd = releaseFixture("openclaw-release-notes-transport-", "main", changelog);
+    const base = commitFixture(cwd, "chore: baseline");
     git(cwd, ["commit", "--allow-empty", "-qm", "chore: source contribution"]);
     const target = git(cwd, ["rev-parse", "HEAD"]);
-    const gh = join(cwd, "gh");
-    writeFileSync(
-      gh,
-      `#!${process.execPath}\n
+    mockGithub(
+      cwd,
+      `
 const fs = require("node:fs");
 const mode = ${JSON.stringify(scenario.mode)};
 const state = fs.existsSync("request-state.json") ? JSON.parse(fs.readFileSync("request-state.json", "utf8")) : { attempts: 0, settled: false };
@@ -1805,7 +1741,6 @@ for (const [, alias] of query.matchAll(/(c\\d+): repository/g)) {
 console.log(JSON.stringify({ data }));
 `,
     );
-    chmodSync(gh, 0o755);
     const waitsPath = join(cwd, "waits.jsonl");
     const preload = join(cwd, "record-waits.mjs");
     writeFileSync(waitsPath, "");
@@ -1853,12 +1788,8 @@ Atomics.wait = function (...args) {
   it.each(["symbolic target", "release-only base", "nonancestor base"])(
     "validates the release range at the CLI boundary: %s",
     (mode) => {
-      const cwd = tempDirs.make("openclaw-release-notes-");
-      git(cwd, ["init", "-q"]);
-      writeFileSync(join(cwd, "CHANGELOG.md"), createReleaseNotesFixtureLines().join("\n"));
-      git(cwd, ["add", "CHANGELOG.md"]);
-      git(cwd, ["commit", "-qm", "initial"]);
-      const root = git(cwd, ["rev-parse", "HEAD"]);
+      const cwd = releaseFixture("openclaw-release-notes-");
+      const root = commitFixture(cwd, "initial");
       if (mode === "release-only base") {
         writeFileSync(join(cwd, "main.txt"), "main\n");
         git(cwd, ["add", "main.txt"]);
@@ -1916,20 +1847,7 @@ Atomics.wait = function (...args) {
   it("leaves split artifacts untouched when the rendered ledger fails validation", () => {
     const cwd = tempDirs.make("openclaw-release-notes-");
     git(cwd, ["init", "-q"]);
-    const changelog = [
-      "# Changelog",
-      "",
-      "## 2026.7.1",
-      "",
-      "### Highlights",
-      "",
-      "- Only one highlight.",
-      "",
-      "### Changes",
-      "",
-      "### Fixes",
-      "",
-    ].join("\n");
+    const changelog = createReleaseNotesFixtureLines(["Only one highlight"]).join("\n");
     writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
     git(cwd, ["add", "CHANGELOG.md"]);
     git(cwd, ["commit", "-qm", "initial"]);
