@@ -174,99 +174,103 @@ describe("mounted sidebar menus", () => {
     });
   });
 
-  it.each(["provider replacement", "native disconnect and reconnect"] as const)(
-    "keeps session-menu work scoped across %s",
-    async (transition) => {
-      setNativeGatewayTestState("local");
-      const retired = createDeferred<{ worktrees: WorktreeRecord[] }>();
-      const current = createDeferred<{ worktrees: WorktreeRecord[] }>();
-      const worktrees = vi
-        .fn()
-        .mockReturnValueOnce(retired.promise)
-        .mockReturnValue(current.promise);
-      const request = createGatewayRequestMock((method) =>
-        method === "worktrees.list" ? worktrees() : Promise.resolve({}),
-      );
-      const sessions = createSessionsHarness("main", ["agent:main:checkout"]);
-      const result = sessions.sessions.state.result!;
-      sessions.publishList({
-        result: {
-          ...result,
-          sessions: result.sessions.map((row) =>
-            Object.assign({}, row, {
-              worktree: { id: "wt-1", branch: "main", repoRoot: "/synthetic/repo" },
-            }),
-          ),
+  it.each([
+    "provider replacement",
+    "client replacement",
+    "native disconnect and reconnect",
+  ] as const)("keeps session-menu work scoped across %s", async (transition) => {
+    setNativeGatewayTestState("local");
+    const retired = createDeferred<{ worktrees: WorktreeRecord[] }>();
+    const current = createDeferred<{ worktrees: WorktreeRecord[] }>();
+    const worktrees = vi.fn().mockReturnValueOnce(retired.promise).mockReturnValue(current.promise);
+    const request = createGatewayRequestMock((method) =>
+      method === "worktrees.list" ? worktrees() : Promise.resolve({}),
+    );
+    const sessions = createSessionsHarness("main", ["agent:main:checkout"]);
+    const result = sessions.sessions.state.result!;
+    sessions.publishList({
+      result: {
+        ...result,
+        sessions: result.sessions.map((row) =>
+          Object.assign({}, row, {
+            worktree: { id: "wt-1", branch: "main", repoRoot: "/synthetic/repo" },
+          }),
+        ),
+      },
+    });
+    const response: { worktrees: WorktreeRecord[] } = {
+      worktrees: [
+        {
+          id: "wt-1",
+          name: "checkout",
+          repoFingerprint: "0123456789abcdef",
+          repoRoot: "/synthetic/repo",
+          path: "/synthetic/worktrees/checkout",
+          branch: "main",
+          baseRef: "main",
+          ownerKind: "session",
+          createdAt: 1,
+          lastActiveAt: 1,
         },
-      });
-      const response: { worktrees: WorktreeRecord[] } = {
-        worktrees: [
-          {
-            id: "wt-1",
-            name: "checkout",
-            repoFingerprint: "0123456789abcdef",
-            repoRoot: "/synthetic/repo",
-            path: "/synthetic/worktrees/checkout",
-            branch: "main",
-            baseRef: "main",
-            ownerKind: "session",
-            createdAt: 1,
-            lastActiveAt: 1,
-          },
-        ],
-      };
-      try {
-        const { sidebar, provider, context } = await mountSidebar(
-          createGateway(createTestGatewayClient(request)),
-          sessions.sessions,
-        );
-        sidebar.connected = true;
-        await sidebar.updateComplete;
-        const trigger = () =>
-          sidebar.querySelector<HTMLButtonElement>("[data-sidebar-session-menu]")!;
-        trigger().click();
-        await waitForSolid(() => expect(worktrees).toHaveBeenCalledTimes(1));
+      ],
+    };
+    try {
+      const gateway = createGatewayHarness(createTestGatewayClient(request));
+      const { sidebar, provider, context } = await mountSidebar(gateway.gateway, sessions.sessions);
+      sidebar.connected = true;
+      await sidebar.updateComplete;
+      const trigger = () =>
+        sidebar.querySelector<HTMLButtonElement>("[data-sidebar-session-menu]")!;
+      trigger().click();
+      await waitForSolid(() => expect(worktrees).toHaveBeenCalledTimes(1));
 
-        if (transition === "provider replacement") {
-          provider.setContext({ ...context });
-          await sidebar.updateComplete;
+      if (transition === "provider replacement") {
+        provider.setContext({ ...context });
+        await sidebar.updateComplete;
+        expect(worktrees).toHaveBeenCalledTimes(1);
+      } else if (transition === "client replacement") {
+        gateway.publish({ client: createTestGatewayClient(request), phase: "reconnecting" });
+        await sidebar.updateComplete;
+      } else {
+        sidebar.hostElement.remove();
+        await sidebar.updateComplete;
+        flush();
+        provider.append(sidebar.hostElement);
+        await sidebar.updateComplete;
+        await waitForSolid(() => expect(trigger()).not.toBeNull());
+        trigger().click();
+        await waitForSolid(() => expect(worktrees).toHaveBeenCalledTimes(2));
+      }
+      await waitForSolid(() =>
+        expect(sidebar.querySelector("openclaw-session-menu")).not.toBeNull(),
+      );
+      const menu = sidebar.querySelector("openclaw-session-menu")!;
+      const advanced = await openSubmenu(menu, "Advanced");
+      expect(menuItemLabels(advanced)).toContain("Open in");
+      const openIn = await openSubmenu(advanced, "Open in");
+      expect(menuItemLabels(openIn)).toContain("New tab");
+      expect(openIn.querySelector('[data-value="open-in:vscode"]')).toBeNull();
+
+      retired.resolve(response);
+      await vi.dynamicImportSettled();
+      await sidebar.updateComplete;
+      if (transition !== "provider replacement") {
+        expect(openIn.querySelector('[data-value="open-in:vscode"]')).toBeNull();
+        if (transition === "client replacement") {
           expect(worktrees).toHaveBeenCalledTimes(1);
-        } else {
-          sidebar.hostElement.remove();
-          await sidebar.updateComplete;
-          flush();
-          provider.append(sidebar.hostElement);
-          await sidebar.updateComplete;
-          await waitForSolid(() => expect(trigger()).not.toBeNull());
-          trigger().click();
+          gateway.publish({ phase: "connected" });
           await waitForSolid(() => expect(worktrees).toHaveBeenCalledTimes(2));
         }
-        await waitForSolid(() =>
-          expect(sidebar.querySelector("openclaw-session-menu")).not.toBeNull(),
-        );
-        const menu = sidebar.querySelector("openclaw-session-menu")!;
-        const advanced = await openSubmenu(menu, "Advanced");
-        expect(menuItemLabels(advanced)).toContain("Open in");
-        const openIn = await openSubmenu(advanced, "Open in");
-        expect(menuItemLabels(openIn)).toContain("New tab");
-        expect(openIn.querySelector('[data-value="open-in:vscode"]')).toBeNull();
-
-        retired.resolve(response);
-        await vi.dynamicImportSettled();
-        await sidebar.updateComplete;
-        if (transition === "native disconnect and reconnect") {
-          expect(openIn.querySelector('[data-value="open-in:vscode"]')).toBeNull();
-          current.resolve(response);
-        }
-        await waitForSolid(() => {
-          const editor = openIn.querySelector<HTMLButtonElement>('[data-value="open-in:vscode"]');
-          expect(editor).not.toBeNull();
-          expect(editor?.disabled).toBe(false);
-        });
-      } finally {
-        retired.resolve({ worktrees: [] });
-        current.resolve({ worktrees: [] });
+        current.resolve(response);
       }
-    },
-  );
+      await waitForSolid(() => {
+        const editor = openIn.querySelector<HTMLButtonElement>('[data-value="open-in:vscode"]');
+        expect(editor).not.toBeNull();
+        expect(editor?.disabled).toBe(false);
+      });
+    } finally {
+      retired.resolve({ worktrees: [] });
+      current.resolve({ worktrees: [] });
+    }
+  });
 });

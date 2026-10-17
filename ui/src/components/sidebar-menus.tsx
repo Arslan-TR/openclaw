@@ -114,6 +114,7 @@ export function createSidebarMenus(deps: {
   const routePreloadTimers = new Map<EventTarget, ReturnType<typeof globalThis.setTimeout>>();
   const sessionMenuWorkOwner = {};
   let sessionMenuWorkStore: ReturnType<typeof sessionPullRequestsForGateway> | null = null;
+  let stopSessionMenuGateway: (() => void) | undefined;
   let sessionMenuWorkVersion = 0;
   let agentMenuHoverOpenTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   let agentMenuHoverCloseTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
@@ -147,6 +148,8 @@ export function createSidebarMenus(deps: {
 
   function releaseSessionMenuWork() {
     sessionMenuWorkVersion += 1;
+    stopSessionMenuGateway?.();
+    stopSessionMenuGateway = undefined;
     sessionMenuWorkStore?.unwatch(sessionMenuWorkOwner);
     sessionMenuWorkStore = null;
   }
@@ -154,7 +157,8 @@ export function createSidebarMenus(deps: {
   function loadSessionMenuWork(session: SidebarRecentSession) {
     const version = ++sessionMenuWorkVersion;
     const context = host.sessionDataContext;
-    const client = context?.gateway.snapshot.client;
+    const snapshot = context?.gateway.snapshot;
+    const client = snapshot?.phase === "connected" ? snapshot.client : null;
     setField(
       "sessionMenuWork",
       session.worktreeId
@@ -165,7 +169,16 @@ export function createSidebarMenus(deps: {
           }
         : null,
     );
-    if (!session.worktreeId || !context || !client) {
+    if (!session.worktreeId || !context) {
+      return;
+    }
+    stopSessionMenuGateway = context.gateway.subscribe((next) => {
+      if (next.phase === "connected" && next.client !== client) {
+        releaseSessionMenuWork();
+        loadSessionMenuWork(session);
+      }
+    });
+    if (!client) {
       return;
     }
     const { selectedAgentId } = host.getSessionNavigationState();

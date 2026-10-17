@@ -13,7 +13,7 @@ import type {
   SidebarSessionSortMode,
 } from "./app-sidebar-session-types.ts";
 import type { SessionDataOwner } from "./session-data.ts";
-import type { SessionOrganizer, SessionOrganizerDependencies } from "./session-organizer.ts";
+import type { SessionOrganizer } from "./session-organizer.ts";
 
 export interface SidebarRouteView {
   readonly activeRouteId?: NavigationRouteId;
@@ -47,20 +47,7 @@ export interface SidebarMenusOwner extends SidebarRouteView {
   navigationView: "pages" | "sessions" | "online";
   readonly pinnedAgentIds: readonly string[];
   readonly selectedSessionKeys: ReadonlySet<string>;
-  readonly sessionData: SessionOrganizerDependencies["sessionData"] &
-    Pick<
-      SessionDataOwner,
-      | "context"
-      | "activeSessionLineageRoot"
-      | "activeSessionLineageSelectedRow"
-      | "childSessionRowsByParent"
-      | "sessionResultsByAgent"
-      | "sessionsLoading"
-      | "sessionsResult"
-      | "archiveSessionCatalog"
-      | "importSessionCatalog"
-      | "sessionScopeGeneration"
-    >;
+  readonly sessionData: SessionDataOwner;
   readonly sessionOrganizer: SessionOrganizer;
   readonly people: import("./sidebar-people.ts").SidebarPeoplePreferences;
   readonly peopleView?: ReturnType<typeof import("./sidebar-people.ts").createSidebarPeople>;
