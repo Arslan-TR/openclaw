@@ -125,8 +125,6 @@ export function renderSidebarAgentMenuForMenus(
             await menus.commit();
           }
         },
-        query: menus.agentMenuQuery,
-        onQueryChange: (query) => menus.setAgentMenuQuery(query),
         rosterMode: host.sidebarAgentsMode === "roster",
         onShowAllAgents: () => {
           host.navigationView = "sessions";

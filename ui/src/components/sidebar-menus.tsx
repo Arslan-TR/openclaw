@@ -76,7 +76,6 @@ type SidebarMenusState = {
   catalogViewMenuPosition: (MenuPosition & { catalogId: string }) | null;
   filterMenuView: SidebarFilterMenuView;
   agentMenuPosition: { x: number; top: number } | null;
-  agentMenuQuery: string;
   agentMenuMode: "hover" | "click";
   // Anchored by its bottom edge so the footer menu grows upward.
   identityMenuPosition: { x: number; bottom: number; width: number } | null;
@@ -104,7 +103,6 @@ export function createSidebarMenus(deps: {
     catalogViewMenuPosition: null,
     filterMenuView: "root",
     agentMenuPosition: null,
-    agentMenuQuery: "",
     agentMenuMode: "click",
     identityMenuPosition: null,
     menuRenderer: null,
@@ -583,11 +581,8 @@ export function createSidebarMenus(deps: {
       }
     },
 
-    setAgentMenuQuery: (query: string) => setField("agentMenuQuery", query),
-
     closeAgentMenu(options: { restoreFocus?: boolean } = {}) {
       clearAgentMenuHoverTimers();
-      setField("agentMenuQuery", "");
       agentMenuFocusBeforeHover = null;
       setField("agentMenuPosition", null);
       releaseTrigger("agent", options.restoreFocus);

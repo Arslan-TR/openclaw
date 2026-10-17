@@ -56,11 +56,9 @@ export interface SidebarMenusOwner extends SidebarRouteView {
   readonly sessionInvolvingMeFilterActive: boolean;
   readonly sessionOwnerOptions: readonly SessionOwnerOption[];
   readonly sessionOwnershipVisibility: { filters: boolean; avatars: boolean };
-  readSessionMutationAccess(request: {
-    method: string;
-    params?: unknown;
-    requiredScope?: "operator.write" | "operator.admin";
-  }): import("../lib/session-method-access.ts").SessionMethodAccess;
+  readSessionMutationAccess(
+    request: import("../lib/session-method-access.ts").SessionMethodAccessRequest,
+  ): import("../lib/session-method-access.ts").SessionMethodAccess;
   readonly sidebarEntries: readonly string[];
   readonly catalogProjectGrouping: CatalogProjectGrouping;
   setCatalogProjectGrouping(grouping: CatalogProjectGrouping): void;
