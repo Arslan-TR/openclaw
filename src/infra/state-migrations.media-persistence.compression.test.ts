@@ -72,7 +72,9 @@ it("repairs mixed trajectory storage and preserves the exact representation of u
   const result = await migrateLegacyMediaPersistence({ env });
 
   expect(result.warnings).toEqual([]);
-  expect(result.changes).toContain(expect.stringContaining("2 trajectory"));
+  expect(result.changes).toContain(
+    `Migrated media persistence in ${pathname}: 0 transcript session(s), 2 trajectory row(s), schema v${OPENCLAW_AGENT_SCHEMA_VERSION}.`,
+  );
   using repaired = openNodeSqliteDatabase(pathname, { readOnly: true });
   const after = executeSqliteQuerySync(repaired, query).rows;
   expect(after.slice(2)).toEqual(before.slice(2));

@@ -12,6 +12,10 @@ import {
   readSqliteDatabaseScopedWriteToken,
   sqliteSessionIdWriteScope,
 } from "../infra/sqlite-database-admission.js";
+import {
+  createSqliteWorkerOperationAdmission,
+  withSqliteWorkerOperationAdmission,
+} from "../infra/sqlite-worker-operation-admission.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
 import {
   openOpenClawAgentDatabase,
@@ -58,9 +62,13 @@ describe("SQLite trajectory runtime store", () => {
     const options = { agentId: "main", path: sqlitePath() };
     const database = openOpenClawAgentDatabase(options);
     const db = getNodeSqliteKysely<TrajectoryRuntimeTestDatabase>(database.db);
-    const events = ["legacy", "first", "second", "third"].map((type) =>
-      createTrajectoryEvent({ type, payloadSize: 4096 }),
-    );
+    const legacyEvent = createTrajectoryEvent({ type: "legacy", payloadSize: 4096 });
+    const events = [
+      legacyEvent,
+      ...["first", "second", "third"].map((type) =>
+        createTrajectoryEvent({ type, payloadSize: 4096 }),
+      ),
+    ];
     runOpenClawAgentWriteTransaction((current) => {
       executeSqliteQuerySync(
         current.db,
@@ -68,8 +76,8 @@ describe("SQLite trajectory runtime store", () => {
           session_id: "session-1",
           seq: 0,
           run_id: "run-1",
-          event_json: JSON.stringify(events[0]),
-          created_at: Date.parse(events[0].ts),
+          event_json: JSON.stringify(legacyEvent),
+          created_at: Date.parse(legacyEvent.ts),
         }),
       );
     }, options);
@@ -86,22 +94,30 @@ describe("SQLite trajectory runtime store", () => {
       writeTransaction: (operationLabel, _owner, write) =>
         runOpenClawAgentWriteTransaction(write, options, { operationLabel }),
     };
-    const append = (batch: TrajectoryEvent[], maxRuntimeBytes?: number) =>
-      operations["trajectory.events.append"](
-        {
-          sessionId: "session-1",
-          maxRuntimeBytes,
-          events: batch.map((event) => ({
-            runId: event.runId,
-            ts: event.ts,
-            get line() {
-              expect(database.db.isTransaction).toBe(false);
-              return JSON.stringify(event);
+    const append = (batch: TrajectoryEvent[], maxRuntimeBytes?: number) => {
+      const admission = createSqliteWorkerOperationAdmission((_request, grant) => grant());
+      try {
+        return withSqliteWorkerOperationAdmission({ port: admission.port }, () =>
+          operations["trajectory.events.append"](
+            {
+              sessionId: "session-1",
+              maxRuntimeBytes,
+              events: batch.map((event) => ({
+                runId: event.runId,
+                ts: event.ts,
+                get line() {
+                  expect(database.db.isTransaction).toBe(false);
+                  return JSON.stringify(event);
+                },
+              })),
             },
-          })),
-        },
-        context,
-      );
+            context,
+          ),
+        );
+      } finally {
+        admission.finish();
+      }
+    };
     append(events.slice(1, 3));
     expect(
       executeSqliteQuerySync(

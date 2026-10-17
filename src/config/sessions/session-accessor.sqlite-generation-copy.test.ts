@@ -91,10 +91,12 @@ it.each(["UTF-8", "UTF-16le"])(
           .where("session_id", "=", sessionId)
           .orderBy("seq");
       for (const options of [sourceOptions, destinationOptions]) {
-        runOpenClawAgentWriteTransaction(({ db }) => {
-          db.prepare(
-            "INSERT INTO session_windows(session_id,session_key,created_at,updated_at) VALUES(?,?,1,1)",
-          ).run(sessionId, "agent:main:trajectory-copy");
+        runOpenClawAgentWriteTransaction((database) => {
+          appendTranscriptEventsInTransaction(
+            database,
+            { ...options, sessionId, sessionKey: `agent:${options.agentId}:trajectory-copy` },
+            [{ type: "session", version: 3, id: sessionId }],
+          );
         }, options);
       }
       runOpenClawAgentWriteTransaction((database) => {
