@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { hostname } from "node:os";
 import path from "node:path";
+import type { Page } from "playwright";
 import { expect, it } from "vitest";
 import { writeOpenAiResponsesText } from "../../../test/helpers/openai-responses-sse.ts";
 import {
@@ -21,15 +22,11 @@ const replies = [
   "The second spoken answer stays visible.",
   "This answer has no speech attachment.",
 ] as const;
-type ProviderRequest = {
-  model: string;
-};
 type HistoryFrame = {
-  type: string;
   id?: string;
   method?: string;
   params?: { sessionKey?: string; cursor?: string };
-  payload?: { deltaCursor?: string; messages?: unknown[] };
+  payload?: { deltaCursor?: string };
 };
 
 function speechWav() {
@@ -58,21 +55,9 @@ function speechWav() {
 
 async function startProvider() {
   const speech: ServerResponse[] = [];
-  const receipts: Array<{
-    method?: string;
-    path: string;
-    model?: string;
-    promptIndex?: number;
-    status?: number;
-  }> = [];
   let turns = 0;
   let requests = 0;
   const server = createServer((request, response) => {
-    const receipt: (typeof receipts)[number] = {
-      method: request.method,
-      path: request.url?.split("?")[0] ?? "",
-    };
-    receipts.push(receipt);
     if (request.method === "GET" && request.url === "/speech") {
       request.resume();
       speech.push(response);
@@ -83,18 +68,14 @@ async function startProvider() {
         body += chunk;
       });
       request.on("end", () => {
-        const input: ProviderRequest = JSON.parse(body);
-        receipt.model = input.model;
+        const input: { model: string } = JSON.parse(body);
         const index = input.model === "echo" ? turns++ : -1;
         const text = input.model === "metadata" ? "Speech fixture" : replies[index];
-        receipt.promptIndex = index;
         if (text === undefined) {
-          receipt.status = 400;
           response.writeHead(400).end("Unexpected model turn");
           return;
         }
         requests += 1;
-        receipt.status = 200;
         writeOpenAiResponsesText(response, {
           text,
           messageId: `speech-answer-${requests}`,
@@ -103,7 +84,6 @@ async function startProvider() {
       });
     } else {
       request.resume();
-      receipt.status = 404;
       response.writeHead(404).end();
     }
   });
@@ -117,7 +97,6 @@ async function startProvider() {
   }
   return {
     port: address.port,
-    receipts,
     speech,
     turns: () => turns,
     release(index: number) {
@@ -139,6 +118,13 @@ async function startProvider() {
 
 let instance: OpenClawTestInstance;
 let provider: Awaited<ReturnType<typeof startProvider>>;
+async function cleanup() {
+  try {
+    await instance?.cleanup();
+  } finally {
+    await provider.close();
+  }
+}
 const suite = createControlUiE2eSuite({
   name: "Speech supplements through real chat.send and cursor history",
   startServerBeforeBrowser: true,
@@ -213,24 +199,215 @@ const suite = createControlUiE2eSuite({
       await instance.startGateway();
       return {
         baseUrl: `http://127.0.0.1:${instance.port}/`,
-        async close() {
-          try {
-            await instance.cleanup();
-          } finally {
-            await provider.close();
-          }
-        },
+        close: cleanup,
       };
     } catch (error) {
-      try {
-        await instance?.cleanup();
-      } finally {
-        await provider.close();
-      }
+      await cleanup();
       throw error;
     }
   },
 });
+
+async function verifySpeech(page: Page, url: string) {
+  let historyConnection = 0;
+  const history: Array<{
+    connection: number;
+    cursor: string;
+    consumedAfterResponse: boolean;
+  }> = [];
+  page.on("websocket", (socket) => {
+    const connection = ++historyConnection;
+    const historyRequests = new Set<string>();
+    socket.on("framesent", ({ payload }) => {
+      const frame: HistoryFrame = JSON.parse(payload.toString());
+      if (
+        frame.id &&
+        ["chat.history", "chat.startup"].includes(frame.method ?? "") &&
+        frame.params?.sessionKey === sessionKey
+      ) {
+        historyRequests.add(frame.id);
+        for (const response of history) {
+          if (response.connection === connection && response.cursor === frame.params.cursor) {
+            response.consumedAfterResponse = true;
+          }
+        }
+      }
+    });
+    socket.on("framereceived", ({ payload }) => {
+      const frame: HistoryFrame = JSON.parse(payload.toString());
+      if (frame.id && historyRequests.has(frame.id) && frame.payload?.deltaCursor) {
+        history.push({
+          connection,
+          cursor: frame.payload.deltaCursor,
+          consumedAfterResponse: false,
+        });
+      }
+    });
+  });
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "openclaw:control-ui:community-invite:v2",
+      JSON.stringify({ dismissedAtMs: 1770000000000 }),
+    );
+  });
+  await page.goto(url);
+  await enterControlUiSession(page);
+  await waitForControlUiGatewayReady(page);
+  const composer = page.getByRole("textbox", { name: "Chat composer", exact: true });
+  const send = async (text: string) => {
+    await composer.fill(text);
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
+  };
+  const answer = (text: string) => page.locator(".chat-bubble").filter({ hasText: text });
+  const assertSpeech = async (text: string, total: number) => {
+    const bubble = answer(text);
+    await expect.poll(() => bubble.count()).toBe(1);
+    await expect.poll(() => bubble.locator("audio").count()).toBe(1);
+    const audio = bubble.locator("audio");
+    await audio.evaluate((element) => {
+      if (!(element instanceof HTMLAudioElement)) {
+        throw new Error("Expected audio");
+      }
+      element.load();
+    });
+    await expect
+      .poll(
+        () =>
+          audio.evaluate(
+            (element) =>
+              element instanceof HTMLAudioElement &&
+              element.readyState >= 2 &&
+              element.duration > 0,
+          ),
+        { message: "The speech attachment must have decoded audio" },
+      )
+      .toBe(true);
+    await audio.evaluate(async (element: HTMLAudioElement) => {
+      await element.play();
+      element.pause();
+    });
+    expect(await page.locator(".chat-bubble audio").count()).toBe(total);
+    expect(
+      await page.locator(".chat-bubble").getByText("Audio reply", { exact: true }).count(),
+    ).toBe(0);
+  };
+  await send("/tts chat on");
+  await page.locator(".chat-bubble").getByText("TTS enabled for this chat.").waitFor();
+  for (const [index, text] of replies.slice(0, 2).entries()) {
+    await send(`Please give spoken answer ${index + 1}.`);
+    await expect
+      .poll(() => answer(text).isVisible(), {
+        message: "The spoken answer must be visible before speech is released",
+      })
+      .toBe(true);
+    await expect.poll(() => provider.speech.length).toBe(index + 1);
+    if (index === 1) {
+      // The first turn covers live delivery; this turn covers speech after hydration.
+      // Persist before reload so startup must reconcile the warm snapshot.
+      await page.evaluate(async () => {
+        const pane = document.querySelector<
+          HTMLElement & { sessionSnapshotStore?: SessionSnapshotStore }
+        >(".chat-pane-cache__pane--active");
+        if (!pane?.sessionSnapshotStore) {
+          throw new Error("Expected the active pane's snapshot store");
+        }
+        await pane.sessionSnapshotStore.flush();
+      });
+      const previousConnection = historyConnection;
+      await page.reload();
+      await waitForControlUiGatewayReady(page);
+      await expect
+        .poll(
+          async () => {
+            // A hydrated answer can be validated by an empty history delta.
+            const hydrationResponses = history.filter(
+              ({ connection }) => connection > previousConnection,
+            );
+            if (hydrationResponses.length === 0) {
+              return false;
+            }
+            const cursors = hydrationResponses.map(({ cursor }) => cursor);
+            const snapshotHost = await page.evaluate(() => {
+              const state = document.querySelector<HTMLElement & { state?: ChatPageHost }>(
+                ".chat-pane-cache__pane--active",
+              )?.state;
+              if (!state?.client?.recoveryScopeReady || !state.client.recoveryScope) {
+                return null;
+              }
+              return {
+                settings: { gatewayUrl: state.settings.gatewayUrl },
+                client: {
+                  recoveryScopeReady: true,
+                  recoveryScope: state.client.recoveryScope,
+                },
+                agentsList: state.agentsList,
+                hello: state.hello,
+                assistantAgentId: state.assistantAgentId,
+              };
+            });
+            if (!snapshotHost) {
+              return false;
+            }
+            const snapshotKey = resolveChatSnapshotKey(snapshotHost, { sessionKey });
+            return page.evaluate(
+              (expected) => {
+                const state = document.querySelector<HTMLElement & { state?: ChatPageHost }>(
+                  ".chat-pane-cache__pane--active",
+                )?.state;
+                const snapshot = state?.chatMessagesBySession?.get(expected.snapshotKey)?.snapshot;
+                return (
+                  state?.sessionKey === expected.sessionKey &&
+                  state.settings.gatewayUrl === expected.gatewayUrl &&
+                  state.client?.recoveryScopeReady === true &&
+                  state.client.recoveryScope === expected.recoveryScope &&
+                  !state.chatLoading &&
+                  (expected.cursors.includes(snapshot?.deltaCursor ?? "") ||
+                    expected.consumedAfterResponse) &&
+                  JSON.stringify(snapshot?.messages ?? []).includes(expected.text)
+                );
+              },
+              {
+                sessionKey,
+                snapshotKey,
+                gatewayUrl: snapshotHost.settings.gatewayUrl,
+                recoveryScope: snapshotHost.client.recoveryScope,
+                text,
+                cursors,
+                consumedAfterResponse: hydrationResponses.some(
+                  (response) => response.consumedAfterResponse,
+                ),
+              },
+            );
+          },
+          {
+            message: "Reload must hydrate the original answer before speech is released",
+          },
+        )
+        .toBe(true);
+    }
+    provider.release(index);
+    await assertSpeech(text, index + 1);
+    await page
+      .getByRole("button", { name: "Stop generating", exact: true })
+      .waitFor({ state: "detached" });
+    await page.reload();
+    await waitForControlUiGatewayReady(page);
+    await assertSpeech(text, index + 1);
+  }
+  await send("/tts chat off");
+  await page.locator(".chat-bubble").getByText("TTS disabled for this chat.").waitFor();
+  await send("Please give a text-only answer.");
+  await expect.poll(() => answer(replies[2]).count()).toBe(1);
+  await page
+    .getByRole("button", { name: "Stop generating", exact: true })
+    .waitFor({ state: "detached" });
+  await expect.poll(() => answer(replies[2]).count()).toBe(1);
+  await answer(replies[2]).waitFor();
+  expect(await answer(replies[2]).locator("audio").count()).toBe(0);
+  expect(await page.locator(".chat-bubble audio").count()).toBe(2);
+  expect(provider.speech).toHaveLength(2);
+  expect(provider.turns()).toBe(3);
+}
 
 suite.define(() => {
   it("attaches delayed speech to each original answer live and after reload", async (context) => {
@@ -254,217 +431,7 @@ suite.define(() => {
           url.pathname = "/chat/main/speech-supplement";
           await suite.withPage(
             { locale: "en-US", serviceWorkers: "block", viewport: { width: 1280, height: 900 } },
-            async ({ page }) => {
-              let historyConnection = 0;
-              const history: Array<{
-                connection: number;
-                frame: HistoryFrame;
-                consumedAfterResponse: boolean;
-              }> = [];
-              page.on("websocket", (socket) => {
-                const connection = ++historyConnection;
-                const historyRequests = new Set<string>();
-                socket.on("framesent", ({ payload }) => {
-                  const frame: HistoryFrame = JSON.parse(payload.toString());
-                  if (
-                    frame.id &&
-                    ["chat.history", "chat.startup"].includes(frame.method ?? "") &&
-                    frame.params?.sessionKey === sessionKey
-                  ) {
-                    historyRequests.add(frame.id);
-                    for (const response of history) {
-                      if (
-                        response.connection === connection &&
-                        response.frame.payload?.deltaCursor === frame.params.cursor
-                      ) {
-                        response.consumedAfterResponse = true;
-                      }
-                    }
-                  }
-                });
-                socket.on("framereceived", ({ payload }) => {
-                  const frame: HistoryFrame = JSON.parse(payload.toString());
-                  if (frame.id && historyRequests.has(frame.id) && frame.payload?.deltaCursor) {
-                    history.push({ connection, frame, consumedAfterResponse: false });
-                  }
-                });
-              });
-              await page.addInitScript(() => {
-                localStorage.setItem(
-                  "openclaw:control-ui:community-invite:v2",
-                  JSON.stringify({ dismissedAtMs: 1770000000000 }),
-                );
-              });
-              await page.goto(url.href);
-              await enterControlUiSession(page);
-              await waitForControlUiGatewayReady(page);
-              const composer = page.getByRole("textbox", { name: "Chat composer", exact: true });
-              const send = async (text: string) => {
-                await composer.fill(text);
-                await page.getByRole("button", { name: "Send message", exact: true }).click();
-              };
-              const answer = (text: string) =>
-                page.locator(".chat-bubble").filter({ hasText: text });
-              const assertSpeech = async (text: string, total: number) => {
-                const bubble = answer(text);
-                await expect.poll(() => bubble.count()).toBe(1);
-                await expect.poll(() => bubble.locator("audio").count()).toBe(1);
-                const audio = bubble.locator("audio");
-                await audio.evaluate((element) => {
-                  if (!(element instanceof HTMLAudioElement)) {
-                    throw new Error("Expected audio");
-                  }
-                  element.load();
-                });
-                await expect
-                  .poll(
-                    () =>
-                      audio.evaluate(
-                        (element) =>
-                          element instanceof HTMLAudioElement &&
-                          element.readyState >= 2 &&
-                          element.duration > 0,
-                      ),
-                    { message: "The speech attachment must have decoded audio" },
-                  )
-                  .toBe(true);
-                await audio.evaluate(async (element) => {
-                  if (!(element instanceof HTMLAudioElement)) {
-                    throw new Error("Expected audio");
-                  }
-                  await element.play();
-                  element.pause();
-                });
-                expect(await page.locator(".chat-bubble audio").count()).toBe(total);
-                expect(
-                  await page
-                    .locator(".chat-bubble")
-                    .getByText("Audio reply", { exact: true })
-                    .count(),
-                ).toBe(0);
-              };
-              await send("/tts chat on");
-              await page.locator(".chat-bubble").getByText("TTS enabled for this chat.").waitFor();
-              for (const [index, text] of replies.slice(0, 2).entries()) {
-                await send(`Please give spoken answer ${index + 1}.`);
-                await expect
-                  .poll(() => answer(text).isVisible(), {
-                    message: "The spoken answer must be visible before speech is released",
-                  })
-                  .toBe(true);
-                await expect.poll(() => provider.speech.length).toBe(index + 1);
-                if (index === 1) {
-                  // The first turn covers live delivery; this turn covers speech after hydration.
-                  // Persist before reload so startup must reconcile the warm snapshot.
-                  await page.evaluate(async () => {
-                    const pane = document.querySelector<
-                      HTMLElement & { sessionSnapshotStore?: SessionSnapshotStore }
-                    >(".chat-pane-cache__pane--active");
-                    if (!pane?.sessionSnapshotStore) {
-                      throw new Error("Expected the active pane's snapshot store");
-                    }
-                    await pane.sessionSnapshotStore.flush();
-                  });
-                  const previousConnection = historyConnection;
-                  await page.reload();
-                  await waitForControlUiGatewayReady(page);
-                  await expect
-                    .poll(
-                      async () => {
-                        // A hydrated answer can be validated by an empty history delta.
-                        const hydrationResponses = history.filter(
-                          ({ connection }) => connection > previousConnection,
-                        );
-                        if (hydrationResponses.length === 0) {
-                          return false;
-                        }
-                        const cursors = hydrationResponses.flatMap(({ frame }) =>
-                          frame.payload?.deltaCursor ? [frame.payload.deltaCursor] : [],
-                        );
-                        const snapshotHost = await page.evaluate(() => {
-                          const state = document.querySelector<
-                            HTMLElement & { state?: ChatPageHost }
-                          >(".chat-pane-cache__pane--active")?.state;
-                          if (!state?.client?.recoveryScopeReady || !state.client.recoveryScope) {
-                            return null;
-                          }
-                          return {
-                            settings: { gatewayUrl: state.settings.gatewayUrl },
-                            client: {
-                              recoveryScopeReady: true,
-                              recoveryScope: state.client.recoveryScope,
-                            },
-                            agentsList: state.agentsList,
-                            hello: state.hello,
-                            assistantAgentId: state.assistantAgentId,
-                          };
-                        });
-                        if (!snapshotHost) {
-                          return false;
-                        }
-                        const snapshotKey = resolveChatSnapshotKey(snapshotHost, { sessionKey });
-                        return page.evaluate(
-                          (expected) => {
-                            const state = document.querySelector<
-                              HTMLElement & { state?: ChatPageHost }
-                            >(".chat-pane-cache__pane--active")?.state;
-                            const snapshot = state?.chatMessagesBySession?.get(
-                              expected.snapshotKey,
-                            )?.snapshot;
-                            return (
-                              state?.sessionKey === expected.sessionKey &&
-                              state.settings.gatewayUrl === expected.gatewayUrl &&
-                              state.client?.recoveryScopeReady === true &&
-                              state.client.recoveryScope === expected.recoveryScope &&
-                              !state.chatLoading &&
-                              (expected.cursors.includes(snapshot?.deltaCursor ?? "") ||
-                                expected.consumedAfterResponse) &&
-                              JSON.stringify(snapshot?.messages ?? []).includes(expected.text)
-                            );
-                          },
-                          {
-                            sessionKey,
-                            snapshotKey,
-                            gatewayUrl: snapshotHost.settings.gatewayUrl,
-                            recoveryScope: snapshotHost.client.recoveryScope,
-                            text,
-                            cursors,
-                            consumedAfterResponse: hydrationResponses.some(
-                              (response) => response.consumedAfterResponse,
-                            ),
-                          },
-                        );
-                      },
-                      {
-                        message:
-                          "Reload must hydrate the original answer before speech is released",
-                      },
-                    )
-                    .toBe(true);
-                }
-                provider.release(index);
-                await assertSpeech(text, index + 1);
-                await page
-                  .getByRole("button", { name: "Stop generating", exact: true })
-                  .waitFor({ state: "detached" });
-                await page.reload();
-                await waitForControlUiGatewayReady(page);
-                await assertSpeech(text, index + 1);
-              }
-              await send("/tts chat off");
-              await page.locator(".chat-bubble").getByText("TTS disabled for this chat.").waitFor();
-              await send("Please give a text-only answer.");
-              await expect.poll(() => answer(replies[2]).count()).toBe(1);
-              await page
-                .getByRole("button", { name: "Stop generating", exact: true })
-                .waitFor({ state: "detached" });
-              await expect.poll(() => answer(replies[2]).count()).toBe(1);
-              await answer(replies[2]).waitFor();
-              expect(await answer(replies[2]).locator("audio").count()).toBe(0);
-              expect(await page.locator(".chat-bubble audio").count()).toBe(2);
-              expect(provider.speech).toHaveLength(2);
-              expect(provider.turns()).toBe(3);
-            },
+            ({ page }) => verifySpeech(page, url.href),
           );
         },
       });
@@ -487,7 +454,6 @@ suite.define(() => {
         path.join(suite.artifactDir, "speech-fixture.failure.json"),
         JSON.stringify(
           {
-            provider: provider.receipts,
             speechRequests: provider.speech.length,
             primaryTurns: provider.turns(),
             gatewayLog,

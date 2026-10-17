@@ -94,20 +94,16 @@ function writeTool(
     name,
     arguments: JSON.stringify(args),
   };
+  const argumentEvent = (phase: "delta" | "done", field: "delta" | "arguments") => ({
+    type: `response.function_call_arguments.${phase}`,
+    output_index: 0,
+    item_id: item.id,
+    [field]: item.arguments,
+  });
   writeOpenAiResponsesSse(response, [
     { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
-    {
-      type: "response.function_call_arguments.delta",
-      output_index: 0,
-      item_id: item.id,
-      delta: item.arguments,
-    },
-    {
-      type: "response.function_call_arguments.done",
-      output_index: 0,
-      item_id: item.id,
-      arguments: item.arguments,
-    },
+    argumentEvent("delta", "delta"),
+    argumentEvent("done", "arguments"),
     { type: "response.output_item.done", output_index: 0, item },
     {
       type: "response.completed",

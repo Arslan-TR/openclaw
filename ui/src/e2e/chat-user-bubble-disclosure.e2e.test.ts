@@ -46,6 +46,62 @@ async function openChat(
   return page;
 }
 
+// Runs in the browser; keep Range sampling shared, with each caller's line policy explicit.
+function measureText(element: Element, mode: "preview" | "details" | "reveal") {
+  const bounds = (node: Element) => {
+    const { left, top, right, bottom } = node.getBoundingClientRect();
+    return { left, top, right, bottom };
+  };
+  const paragraph = mode === "preview" ? element.querySelector("p, li")! : element;
+  const style = getComputedStyle(paragraph);
+  const clip = element.closest(".chat-message-disclosure__content")!;
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  const lines: Array<{ top: number; bottom: number; height: number }> = [];
+  const range = document.createRange();
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (
+      !node.textContent?.trim() ||
+      (mode === "details" && node.parentElement?.closest("summary"))
+    ) {
+      continue;
+    }
+    range.selectNodeContents(node);
+    for (const rect of range.getClientRects()) {
+      if (
+        rect.width > 0 &&
+        (mode === "reveal" ? rect.height > 0 : !lines.some((line) => line.top === rect.top))
+      ) {
+        lines.push({ top: rect.top, bottom: rect.bottom, height: rect.height });
+      }
+    }
+  }
+  const transcript = element.closest<HTMLElement>(".chat-thread");
+  if (!transcript) {
+    throw new Error("Disclosure content has no transcript");
+  }
+  const transcriptBounds = bounds(transcript);
+  const left = transcriptBounds.left + transcript.clientLeft;
+  const top = transcriptBounds.top + transcript.clientTop;
+  const context = document.createElement("canvas").getContext("2d")!;
+  context.font = style.font;
+  return {
+    lines,
+    bounds: bounds(element),
+    clip: bounds(clip),
+    paragraph: bounds(paragraph),
+    scrollTop: clip.scrollTop,
+    lineHeight: Number.parseFloat(style.lineHeight),
+    ascent: context.measureText("x").fontBoundingBoxAscent,
+    viewport: { width: innerWidth, height: innerHeight },
+    transcriptClip: {
+      left,
+      top,
+      right: left + transcript.clientWidth,
+      bottom: top + transcript.clientHeight,
+    },
+  };
+}
+
 async function expectCenteredToggle(bubble: Locator) {
   const { above, below } = await bubble.evaluate((element) => {
     const content = element.querySelector(".chat-message-disclosure__content")!;
@@ -69,63 +125,17 @@ async function expectReadableLastLine(page: Page, content: Locator) {
   const text = content.locator(".chat-text");
   await waitForControlUiProofSurface(content, [text]);
   await waitForLayoutSettled(page, ".chat-message-disclosure__content");
-  const geometry = await content.evaluate((element) => {
-    const paragraph = element.querySelector("p, li")!;
-    const style = getComputedStyle(paragraph);
-    const lineHeight = Number.parseFloat(style.lineHeight);
-    const clip = element.getBoundingClientRect();
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-    const lines: DOMRect[] = [];
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      if (!node.textContent?.trim()) {
-        continue;
-      }
-      const range = document.createRange();
-      range.selectNodeContents(node);
-      for (const rect of range.getClientRects()) {
-        if (rect.width > 0 && !lines.some((line) => line.top === rect.top)) {
-          lines.push(rect);
-        }
-      }
-    }
-    const visible = lines.filter((line) => line.top < clip.bottom);
-    const last = visible.at(-1)!;
-    const leading = lines[0]!.top - paragraph.getBoundingClientRect().top;
-    const lineTop = last.top - leading;
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d")!;
-    context.font = style.font;
-    const metrics = context.measureText("x");
-    const baseline = last.top + metrics.fontBoundingBoxAscent;
-    const transcript = element.closest<HTMLElement>(".chat-thread");
-    if (!transcript) {
-      throw new Error("Disclosure content has no transcript");
-    }
-    const transcriptBounds = transcript.getBoundingClientRect();
-    const transcriptLeft = transcriptBounds.left + transcript.clientLeft;
-    const transcriptTop = transcriptBounds.top + transcript.clientTop;
-    return {
-      bounds: { left: clip.left, top: clip.top, right: clip.right, bottom: clip.bottom },
-      viewport: { width: innerWidth, height: innerHeight },
-      transcriptClip: {
-        left: transcriptLeft,
-        top: transcriptTop,
-        right: transcriptLeft + transcript.clientWidth,
-        bottom: transcriptTop + transcript.clientHeight,
-      },
-      visibleLines: visible.length,
-      fraction: (clip.bottom - lineTop) / lineHeight,
-      baselineVisible: clip.bottom > baseline,
-      upperRow: Math.floor(lineTop + lineHeight / 2 - clip.top) - 1,
-      lowerRow: Math.floor(baseline - clip.top - 1),
-    };
-  });
-  expect(geometry.visibleLines).toBe(5);
-  expect(geometry.fraction).toBeGreaterThanOrEqual(0.66);
-  expect(geometry.fraction).toBeLessThanOrEqual(0.75);
-  expect(geometry.baselineVisible, "the x-height fits above the cut").toBe(true);
-
-  const { bounds, viewport, transcriptClip } = geometry;
+  const geometry = await content.evaluate(measureText, "preview");
+  const { bounds, viewport, transcriptClip, lines, lineHeight } = geometry;
+  const visible = lines.filter((line) => line.top < bounds.bottom);
+  const last = visible.at(-1)!;
+  const lineTop = last.top - (lines[0]!.top - geometry.paragraph.top);
+  const baseline = last.top + geometry.ascent;
+  const fraction = (bounds.bottom - lineTop) / lineHeight;
+  expect(visible).toHaveLength(5);
+  expect(fraction).toBeGreaterThanOrEqual(0.66);
+  expect(fraction).toBeLessThanOrEqual(0.75);
+  expect(bounds.bottom > baseline, "the x-height fits above the cut").toBe(true);
   expect(bounds.right).toBeGreaterThan(bounds.left);
   expect(bounds.bottom).toBeGreaterThan(bounds.top);
   expect(bounds.left).toBeGreaterThanOrEqual(Math.max(0, transcriptClip.left));
@@ -154,7 +164,7 @@ async function expectReadableLastLine(page: Page, content: Locator) {
     );
   }
   const rows = await content.evaluate(
-    async (_, { images, sampleRows, bounds: sampleBounds, viewport: viewportSize }) => {
+    async (_, { images, sampleRows, bounds: clip, viewport: size }) => {
       const sampleImage = async (source: string) => {
         const image = new Image();
         image.src = source;
@@ -164,11 +174,11 @@ async function expectReadableLastLine(page: Page, content: Locator) {
         canvas.height = image.height;
         const context = canvas.getContext("2d")!;
         context.drawImage(image, 0, 0);
-        const scaleX = image.width / viewportSize.width;
-        const scaleY = image.height / viewportSize.height;
-        const left = Math.floor(sampleBounds.left * scaleX);
-        const right = Math.ceil(sampleBounds.right * scaleX);
-        const top = Math.floor(sampleBounds.top * scaleY);
+        const scaleX = image.width / size.width;
+        const scaleY = image.height / size.height;
+        const left = Math.floor(clip.left * scaleX);
+        const right = Math.ceil(clip.right * scaleX);
+        const top = Math.floor(clip.top * scaleY);
         const sampleRow = (relativeY: number) => {
           // Match an enclosing element crop while scaling CSS rows to device pixels.
           const y = top + Math.floor(relativeY * scaleY);
@@ -195,7 +205,10 @@ async function expectReadableLastLine(page: Page, content: Locator) {
         masked: `data:image/png;base64,${masked.toString("base64")}`,
         unmasked: `data:image/png;base64,${unmasked.toString("base64")}`,
       },
-      sampleRows: { upper: geometry.upperRow, lower: geometry.lowerRow },
+      sampleRows: {
+        upper: Math.floor(lineTop + lineHeight / 2 - bounds.top) - 1,
+        lower: Math.floor(baseline - bounds.top - 1),
+      },
       bounds,
       viewport,
     },
@@ -346,30 +359,12 @@ suite.define(() => {
       await details.waitFor();
       await page.evaluate(() => document.fonts.ready);
       const expectFourthProseLineCut = async (paragraph: Locator) => {
-        const fraction = () =>
-          paragraph.evaluate((element) => {
-            const range = document.createRange();
-            const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-            const lines: DOMRect[] = [];
-            for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-              if (!node.textContent?.trim() || node.parentElement?.closest("summary")) {
-                continue;
-              }
-              range.selectNodeContents(node);
-              for (const rect of range.getClientRects()) {
-                if (rect.width > 0 && !lines.some((line) => line.top === rect.top)) {
-                  lines.push(rect);
-                }
-              }
-            }
-            const fourthLine = lines[3]!;
-            const lineHeight = Number.parseFloat(getComputedStyle(element).lineHeight);
-            const lineTop = fourthLine.top - Math.floor((lineHeight - fourthLine.height) / 2);
-            const bottom = element
-              .closest(".chat-message-disclosure__content")!
-              .getBoundingClientRect().bottom;
-            return (bottom - lineTop) / lineHeight;
-          });
+        const fraction = async () => {
+          const { lines, lineHeight, clip } = await paragraph.evaluate(measureText, "details");
+          const fourth = lines[3]!;
+          const lineTop = fourth.top - Math.floor((lineHeight - fourth.height) / 2);
+          return (clip.bottom - lineTop) / lineHeight;
+        };
         // The visible summary owns the first preview line; prose supplies the next four.
         await expect.poll(fraction).toSatisfy((value: number) => value >= 0.66 && value <= 0.75);
       };
@@ -387,10 +382,7 @@ suite.define(() => {
   it("keeps densely spaced block art within five preview rows", async () => {
     const page = await openChat([
       message(
-        "```\n" +
-          Array.from({ length: 24 }, () => "█▀▄ ".repeat(20)).join("\n") +
-          "\n```\n\n" +
-          "Follow the sample notes. ".repeat(60),
+        `\`\`\`\n${Array.from({ length: 24 }, () => "█▀▄ ".repeat(20)).join("\n")}\n\`\`\`\n\n${"Follow the sample notes. ".repeat(60)}`,
       ),
     ]);
     const content = preview(page);
@@ -449,35 +441,17 @@ suite.define(() => {
       // Browser descendant reveal can scroll an overflow-hidden preview without expanding it.
       const revealedParagraph = markdown.locator("p").nth(9);
       await revealedParagraph.scrollIntoViewIfNeeded();
-      const geometry = await revealedParagraph.evaluate((paragraph) => {
-        const clip = paragraph.closest(".chat-message-disclosure__content");
-        if (!clip) {
-          throw new Error("Missing user message preview");
-        }
-        const clipRect = clip.getBoundingClientRect();
-        const paragraphRect = paragraph.getBoundingClientRect();
-        // Read individual text nodes so BR boxes and duplicate element fragments are excluded.
-        const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
-        const lines: Array<{ top: number; bottom: number }> = [];
-        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-          if (!node.textContent?.trim()) {
-            continue;
-          }
-          const range = document.createRange();
-          range.selectNodeContents(node);
-          for (const rect of range.getClientRects()) {
-            if (rect.width > 0 && rect.height > 0) {
-              lines.push({ top: rect.top, bottom: rect.bottom });
-            }
-          }
-        }
-        return {
-          scrollTop: clip.scrollTop,
-          clip: { top: clipRect.top, bottom: clipRect.bottom },
-          paragraph: { top: paragraphRect.top, bottom: paragraphRect.bottom },
-          lines,
-        };
+      const measured = await revealedParagraph.evaluate(measureText, "reveal");
+      const verticalBounds = ({ top, bottom }: { top: number; bottom: number }) => ({
+        top,
+        bottom,
       });
+      const geometry = {
+        scrollTop: measured.scrollTop,
+        clip: verticalBounds(measured.clip),
+        paragraph: verticalBounds(measured.paragraph),
+        lines: measured.lines.map(verticalBounds),
+      };
       await screenshot(page, `${viewport.name}-revealed.png`);
       if (captureUiProofEnabled) {
         await writeFile(
@@ -529,11 +503,8 @@ suite.define(() => {
         }),
       );
       expect(boxes).toHaveLength(3);
-      for (const [index, box] of boxes.entries()) {
-        const previous = boxes[index - 1];
-        if (previous) {
-          expect(previous.bottom).toBeLessThanOrEqual(box.top + 1);
-        }
+      for (let index = 1; index < boxes.length; index++) {
+        expect(boxes[index - 1]!.bottom).toBeLessThanOrEqual(boxes[index]!.top + 1);
       }
     },
   );
