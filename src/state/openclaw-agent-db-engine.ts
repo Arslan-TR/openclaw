@@ -14,6 +14,7 @@ import { admitSqliteSchema, getAdmittedSqliteSchemaFacts } from "../infra/sqlite
 import { VERSION } from "../version.js";
 import {
   AGENT_WRITE_LAYOUT_SCHEMA_VERSION,
+  AGENT_TRAJECTORY_STORAGE_SCHEMA_VERSION,
   OPENCLAW_AGENT_SCHEMA_VERSION,
 } from "./openclaw-agent-db-contract.js";
 import { assertAgentDatabaseMaintenanceAuthority } from "./openclaw-agent-db-maintenance-authority.js";
@@ -23,6 +24,10 @@ import {
 } from "./openclaw-agent-db-metadata.js";
 import { assertCurrentAgentSchemaMetadata } from "./openclaw-agent-db-schema-read.js";
 import { agentTranscriptSearchSchema } from "./openclaw-agent-search-schema.js";
+import {
+  AGENT_TRAJECTORY_STORAGE_POSTGRES_MIGRATION_SQL,
+  withLegacyAgentPostgresTrajectoryStorage,
+} from "./openclaw-agent-trajectory-storage-migration.js";
 import {
   AGENT_WRITE_LAYOUT_POSTGRES_MIGRATION_SQL,
   withLegacyAgentPostgresWriteLayout,
@@ -60,6 +65,7 @@ export function admitAgentEngineSearchExtensions(
 }
 
 const agentPostgresSql = `${agentPostgresRuntime.sql}\n${agentSearchPostgresRuntime.sql}`;
+const agentTextTrajectoryPostgresSql = withLegacyAgentPostgresTrajectoryStorage(agentPostgresSql);
 
 export const agentEngineSchema: StoreSchema = {
   id: "agent",
@@ -70,11 +76,22 @@ export const agentEngineSchema: StoreSchema = {
   postgresMigrations: [
     {
       version: AGENT_WRITE_LAYOUT_SCHEMA_VERSION,
-      fromSchema: { postgres: withLegacyAgentPostgresWriteLayout(agentPostgresSql) },
-      schema: { postgres: agentPostgresSql },
+      fromSchema: { postgres: withLegacyAgentPostgresWriteLayout(agentTextTrajectoryPostgresSql) },
+      schema: { postgres: agentTextTrajectoryPostgresSql },
       sql: `${AGENT_WRITE_LAYOUT_POSTGRES_MIGRATION_SQL}
         UPDATE schema_meta
         SET schema_version = ${AGENT_WRITE_LAYOUT_SCHEMA_VERSION},
+          app_version = '${VERSION.replaceAll("'", "''")}',
+          updated_at = CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000 AS bigint)
+        WHERE meta_key = 'primary';`,
+    },
+    {
+      version: AGENT_TRAJECTORY_STORAGE_SCHEMA_VERSION,
+      fromSchema: { postgres: agentTextTrajectoryPostgresSql },
+      schema: { postgres: agentPostgresSql },
+      sql: `${AGENT_TRAJECTORY_STORAGE_POSTGRES_MIGRATION_SQL}
+        UPDATE schema_meta
+        SET schema_version = ${AGENT_TRAJECTORY_STORAGE_SCHEMA_VERSION},
           app_version = '${VERSION.replaceAll("'", "''")}',
           updated_at = CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000 AS bigint)
         WHERE meta_key = 'primary';`,

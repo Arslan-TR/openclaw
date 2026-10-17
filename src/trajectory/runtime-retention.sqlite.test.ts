@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import {
@@ -22,6 +22,7 @@ import { loadAgentTrajectoryOperations } from "../state/openclaw-agent-execution
 import type { AgentWorkerOperationContext } from "../state/openclaw-agent-operation-context.js";
 import { requireNativeSqliteDatabase } from "../test-utils/native-sqlite.js";
 import { useSessionStoreTempDirs } from "../test-utils/session-state-cleanup.js";
+import { readTrajectoryPayload } from "./runtime-payload.js";
 import {
   beginTrajectoryRuntimeRetention,
   prepareTrajectoryRuntimeRetention,
@@ -179,6 +180,7 @@ describe("SQLite trajectory runtime retention", () => {
                 events: [{ runId: trigger.runId, ts: trigger.ts, line: JSON.stringify(trigger) }],
                 discardPrevious: true,
               },
+              openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() }),
               (operationLabel, write) =>
                 runOpenClawAgentWriteTransaction(
                   write,
@@ -344,6 +346,7 @@ describe("SQLite trajectory runtime retention", () => {
             sessionId: "history",
             events: [{ runId: event.runId, ts: event.ts, line: JSON.stringify(event) }],
           },
+          openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() }),
           (operationLabel, write) =>
             runOpenClawAgentWriteTransaction(
               write,
@@ -462,9 +465,29 @@ describe("SQLite trajectory runtime retention", () => {
     ]);
   });
 
-  it.each([0, -1])(
-    "evicts complete runs at the global UTF-8 byte budget (%i-byte adjustment)",
-    async (delta) => {
+  it.each(
+    ["UTF-8", "UTF-16le", "UTF-16be"].flatMap((encoding) =>
+      [0, -1].map((delta) => ({ encoding, delta })),
+    ),
+  )(
+    "evicts complete runs at the global native-byte budget in $encoding ($delta-byte adjustment)",
+    async ({ encoding, delta }) => {
+      if (encoding !== "UTF-8") {
+        storePath = path.join(tempDir, `${encoding}.sqlite`);
+        const seed = new DatabaseSync(storePath);
+        try {
+          seed.exec(
+            `PRAGMA encoding = '${encoding}'; CREATE TABLE encoding_seed (id INTEGER); DROP TABLE encoding_seed;`,
+          );
+        } finally {
+          seed.close();
+        }
+        await replaceSessionEntry(
+          { sessionKey: "agent:main:main", storePath },
+          { sessionId: "session-1", updatedAt: 10 },
+        );
+      }
+      const nativeEncoding = encoding === "UTF-8" ? "utf8" : "utf16le";
       const now = Date.parse("2026-07-26T00:00:00.000Z");
       vi.useFakeTimers();
       vi.setSystemTime(now);
@@ -483,18 +506,18 @@ describe("SQLite trajectory runtime retention", () => {
             sessionId === "middle" || (sessionId === "oldest" && part === 0)
               ? undefined
               : "shared-run";
-          event.data = { payload: "日本語🦞".repeat(40) };
+          event.data = { payload: "日本語🦞".repeat(100) };
           return event;
         });
         appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath }, events);
       }
-      const bytesBefore = runtimeBytesBySession();
+      const bytesBefore = runtimeBytesBySession(nativeEncoding);
       const trigger = createTrajectoryEvent({
         payloadSize: 200,
         type: "current-newest",
         ts: new Date(now + 60 * 60 * 1_000).toISOString(),
       });
-      const triggerBytes = Buffer.byteLength(JSON.stringify(trigger), "utf8") + 1;
+      const triggerBytes = Buffer.byteLength(JSON.stringify(trigger), nativeEncoding) + 1;
       const maxGlobalRuntimeBytes =
         [...bytesBefore.values()].reduce((total, bytes) => total + bytes, 0) +
         triggerBytes -
@@ -858,7 +881,9 @@ describe("SQLite trajectory runtime retention", () => {
   }
 
   function sqlitePath(): string {
-    return path.join(tempDir, "agents", "main", "agent", "openclaw-agent.sqlite");
+    return storePath.endsWith(".sqlite")
+      ? storePath
+      : path.join(tempDir, "agents", "main", "agent", "openclaw-agent.sqlite");
   }
 
   async function addSession(sessionId: string): Promise<void> {
@@ -873,18 +898,22 @@ describe("SQLite trajectory runtime retention", () => {
     return events.map((event) => event.type);
   }
 
-  function runtimeBytesBySession(): Map<string, number> {
+  function runtimeBytesBySession(encoding: BufferEncoding = "utf8"): Map<string, number> {
     const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
     const db = getNodeSqliteKysely<TrajectoryRuntimeTestDatabase>(database.db);
     const rows = executeSqliteQuerySync(
       database.db,
-      db.selectFrom("trajectory_runtime_events").select(["session_id", "event_json"]),
+      db
+        .selectFrom("trajectory_runtime_events")
+        .select(["session_id", "event_json", "event_payload", "event_codec", "event_utf8_bytes"]),
     ).rows;
     const bytesBySession = new Map<string, number>();
     for (const row of rows) {
       bytesBySession.set(
         row.session_id,
-        (bytesBySession.get(row.session_id) ?? 0) + Buffer.byteLength(row.event_json, "utf8") + 1,
+        (bytesBySession.get(row.session_id) ?? 0) +
+          Buffer.byteLength(readTrajectoryPayload(row), encoding) +
+          1,
       );
     }
     return bytesBySession;

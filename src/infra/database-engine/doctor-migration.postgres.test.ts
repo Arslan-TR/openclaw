@@ -579,7 +579,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
     },
   );
   it.each([false, true])(
-    "keeps the real agent v27→v28 rollback exact (foreign write: %s)",
+    "keeps the real agent v27 rollback exact (foreign write: %s)",
     async (foreignWrite) => {
       // The preceding foreign-write case deliberately retains the candidate state schema.
       closeOpenClawStateDatabaseForTest();
@@ -601,9 +601,33 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         postgres: migration.fromSchema.postgres,
         postgresMigrations: [],
       };
+      const targetNamespace = withEngineStoreAdmission(() => {
+        using anchor = openNodeSqliteDatabase(":memory:");
+        const engine = openAgentEngineStore(anchor, "main", `${agentPath}.target`);
+        try {
+          return getPostgresPhysicalFacts(engine)!.namespace;
+        } finally {
+          engine.close();
+        }
+      });
+      namespaces.add(targetNamespace);
+      const targetAgentFingerprint = (
+        await client.query(`SELECT fingerprint FROM "${targetNamespace}".openclaw_schema_meta`)
+      ).rows[0].fingerprint;
+      // Build the actual historical layout; dropping current columns would leave
+      // PostgreSQL attribute-number holes and change the later migration catalog.
       let agentNamespace = withEngineStoreAdmission(() => {
         using anchor = openNodeSqliteDatabase(agentPath);
-        const engine = openAgentEngineStore(anchor, "main", agentPath);
+        const engine = openEngineStore({
+          anchor,
+          schema: installed,
+          input: { connection: connection!, schemaPrefix: "doctor_fixture" },
+          inspectSqlite: () => ({ hasExistingData: false, hasEngineAnchor: false }),
+          prepareAnchor() {},
+          openSqlite() {
+            throw new Error("Expected PostgreSQL");
+          },
+        });
         try {
           return getPostgresPhysicalFacts(engine)!.namespace;
         } finally {
@@ -611,21 +635,11 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         }
       });
       namespaces.add(agentNamespace);
-      const targetAgentFingerprint = (
-        await client.query(`SELECT fingerprint FROM "${agentNamespace}".openclaw_schema_meta`)
-      ).rows[0].fingerprint;
       await client.query(`
-        DROP INDEX "${agentNamespace}".idx_agent_session_windows_conversation;
-        CREATE INDEX idx_agent_session_windows_conversation
-          ON "${agentNamespace}".session_windows
-            (primary_conversation_id NULLS FIRST, updated_at DESC NULLS LAST, session_id NULLS FIRST)
-          WHERE primary_conversation_id IS NOT NULL;
-        CREATE INDEX idx_agent_transcript_event_parent
-          ON "${agentNamespace}".transcript_event_identities
-            (session_id NULLS FIRST, parent_id NULLS FIRST) WHERE parent_id IS NOT NULL;
-        UPDATE "${agentNamespace}".openclaw_schema_meta
-          SET version = 27, fingerprint = NULL, ddl_hash = NULL, server_major = NULL;
-        UPDATE "${agentNamespace}".schema_meta SET schema_version = 27;
+        INSERT INTO "${agentNamespace}".schema_meta
+          VALUES ('primary', 'agent', 27, 'main', NULL, 1, 1);
+        INSERT INTO "${agentNamespace}".session_key_contract VALUES (1, 'main', 0);
+        INSERT INTO "${agentNamespace}".memory_index_state VALUES (1, 0);
         INSERT INTO "${agentNamespace}".session_nodes
           (session_key, current_session_id, entry_json, updated_at)
           VALUES ('agent:main:main', 'session', '{"sessionId":"session"}', 1);

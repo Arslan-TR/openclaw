@@ -53,6 +53,7 @@ import {
   AGENT_JSON_PREDICATE_SCHEMA_VERSION,
   AGENT_OUTBOX_SEQUENCE_SCHEMA_VERSION,
   AGENT_WRITE_LAYOUT_SCHEMA_VERSION,
+  AGENT_TRAJECTORY_STORAGE_SCHEMA_VERSION,
   CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION,
   CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION,
   OPENCLAW_AGENT_SCHEMA_VERSION,
@@ -114,6 +115,10 @@ import {
   withoutSessionEntrySnapshotsSchema,
 } from "./openclaw-agent-session-snapshots-schema.js";
 import { withLegacyAgentStorageSchema } from "./openclaw-agent-storage-schema.js";
+import {
+  migrateAgentTrajectoryStorageInTransaction,
+  withoutTrajectoryPayloadColumns,
+} from "./openclaw-agent-trajectory-storage-migration.js";
 import { migrateDeployedTranscriptFtsRowsInTransaction } from "./openclaw-agent-transcript-fts-schema.js";
 import { migrateTranscriptPayloadStorageInTransaction } from "./openclaw-agent-transcript-payload-migration.js";
 import { migrateAgentWriteLayoutInTransaction } from "./openclaw-agent-write-layout-migration.js";
@@ -357,21 +362,20 @@ function ensureAgentSchema(
         created = true;
         return;
       }
-      const requiresCanonicalWriterMigration =
-        !isEmptyDatabase &&
-        previousVersion < CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION &&
-        targetVersion >= CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION;
-      const requiresStorageMigration =
-        !isEmptyDatabase &&
-        previousVersion < AGENT_STORAGE_SCHEMA_VERSION &&
-        targetVersion >= AGENT_STORAGE_SCHEMA_VERSION;
-      const requiresSnapshotMigration =
-        !isEmptyDatabase &&
-        previousVersion < SESSION_ENTRY_SNAPSHOTS_SCHEMA_VERSION &&
-        targetVersion >= SESSION_ENTRY_SNAPSHOTS_SCHEMA_VERSION;
-      const storageSchemaSql = requiresSnapshotMigration
-        ? withoutSessionEntrySnapshotsSchema(schemaSql)
+      const crossesVersion = (version: number) =>
+        !isEmptyDatabase && previousVersion < version && targetVersion >= version;
+      const requiresCanonicalWriterMigration = crossesVersion(
+        CANONICAL_SESSION_WRITER_VALIDATION_SCHEMA_VERSION,
+      );
+      const requiresStorageMigration = crossesVersion(AGENT_STORAGE_SCHEMA_VERSION);
+      const requiresSnapshotMigration = crossesVersion(SESSION_ENTRY_SNAPSHOTS_SCHEMA_VERSION);
+      const requiresTrajectoryMigration = crossesVersion(AGENT_TRAJECTORY_STORAGE_SCHEMA_VERSION);
+      const trajectorySchemaSql = requiresTrajectoryMigration
+        ? withoutTrajectoryPayloadColumns(schemaSql)
         : schemaSql;
+      const storageSchemaSql = requiresSnapshotMigration
+        ? withoutSessionEntrySnapshotsSchema(trajectorySchemaSql)
+        : trajectorySchemaSql;
       const migrationSchemaSql = requiresStorageMigration
         ? withLegacyAgentStorageSchema(storageSchemaSql, previousVersion)
         : storageSchemaSql;
@@ -385,11 +389,7 @@ function ensureAgentSchema(
         if (requiresCanonicalWriterMigration) {
           migrateCanonicalSessionWriterValidation(db);
         }
-        if (
-          !isEmptyDatabase &&
-          previousVersion < AGENT_JSON_PREDICATE_SCHEMA_VERSION &&
-          targetVersion >= AGENT_JSON_PREDICATE_SCHEMA_VERSION
-        ) {
+        if (crossesVersion(AGENT_JSON_PREDICATE_SCHEMA_VERSION)) {
           migrateAgentJsonPredicatesInTransaction(db);
         }
         if (
@@ -405,12 +405,11 @@ function ensureAgentSchema(
             });
           }
         }
-        if (
-          !isEmptyDatabase &&
-          previousVersion < AGENT_WRITE_LAYOUT_SCHEMA_VERSION &&
-          targetVersion >= AGENT_WRITE_LAYOUT_SCHEMA_VERSION
-        ) {
+        if (crossesVersion(AGENT_WRITE_LAYOUT_SCHEMA_VERSION)) {
           migrateAgentWriteLayoutInTransaction(db);
+        }
+        if (requiresTrajectoryMigration) {
+          migrateAgentTrajectoryStorageInTransaction(db);
         }
         // Historical rebuilds also converge indexes. Later version steps own
         // only their declared tables; additive index repair stays at admission.

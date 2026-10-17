@@ -22,7 +22,9 @@ import {
 import { createLocalSnapshotProvider } from "../../snapshot/local-repository.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../../state/openclaw-agent-db-contract.js";
 import { openAgentEngineStore } from "../../state/openclaw-agent-db-engine.js";
+import { getOpenClawAgentMigrationSchema } from "../../state/openclaw-agent-db-schema-helpers.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../../state/openclaw-state-db-contract.js";
+import { prepareTrajectoryPayload } from "../../trajectory/runtime-payload.js";
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
 import { isPostgresSqlConnection } from "../sql-connection.js";
 import { admitSqliteSchema } from "../sqlite-schema-facts.js";
@@ -74,7 +76,50 @@ describe.skipIf(!connection)("agent database port", () => {
     ).toEqual([]);
   });
 
-  it("round-trips compressed transcripts, FIFO work, cold archives and matched backups", async () => {
+  it.each([27, 28])("round-trips the text-only version %s before migration", async (version) => {
+    const descriptor = await agentPortProvider.loadDescriptor(undefined, version);
+    using source = openNodeSqliteDatabase(":memory:");
+    source.exec(getOpenClawAgentMigrationSchema(version));
+    source.exec(`
+      INSERT INTO schema_meta VALUES ('primary', 'agent', ${version}, 'main', NULL, 1, 1);
+      INSERT INTO session_nodes (session_key, current_session_id, entry_json, updated_at)
+        VALUES ('agent:main:main', 'session', '{"sessionId":"session"}', 1);
+      INSERT INTO session_windows (session_id, session_key, created_at, updated_at)
+        VALUES ('session', 'agent:main:main', 1, 1);
+    `);
+    const event = '{ "type": "legacy", "data": { "text": "café 🦞" } }';
+    source
+      .prepare("INSERT INTO trajectory_runtime_events VALUES ('session', 0, NULL, ?, 1)")
+      .run(event);
+    const namespace = `agent_legacy_${randomUUID().replaceAll("-", "")}`;
+    const storeId = randomUUID();
+    namespaces.add(namespace);
+    await materializeDatabasePort({
+      source: { engine: "sqlite", db: source },
+      destination: { engine: "postgres", db: client, namespace },
+      descriptor,
+      storeId,
+      assertCurrent() {},
+    });
+    expect(
+      (await client.query(`SELECT * FROM "${namespace}".trajectory_runtime_events`)).rows,
+    ).toEqual([
+      { session_id: "session", seq: "0", run_id: null, event_json: event, created_at: "1" },
+    ]);
+    using restored = openNodeSqliteDatabase(":memory:");
+    await materializeDatabasePort({
+      source: { engine: "postgres", db: client, namespace },
+      destination: { engine: "sqlite", db: restored },
+      descriptor,
+      storeId,
+      assertCurrent() {},
+    });
+    expect(restored.prepare("SELECT * FROM trajectory_runtime_events").all()).toEqual([
+      { session_id: "session", seq: 0, run_id: null, event_json: event, created_at: 1 },
+    ]);
+  });
+
+  it("round-trips compressed transcripts and trajectories, FIFO work, cold archives and matched backups", async () => {
     const descriptor = await agentPortProvider.loadDescriptor();
     const directory = tempDirs.make("agent-port-");
     const sourcePath = path.join(directory, "openclaw-agent.sqlite");
@@ -122,6 +167,21 @@ describe.skipIf(!connection)("agent database port", () => {
     source.exec(`INSERT INTO transcript_event_identities
       (session_id, event_id, seq, event_type, message_idempotency_key, created_at)
       VALUES ('session', 'message', 1, 'message', 'idempotent', 1);`);
+    const legacyTrajectory = '{ "type": "legacy", "data": { "value": "retained" } }';
+    const compressedTrajectory = `{ "type": "context.compiled", "data": { "text": "${"café 🦞 ".repeat(500)}" } }`;
+    const trajectoryPayload = prepareTrajectoryPayload(source, compressedTrajectory);
+    expect(trajectoryPayload.event_payload).toBeInstanceOf(Uint8Array);
+    source
+      .prepare(`INSERT INTO trajectory_runtime_events
+      (session_id, seq, event_json, event_payload, event_codec, event_utf8_bytes, created_at)
+      VALUES ('session', 0, ?, NULL, NULL, NULL, 1), ('session', 1, ?, ?, ?, ?, 1)`)
+      .run(
+        legacyTrajectory,
+        trajectoryPayload.event_json,
+        trajectoryPayload.event_payload,
+        trajectoryPayload.event_codec,
+        trajectoryPayload.event_utf8_bytes,
+      );
     const archivedEvent = JSON.stringify({
       type: "message",
       id: "archived",
@@ -166,6 +226,25 @@ describe.skipIf(!connection)("agent database port", () => {
       (await client.query(`SELECT event_json, event_zstd FROM "${namespace}".transcript_events`))
         .rows,
     ).toEqual([{ event_json: event, event_zstd: null }]);
+    expect(
+      (
+        await client.query(`SELECT event_json, event_payload, event_codec, event_utf8_bytes
+        FROM "${namespace}".trajectory_runtime_events ORDER BY seq`)
+      ).rows,
+    ).toEqual([
+      {
+        event_json: legacyTrajectory,
+        event_payload: null,
+        event_codec: null,
+        event_utf8_bytes: null,
+      },
+      {
+        event_json: compressedTrajectory,
+        event_payload: null,
+        event_codec: null,
+        event_utf8_bytes: String(Buffer.byteLength(compressedTrajectory)),
+      },
+    ]);
     expect(
       (
         await client.query(
@@ -263,6 +342,25 @@ describe.skipIf(!connection)("agent database port", () => {
       expect(
         roundtrip.prepare("SELECT event_json, event_zstd FROM transcript_events").get(),
       ).toEqual({ event_json: event, event_zstd: null });
+      expect(
+        roundtrip
+          .prepare(`SELECT event_json, event_payload, event_codec, event_utf8_bytes
+          FROM trajectory_runtime_events ORDER BY seq`)
+          .all(),
+      ).toEqual([
+        {
+          event_json: legacyTrajectory,
+          event_payload: null,
+          event_codec: null,
+          event_utf8_bytes: null,
+        },
+        {
+          event_json: compressedTrajectory,
+          event_payload: null,
+          event_codec: null,
+          event_utf8_bytes: Buffer.byteLength(compressedTrajectory),
+        },
+      ]);
       expect(
         roundtrip.prepare("SELECT entry_key, origin_class FROM memory_entry_origins").all(),
       ).toEqual([{ entry_key: "retained-memory", origin_class: "owner" }]);
