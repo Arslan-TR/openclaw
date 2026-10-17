@@ -1,9 +1,11 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { snapshotReaderSlot } from "../plugins/plugin-metadata-snapshot-readers.js";
 
+// mock-isolation: Fail if the marker SDK eagerly loads the canonical manifest owner.
 vi.mock("../plugins/manifest-metadata-scan.js", () => {
   throw new Error("Marker SDK imports must not reload the manifest metadata owner");
 });
+// mock-isolation: Fail if the marker SDK eagerly loads the canonical provider env owner.
 vi.mock("../secrets/provider-env-vars.js", () => {
   throw new Error("Marker SDK imports must not reload the provider env policy owner");
 });
