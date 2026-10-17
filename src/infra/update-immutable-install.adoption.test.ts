@@ -1,5 +1,4 @@
 import fsSync from "node:fs";
-import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
@@ -9,7 +8,6 @@ import {
   updateImmutableInstallRecord,
 } from "./package-update-activation-immutable.js";
 import {
-  packageActivationRuntimeIdentity,
   resolvePackageActivationAnchor,
   resolvePackageActivationJournalPath,
 } from "./package-update-activation-paths.js";
@@ -19,6 +17,7 @@ import type {
   ImmutableInstallRecord,
 } from "./update-immutable-install-schema.js";
 import { adoptImmutableInstall } from "./update-immutable-install.js";
+import { immutableLayout, identity } from "./update-immutable-layout.test-support.js";
 
 const mocks = vi.hoisted(() => ({
   read: vi.fn(),
@@ -59,10 +58,6 @@ let bridgePath: string;
 let servingPath: string;
 let original: ImmutableInstallRecord;
 let params: Parameters<typeof adoptImmutableInstall>[0];
-const identity = (file: string) => {
-  const stat = fsSync.lstatSync(file, { bigint: true });
-  return `${stat.dev}:${stat.ino}`;
-};
 const journal = () => resolvePackageActivationJournalPath(resolvePackageActivationAnchor(root));
 const read = () =>
   immutableInstallReadOperations["immutableInstall.read"](
@@ -165,76 +160,19 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
   beforeEach(async () => {
     vi.resetAllMocks();
     const parent = fsSync.realpathSync(dirs.make("immutable-bridge-adoption-"));
-    root = path.join(parent, "installation");
-    const previousPath = path.join(root, "releases", previousSha);
+    const descriptor = immutableLayout(parent, {
+      sha: previousSha,
+      buildDigest: previousDigest,
+      unit: "immutable-fixture.service",
+      account: "synthetic",
+      externalRuntime: true,
+    });
+    root = descriptor.root;
+    const runtime = descriptor.runtime.path;
     bridgePath = path.join(root, "releases", bridgeSha);
-    fsSync.mkdirSync(previousPath, { recursive: true, mode: 0o755 });
     fsSync.mkdirSync(bridgePath, { mode: 0o755 });
-    fsSync.writeFileSync(path.join(previousPath, "retained"), "previous sealed bytes");
-    fsSync.symlinkSync(`releases/${previousSha}`, path.join(root, "current"));
-    const runtime = path.join(parent, "node");
-    fsSync.writeFileSync(runtime, "synthetic external runtime", { mode: 0o755 });
-    const runtimeParents = new Set<string>();
-    for (let entry = parent; ; entry = path.dirname(entry)) {
-      runtimeParents.add(entry);
-      if (entry === path.dirname(entry)) {
-        break;
-      }
-    }
-    // Project privileged fixture ownership while preserving actual inodes,
-    // bytes, SQLite transactions, and the external runtime path hierarchy.
-    const lstat = fsSync.lstatSync;
-    vi.spyOn(fsSync, "lstatSync").mockImplementation((...args) => {
-      const stat = lstat(...args);
-      const file = String(args[0]);
-      if (stat && (runtimeParents.has(file) || file.startsWith(`${parent}${path.sep}`))) {
-        Object.defineProperty(stat, "uid", { value: typeof stat.uid === "bigint" ? 0n : 0 });
-        if (runtimeParents.has(file)) {
-          Object.defineProperty(stat, "mode", {
-            value: typeof stat.mode === "bigint" ? stat.mode & ~0o022n : stat.mode & ~0o022,
-          });
-        }
-      }
-      return stat;
-    });
-    const lstatAsync = fs.lstat;
-    vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
-      const stat = await lstatAsync(...args);
-      if (String(args[0]) === runtime) {
-        Object.defineProperty(stat, "uid", { value: typeof stat.uid === "bigint" ? 0n : 0 });
-      }
-      return stat;
-    });
-    if (process.geteuid) {
-      vi.spyOn(process, "geteuid").mockReturnValue(0);
-    }
-    original = createImmutableInstallRecord(
-      {
-        version: 1,
-        kind: "immutable",
-        root,
-        rootIdentity: identity(root),
-        releasesIdentity: identity(path.join(root, "releases")),
-        current: {
-          sha: previousSha,
-          path: previousPath,
-          identity: identity(previousPath),
-          pointerIdentity: identity(path.join(root, "current")),
-          buildDigest: previousDigest,
-        },
-        service: {
-          unit: "immutable-fixture.service",
-          scope: "system",
-          account: "synthetic",
-          stateDir: path.join(parent, "state"),
-          configPath: path.join(parent, "state", "openclaw.json"),
-          profile: null,
-        },
-        runtime: { path: runtime, identity: packageActivationRuntimeIdentity(runtime) },
-        source: "https://github.com/openclaw/openclaw.git",
-      },
-      () => {},
-    );
+    fsSync.writeFileSync(path.join(descriptor.current.path, "retained"), "previous sealed bytes");
+    original = createImmutableInstallRecord(descriptor, () => {});
     params = {
       root,
       service: original.descriptor.service,
@@ -250,16 +188,18 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
       identity: identity(generation),
       buildDigest: generation === bridgePath ? bridgeDigest : previousDigest,
     }));
-    mocks.inspect.mockImplementation(async ({ descriptor, generationPath, assertCurrent }) => {
-      assertCurrent();
-      if (generationPath !== servingPath) {
-        throw new Error("Bridge is not the serving physical generation");
-      }
-      return syntheticImmutableServiceObservation(descriptor, {
-        pid: 42,
-        generationPath: servingPath,
-      });
-    });
+    mocks.inspect.mockImplementation(
+      async ({ descriptor: selected, generationPath, assertCurrent }) => {
+        assertCurrent();
+        if (generationPath !== servingPath) {
+          throw new Error("Bridge is not the serving physical generation");
+        }
+        return syntheticImmutableServiceObservation(selected, {
+          pid: 42,
+          generationPath: servingPath,
+        });
+      },
+    );
     mocks.current.mockImplementation((observed) => {
       if (observed.generationPath !== servingPath) {
         throw new Error("Bridge process changed");
@@ -267,7 +207,7 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
     });
     mocks.launcher.mockImplementation(async ({ upgrade }) => {
       upgrade?.assertCurrent();
-      return path.join(root, "bin", "openclaw-gateway");
+      return path.join(root, "bin/openclaw-gateway");
     });
   });
   afterEach(() => vi.restoreAllMocks());
@@ -402,9 +342,7 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
     });
     expect(result.releaseRetention).toMatchObject({ mode: "inspect", generations: [] });
     expect(mocks.launcher).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        upgrade: { version: 2, assertCurrent: expect.any(Function) },
-      }),
+      expect.objectContaining({ upgrade: { version: 2, assertCurrent: expect.any(Function) } }),
     );
     expect(
       fsSync.readFileSync(path.join(original.activation!.previous!.path, "retained"), "utf8"),

@@ -26,6 +26,7 @@ import type {
   ImmutableInstallDescriptor,
   ImmutablePreparedGeneration,
 } from "./update-immutable-install-schema.js";
+import { expectUncalled } from "./update-immutable-layout.test-support.js";
 import type { ImmutableProtectionSnapshot } from "./update-immutable-protection-schema.js";
 import type { ImmutableServiceObservation } from "./update-immutable-service.js";
 import type { ImmutableGatewayObservation } from "./update-immutable-verification.js";
@@ -196,16 +197,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
       return {
         status: "ok",
         phase: "readiness",
-        steps: [
-          {
-            name: "candidate-gateway-startup",
-            command: "gateway run",
-            durationMs: 1,
-            exitCode: 0,
-          },
-        ],
-        durationMs: 1,
-        logTail: [],
+        steps: [{ name: "candidate-gateway-startup", exitCode: 0 }],
       };
     });
     mocks.inspect.mockImplementation(async ({ assertCurrent: check }) => {
@@ -344,9 +336,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
     const before = read();
     const pid = serving?.pid;
     await expect(activate()).rejects.toThrow("cannot read this control format");
-    expect(mocks.drain).not.toHaveBeenCalled();
-    expect(mocks.stop).not.toHaveBeenCalled();
-    expect(mocks.prepareRecovery).not.toHaveBeenCalled();
+    expectUncalled(mocks.drain, mocks.stop, mocks.prepareRecovery);
     expect(serving?.pid).toBe(pid);
     expect(read()).toEqual(before);
     expect(selectedSha()).toBe(previousSha);
@@ -356,7 +346,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
     "prewarms before stopping the service and treats exit %i as advisory",
     async (code) => {
       fs.mkdirSync(path.join(candidate.path, "dist"), { recursive: true });
-      fs.writeFileSync(path.join(candidate.path, "dist", "gateway-prewarm.js"), "");
+      fs.writeFileSync(path.join(candidate.path, "dist/gateway-prewarm.js"), "");
       mocks.prewarm.mockImplementation(async (argv) => {
         expect(serving?.generationPath).toBe(descriptor.current.path);
         expect(argv).toEqual([
@@ -410,12 +400,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
           operationId: result.operationId,
           outcome: "succeeded",
           selectedSha: candidateSha,
-          gateway: {
-            pid: 4_201,
-            bootId: "boot-4201",
-            version: "2026.10.3",
-            buildId: candidateSha,
-          },
+          gateway: { pid: 4_201, bootId: "boot-4201", version: "2026.10.3", buildId: candidateSha },
         },
       },
     });
@@ -473,8 +458,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
     expect(read().prepared).toEqual(replacement);
     expect(selectedSha()).toBe(previousSha);
     expect(events).toEqual([]);
-    expect(mocks.drain).not.toHaveBeenCalled();
-    expect(mocks.stop).not.toHaveBeenCalled();
+    expectUncalled(mocks.drain, mocks.stop);
   });
 
   it.each([1, 2] as const)(
@@ -509,8 +493,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
       expect(receipts).toEqual(["immutable:control-recovered"]);
       expect(events).toEqual([]);
       expect(selectedSha()).toBe(previousSha);
-      expect(mocks.operationLock).not.toHaveBeenCalled();
-      expect(mocks.verifyRecovery).not.toHaveBeenCalled();
+      expectUncalled(mocks.operationLock, mocks.verifyRecovery);
     },
   );
 

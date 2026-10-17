@@ -47,8 +47,10 @@ function resolveTarget(
   });
 }
 
+let base: string;
 const runHostCommandBuffered = exec.runCommandBuffered;
 beforeEach(() => {
+  base = dirs.make("openclaw-global-ownership-");
   vi.spyOn(exec, "runCommandBuffered").mockImplementation((argv, options) =>
     argv[0] === "pacman" || argv[0] === "/usr/sbin/pkg"
       ? Promise.resolve(pkgQueryResult())
@@ -104,20 +106,18 @@ async function writePnpmIsolatedPackage(params: {
   const packageRoot = params.nestedStore
     ? path.join(
         installDir,
-        "node_modules",
-        ".pnpm",
+        "node_modules/.pnpm",
         `openclaw@${params.version}`,
-        "node_modules",
-        "openclaw",
+        "node_modules/openclaw",
       )
-    : path.join(installDir, "node_modules", "openclaw");
+    : path.join(installDir, "node_modules/openclaw");
   await fs.mkdir(packageRoot, { recursive: true });
   await Promise.all([
     writeGlobalPackageJson(packageRoot, params.version),
     writePnpmProject(installDir, { openclaw: params.version, ...params.dependencies }),
   ]);
   if (params.nestedStore) {
-    await fs.symlink(packageRoot, path.join(installDir, "node_modules", "openclaw"), "dir");
+    await fs.symlink(packageRoot, path.join(installDir, "node_modules/openclaw"), "dir");
   }
   await fs.symlink(installDir, path.join(params.globalRoot, `hash-${params.installName}`), "dir");
   return packageRoot;
@@ -126,10 +126,8 @@ async function writePnpmIsolatedPackage(params: {
 describe("pnpm isolated global install discovery", () => {
   it("detects nested pnpm v11 installs", async () => {
     const layoutVersion = 11;
-    const base = dirs.make("openclaw-update-pnpm-isolated-root-");
-
-    const npmRoot = path.join(base, "npm", "lib", "node_modules");
-    const pnpmGlobalDir = path.join(base, "pnpm-home", "global");
+    const npmRoot = path.join(base, "npm/lib/node_modules");
+    const pnpmGlobalDir = path.join(base, "pnpm-home/global");
     const pnpmGlobalRoot = path.join(pnpmGlobalDir, `v${layoutVersion}`);
     const pkgRoot = await writePnpmIsolatedPackage({
       globalRoot: pnpmGlobalRoot,
@@ -137,16 +135,14 @@ describe("pnpm isolated global install discovery", () => {
       version: "2026.7.1",
       nestedStore: true,
     });
-    const hashLinkedPkgRoot = path.join(pnpmGlobalRoot, "hash-a1b2", "node_modules", "openclaw");
+    const hashLinkedPkgRoot = path.join(pnpmGlobalRoot, "hash-a1b2/node_modules/openclaw");
     const pnpmHomeAlias = path.join(base, "pnpm-home-alias");
     await fs.symlink(path.join(base, "pnpm-home"), pnpmHomeAlias, "dir");
     const aliasedPkgRoot = path.join(
       pnpmHomeAlias,
       "global",
       `v${layoutVersion}`,
-      "a1b2",
-      "node_modules",
-      "openclaw",
+      "a1b2/node_modules/openclaw",
     );
     await fs.mkdir(path.join(npmRoot, "openclaw"), { recursive: true });
 
@@ -191,9 +187,7 @@ describe("pnpm isolated global install discovery", () => {
   });
 
   it("prefers the invoking project when multiple installs are active", async () => {
-    const base = dirs.make("openclaw-update-pnpm-isolated-owner-");
-
-    const pnpmGlobalRoot = path.join(base, "pnpm-home", "global", "v11");
+    const pnpmGlobalRoot = path.join(base, "pnpm-home/global/v11");
     await writePnpmIsolatedPackage({
       globalRoot: pnpmGlobalRoot,
       installName: "a-other",
@@ -208,42 +202,34 @@ describe("pnpm isolated global install discovery", () => {
     const runCommand = probeRunner({ "pnpm root -g": commandResult(`${pnpmGlobalRoot}\n`) });
 
     await expect(
-      listActivePnpmIsolatedGlobalPackages({
-        globalRoot: pnpmGlobalRoot,
-        packageName: "openclaw",
-      }),
+      listActivePnpmIsolatedGlobalPackages({ globalRoot: pnpmGlobalRoot, packageName: "openclaw" }),
     ).resolves.toEqual([
       {
-        packageRoot: path.join(pnpmGlobalRoot, "hash-a-other", "node_modules", "openclaw"),
+        packageRoot: path.join(pnpmGlobalRoot, "hash-a-other/node_modules/openclaw"),
         packageNames: ["openclaw"],
       },
       {
-        packageRoot: path.join(pnpmGlobalRoot, "hash-z-invoking", "node_modules", "openclaw"),
+        packageRoot: path.join(pnpmGlobalRoot, "hash-z-invoking/node_modules/openclaw"),
         packageNames: ["cowsay", "openclaw"],
       },
     ]);
     await expect(
-      resolveTarget(runCommand, invokingPackageRoot, {
-        manager: "pnpm",
-        packageName: "openclaw",
-      }),
+      resolveTarget(runCommand, invokingPackageRoot, { manager: "pnpm", packageName: "openclaw" }),
     ).resolves.toEqual(
       pnpmTarget(
         pnpmGlobalRoot,
-        path.join(pnpmGlobalRoot, "hash-z-invoking", "node_modules", "openclaw"),
+        path.join(pnpmGlobalRoot, "hash-z-invoking/node_modules/openclaw"),
       ),
     );
   });
 
   it("does not adopt another pnpm project through a shared-store package symlink", async () => {
-    const base = dirs.make("openclaw-update-pnpm-shared-store-owner-");
-
-    const globalRoot = path.join(base, "pnpm-home", "global", "v11");
+    const globalRoot = path.join(base, "pnpm-home/global/v11");
     const activeInstallRoot = path.join(globalRoot, "active");
     const orphanInstallRoot = path.join(globalRoot, "orphan");
-    const activePackageRoot = path.join(activeInstallRoot, "node_modules", "openclaw");
-    const orphanPackageRoot = path.join(orphanInstallRoot, "node_modules", "openclaw");
-    const sharedPackageRoot = path.join(base, "store", "openclaw");
+    const activePackageRoot = path.join(activeInstallRoot, "node_modules/openclaw");
+    const orphanPackageRoot = path.join(orphanInstallRoot, "node_modules/openclaw");
+    const sharedPackageRoot = path.join(base, "store/openclaw");
     await Promise.all([
       fs.mkdir(path.dirname(activePackageRoot), { recursive: true }),
       fs.mkdir(path.dirname(orphanPackageRoot), { recursive: true }),
@@ -274,10 +260,8 @@ describe("pnpm isolated global install discovery", () => {
   });
 
   it("preserves pnpm 11 ownership when the invoking project is orphaned", async () => {
-    const base = dirs.make("openclaw-update-pnpm-isolated-orphan-");
-
-    const pnpmGlobalRoot = path.join(base, "pnpm-home", "global", "v11");
-    const orphanPackageRoot = path.join(pnpmGlobalRoot, "orphan", "node_modules", "openclaw");
+    const pnpmGlobalRoot = path.join(base, "pnpm-home/global/v11");
+    const orphanPackageRoot = path.join(pnpmGlobalRoot, "orphan/node_modules/openclaw");
     await fs.mkdir(orphanPackageRoot, { recursive: true });
     const orphanInstallRoot = path.join(pnpmGlobalRoot, "orphan");
     await Promise.all([
@@ -285,11 +269,9 @@ describe("pnpm isolated global install discovery", () => {
       writePnpmProject(orphanInstallRoot, { openclaw: "2026.7.1" }),
       fs.writeFile(path.join(orphanInstallRoot, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n"),
     ]);
-    const detectRunner = vi.fn<CommandRunner>().mockResolvedValue({
-      stdout: "",
-      stderr: "not active",
-      code: 1,
-    });
+    const detectRunner = vi
+      .fn<CommandRunner>()
+      .mockResolvedValue({ stdout: "", stderr: "not active", code: 1 });
 
     await expect(
       detectGlobalInstallManagerForRoot(detectRunner, orphanPackageRoot, 1000),
@@ -297,7 +279,7 @@ describe("pnpm isolated global install discovery", () => {
     expect(detectRunner).toHaveBeenCalledTimes(2);
 
     const runCommand = probeRunner({
-      "pnpm root -g": commandResult(`${path.join(base, "other-pnpm-home", "global", "v11")}\n`),
+      "pnpm root -g": commandResult(`${path.join(base, "other-pnpm-home/global/v11")}\n`),
     });
     await expect(
       resolveTarget(runCommand, orphanPackageRoot, { packageName: "openclaw" }),
@@ -305,17 +287,15 @@ describe("pnpm isolated global install discovery", () => {
   });
 
   it("keeps npm ownership when its prefix is named like a pnpm layout", async () => {
-    const base = dirs.make("openclaw-update-npm-v11-prefix-");
-
     const npmPrefix = path.join(base, "v11");
-    const npmGlobalRoot = path.join(npmPrefix, "lib", "node_modules");
+    const npmGlobalRoot = path.join(npmPrefix, "lib/node_modules");
     const packageRoot = path.join(npmGlobalRoot, "openclaw");
     await fs.mkdir(packageRoot, { recursive: true });
     await writeGlobalPackageJson(packageRoot, "2026.7.1");
     const runCommand = probeRunner({
       "npm root -g": commandResult(`${npmGlobalRoot}\n`),
       "npm --version": commandResult("12.0.0\n"),
-      "pnpm root -g": commandResult(`${path.join(base, "pnpm-home", "global", "v11")}\n`),
+      "pnpm root -g": commandResult(`${path.join(base, "pnpm-home/global/v11")}\n`),
     });
 
     await expect(detectGlobalInstallManagerForRoot(runCommand, packageRoot, 1000)).resolves.toBe(
@@ -328,24 +308,19 @@ describe("pnpm isolated global install discovery", () => {
       command: "npm",
       globalRoot: npmGlobalRoot,
       packageRoot,
-      npmOwner: {
-        version: "12.0.0",
-        lifecyclePolicy: "allow-scripts",
-      },
+      npmOwner: { version: "12.0.0", lifecyclePolicy: "allow-scripts" },
     });
   });
 
   it("keeps fallback without metadata", async () => {
-    const base = dirs.make("openclaw-update-pnpm-shape-only-");
-
     const customGlobalDir = path.join(base, "custom-pnpm");
-    const customGlobalRoot = path.join(customGlobalDir, "5", "node_modules");
+    const customGlobalRoot = path.join(customGlobalDir, "5/node_modules");
     const pkgRoot = path.join(customGlobalRoot, "openclaw");
-    const defaultPnpmRoot = path.join(base, "default-pnpm", "5", "node_modules");
-    const pnpmCommand = path.join(base, "bin", "pnpm");
+    const defaultPnpmRoot = path.join(base, "default-pnpm/5/node_modules");
+    const pnpmCommand = path.join(base, "bin/pnpm");
     await fs.mkdir(pkgRoot, { recursive: true });
     await fs.writeFile(
-      path.join(customGlobalDir, "5", "pnpm-lock.yaml"),
+      path.join(customGlobalDir, "5/pnpm-lock.yaml"),
       "lockfileVersion: '9.0'\n",
       "utf8",
     );
@@ -379,12 +354,10 @@ describe("custom Bun global installation ownership", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("preserves ownership when the original BUN_INSTALL is unavailable", async () => {
-    const base = dirs.make("openclaw-update-custom-bun-root-");
-
     await withEnvAsync({ BUN_INSTALL: undefined, BUN_INSTALL_GLOBAL_DIR: undefined }, async () => {
-      const bunRoot = path.join(base, "custom-bun", "install", "global", "node_modules");
+      const bunRoot = path.join(base, "custom-bun/install/global/node_modules");
       const pkgRoot = path.join(bunRoot, "openclaw");
-      const npmRoot = path.join(base, "shell", "lib", "node_modules");
+      const npmRoot = path.join(base, "shell/lib/node_modules");
       await fs.mkdir(pkgRoot, { recursive: true });
       const runCommand = vi.fn<CommandRunner>(async () => commandResult(`${npmRoot}\n`));
 
@@ -398,23 +371,21 @@ describe("custom Bun global installation ownership", () => {
   });
 
   it.each([
-    { runtime: "current", pathBun: "missing", supplyEnv: false, installFails: false },
-    { runtime: "pinned", pathBun: "missing", supplyEnv: true, installFails: true },
+    { runtime: "current", supplyEnv: false, installFails: false },
+    { runtime: "pinned", supplyEnv: true, installFails: true },
   ] as const)(
-    "uses $runtime Bun with $pathBun PATH Bun (install fails: $installFails)",
-    async ({ runtime, pathBun, supplyEnv, installFails }) => {
-      const base = dirs.make("openclaw-package-update-bun-owner-");
-
+    "uses $runtime Bun without PATH Bun (install fails: $installFails)",
+    async ({ runtime, supplyEnv, installFails }) => {
       const bunInstall = path.join(base, "owning-bun");
-      const globalProject = path.join(bunInstall, "install", "global");
+      const globalProject = path.join(bunInstall, "install/global");
       const globalRoot = path.join(globalProject, "node_modules");
       const packageRoot = path.join(globalRoot, "openclaw");
       const conflictingInstall = path.join(base, "unrelated-bun");
       const conflictingGlobalProject = path.join(base, "unrelated-global");
       const owningBin = path.join(base, "custom-bun-bin");
-      const currentBun = path.join(base, "current-runtime", "fork-bun");
+      const currentBun = path.join(base, "current-runtime/fork-bun");
       const command =
-        runtime === "pinned" ? path.join(base, "service-runtime", "fork-bun") : currentBun;
+        runtime === "pinned" ? path.join(base, "service-runtime/fork-bun") : currentBun;
       vi.stubGlobal(
         "process",
         Object.create(process, {
@@ -426,131 +397,117 @@ describe("custom Bun global installation ownership", () => {
       await fs.mkdir(owningBin);
       await fs.writeFile(path.join(owningBin, "openclaw"), "original launcher\n");
 
-      await withEnvAsync(
-        {
+      const callerEnv: NodeJS.ProcessEnv = {
+        BUN_INSTALL: conflictingInstall,
+        BUN_INSTALL_GLOBAL_DIR: conflictingGlobalProject,
+        BUN_INSTALL_BIN: owningBin,
+        PATH: "",
+      };
+      await withEnvAsync(callerEnv, async () => {
+        const originalCallerEnv = { ...callerEnv };
+        const runCommand = vi.fn<CommandRunner>(async (argv, { env }) => {
+          expect(argv).toEqual([command, "pm", "bin", "-g"]);
+          expect(env).toMatchObject({
+            BUN_INSTALL: bunInstall,
+            BUN_INSTALL_GLOBAL_DIR: globalProject,
+            BUN_INSTALL_BIN: owningBin,
+          });
+          return commandResult(`${owningBin}\n`);
+        });
+        const runStep = vi.fn(async ({ name, argv, cwd, env }) => {
+          expect(argv).toEqual([command, "add", "-g", "--trust", "openclaw@2.0.0"]);
+          const stageProject = env?.BUN_INSTALL_GLOBAL_DIR;
+          const stageBin = env?.BUN_INSTALL_BIN;
+          if (!stageProject || !stageBin) {
+            throw new Error("Bun staging destinations missing");
+          }
+          expect(env?.BUN_INSTALL).toBe(bunInstall);
+          expect(path.dirname(stageProject)).toBe(path.dirname(globalProject));
+          expect(stageProject).not.toBe(globalProject);
+          expect(stageBin).not.toBe(owningBin);
+          expect(cwd).toBe(stageProject);
+          await expect(
+            fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
+          ).resolves.toContain('"version":"1.0.0"');
+          const stagedPackageRoot = path.join(stageProject, "node_modules/openclaw");
+          await writePackageRoot(stagedPackageRoot, "2.0.0");
+          await fs.symlink(
+            path.relative(stageBin, path.join(stagedPackageRoot, "dist/index.js")),
+            path.join(stageBin, "openclaw"),
+          );
+          return {
+            name,
+            command: argv.join(" "),
+            cwd: cwd ?? base,
+            durationMs: 1,
+            exitCode: installFails ? 1 : 0,
+            ...(installFails ? { stderrTail: "staged Bun install failed" } : {}),
+          };
+        });
+
+        const installTarget = await resolveTarget(runCommand, packageRoot, {
+          manager: runtime === "pinned" ? { manager: "bun", command } : "bun",
+          honorPackageRoot: true,
+        });
+        const beforeActivate = vi.fn(async () => {});
+        const result = await runGlobalPackageUpdateSteps({
+          installTarget,
+          installSpec: "openclaw@2.0.0",
+          packageName: "openclaw",
+          packageRoot,
+          runCommand,
+          runStep,
+          beforeActivate,
+          timeoutMs: 1000,
+          ...(supplyEnv ? { env: callerEnv } : {}),
+        });
+
+        expect(runCommand).toHaveBeenCalledOnce();
+        if (process.platform === "win32") {
+          expect(result.failedStep?.stderrTail).toContain("Bun Windows binary launchers");
+          expect(runStep).not.toHaveBeenCalled();
+          expect(beforeActivate).not.toHaveBeenCalled();
+        } else if (installFails) {
+          expect(result.failedStep).toMatchObject({
+            name: "package-install",
+            stderrTail: "staged Bun install failed",
+          });
+          expect(result.recovery).toMatchObject({ serviceRestartSafe: true, version: "1.0.0" });
+          expect(beforeActivate).not.toHaveBeenCalled();
+          expect(runStep).toHaveBeenCalledOnce();
+          await expect(fs.readdir(path.dirname(globalProject))).resolves.toEqual(["global"]);
+          await expect(fs.readFile(path.join(owningBin, "openclaw"), "utf8")).resolves.toBe(
+            "original launcher\n",
+          );
+        } else {
+          expect(result.failedStep).toBeNull();
+          expect(result.afterVersion).toBe("2.0.0");
+          expect(runStep).toHaveBeenCalledOnce();
+          expect(beforeActivate).toHaveBeenCalledOnce();
+          await expect(fs.realpath(path.join(owningBin, "openclaw"))).resolves.toBe(
+            await fs.realpath(path.join(packageRoot, "dist/index.js")),
+          );
+        }
+        await expect(
+          fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
+        ).resolves.toContain(
+          `"version":"${process.platform === "win32" || installFails ? "1.0.0" : "2.0.0"}"`,
+        );
+        await expect(fs.stat(conflictingInstall)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(fs.stat(conflictingGlobalProject)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(callerEnv).toEqual(originalCallerEnv);
+        expect(process.env).toMatchObject({
           BUN_INSTALL: conflictingInstall,
           BUN_INSTALL_GLOBAL_DIR: conflictingGlobalProject,
           BUN_INSTALL_BIN: owningBin,
-          PATH: pathBun === "missing" ? "" : path.join(conflictingInstall, "bin"),
-        },
-        async () => {
-          const callerEnv: NodeJS.ProcessEnv = {
-            BUN_INSTALL: conflictingInstall,
-            BUN_INSTALL_GLOBAL_DIR: conflictingGlobalProject,
-            BUN_INSTALL_BIN: owningBin,
-            PATH: process.env.PATH,
-          };
-          const originalCallerEnv = { ...callerEnv };
-          const runCommand = vi.fn<CommandRunner>(async (argv, { env }) => {
-            expect(argv).toEqual([command, "pm", "bin", "-g"]);
-            expect(env).toMatchObject({
-              BUN_INSTALL: bunInstall,
-              BUN_INSTALL_GLOBAL_DIR: globalProject,
-              BUN_INSTALL_BIN: owningBin,
-            });
-            return commandResult(`${owningBin}\n`);
-          });
-          const runStep = vi.fn(async ({ name, argv, cwd, env }) => {
-            expect(argv).toEqual([command, "add", "-g", "--trust", "openclaw@2.0.0"]);
-            const stageProject = env?.BUN_INSTALL_GLOBAL_DIR;
-            const stageBin = env?.BUN_INSTALL_BIN;
-            if (!stageProject || !stageBin) {
-              throw new Error("Bun staging destinations missing");
-            }
-            expect(env?.BUN_INSTALL).toBe(bunInstall);
-            expect(path.dirname(stageProject)).toBe(path.dirname(globalProject));
-            expect(stageProject).not.toBe(globalProject);
-            expect(stageBin).not.toBe(owningBin);
-            expect(cwd).toBe(stageProject);
-            await expect(
-              fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-            ).resolves.toContain('"version":"1.0.0"');
-            const stagedPackageRoot = path.join(stageProject, "node_modules", "openclaw");
-            await writePackageRoot(stagedPackageRoot, "2.0.0");
-            await fs.symlink(
-              path.relative(stageBin, path.join(stagedPackageRoot, "dist", "index.js")),
-              path.join(stageBin, "openclaw"),
-            );
-            return {
-              name,
-              command: argv.join(" "),
-              cwd: cwd ?? base,
-              durationMs: 1,
-              exitCode: installFails ? 1 : 0,
-              ...(installFails ? { stderrTail: "staged Bun install failed" } : {}),
-            };
-          });
-
-          const installTarget = await resolveTarget(runCommand, packageRoot, {
-            manager: runtime === "pinned" ? { manager: "bun", command } : "bun",
-            honorPackageRoot: true,
-          });
-          const beforeActivate = vi.fn(async () => {});
-          const result = await runGlobalPackageUpdateSteps({
-            installTarget,
-            installSpec: "openclaw@2.0.0",
-            packageName: "openclaw",
-            packageRoot,
-            runCommand,
-            runStep,
-            beforeActivate,
-            timeoutMs: 1000,
-            ...(supplyEnv ? { env: callerEnv } : {}),
-          });
-
-          expect(runCommand).toHaveBeenCalledOnce();
-          if (process.platform === "win32") {
-            expect(result.failedStep?.stderrTail).toContain("Bun Windows binary launchers");
-            expect(runStep).not.toHaveBeenCalled();
-            expect(beforeActivate).not.toHaveBeenCalled();
-          } else if (installFails) {
-            expect(result.failedStep).toMatchObject({
-              name: "package-install",
-              stderrTail: "staged Bun install failed",
-            });
-            expect(result.recovery).toMatchObject({
-              serviceRestartSafe: true,
-              version: "1.0.0",
-            });
-            expect(beforeActivate).not.toHaveBeenCalled();
-            expect(runStep).toHaveBeenCalledOnce();
-            await expect(fs.readdir(path.dirname(globalProject))).resolves.toEqual(["global"]);
-            await expect(fs.readFile(path.join(owningBin, "openclaw"), "utf8")).resolves.toBe(
-              "original launcher\n",
-            );
-          } else {
-            expect(result.failedStep).toBeNull();
-            expect(result.afterVersion).toBe("2.0.0");
-            expect(runStep).toHaveBeenCalledOnce();
-            expect(beforeActivate).toHaveBeenCalledOnce();
-            await expect(fs.realpath(path.join(owningBin, "openclaw"))).resolves.toBe(
-              await fs.realpath(path.join(packageRoot, "dist", "index.js")),
-            );
-          }
-          await expect(
-            fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-          ).resolves.toContain(
-            `"version":"${process.platform === "win32" || installFails ? "1.0.0" : "2.0.0"}"`,
-          );
-          await expect(fs.stat(conflictingInstall)).rejects.toMatchObject({ code: "ENOENT" });
-          await expect(fs.stat(conflictingGlobalProject)).rejects.toMatchObject({
-            code: "ENOENT",
-          });
-          expect(callerEnv).toEqual(originalCallerEnv);
-          expect(process.env.BUN_INSTALL).toBe(conflictingInstall);
-          expect(process.env.BUN_INSTALL_GLOBAL_DIR).toBe(conflictingGlobalProject);
-          expect(process.env.BUN_INSTALL_BIN).toBe(owningBin);
-        },
-      );
+        });
+      });
     },
   );
 });
 
 describe("FreeBSD package-manager admission", () => {
-  afterEach(() => vi.restoreAllMocks());
   it("stops cleanup when ownership inspection exhausts the budget", async () => {
-    const base = dirs.make("openclaw-pkg-cleanup-budget-");
-
     await fs.mkdir(path.join(base, ".openclaw-first"));
     await fs.mkdir(path.join(base, ".openclaw-second"));
     const now = Date.now();
@@ -569,8 +526,6 @@ describe("FreeBSD package-manager admission", () => {
   });
 
   it("refreshes pkg ownership separately before each cleanup deletion", async () => {
-    const base = dirs.make("openclaw-pkg-cleanup-refresh-");
-
     await fs.mkdir(path.join(base, ".openclaw-first"));
     await fs.mkdir(path.join(base, ".openclaw-second"));
     const [firstName, secondName] = await fs.readdir(base);
@@ -599,8 +554,6 @@ describe("FreeBSD package-manager admission", () => {
   });
 
   it("skips a cleanup directory replaced during ownership inspection", async () => {
-    const base = dirs.make("openclaw-pkg-cleanup-replaced-");
-
     const candidate = path.join(base, ".openclaw-interrupted");
     await fs.mkdir(candidate);
     vi.spyOn(exec, "runCommandBuffered").mockImplementationOnce(async () => {
@@ -617,9 +570,7 @@ describe("FreeBSD package-manager admission", () => {
     await expect(fs.readFile(path.join(candidate, "marker"), "utf8")).resolves.toBe("replacement");
   });
   it("keeps startup discovery read-only for a pkg installation", async () => {
-    const base = dirs.make("openclaw-pkg-discovery-");
-
-    const globalRoot = path.join(base, "lib", "node_modules");
+    const globalRoot = path.join(base, "lib/node_modules");
     const root = path.join(globalRoot, "openclaw");
     await writePackageRoot(root, "1.0.0");
     const runCommand = createRootRunner(globalRoot);
@@ -653,11 +604,7 @@ describe("FreeBSD package-manager admission", () => {
       });
       try {
         const first = await startup.initialize();
-        expect(first.status).toMatchObject({
-          root,
-          installKind: "package",
-          packageManager: "npm",
-        });
+        expect(first.status).toMatchObject({ root, installKind: "package", packageManager: "npm" });
         await expect(startup.initialize()).resolves.toBe(first);
       } finally {
         await startup.stop();
@@ -667,10 +614,8 @@ describe("FreeBSD package-manager admission", () => {
   });
 
   it("checks the actual manager-selected destination before selecting its npm runtime", async () => {
-    const base = dirs.make("openclaw-pkg-target-");
-
     const requested = path.join(base, "source");
-    const globalRoot = path.join(base, "package prefix", "lib", "node_modules");
+    const globalRoot = path.join(base, "package prefix/lib/node_modules");
     const target = path.join(globalRoot, "openclaw");
     await writePackageRoot(requested, "1.0.0");
     await writePackageRoot(target, "1.0.0");

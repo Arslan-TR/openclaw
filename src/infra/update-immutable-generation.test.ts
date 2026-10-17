@@ -62,8 +62,8 @@ const runGit: CommandRunner = async (argv, options) => {
 
 async function generation() {
   const root = temporary.make("openclaw-immutable-generation-");
-  await fs.mkdir(path.join(root, "dist", "plugin-sdk"), { recursive: true });
-  await fs.mkdir(path.join(root, "dist", "control-ui"), { recursive: true });
+  await fs.mkdir(path.join(root, "dist/plugin-sdk"), { recursive: true });
+  await fs.mkdir(path.join(root, "dist/control-ui"), { recursive: true });
   await fs.writeFile(path.join(root, ".gitignore"), "dist/\n");
   await fs.writeFile(path.join(root, "source.txt"), "source\n");
   await fs.writeFile(
@@ -95,9 +95,9 @@ async function generation() {
   for (const name of ["entry.js", "index.js", "plugin-sdk/core.js"]) {
     await fs.writeFile(path.join(root, "dist", name), "export {};\n");
   }
-  await fs.writeFile(path.join(root, "dist", "control-ui", "index.html"), "ready");
+  await fs.writeFile(path.join(root, "dist/control-ui/index.html"), "ready");
   await fs.writeFile(
-    path.join(root, "dist", "build-info.json"),
+    path.join(root, "dist/build-info.json"),
     JSON.stringify({ commit: sha, buildId: sha }),
   );
   for (const name of [".buildstamp", ".runtime-postbuildstamp"]) {
@@ -114,13 +114,10 @@ describe("sealed immutable generation", () => {
       const metadata = kind === "config" ? path.join(root, ".git") : path.join(root, "shared-git");
       if (kind === "commondir") {
         await fs.cp(path.join(root, ".git"), metadata, { recursive: true });
-        await fs.writeFile(path.join(root, ".git", "commondir"), "../shared-git\n");
+        await fs.writeFile(path.join(root, ".git/commondir"), "../shared-git\n");
       }
       await fs.appendFile(path.join(metadata, "config"), '\n[filter "candidate"]\n\tclean = cat\n');
-      await fs.writeFile(
-        path.join(metadata, "info", "attributes"),
-        "source.txt filter=candidate\n",
-      );
+      await fs.writeFile(path.join(metadata, "info/attributes"), "source.txt filter=candidate\n");
       await sealImmutableGeneration(root);
       const command = vi.fn(runGit);
       await expect(verifyImmutableGeneration(root, sha, command)).rejects.toThrow(
@@ -149,12 +146,12 @@ describe("sealed immutable generation", () => {
 
   it("seals code and dependencies while preserving executable bits and contained links, and verifies without writing Git metadata", async () => {
     const { root, sha } = await generation();
-    const executable = path.join(root, "dist", "index.js");
+    const executable = path.join(root, "dist/index.js");
     await fs.chmod(executable, 0o755);
     await fs.mkdir(path.join(root, "node_modules"));
-    await fs.appendFile(path.join(root, ".git", "info", "exclude"), "\nnode_modules/\n");
-    await fs.symlink("../dist/index.js", path.join(root, "node_modules", "contained"));
-    const index = path.join(root, ".git", "index");
+    await fs.appendFile(path.join(root, ".git/info/exclude"), "\nnode_modules/\n");
+    await fs.symlink("../dist/index.js", path.join(root, "node_modules/contained"));
+    const index = path.join(root, ".git/index");
     const beforeIndex = await fs.readFile(index);
     await sealImmutableGeneration(root);
     const beforeMtime = (await fs.stat(index)).mtimeMs;
@@ -178,7 +175,7 @@ describe("sealed immutable generation", () => {
       await fs.writeFile(path.join(root, "source.txt"), "edited\n");
     } else if (kind === "stale build") {
       await fs.writeFile(
-        path.join(root, "dist", "build-info.json"),
+        path.join(root, "dist/build-info.json"),
         JSON.stringify({ commit: "0".repeat(40) }),
       );
     }
@@ -209,7 +206,7 @@ describe("sealed immutable generation", () => {
   it("rejects a generation made writable after sealing", async () => {
     const { root, sha } = await generation();
     await sealImmutableGeneration(root);
-    await fs.chmod(path.join(root, "dist", "plugin-sdk", "core.js"), 0o644);
+    await fs.chmod(path.join(root, "dist/plugin-sdk/core.js"), 0o644);
     await expect(verifyImmutableGeneration(root, sha, runGit)).rejects.toThrow("not sealed");
   });
 });

@@ -30,74 +30,44 @@ describe("npm global install lifecycle policy", () => {
   });
 
   it("builds npm staged install argv with an explicit prefix", () => {
-    expect(globalInstallArgs("npm", "openclaw@latest", null, "/tmp/stage")).toEqual([
-      "npm",
-      "i",
-      "-g",
-      "--allow-scripts=openclaw",
-      "--prefix",
-      "/tmp/stage",
-      "openclaw@latest",
-      "--no-fund",
-      "--no-audit",
-      "--loglevel=error",
-      "--min-release-age=0",
-    ]);
-  });
-
-  it("allows only the resolved npm candidate lifecycle identity", () => {
-    const archive = path.resolve("/tmp/openclaw-2026.7.2.tgz");
-    for (const [spec, identity] of [
-      [archive, archive],
-      ["openclaw@npm:@vendor/openclaw@1.2.3", "@vendor/openclaw"],
-      ["openclaw@npm:vendor-openclaw@1.2.3", "vendor-openclaw"],
-      ["openclaw@npm:@vendor/client.tgz@1.2.3", "@vendor/client.tgz"],
-      ["./openclaw-candidate", "./openclaw-candidate"],
-      ["vendor/repo.tgz", "vendor/repo.tgz"],
-      ["vendor/repo#release.tgz", "vendor/repo#release.tgz"],
-    ] as const) {
-      expect(installArgs(spec)).toContain(`--allow-scripts=${identity}`);
-    }
-  });
-
-  it("uses the absolute npm tarball identity for relative input", () => {
-    const cwd = path.resolve("/tmp/openclaw-update-identity/work");
-    const candidate = path.resolve(cwd, "../candidate.tgz");
-    const spec = "../candidate.tgz";
-    const args = installArgs(spec, cwd);
-    expect(args).toContain(`--allow-scripts=${candidate}`);
-    expect(args).toContain(spec);
-  });
-
-  it("rejects comma tarball identities before building npm install commands", () => {
-    const cwd = path.resolve("/tmp/build,cache");
-    expect(() => installArgs(path.join(cwd, "candidate.tgz"), cwd)).toThrow("without commas");
-  });
-
-  it("preserves npm's home-relative archive resolution", () => {
-    const cwd = path.resolve("/tmp/openclaw-update-identity/work");
-    const expected = path.join(os.homedir(), "candidate.tgz");
-    expect(installArgs("file:~/candidate.tgz", cwd)).toContain(`--allow-scripts=file:${expected}`);
-  });
-
-  it("normalizes file URLs while preserving literal archive characters", () => {
-    const archive = path.resolve("/tmp/openclaw/a%2C#b.tar");
-    const spec = `file:///${archive.replaceAll("\\", "/").replace(/^\/+/u, "")}`;
-    expect(installArgs(spec)).toContain(`--allow-scripts=file:${archive}`);
-  });
-
-  it("preserves npm 11 advisory comma-archive identity without changing npm policy", () => {
-    const cwd = path.resolve("/tmp/build,cache");
-    expect(
-      globalInstallArgs(
-        "npm",
-        path.join(cwd, "candidate.tgz"),
-        null,
-        null,
-        cwd,
-        "allow-scripts-advisory",
+    expect(globalInstallArgs("npm", "openclaw@latest", null, "/tmp/stage")).toEqual(
+      "npm i -g --allow-scripts=openclaw --prefix /tmp/stage openclaw@latest --no-fund --no-audit --loglevel=error --min-release-age=0".split(
+        " ",
       ),
-    ).toContain("--allow-scripts=./candidate.tgz");
+    );
+  });
+
+  const cwd = path.resolve("/tmp/openclaw-update-identity/work");
+  const archive = path.resolve("/tmp/openclaw/a%2C#b.tar");
+  it.each([
+    [path.resolve("/tmp/openclaw-2026.7.2.tgz"), path.resolve("/tmp/openclaw-2026.7.2.tgz")],
+    ["openclaw@npm:@vendor/openclaw@1.2.3", "@vendor/openclaw"],
+    ["openclaw@npm:vendor-openclaw@1.2.3", "vendor-openclaw"],
+    ["openclaw@npm:@vendor/client.tgz@1.2.3", "@vendor/client.tgz"],
+    ["./openclaw-candidate", "./openclaw-candidate"],
+    ["vendor/repo.tgz", "vendor/repo.tgz"],
+    ["vendor/repo#release.tgz", "vendor/repo#release.tgz"],
+    ["../candidate.tgz", path.resolve(cwd, "../candidate.tgz")],
+    ["file:~/candidate.tgz", `file:${path.join(os.homedir(), "candidate.tgz")}`],
+    [`file:///${archive.replaceAll("\\", "/").replace(/^\/+/u, "")}`, `file:${archive}`],
+  ] as const)("allows only the resolved lifecycle identity for %s", (spec, identity) => {
+    expect(installArgs(spec, cwd)).toEqual(
+      expect.arrayContaining([spec, `--allow-scripts=${identity}`]),
+    );
+  });
+
+  it.each([
+    ["allow-scripts", true],
+    ["allow-scripts-advisory", false],
+  ] as const)("handles comma archive identities with npm policy %s", (policy, rejects) => {
+    const commaCwd = path.resolve("/tmp/build,cache");
+    const install = () =>
+      globalInstallArgs("npm", path.join(commaCwd, "candidate.tgz"), null, null, commaCwd, policy);
+    if (rejects) {
+      expect(install).toThrow("without commas");
+    } else {
+      expect(install()).toContain("--allow-scripts=./candidate.tgz");
+    }
   });
 });
 
@@ -140,15 +110,7 @@ describe("custom npm global installation ownership", () => {
             path.join(layout.binDir, "openclaw"),
           );
         }
-        const otherRoot = path.join(
-          base,
-          ".nvm",
-          "versions",
-          "node",
-          "v26.8.2",
-          "lib",
-          "node_modules",
-        );
+        const otherRoot = path.join(base, ".nvm/versions/node/v26.8.2/lib/node_modules");
         const runCommand: CommandRunner = async (argv) => ({
           stdout: argv[1] === "--version" ? "12.0.0\n" : `${otherRoot}\n`,
           stderr: "",
@@ -175,8 +137,8 @@ describe("custom npm global installation ownership", () => {
       const base = dirs.make("openclaw-update-npm-prefix-probe-");
 
       const prefix = path.join(base, ".npm-global");
-      const pkgRoot = path.join(prefix, "lib", "node_modules", "openclaw");
-      const nodeBin = path.join(base, ".nvm", "versions", "node", "v26.8.2", "bin");
+      const pkgRoot = path.join(prefix, "lib/node_modules/openclaw");
+      const nodeBin = path.join(base, ".nvm/versions/node/v26.8.2/bin");
       const npmCli = path.join(nodeBin, "npm-cli.js");
       await fs.mkdir(pkgRoot, { recursive: true });
       await fs.mkdir(nodeBin, { recursive: true });
