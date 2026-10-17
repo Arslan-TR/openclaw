@@ -2205,15 +2205,18 @@ adopts newly established integrity verification only after operation cleanup and
 while its database claim remains current. These connection lifetimes are documented in the
 [accepted reclamation design](https://github.com/openclaw/openclaw/pull/140897#issuecomment-5647899202).
 
-Pressure sweeps and explicit deletion reuse one archive worker within their operation
-scope. The shared archive queue admits each materialization or publication separately;
+Pressure sweeps and explicit deletion reuse one archive worker across successful operation
+scopes. The shared archive queue admits each materialization or publication separately;
 every request opens a fresh read-only database and closes its database and file handles
 before acknowledging completion. No archive database connection or lease survives
 between requests. Each victim still commits and publishes before the next victim is
 deleted. A preparation or publication failure retires the worker and joins its native
-exit before returning the existing error. Scope completion and database retirement
-revoke queued requests, drain dispatched work, and join native exit. The process keeps
-at most one reusable archive worker; competing scopes retire the previous idle worker.
+exit before returning the existing error. Scope completion refuses further work under
+that scope while retaining a healthy idle worker. Database retirement revokes queued
+requests, drains dispatched work, and joins native exit. The process keeps at most one
+reusable archive worker; scopes in the same state directory transfer it with fresh
+authority. Different state directories and unhealthy workers require native exit
+before replacement.
 Cold preparation and mutations retain their separate one-shot workers; cold mutations
 join their existing page maintenance and native exit.
 
