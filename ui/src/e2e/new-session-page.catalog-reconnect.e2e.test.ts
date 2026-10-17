@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { BrowserContextOptions } from "playwright";
 import { expect, it } from "vitest";
 import {
   waitForControlUiGatewayReady,
@@ -15,6 +16,7 @@ import {
   REFRESHED_RESEARCH_WORKSPACE,
   SESSION_LIST_DEFAULTS,
   WORKSPACE,
+  LOCAL_GIT_WORKSPACE_RESPONSES,
   checkoutBaseRefInput,
   controlUiSessionPath,
   createNewSessionPageE2eSuite,
@@ -57,6 +59,18 @@ function requestHasParam(request: { params?: unknown }, key: string, value: unkn
     !Array.isArray(request.params) &&
     (request.params as Record<string, unknown>)[key] === value,
   );
+}
+
+function recordingOptions(name: string, desktop = true): BrowserContextOptions {
+  const viewport = { height: 900, width: 1280 };
+  return {
+    locale: "en-US",
+    serviceWorkers: "block",
+    ...(desktop ? { viewport } : {}),
+    ...(captureCliAgentsProof
+      ? { viewport, recordVideo: { dir: path.join(suite.artifactDir, name), size: viewport } }
+      : {}),
+  };
 }
 
 suite.define(() => {
@@ -127,19 +141,7 @@ suite.define(() => {
     if (captureCliAgentsProof) {
       await mkdir(path.join(suite.artifactDir, "cli-agents-picker"), { recursive: true });
     }
-    const context = await suite.browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-      ...(captureCliAgentsProof
-        ? {
-            recordVideo: {
-              dir: path.join(suite.artifactDir, "cli-agents-picker"),
-              size: { height: 900, width: 1280 },
-            },
-          }
-        : {}),
-    });
+    const context = await suite.browser.newContext(recordingOptions("cli-agents-picker"));
     const page = await context.newPage();
     const terminalCatalog = cliAgentCatalog(true);
     const historyCatalog = {
@@ -262,11 +264,7 @@ suite.define(() => {
         "sessions.catalog.list": {
           catalogs: [cliAgentCatalog(testCase.startTerminal)],
         },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
       },
     });
 
@@ -292,19 +290,7 @@ suite.define(() => {
     if (captureCliAgentsProof) {
       await mkdir(path.join(suite.artifactDir, "cli-agents-picker"), { recursive: true });
     }
-    const context = await suite.browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-      ...(captureCliAgentsProof
-        ? {
-            recordVideo: {
-              dir: path.join(suite.artifactDir, "cli-agents-picker"),
-              size: { height: 900, width: 1280 },
-            },
-          }
-        : {}),
-    });
+    const context = await suite.browser.newContext(recordingOptions("cli-agents-picker"));
     const page = await context.newPage();
     const worktreePath = "/home/peter/.openclaw/worktrees/terminal-e2e";
     const config = { tools: { web: { search: { provider: "brave" } } } };
@@ -325,11 +311,7 @@ suite.define(() => {
         },
         "agents.list": mainAndResearchAgents(WORKSPACE, WORKSPACE),
         "sessions.catalog.list": { catalogs: [cliAgentCatalog(true)] },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
         "worktrees.create": {
           id: "terminal-e2e",
           name: "terminal-task",
@@ -460,11 +442,7 @@ suite.define(() => {
       featureMethods: [...TERMINAL_START_FEATURE_METHODS],
       methodResponses: {
         "sessions.catalog.list": { catalogs: [cliAgentCatalog(true)] },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
         "sessions.catalog.startTerminal": {
           __mockError: { code: "INVALID_REQUEST", message: serverMessage },
         },
@@ -580,27 +558,10 @@ suite.define(() => {
     const gateway = await installMockGateway(page, {
       workspaceGit: true,
       methodResponses: {
-        "agents.list": {
-          agents: [
-            {
-              id: "main",
-              identity: { name: "Main" },
-              name: "Main",
-              workspace: WORKSPACE,
-              workspaceGit: true,
-            },
-          ],
-          defaultId: "main",
-          mainKey: "main",
-          scope: "agent",
-        },
+        "agents.list": LOCAL_GIT_WORKSPACE_RESPONSES["agents.list"],
         "sessions.create": { key: sessionKey },
         "sessions.list": listResponse,
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
       },
     });
 
@@ -645,32 +606,8 @@ suite.define(() => {
       terminalEnabled: true,
       featureMethods: [...TERMINAL_START_FEATURE_METHODS],
       methodResponses: {
-        "agents.list": {
-          agents: [
-            {
-              id: "main",
-              identity: { name: "Main" },
-              name: "Main",
-              workspace: WORKSPACE,
-              workspaceGit: true,
-            },
-            {
-              id: "research",
-              identity: { name: "Research" },
-              name: "Research",
-              workspace: "/home/peter/research",
-              workspaceGit: true,
-            },
-          ],
-          defaultId: "main",
-          mainKey: "main",
-          scope: "agent",
-        },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "agents.list": mainAndResearchAgents(WORKSPACE, "/home/peter/research"),
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
         "sessions.catalog.list": {
           catalogs: [
             {
@@ -797,32 +734,8 @@ suite.define(() => {
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       methodResponses: {
-        "agents.list": {
-          agents: [
-            {
-              id: "main",
-              identity: { name: "Main" },
-              name: "Main",
-              workspace: WORKSPACE,
-              workspaceGit: true,
-            },
-            {
-              id: "research",
-              identity: { name: "Research" },
-              name: "Research",
-              workspace: "/home/peter/research",
-              workspaceGit: true,
-            },
-          ],
-          defaultId: "main",
-          mainKey: "main",
-          scope: "agent",
-        },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "agents.list": mainAndResearchAgents(WORKSPACE, "/home/peter/research"),
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
         "sessions.create": { key: "agent:research:manual-reconnect" },
       },
     });

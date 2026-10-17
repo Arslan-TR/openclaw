@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { Locator } from "playwright";
 import { expect, it } from "vitest";
 import {
   evaluateControlUiContext,
@@ -61,6 +62,25 @@ type SessionTransitionFrames = {
 
 function transitionProofDir() {
   return path.join(suite.artifactDir, "new-session-transition");
+}
+
+function createdKey(params: unknown) {
+  if (
+    !params ||
+    typeof params !== "object" ||
+    !("key" in params) ||
+    typeof params.key !== "string"
+  ) {
+    throw new Error("Expected a sessions.create key");
+  }
+  return params.key;
+}
+
+async function expectPlainJson(prompt: Locator, message: string) {
+  const text = prompt.locator(".chat-text");
+  await text.locator("pre code").waitFor({ state: "visible" });
+  await pollLocatorText(text.locator("pre code")).toBe(message);
+  expect(await text.locator("button, details, .code-block-wrapper").count()).toBe(0);
 }
 
 async function captureProof(page: import("playwright").Page, fileName: string) {
@@ -262,17 +282,7 @@ suite.define(() => {
       await expect(gateway.waitForRequest("sessions.create")).resolves.toMatchObject({
         params: { agentId: "main", message: "verify the default mock" },
       });
-      const firstCreate = await gateway.waitForRequest("sessions.create");
-      const firstParams = firstCreate.params;
-      if (
-        !firstParams ||
-        typeof firstParams !== "object" ||
-        !("key" in firstParams) ||
-        typeof firstParams.key !== "string"
-      ) {
-        throw new Error("Expected the first sessions.create key");
-      }
-      const firstKey = firstParams.key;
+      const firstKey = createdKey((await gateway.waitForRequest("sessions.create")).params);
       await expect.poll(() => new URL(page.url()).pathname).toBe(controlUiSessionPath(firstKey));
       await captureProof(page, "ime-deliberate-enter-created.png");
 
@@ -284,16 +294,9 @@ suite.define(() => {
       expect((await gateway.getRequests("sessions.create")).at(-1)).toMatchObject({
         params: { agentId: "main", message: "verify another default mock" },
       });
-      const secondParams = (await gateway.waitForRequest("sessions.create", { after: 1 })).params;
-      if (
-        !secondParams ||
-        typeof secondParams !== "object" ||
-        !("key" in secondParams) ||
-        typeof secondParams.key !== "string"
-      ) {
-        throw new Error("Expected the second sessions.create key");
-      }
-      const secondKey = secondParams.key;
+      const secondKey = createdKey(
+        (await gateway.waitForRequest("sessions.create", { after: 1 })).params,
+      );
       await expect.poll(() => new URL(page.url()).pathname).toBe(controlUiSessionPath(secondKey));
       for (const sessionKey of [firstKey, secondKey]) {
         await expect
@@ -781,12 +784,7 @@ suite.define(() => {
           expect(await gateway.getRequests("chat.startup")).toHaveLength(0);
           await expect.poll(() => submittedPrompt.isVisible()).toBe(true);
           if (content === "json") {
-            const pendingJson = submittedPrompt.locator(".chat-text");
-            await pendingJson.locator("pre code").waitFor({ state: "visible" });
-            await pollLocatorText(pendingJson.locator("pre code")).toBe(submittedMessage);
-            expect(await pendingJson.locator("button, details, .code-block-wrapper").count()).toBe(
-              0,
-            );
+            await expectPlainJson(submittedPrompt, submittedMessage);
           } else {
             const pendingMarkdown = submittedPrompt.locator(".chat-text");
             await pollLocatorText(pendingMarkdown.locator("strong")).toBe(submittedSummary);
@@ -902,12 +900,7 @@ suite.define(() => {
               .click();
             await expandedTable.waitFor({ state: "detached" });
           } else {
-            const acceptedJson = acceptedPrompt.locator(".chat-text");
-            await acceptedJson.locator("pre code").waitFor({ state: "visible" });
-            await pollLocatorText(acceptedJson.locator("pre code")).toBe(submittedMessage);
-            expect(await acceptedJson.locator("button, details, .code-block-wrapper").count()).toBe(
-              0,
-            );
+            await expectPlainJson(acceptedPrompt, submittedMessage);
           }
           await expectDecodedThumbnail(acceptedPrompt.locator("img.chat-message-image"));
           await captureUiProof(suite, page, `${proofName}-accepted.png`);

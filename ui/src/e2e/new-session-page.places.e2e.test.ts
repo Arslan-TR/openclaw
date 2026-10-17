@@ -1,12 +1,13 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Page } from "playwright";
+import type { BrowserContextOptions, Locator, Page } from "playwright";
 import { expect, it } from "vitest";
 import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { revealChatModelOption } from "../test-helpers/select-picker-e2e.ts";
 import {
   PICKED,
   WORKSPACE,
+  LOCAL_GIT_WORKSPACE_RESPONSES,
   captureNewSessionComposerUiProof,
   captureProjectUiProof,
   captureUiProofEnabled,
@@ -34,38 +35,33 @@ async function captureFolderBrowser(page: Page, name: string) {
   await writeFile(path.join(suite.artifactDir, name), frame.png);
 }
 
+function recordingOptions(name: string, desktop = true): BrowserContextOptions {
+  const viewport = { height: 900, width: 1280 };
+  return {
+    locale: "en-US",
+    serviceWorkers: "block",
+    ...(desktop ? { viewport } : {}),
+    ...(captureUiProofEnabled
+      ? { viewport, recordVideo: { dir: path.join(suite.artifactDir, name), size: viewport } }
+      : {}),
+  };
+}
+
+async function bounds(locator: Locator) {
+  const box = await locator.boundingBox();
+  if (!box) {
+    throw new Error("Expected visible bounds for " + locator);
+  }
+  return box;
+}
+
 suite.define(() => {
   it("keeps the pre-submit draft on the composer and creates exactly one session", async () => {
-    const context = await suite.browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-      ...(captureUiProofEnabled
-        ? {
-            recordVideo: {
-              dir: path.join(suite.artifactDir, "new-session-slash-menu"),
-              size: { height: 900, width: 1280 },
-            },
-          }
-        : {}),
-    });
+    const context = await suite.browser.newContext(recordingOptions("new-session-slash-menu"));
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       methodResponses: {
-        "agents.list": {
-          agents: [
-            {
-              id: "main",
-              identity: { name: "Main" },
-              name: "Main",
-              workspace: WORKSPACE,
-              workspaceGit: true,
-            },
-          ],
-          defaultId: "main",
-          mainKey: "main",
-          scope: "agent",
-        },
+        "agents.list": LOCAL_GIT_WORKSPACE_RESPONSES["agents.list"],
         "sessions.list": createdSessionListResult("agent:main:existing"),
         "sessions.create": { key: "agent:main:draft-e2e" },
       },
@@ -89,11 +85,7 @@ suite.define(() => {
       }
       await message.fill("fix the flaky draft test");
 
-      // Owner boundary: the New Session page (new-session-page.ts:228) keeps
-      // the draft message on DraftSubmissionFlow until the composer submits,
-      // so the route, the typed text, and the sidebar's canonical
-      // sessions.list row must all stay put with zero sessions.create
-      // requests before that happens.
+      // DraftSubmissionFlow retains the route, text, and roster until submission.
       expect(new URL(page.url()).pathname).toBe("/new");
       expect(new URL(page.url()).search).toBe("?agent=main");
       expect(await message.inputValue()).toBe("fix the flaky draft test");
@@ -113,11 +105,7 @@ suite.define(() => {
         message: "fix the flaky draft test",
       });
 
-      // Wait for the same canonical settle signal the neighboring submission
-      // test uses (navigation to the created session route) before counting
-      // requests: the exactly-once assert must observe the submission flow
-      // after it has fully resolved, not mid-flight, or a late duplicate
-      // sessions.create could land after a premature pass.
+      // Count only after navigation settles so a late duplicate cannot escape the assertion.
       await expect
         .poll(() => new URL(page.url()).pathname)
         .toBe(controlUiSessionPath("agent:main:draft-e2e"));
@@ -128,19 +116,7 @@ suite.define(() => {
   });
 
   it("drafts a session with a browsed folder and creates it on first message", async () => {
-    const context = await suite.browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-      ...(captureUiProofEnabled
-        ? {
-            recordVideo: {
-              dir: path.join(suite.artifactDir, "project-registry"),
-              size: { height: 900, width: 1280 },
-            },
-          }
-        : {}),
-    });
+    const context = await suite.browser.newContext(recordingOptions("project-registry"));
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       workspaceGit: true,
@@ -213,15 +189,12 @@ suite.define(() => {
 
       // Incognito stays at the page's top-right, independent of rail navigation.
       const incognitoToggle = page.getByRole("switch", { name: "Incognito" });
-      const incognitoBox = await incognitoToggle.boundingBox();
-      const pageBox = await page.locator(".new-session-page").boundingBox();
-      expect(incognitoBox).not.toBeNull();
-      expect(pageBox).not.toBeNull();
-      expect(incognitoBox?.x ?? 0).toBeGreaterThan((pageBox?.x ?? 0) + (pageBox?.width ?? 0) / 2);
-      expect((incognitoBox?.x ?? 0) + (incognitoBox?.width ?? 0)).toBeLessThanOrEqual(
-        (pageBox?.x ?? 0) + (pageBox?.width ?? 0),
-      );
-      expect(incognitoBox?.y ?? 0).toBeGreaterThanOrEqual(pageBox?.y ?? 0);
+      const incognitoBox = await bounds(incognitoToggle);
+      const pageBox = await bounds(page.locator(".new-session-page"));
+
+      expect(incognitoBox.x).toBeGreaterThan(pageBox.x + pageBox.width / 2);
+      expect(incognitoBox.x + incognitoBox.width).toBeLessThanOrEqual(pageBox.x + pageBox.width);
+      expect(incognitoBox.y).toBeGreaterThanOrEqual(pageBox.y);
       expect(
         await page
           .locator(".new-session-page__composer")
@@ -246,38 +219,25 @@ suite.define(() => {
 
       // Unified layout: the trigger row (menus above the composer) sits
       // inside the start-screen welcome, below the hero.
-      const heroBox = await page.locator(".agent-chat__welcome h2").boundingBox();
-      const triggersBox = await page.locator(".new-session-page__triggers").boundingBox();
-      const composerBox = await page.locator(".new-session-page__composer").boundingBox();
-      const modelBox = await page.locator('[data-chat-model-select="true"]').boundingBox();
-      const modelWrapperBox = await page
-        .locator(".new-session-page__composer .chat-composer-model-control")
-        .boundingBox();
-      const footerBox = await page
-        .locator(".new-session-page__composer .agent-chat__composer-footer")
-        .boundingBox();
-      const actionsBox = await page
-        .locator(".new-session-page__composer .agent-chat__composer-actions")
-        .boundingBox();
+      const heroBox = await bounds(page.locator(".agent-chat__welcome h2"));
+      const triggersBox = await bounds(page.locator(".new-session-page__triggers"));
+      const composerBox = await bounds(page.locator(".new-session-page__composer"));
+      await bounds(page.locator('[data-chat-model-select="true"]'));
+      const modelWrapperBox = await bounds(
+        page.locator(".new-session-page__composer .chat-composer-model-control"),
+      );
+      const footerBox = await bounds(
+        page.locator(".new-session-page__composer .agent-chat__composer-footer"),
+      );
+      const actionsBox = await bounds(
+        page.locator(".new-session-page__composer .agent-chat__composer-actions"),
+      );
       const attachmentButton = page.getByRole("button", { name: "Add attachment" });
-      const attachmentBox = await attachmentButton.boundingBox();
-      expect(heroBox).not.toBeNull();
-      expect(triggersBox).not.toBeNull();
-      expect(composerBox).not.toBeNull();
-      expect(modelBox).not.toBeNull();
-      expect(modelWrapperBox).not.toBeNull();
-      expect(footerBox).not.toBeNull();
-      expect(actionsBox).not.toBeNull();
-      expect(attachmentBox).not.toBeNull();
-      expect((incognitoBox?.y ?? 0) + (incognitoBox?.height ?? 0)).toBeLessThanOrEqual(
-        composerBox?.y ?? 0,
-      );
-      expect((heroBox?.y ?? 0) + (heroBox?.height ?? 0)).toBeLessThanOrEqual(
-        (triggersBox?.y ?? 0) + 1,
-      );
-      expect((triggersBox?.y ?? 0) + (triggersBox?.height ?? 0)).toBeLessThanOrEqual(
-        (composerBox?.y ?? 0) + 1,
-      );
+      const attachmentBox = await bounds(attachmentButton);
+
+      expect(incognitoBox.y + incognitoBox.height).toBeLessThanOrEqual(composerBox.y);
+      expect(heroBox.y + heroBox.height).toBeLessThanOrEqual(triggersBox.y + 1);
+      expect(triggersBox.y + triggersBox.height).toBeLessThanOrEqual(composerBox.y + 1);
       expect(
         await page.locator(".new-session-page__composer .agent-chat__composer-footer").count(),
       ).toBe(1);
@@ -296,22 +256,16 @@ suite.define(() => {
           (element) => element.closest(".agent-chat__composer-input-row") == null,
         ),
       ).toBe(true);
-      expect(attachmentBox?.x ?? 0).toBeLessThan(modelWrapperBox?.x ?? 0);
-      expect(modelWrapperBox?.x ?? 0).toBeGreaterThan(
-        (footerBox?.x ?? 0) + (footerBox?.width ?? 0) / 2,
+      expect(attachmentBox.x).toBeLessThan(modelWrapperBox.x);
+      expect(modelWrapperBox.x).toBeGreaterThan(footerBox.x + footerBox.width / 2);
+      expect(actionsBox.x - (modelWrapperBox.x + modelWrapperBox.width)).toBeLessThanOrEqual(12);
+      expect(modelWrapperBox.x + modelWrapperBox.width).toBeLessThanOrEqual(actionsBox.x);
+      expect(actionsBox.x + actionsBox.width).toBeLessThanOrEqual(
+        footerBox.x + footerBox.width + 1,
       );
-      expect(
-        (actionsBox?.x ?? 0) - ((modelWrapperBox?.x ?? 0) + (modelWrapperBox?.width ?? 0)),
-      ).toBeLessThanOrEqual(12);
-      expect((modelWrapperBox?.x ?? 0) + (modelWrapperBox?.width ?? 0)).toBeLessThanOrEqual(
-        actionsBox?.x ?? 0,
-      );
-      expect((actionsBox?.x ?? 0) + (actionsBox?.width ?? 0)).toBeLessThanOrEqual(
-        (footerBox?.x ?? 0) + (footerBox?.width ?? 0) + 1,
-      );
-      expect(triggersBox?.x).toBeCloseTo(composerBox?.x ?? 0, 0);
-      expect(triggersBox?.width).toBeCloseTo(composerBox?.width ?? 0, 0);
-      expect(composerBox?.width).toBeCloseTo(48 * 16, 0);
+      expect(triggersBox.x).toBeCloseTo(composerBox.x, 0);
+      expect(triggersBox.width).toBeCloseTo(composerBox.width, 0);
+      expect(composerBox.width).toBeCloseTo(48 * 16, 0);
       expect(await page.locator(".new-session-page__message").getAttribute("rows")).toBe("1");
       await captureProjectUiProof(suite, page, "new-session-control-layout.png");
 
@@ -569,19 +523,7 @@ suite.define(() => {
   });
 
   it("selects an eligible checkout for a restricted registered project", async () => {
-    const context = await suite.browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-      ...(captureUiProofEnabled
-        ? {
-            recordVideo: {
-              dir: path.join(suite.artifactDir, "checkout-choice"),
-              size: { height: 900, width: 1280 },
-            },
-          }
-        : {}),
-    });
+    const context = await suite.browser.newContext(recordingOptions("checkout-choice"));
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       operatorScopes: ["operator.read", "operator.sessions.write"],
@@ -682,19 +624,7 @@ suite.define(() => {
   });
 
   it("selects a registered project and submits its id at write scope", async () => {
-    const context = await suite.browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      ...(captureUiProofEnabled
-        ? {
-            recordVideo: {
-              dir: path.join(suite.artifactDir, "project-registry"),
-              size: { height: 900, width: 1280 },
-            },
-            viewport: { height: 900, width: 1280 },
-          }
-        : {}),
-    });
+    const context = await suite.browser.newContext(recordingOptions("project-registry", false));
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       workspace: WORKSPACE,
@@ -730,11 +660,7 @@ suite.define(() => {
           environments: [],
           profiles: [],
         },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
         "sessions.create": { key: "agent:main:project-e2e" },
       },
     });
@@ -903,11 +829,7 @@ suite.define(() => {
           home: WORKSPACE,
           entries: [],
         },
-        "worktrees.branches": {
-          branches: [{ kind: "local", name: "main" }],
-          defaultBranch: "main",
-          repositoryStatus: "git",
-        },
+        "worktrees.branches": LOCAL_GIT_WORKSPACE_RESPONSES["worktrees.branches"],
       },
     });
 

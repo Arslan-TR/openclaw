@@ -6,6 +6,7 @@ import { selectChatModel } from "../test-helpers/select-picker-e2e.ts";
 import {
   MOVED_WORKSPACE,
   NEW_SESSION_MODEL_CATALOG,
+  LOCAL_GIT_WORKSPACE_RESPONSES,
   PICKED,
   SESSION_LIST_DEFAULTS,
   TARGET_REPO,
@@ -59,18 +60,14 @@ const FOLDER_LISTINGS = {
 
 function mainAgentList(workspace = WORKSPACE, workspaceGit = true) {
   return {
+    ...LOCAL_GIT_WORKSPACE_RESPONSES["agents.list"],
     agents: [
       {
-        id: "main",
-        identity: { name: "Main" },
-        name: "Main",
+        ...LOCAL_GIT_WORKSPACE_RESPONSES["agents.list"].agents[0],
         workspace,
         workspaceGit,
       },
     ],
-    defaultId: "main",
-    mainKey: "main",
-    scope: "agent",
   };
 }
 
@@ -172,11 +169,7 @@ suite.define(() => {
       expect(attachBox).not.toBeNull();
       expect(draftBox).not.toBeNull();
       expect(modelBox).not.toBeNull();
-      // The row reads as the settings for the next turn, in the order the
-      // operator decides them: attachments, draft visibility, then the model and
-      // its reasoning. This viewport is narrow enough that
-      // the row wraps, so the comparison is reading order — which line a control
-      // is on first, then where it sits on that line.
+      // At narrow widths, compare reading order across wrapped rows.
       const followsInReadingOrder = (
         previous: { x: number; y: number; height: number } | null,
         next: { x: number; y: number; height: number } | null,
@@ -189,12 +182,7 @@ suite.define(() => {
         const sameLine = Math.abs(nextCenter - previousCenter) <= previous.height / 2;
         return sameLine ? next.x > previous.x : nextCenter > previousCenter;
       };
-      const sequence = [attachBox, modelBox];
-      for (let index = 1; index < sequence.length; index += 1) {
-        expect(followsInReadingOrder(sequence[index - 1] ?? null, sequence[index] ?? null)).toBe(
-          true,
-        );
-      }
+      expect(followsInReadingOrder(attachBox, modelBox)).toBe(true);
       for (const control of [attachBox, modelBox]) {
         expect(control?.x ?? 0).toBeGreaterThanOrEqual(footerBox?.x ?? 0);
         expect((control?.x ?? 0) + (control?.width ?? 0)).toBeLessThanOrEqual(
@@ -208,11 +196,7 @@ suite.define(() => {
 
       await attach.click();
       await expect.poll(() => takePhoto.isVisible()).toBe(true);
-      // The plus becomes a close mark while its menu is up: one glyph rotating,
-      // so the button that opened the menu visibly is the one that dismisses it.
-      // A CSS rotation matrix is [cos, sin, -sin, cos], so the sine term carries
-      // the direction: negative is counter-clockwise, turning back against the
-      // upward travel of the menu rather than with it.
+      // The plus rotates counter-clockwise into a close mark (negative matrix sine).
       const attachGlyphSine = () =>
         attach.evaluate((element) => {
           const { transform } = getComputedStyle(element.querySelector("svg") as SVGElement);
