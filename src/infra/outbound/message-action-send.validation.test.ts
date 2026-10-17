@@ -8,13 +8,46 @@ import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { runMessageAction } from "./message-action-runner.js";
 import {
   forumTestPlugin,
-  runDrySend,
+  runDrySend as runFixtureDrySend,
   workspaceConfig,
   workspaceTestPlugin,
 } from "./message-action-runner.test-support.js";
 
 const emptyConfig = {} as OpenClawConfig;
 const portableLocation = { latitude: 48.858844, longitude: 2.294351 };
+const target = { channel: "workspace", target: "#C12345678" };
+const toolContext = { currentChannelId: "C12345678" };
+const crossContext = { ...toolContext, currentChannelProvider: "workspace" };
+const runDrySend = (actionParams: Record<string, unknown>, cross = false) =>
+  runFixtureDrySend({
+    cfg: workspaceConfig,
+    actionParams: { ...target, ...actionParams },
+    toolContext: cross ? crossContext : toolContext,
+  });
+
+function captureWorkspaceSend(messageId = "workspace-test-message") {
+  const sentText: string[] = [];
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: "workspace",
+        source: "test",
+        plugin: {
+          ...workspaceTestPlugin,
+          outbound: {
+            ...workspaceTestPlugin.outbound,
+            sendText: async (ctx: ChannelOutboundContext) => {
+              sentText.push(ctx.text);
+              return { channel: "workspace", messageId };
+            },
+          },
+        },
+      },
+    ]),
+  );
+  return sentText;
+}
+
 describe("runMessageAction send validation", () => {
   beforeEach(() => {
     setActivePluginRegistry(
@@ -37,28 +70,11 @@ describe("runMessageAction send validation", () => {
     setActivePluginRegistry(createTestRegistry([]));
   });
   it("requires message when no media hint is provided", async () => {
-    await expect(
-      runDrySend({
-        cfg: workspaceConfig,
-        actionParams: {
-          channel: "workspace",
-          target: "#C12345678",
-        },
-        toolContext: { currentChannelId: "C12345678" },
-      }),
-    ).rejects.toThrow(/message required/i);
+    await expect(runDrySend({})).rejects.toThrow(/message required/i);
   });
 
   it("allows send when only a portable location is provided", async () => {
-    const result = await runDrySend({
-      cfg: workspaceConfig,
-      actionParams: {
-        channel: "workspace",
-        target: "#C12345678",
-        location: { latitude: 48.858844, longitude: 2.294351 },
-      },
-      toolContext: { currentChannelId: "C12345678" },
-    });
+    const result = await runDrySend({ location: portableLocation });
 
     expect(result.kind).toBe("send");
   });
@@ -70,19 +86,7 @@ describe("runMessageAction send validation", () => {
     "rejects location sends mixed with $name before cross-context decoration",
     async ({ extra }) => {
       await expect(
-        runDrySend({
-          cfg: workspaceConfig,
-          actionParams: {
-            channel: "workspace",
-            target: "channel:C99999999",
-            location: { latitude: 48.858844, longitude: 2.294351 },
-            ...extra,
-          },
-          toolContext: {
-            currentChannelId: "C12345678",
-            currentChannelProvider: "workspace",
-          },
-        }),
+        runDrySend({ target: "channel:C99999999", location: portableLocation, ...extra }, true),
       ).rejects.toThrow(/cannot be combined/i);
     },
   );
@@ -102,10 +106,7 @@ describe("runMessageAction send validation", () => {
         ...content,
         location: portableLocation,
       },
-      toolContext: {
-        currentChannelId: "C12345678",
-        currentChannelProvider: "workspace",
-      },
+      toolContext: crossContext,
       dryRun: true,
     });
 
@@ -119,35 +120,13 @@ describe("runMessageAction send validation", () => {
     });
   });
   it("strips unsupported citation control markers from normal channel sends", async () => {
-    const sentText: string[] = [];
-    const sendText: NonNullable<
-      NonNullable<typeof workspaceTestPlugin.outbound>["sendText"]
-    > = async (ctx) => {
-      sentText.push(ctx.text);
-      return { channel: "workspace", messageId: "workspace-test-message" };
-    };
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "workspace",
-          source: "test",
-          plugin: {
-            ...workspaceTestPlugin,
-            outbound: {
-              ...workspaceTestPlugin.outbound,
-              sendText,
-            },
-          },
-        },
-      ]),
-    );
+    const sentText = captureWorkspaceSend();
 
     const result = await runMessageAction({
       cfg: workspaceConfig,
       action: "send",
       params: {
-        channel: "workspace",
-        target: "#C12345678",
+        ...target,
         message: "v2026.5.20 release note citeturn2view0",
       },
     });
@@ -163,13 +142,7 @@ describe("runMessageAction send validation", () => {
   it("rejects message sends whose body is only leaked plain-text tool calls", async () => {
     await expect(
       runDrySend({
-        cfg: workspaceConfig,
-        actionParams: {
-          channel: "workspace",
-          target: "#C12345678",
-          message: '[tool:read] {"path":"/app/skills/meme-maker/SKILL.md"}',
-        },
-        toolContext: { currentChannelId: "C12345678" },
+        message: '[tool:read] {"path":"/app/skills/meme-maker/SKILL.md"}',
       }),
     ).rejects.toThrow(/send requires text or media/i);
   });
@@ -178,8 +151,7 @@ describe("runMessageAction send validation", () => {
     {
       name: "structured poll params",
       actionParams: {
-        channel: "workspace",
-        target: "#C12345678",
+        ...target,
         message: "hi",
         pollQuestion: "Ready?",
         pollOption: ["Yes", "No"],
@@ -188,8 +160,7 @@ describe("runMessageAction send validation", () => {
     {
       name: "snake_case content poll params",
       actionParams: {
-        channel: "workspace",
-        target: "#C12345678",
+        ...target,
         message: "hi",
         poll_question: "Ready?",
         poll_option: ["Yes", "No"],
@@ -197,26 +168,14 @@ describe("runMessageAction send validation", () => {
       },
     },
   ])("rejects send actions that include $name", async ({ actionParams }) => {
-    await expect(
-      runDrySend({
-        cfg: workspaceConfig,
-        actionParams,
-        toolContext: { currentChannelId: "C12345678" },
-      }),
-    ).rejects.toThrow(/use action "poll" instead of "send"/i);
+    await expect(runDrySend(actionParams)).rejects.toThrow(/use action "poll" instead of "send"/i);
   });
 
   it("keeps rejecting a non-empty event location string on send", async () => {
     await expect(
       runDrySend({
-        cfg: workspaceConfig,
-        actionParams: {
-          channel: "workspace",
-          target: "#C12345678",
-          message: "hello",
-          location: "Main stage",
-        },
-        toolContext: { currentChannelId: "C12345678" },
+        message: "hello",
+        location: "Main stage",
       }),
     ).rejects.toThrow("location must be an object");
   });
@@ -250,29 +209,11 @@ describe("message body alias normalization", () => {
     },
     { name: "caption fallback", body: { message: "", caption: "    indented body" } },
   ])("delivers code indentation through $name", async ({ body }) => {
-    const sentText: string[] = [];
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "workspace",
-          source: "test",
-          plugin: {
-            ...workspaceTestPlugin,
-            outbound: {
-              ...workspaceTestPlugin.outbound,
-              sendText: async (ctx: ChannelOutboundContext) => {
-                sentText.push(ctx.text);
-                return { channel: "workspace", messageId: "body-whitespace" };
-              },
-            },
-          },
-        },
-      ]),
-    );
+    const sentText = captureWorkspaceSend("body-whitespace");
     const result = await runMessageAction({
       cfg: workspaceConfig,
       action: "send",
-      params: { channel: "workspace", target: "#C12345678", ...body },
+      params: { ...target, ...body },
     });
     expect(result.kind).toBe("send");
     expect(sentText).toEqual(["    indented body"]);

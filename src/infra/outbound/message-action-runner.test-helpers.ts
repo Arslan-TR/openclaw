@@ -160,21 +160,22 @@ export function createAlwaysConfiguredPluginConfig(
   };
 }
 
+function actionPluginBase(id: string, label: string, blurb: string): ChannelPlugin {
+  const base = createChannelTestPluginBase({
+    id,
+    label,
+    config: createAlwaysConfiguredPluginConfig(),
+  });
+  return { ...base, meta: { ...base.meta, blurb } };
+}
+
 function createActionHubPluginFixture() {
   const handleAction = vi.fn(async ({ params }: { params: Record<string, unknown> }) =>
     jsonResult({ ok: true, params }),
   );
   const plugin: ChannelPlugin = {
-    id: "actionhub",
-    meta: {
-      id: "actionhub",
-      label: "Action Hub",
-      selectionLabel: "Action Hub",
-      docsPath: "/channels/actionhub",
-      blurb: "Action Hub action dispatch test plugin.",
-    },
+    ...actionPluginBase("actionhub", "Action Hub", "Action Hub action dispatch test plugin."),
     capabilities: { chatTypes: ["direct", "channel"] },
-    config: createAlwaysConfiguredPluginConfig(),
     messaging: {
       targetPrefixes: ["actionhub", "actionhub-alias"],
       normalizeTarget: (raw) => raw.replace(/^actionhub-alias:/i, "actionhub:"),
@@ -239,16 +240,8 @@ export function createGatewayActionPlugin(params: {
   const actions = new Set(params.actions);
   const gatewayActions = new Set(params.gatewayActions ?? params.actions);
   return {
-    id: params.pluginId,
-    meta: {
-      id: params.pluginId,
-      label: params.label,
-      selectionLabel: params.label,
-      docsPath: `/channels/${params.pluginId}`,
-      blurb: params.blurb,
-    },
+    ...actionPluginBase(params.pluginId, params.label, params.blurb),
     capabilities: params.capabilities ?? { chatTypes: ["direct"] },
-    config: createAlwaysConfiguredPluginConfig(),
     messaging: params.messaging,
     threading: params.threading,
     actions: {
@@ -267,16 +260,7 @@ export function createPollForwardingPlugin(params: {
   handleAction: ChannelActionHandler;
 }): ChannelPlugin {
   return {
-    id: params.pluginId,
-    meta: {
-      id: params.pluginId,
-      label: params.label,
-      selectionLabel: params.label,
-      docsPath: `/channels/${params.pluginId}`,
-      blurb: params.blurb,
-    },
-    capabilities: { chatTypes: ["direct"] },
-    config: createAlwaysConfiguredPluginConfig(),
+    ...actionPluginBase(params.pluginId, params.label, params.blurb),
     messaging: {
       targetResolver: {
         looksLikeId: () => true,
@@ -434,18 +418,14 @@ const requireLabeledRecord = createRequireRecord("record", "expected-label");
 export function readFirstPluginCall(mock: {
   mock: { calls: unknown[][] };
 }): Record<string, unknown> {
-  const [mockCall] = mock.mock.calls;
-  const call = mockCall?.[0];
-  return requireRecord(call);
+  return readPluginCall(mock, 0);
 }
 
 export function readPluginCall(
   mock: { mock: { calls: unknown[][] } },
   callIndex: number,
 ): Record<string, unknown> {
-  const mockCall = mock.mock.calls[callIndex];
-  const call = mockCall?.[0];
-  return requireRecord(call);
+  return requireRecord(mock.mock.calls[callIndex]?.[0]);
 }
 
 export function readLastPluginCall(mock: {
@@ -459,14 +439,11 @@ export function readMockCallArg(
   label: string,
   callIndex = 0,
 ): Record<string, unknown> {
-  const mockCall = mock.mock.calls[callIndex];
-  const value = mockCall?.[0];
-  return requireLabeledRecord(value, label);
+  return requireLabeledRecord(mock.mock.calls[callIndex]?.[0], label);
 }
 
 export function readRecordField(record: Record<string, unknown>, key: string, label: string) {
-  const value = record[key];
-  return requireLabeledRecord(value, label);
+  return requireLabeledRecord(record[key], label);
 }
 
 export function expectRecordFields(

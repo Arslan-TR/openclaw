@@ -12,7 +12,18 @@ import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { mockFirstRecordArg } from "../../test-utils/mock-call-assertions.js";
 import { OutboundDeliveryError } from "./deliver-types.js";
-import { runMessageAction } from "./message-action-runner.js";
+import { runMessageAction as runAction } from "./message-action-runner.js";
+
+type SendInput = Omit<Parameters<typeof runAction>[0], "action" | "cfg"> & { cfg?: OpenClawConfig };
+function runMessageAction({ params, ...input }: SendInput) {
+  return runAction({
+    action: "send",
+    cfg: { channels: { testchat: { enabled: true } } } as OpenClawConfig,
+    dryRun: false,
+    ...input,
+    params: { channel: "testchat", target: "channel:abc", ...params },
+  });
+}
 
 const ttsMocks = vi.hoisted(() => ({
   maybeApplyTtsToPayload: vi.fn(async (params: { payload: unknown }) => params.payload),
@@ -22,51 +33,44 @@ vi.mock("../../tts/tts.runtime.js", () => ({
   maybeApplyTtsToPayload: ttsMocks.maybeApplyTtsToPayload,
 }));
 
-function registerTestChatPlugin(outbound: NonNullable<ChannelPlugin["outbound"]>) {
-  setActivePluginRegistry(
-    createTestRegistry([
-      {
-        pluginId: "testchat",
-        source: "test",
-        plugin: createOutboundTestPlugin({ id: "testchat", outbound }),
-      },
-    ]),
-  );
+function registerPlugin(
+  id: string,
+  outbound: NonNullable<ChannelPlugin["outbound"]>,
+  overrides: Partial<ChannelPlugin> = {},
+) {
+  const plugin = { ...createOutboundTestPlugin({ id, outbound }), ...overrides };
+  setActivePluginRegistry(createTestRegistry([{ pluginId: id, source: "test", plugin }]));
 }
+function registerTestChatPlugin(
+  outbound: NonNullable<ChannelPlugin["outbound"]>,
+  overrides: Partial<ChannelPlugin> = {},
+) {
+  registerPlugin("testchat", outbound, overrides);
+}
+const receipt = (channel: string, messageId: string, chatId: string) => ({
+  channel,
+  messageId,
+  chatId,
+});
 
 function registerSlackTextPlugin(
   accountIds: string[] = ["default"],
   defaultAccountId?: string,
   deliveryMode: "direct" | "gateway" = "direct",
 ) {
-  const sendText = vi.fn().mockResolvedValue({
-    channel: "slack",
-    messageId: "m1",
-    chatId: "C123",
-  });
-  setActivePluginRegistry(
-    createTestRegistry([
-      {
-        pluginId: "slack",
-        source: "test",
-        plugin: {
-          ...createOutboundTestPlugin({
-            id: "slack",
-            outbound: {
-              deliveryMode,
-              sendText,
-            },
-          }),
-          config: {
-            listAccountIds: () => accountIds,
-            ...(defaultAccountId ? { defaultAccountId: () => defaultAccountId } : {}),
-            resolveAccount: () => ({ enabled: true }),
-            isConfigured: () => true,
-          },
-          threading: { threadAddressing: "message" },
-        },
+  const sendText = vi.fn().mockResolvedValue(receipt("slack", "m1", "C123"));
+  registerPlugin(
+    "slack",
+    { deliveryMode, sendText },
+    {
+      config: {
+        listAccountIds: () => accountIds,
+        ...(defaultAccountId ? { defaultAccountId: () => defaultAccountId } : {}),
+        resolveAccount: () => ({ enabled: true }),
+        isConfigured: () => true,
       },
-    ]),
+      threading: { threadAddressing: "message" },
+    },
   );
   return sendText;
 }
@@ -103,13 +107,7 @@ describe("runMessageAction core send routing", () => {
       registerTestChatPlugin({ deliveryMode: "direct", sendText });
 
       const result = await runMessageAction({
-        cfg: {
-          channels: { testchat: { enabled: true } },
-        } as OpenClawConfig,
-        action: "send",
         params: {
-          channel: "testchat",
-          target: "channel:abc",
           message: "hello",
         },
         gateway: {
@@ -117,7 +115,6 @@ describe("runMessageAction core send routing", () => {
           mode: GATEWAY_CLIENT_MODES.CLI,
         },
         conversationReadOrigin: "direct-operator",
-        dryRun: false,
       });
 
       expect(result).toMatchObject({
@@ -139,50 +136,23 @@ describe("runMessageAction core send routing", () => {
 
     await expect(
       runMessageAction({
-        cfg: {
-          channels: { testchat: { enabled: true } },
-        } as OpenClawConfig,
-        action: "send",
         params: {
-          channel: "testchat",
-          target: "channel:abc",
           message: "hello",
         },
-        dryRun: false,
       }),
     ).rejects.toThrow("provider rejected the message");
     expect(sendText).toHaveBeenCalledOnce();
   });
 
   it("does not misclassify send as poll when zero-valued poll params are present", async () => {
-    const sendMedia = vi.fn().mockResolvedValue({
-      channel: "testchat",
-      messageId: "m2",
-      chatId: "c1",
-    });
+    const sendMedia = vi.fn().mockResolvedValue(receipt("testchat", "m2", "c1"));
     registerTestChatPlugin({
       deliveryMode: "direct",
-      sendText: vi.fn().mockResolvedValue({
-        channel: "testchat",
-        messageId: "t2",
-        chatId: "c1",
-      }),
+      sendText: vi.fn().mockResolvedValue(receipt("testchat", "t2", "c1")),
       sendMedia,
     });
-    const cfg = {
-      channels: {
-        testchat: {
-          enabled: true,
-        },
-      },
-    } as OpenClawConfig;
-
     const result = await runMessageAction({
-      cfg,
-      action: "send",
       params: {
-        channel: "testchat",
-        target: "channel:abc",
         media: "https://example.com/file.txt",
         message: "hello",
         pollDurationHours: 0,
@@ -194,7 +164,6 @@ describe("runMessageAction core send routing", () => {
         pollQuestion: "",
         pollOption: [],
       },
-      dryRun: false,
     });
 
     expect(result.kind).toBe("send");
@@ -205,62 +174,22 @@ describe("runMessageAction core send routing", () => {
   });
 
   it("preserves an explicit provider reply target with its canonical thread root", async () => {
-    const sendText = vi.fn().mockResolvedValue({
-      channel: "testchat",
-      messageId: "m1",
-      chatId: "C1",
-    });
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "testchat",
-          source: "test",
-          plugin: {
-            ...createOutboundTestPlugin({
-              id: "testchat",
-              outbound: {
-                deliveryMode: "direct",
-                sendText,
-              },
-            }),
-            threading: {
-              resolveAutoThreadId: ({
-                toolContext,
-                replyToId,
-              }: {
-                toolContext?: {
-                  currentMessageId?: string | number;
-                  currentThreadTs?: string;
-                };
-                replyToId?: string | null;
-              }) =>
-                replyToId === toolContext?.currentMessageId
-                  ? toolContext?.currentThreadTs
-                  : undefined,
-              resolveReplyTransport: ({
-                threadId,
-              }: {
-                threadId?: string | number | null;
-                replyToId?: string | null;
-              }) => {
-                const root = threadId == null ? undefined : String(threadId);
-                return { replyToId: root, threadId: root };
-              },
-            },
+    const sendText = vi.fn().mockResolvedValue(receipt("testchat", "m1", "C1"));
+    registerTestChatPlugin(
+      { deliveryMode: "direct", sendText },
+      {
+        threading: {
+          resolveAutoThreadId: ({ toolContext, replyToId }) =>
+            replyToId === toolContext?.currentMessageId ? toolContext?.currentThreadTs : undefined,
+          resolveReplyTransport: ({ threadId }) => {
+            const root = threadId == null ? undefined : String(threadId);
+            return { replyToId: root, threadId: root };
           },
         },
-      ]),
+      },
     );
 
     await runMessageAction({
-      cfg: {
-        channels: {
-          testchat: {
-            enabled: true,
-          },
-        },
-      } as OpenClawConfig,
-      action: "send",
       params: {
         channel: "testchat",
         target: "channel:C1",
@@ -275,7 +204,6 @@ describe("runMessageAction core send routing", () => {
         currentMessageId: "child-1",
         replyToMode: "all",
       },
-      dryRun: false,
     });
 
     expect(mockFirstRecordArg(sendText, "send text")).toMatchObject({
@@ -326,8 +254,6 @@ describe("runMessageAction core send routing", () => {
       });
 
       await runMessageAction({
-        cfg: { channels: { testchat: { enabled: true } } } as OpenClawConfig,
-        action: "send",
         params: {
           channel: "testchat",
           target: "channel:C1",
@@ -343,7 +269,6 @@ describe("runMessageAction core send routing", () => {
           replyToMode,
           hasRepliedRef: { value: false },
         },
-        dryRun: false,
       });
 
       expect(sendText.mock.calls.map(([call]) => call.replyToId)).toEqual(expectedReplyIds);
@@ -398,7 +323,6 @@ describe("runMessageAction core send routing", () => {
             }
           : {}),
       } as OpenClawConfig,
-      action: "send",
       agentId: "main",
       defaultAccountId: testCase.defaultAccountId,
       gatewayOwnedDelivery: testCase.gatewayOwnedDelivery,
@@ -424,13 +348,11 @@ describe("runMessageAction core send routing", () => {
       cfg: {
         channels: { slack: { enabled: true, responsePrefix: "[Nexus]" } },
       } as OpenClawConfig,
-      action: "send",
       params: {
         channel: "slack",
         target: "channel:OTHER",
         message: "[Nexus] already prefixed",
       },
-      dryRun: false,
     });
 
     expect(sendText).toHaveBeenCalledOnce();
@@ -438,50 +360,32 @@ describe("runMessageAction core send routing", () => {
   });
 
   it("leaves media-only sends without a responsePrefix", async () => {
-    const sendMedia = vi.fn().mockResolvedValue({
-      channel: "slack",
-      messageId: "m1",
-      chatId: "C123",
-    });
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "slack",
-          source: "test",
-          plugin: {
-            ...createOutboundTestPlugin({
-              id: "slack",
-              outbound: {
-                deliveryMode: "direct",
-                sendText: vi.fn().mockResolvedValue({
-                  channel: "slack",
-                  messageId: "t1",
-                  chatId: "C123",
-                }),
-                sendMedia,
-              },
-            }),
-            config: {
-              listAccountIds: () => ["default"],
-              resolveAccount: () => ({ enabled: true }),
-              isConfigured: () => true,
-            },
-          },
+    const sendMedia = vi.fn().mockResolvedValue(receipt("slack", "m1", "C123"));
+    registerPlugin(
+      "slack",
+      {
+        deliveryMode: "direct",
+        sendText: vi.fn().mockResolvedValue(receipt("slack", "t1", "C123")),
+        sendMedia,
+      },
+      {
+        config: {
+          listAccountIds: () => ["default"],
+          resolveAccount: () => ({ enabled: true }),
+          isConfigured: () => true,
         },
-      ]),
+      },
     );
 
     await runMessageAction({
       cfg: {
         channels: { slack: { enabled: true, responsePrefix: "[Nexus]" } },
       } as OpenClawConfig,
-      action: "send",
       params: {
         channel: "slack",
         target: "channel:OTHER",
         media: "https://example.com/cat.png",
       },
-      dryRun: false,
     });
 
     expect(sendMedia).toHaveBeenCalledOnce();
@@ -496,14 +400,12 @@ describe("runMessageAction core send routing", () => {
         channels: { slack: { enabled: true, responsePrefix: "[{identity.name}]" } },
         agents: { entries: { main: { identity: { name: "Nexus" } } } },
       } as OpenClawConfig,
-      action: "send",
       params: {
         channel: "slack",
         target: "channel:OTHER",
         message: "hello world",
       },
       agentId: "main",
-      dryRun: false,
     });
 
     expect(sendText).toHaveBeenCalledOnce();
@@ -517,13 +419,11 @@ describe("runMessageAction core send routing", () => {
       cfg: {
         channels: { slack: { enabled: true, responsePrefix: "[{provider}/{model}]" } },
       } as OpenClawConfig,
-      action: "send",
       params: {
         channel: "slack",
         target: "channel:OTHER",
         message: "hello world",
       },
-      dryRun: false,
     });
 
     expect(sendText).toHaveBeenCalledOnce();
@@ -533,11 +433,7 @@ describe("runMessageAction core send routing", () => {
   });
 
   it("preserves structured speech through response prefixes when automatic TTS is off", async () => {
-    const sendMedia = vi.fn().mockResolvedValue({
-      channel: "testchat",
-      messageId: "voice-1",
-      chatId: "c1",
-    });
+    const sendMedia = vi.fn().mockResolvedValue(receipt("testchat", "voice-1", "c1"));
     ttsMocks.maybeApplyTtsToPayload.mockResolvedValueOnce({
       mediaUrl: "file:///tmp/openclaw-voice.ogg",
       audioAsVoice: true,
@@ -551,20 +447,10 @@ describe("runMessageAction core send routing", () => {
 
     await runMessageAction({
       cfg: {
-        channels: {
-          testchat: {
-            enabled: true,
-            responsePrefix: "[Nexus]",
-          },
-        },
-        tts: {
-          auto: "off",
-        },
+        channels: { testchat: { enabled: true, responsePrefix: "[Nexus]" } },
+        tts: { auto: "off" },
       } as OpenClawConfig,
-      action: "send",
       params: {
-        channel: "testchat",
-        target: "channel:abc",
         message: "Visible greeting",
         voiceText: "hello there",
         voiceProvider: "mock",
@@ -572,7 +458,6 @@ describe("runMessageAction core send routing", () => {
         asVoice: true,
       },
       sessionKey: "agent:main:testchat:channel:abc",
-      dryRun: false,
     });
 
     expect(ttsMocks.maybeApplyTtsToPayload).toHaveBeenCalledWith(
@@ -606,11 +491,7 @@ describe("runMessageAction core send routing", () => {
   });
 
   it("forwards inbound audio context to message-tool TTS", async () => {
-    const sendText = vi.fn().mockResolvedValue({
-      channel: "testchat",
-      messageId: "text-1",
-      chatId: "c1",
-    });
+    const sendText = vi.fn().mockResolvedValue(receipt("testchat", "text-1", "c1"));
     registerTestChatPlugin({
       deliveryMode: "direct",
       sendText,
@@ -618,24 +499,14 @@ describe("runMessageAction core send routing", () => {
 
     await runMessageAction({
       cfg: {
-        channels: {
-          testchat: {
-            enabled: true,
-          },
-        },
-        tts: {
-          auto: "inbound",
-        },
+        channels: { testchat: { enabled: true } },
+        tts: { auto: "inbound" },
       } as OpenClawConfig,
-      action: "send",
       params: {
-        channel: "testchat",
-        target: "channel:abc",
         message: "voice reply",
       },
       sessionKey: "agent:main:testchat:channel:abc",
       inboundAudio: true,
-      dryRun: false,
     });
 
     expect(ttsMocks.maybeApplyTtsToPayload).toHaveBeenCalledWith(

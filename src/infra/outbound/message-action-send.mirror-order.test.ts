@@ -34,6 +34,20 @@ describe("outbound mirror route ordering", () => {
   let cfg: OpenClawConfig;
   const handleAction = vi.fn();
   const sendMedia = vi.fn();
+  const transcriptScope = () => ({
+    agentId: "main",
+    sessionKey: MAIN_SESSION_KEY,
+    sessionId: "main-session",
+    storePath,
+  });
+  const send = (params: Record<string, unknown>) =>
+    runMessageAction({
+      cfg,
+      action: "send",
+      params: { channel: "testchat", ...params },
+      agentId: "main",
+      dryRun: false,
+    });
 
   function registerTestChannel() {
     const plugin: ChannelPlugin = {
@@ -105,15 +119,7 @@ describe("outbound mirror route ordering", () => {
       new Error("testchat bot token missing. Set channels.testchat.botToken."),
     );
 
-    await expect(
-      runMessageAction({
-        cfg,
-        action: "send",
-        params: { channel: "testchat", to: "user:12345", message: "hi" },
-        agentId: "main",
-        dryRun: false,
-      }),
-    ).rejects.toThrow("token missing");
+    await expect(send({ to: "user:12345", message: "hi" })).rejects.toThrow("token missing");
 
     expect(handleAction).toHaveBeenCalledOnce();
     expect(mainSessionOrigin()).toMatchObject({
@@ -125,13 +131,7 @@ describe("outbound mirror route ordering", () => {
   it("persists the outbound mirror route after a successful send", async () => {
     handleAction.mockResolvedValue(jsonResult({ ok: true, messageId: "m1" }));
 
-    const result = await runMessageAction({
-      cfg,
-      action: "send",
-      params: { channel: "testchat", to: "user:12345", message: "hi" },
-      agentId: "main",
-      dryRun: false,
-    });
+    const result = await send({ to: "user:12345", message: "hi" });
 
     expect(result.kind).toBe("send");
     expect(mainSessionOrigin()).toMatchObject({
@@ -149,21 +149,10 @@ describe("outbound mirror route ordering", () => {
       sendMedia.mockResolvedValue({ channel: "testchat", messageId: "media-send" });
       const mediaUrls = ["https://example.com/one/chart.png", "https://example.com/two/chart.png"];
       for (const media of [...mediaUrls, mediaUrls[1]]) {
-        const result = await runMessageAction({
-          cfg,
-          action: "send",
-          params: { channel: "testchat", target: "user:12345", message: "Chart", media },
-          agentId: "main",
-          dryRun: false,
-        });
+        const result = await send({ target: "user:12345", message: "Chart", media });
         expect(result.handledBy).toBe(handledBy);
       }
-      const events = loadTranscriptEventsSync({
-        agentId: "main",
-        sessionKey: MAIN_SESSION_KEY,
-        sessionId: "main-session",
-        storePath,
-      });
+      const events = loadTranscriptEventsSync(transcriptScope());
       expect(events).toEqual([
         expect.objectContaining({ type: "session", id: "main-session" }),
         ...mediaUrls.map((mediaUrl) =>
@@ -196,27 +185,15 @@ describe("outbound mirror route ordering", () => {
   ])(
     "leaves the stored route and transcript untouched when a plugin $name",
     async ({ payload }) => {
-      const transcriptScope = {
-        agentId: "main",
-        sessionKey: MAIN_SESSION_KEY,
-        sessionId: "main-session",
-        storePath,
-      };
-      const transcriptBefore = loadTranscriptEventsSync(transcriptScope);
+      const transcriptBefore = loadTranscriptEventsSync(transcriptScope());
       handleAction.mockResolvedValue(jsonResult(payload));
-      const result = await runMessageAction({
-        cfg,
-        action: "send",
-        params: { channel: "testchat", to: "user:12345", message: "omitted" },
-        agentId: "main",
-        dryRun: false,
-      });
+      const result = await send({ to: "user:12345", message: "omitted" });
       expect(result.payload).toEqual(payload);
       expect.soft(mainSessionOrigin()).toMatchObject({
         provider: "discord",
         from: "discord:operator",
       });
-      expect(loadTranscriptEventsSync(transcriptScope)).toEqual(transcriptBefore);
+      expect(loadTranscriptEventsSync(transcriptScope())).toEqual(transcriptBefore);
     },
   );
 });

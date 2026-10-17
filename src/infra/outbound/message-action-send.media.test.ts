@@ -53,15 +53,15 @@ async function withTempOpenClawStateDir<T>(test: (stateDir: string) => Promise<T
 }
 
 const runDrySend = (params: {
-  cfg: OpenClawConfig;
+  cfg?: OpenClawConfig;
   actionParams: Record<string, unknown>;
   sandboxRoot?: string;
   sandboxContainerWorkdir?: string;
 }) =>
   runMessageAction({
-    cfg: params.cfg,
+    cfg: params.cfg ?? workspaceConfig,
     action: "send",
-    params: params.actionParams as never,
+    params: { channel: "workspace", target: "12345678", ...params.actionParams },
     dryRun: true,
     sandboxRoot: params.sandboxRoot,
     sandboxContainerWorkdir: params.sandboxContainerWorkdir,
@@ -69,15 +69,28 @@ const runDrySend = (params: {
 
 const requireRecord = createRequireRecord("record", "expected-non-array-record");
 
+function sendResult(result: Awaited<ReturnType<typeof runMessageAction>>) {
+  expect(result.kind).toBe("send");
+  if (result.kind !== "send") {
+    throw new Error("expected send result");
+  }
+  return result.sendResult;
+}
+const sendArgs = () =>
+  mockFirstRecordArg(
+    channelResolutionMocks.executeSendAction,
+    "executeSendAction",
+    "Expected a non-array record",
+  );
+
 const workspacePlugin = createWorkspaceMediaTestPlugin();
 
 describe("runMessageAction media behavior", () => {
   beforeEach(async () => {
     await resetMessageActionMediaMocks();
+    setTestPlugin(workspacePlugin, "workspace");
   });
   it("materializes buffer-only send attachments into outbound media paths", async () => {
-    setTestPlugin(workspacePlugin, "workspace");
-
     await withTempOpenClawStateDir(async () => {
       const result = await runMessageAction({
         cfg: workspaceConfig,
@@ -92,84 +105,55 @@ describe("runMessageAction media behavior", () => {
         },
       });
 
-      expect(result.kind).toBe("send");
-      if (result.kind !== "send") {
-        throw new Error("expected send result");
-      }
-      expect(result.sendResult?.mediaUrl).toBeTypeOf("string");
-      await expect(fs.readFile(String(result.sendResult?.mediaUrl), "utf8")).resolves.toBe(
-        "artifact bytes",
-      );
+      const sent = sendResult(result);
+      expect(sent?.mediaUrl).toBeTypeOf("string");
+      await expect(fs.readFile(String(sent?.mediaUrl), "utf8")).resolves.toBe("artifact bytes");
 
-      const sendArgs = mockFirstRecordArg(
-        channelResolutionMocks.executeSendAction,
-        "executeSendAction",
-        "Expected a non-array record",
-      );
-      const sendCtx = requireRecord(sendArgs.ctx);
+      const args = sendArgs();
+      const sendCtx = requireRecord(args.ctx);
       expect(sendCtx.idempotencyKey).toBe("run-1:message-tool:send-1:fingerprint");
       expect(sendCtx.channelPlugin).toBe(workspacePlugin);
       expect(channelResolutionMocks.resolveOutboundChannelPlugin).toHaveBeenCalledTimes(1);
       const sendParams = requireRecord(sendCtx.params);
       expect(sendParams.buffer).toBeUndefined();
-      expect(sendArgs.mediaUrl).toBe(result.sendResult?.mediaUrl);
-      expect(sendArgs.mediaUrls).toEqual([result.sendResult?.mediaUrl]);
+      expect(args.mediaUrl).toBe(sent?.mediaUrl);
+      expect(args.mediaUrls).toEqual([sent?.mediaUrl]);
     });
   });
 
   it("treats top-level image param as a send media source", async () => {
-    setTestPlugin(workspacePlugin, "workspace");
-
     await withSandbox(async (sandboxDir) => {
       const result = await runDrySend({
-        cfg: workspaceConfig,
         actionParams: {
-          channel: "workspace",
-          target: "12345678",
           message: "1/7",
           image: "/workspace/photo.jpg",
         },
         sandboxRoot: sandboxDir,
       });
 
-      expect(result.kind).toBe("send");
-      if (result.kind !== "send") {
-        throw new Error("expected send result");
-      }
-      expect(result.sendResult?.mediaUrl).toBe(path.join(sandboxDir, "photo.jpg"));
-      expect(result.sendResult?.mediaUrls).toEqual([path.join(sandboxDir, "photo.jpg")]);
+      const sent = sendResult(result);
+      expect(sent?.mediaUrl).toBe(path.join(sandboxDir, "photo.jpg"));
+      expect(sent?.mediaUrls).toEqual([path.join(sandboxDir, "photo.jpg")]);
     });
   });
 
   it("sends structured mediaUrls arrays", async () => {
-    setTestPlugin(workspacePlugin, "workspace");
-
     await withSandbox(async (sandboxDir) => {
       const result = await runDrySend({
-        cfg: workspaceConfig,
         actionParams: {
-          channel: "workspace",
-          target: "12345678",
           mediaUrls: ["./one.png", "/workspace/two.png"],
         },
         sandboxRoot: sandboxDir,
       });
 
-      expect(result.kind).toBe("send");
-      if (result.kind !== "send") {
-        throw new Error("expected send result");
-      }
-      expect(result.sendResult?.mediaUrl).toBe(path.join(sandboxDir, "one.png"));
-      expect(result.sendResult?.mediaUrls).toEqual([
+      const sent = sendResult(result);
+      expect(sent?.mediaUrl).toBe(path.join(sandboxDir, "one.png"));
+      expect(sent?.mediaUrls).toEqual([
         path.join(sandboxDir, "one.png"),
         path.join(sandboxDir, "two.png"),
       ]);
-      const sendArgs = mockFirstRecordArg(
-        channelResolutionMocks.executeSendAction,
-        "executeSendAction",
-        "Expected a non-array record",
-      );
-      const sendCtx = requireRecord(sendArgs.ctx);
+      const args = sendArgs();
+      const sendCtx = requireRecord(args.ctx);
       const sendParams = requireRecord(sendCtx.params);
       const sendMediaAccess = requireRecord(sendCtx.mediaAccess);
       expect(sendMediaAccess.localRoots).toEqual(expect.arrayContaining([sandboxDir]));
@@ -183,14 +167,9 @@ describe("runMessageAction media behavior", () => {
   maybeIt.each([{ name: "OpenShell", containerWorkdir: "/sandbox" }])(
     "dedupes resolved $name media while retaining first-entry metadata",
     async ({ containerWorkdir }) => {
-      setTestPlugin(workspacePlugin, "workspace");
-
       await withSandbox(async (sandboxDir) => {
         await runDrySend({
-          cfg: workspaceConfig,
           actionParams: {
-            channel: "workspace",
-            target: "12345678",
             message: "attachments ready",
             media: `file://${containerWorkdir}/assets/photo.png`,
             filename: "first.png",
@@ -221,19 +200,15 @@ describe("runMessageAction media behavior", () => {
         });
 
         expect(channelResolutionMocks.executeSendAction).toHaveBeenCalledTimes(1);
-        const sendArgs = mockFirstRecordArg(
-          channelResolutionMocks.executeSendAction,
-          "executeSendAction",
-          "Expected a non-array record",
-        );
+        const args = sendArgs();
         const mediaUrls = [
           path.join(sandboxDir, "assets", "photo.png"),
           "buffer://message-send/attachment",
           path.join(sandboxDir, "last.txt"),
         ];
-        expect(sendArgs.mediaUrls).toEqual(mediaUrls);
-        expect(requireRecord(sendArgs.payload).mediaUrls).toEqual(mediaUrls);
-        expect(requireRecord(sendArgs.payload).attachments).toEqual([
+        expect(args.mediaUrls).toEqual(mediaUrls);
+        expect(requireRecord(args.payload).mediaUrls).toEqual(mediaUrls);
+        expect(requireRecord(args.payload).attachments).toEqual([
           { path: mediaUrls[0], type: "file", name: "first.png", mimeType: "image/png" },
           { path: mediaUrls[1] },
           { path: mediaUrls[2], type: "file", name: "last.txt", mimeType: "text/plain" },
@@ -245,7 +220,6 @@ describe("runMessageAction media behavior", () => {
   it.each([{ name: "blank", sandboxRoot: "   " }])(
     "preserves ordered remote media when the sandbox root is $name",
     async ({ sandboxRoot }) => {
-      setTestPlugin(workspacePlugin, "workspace");
       const mediaUrls = [
         "https://example.com/first.png?sig=1",
         "http://example.com/second.png",
@@ -254,10 +228,7 @@ describe("runMessageAction media behavior", () => {
       ];
 
       await runDrySend({
-        cfg: workspaceConfig,
         actionParams: {
-          channel: "workspace",
-          target: "12345678",
           message: "attachments ready",
           mediaUrls: [` ${mediaUrls[0]} `, mediaUrls[0], ...mediaUrls.slice(1), " "],
         },
@@ -265,28 +236,20 @@ describe("runMessageAction media behavior", () => {
       });
 
       expect(channelResolutionMocks.executeSendAction).toHaveBeenCalledTimes(1);
-      const sendArgs = mockFirstRecordArg(
-        channelResolutionMocks.executeSendAction,
-        "executeSendAction",
-        "Expected a non-array record",
-      );
-      expect(sendArgs.mediaUrls).toEqual(mediaUrls);
-      expect(requireRecord(sendArgs.payload).mediaUrls).toEqual(mediaUrls);
-      expect(requireRecord(sendArgs.payload)).not.toHaveProperty("attachments");
+      const args = sendArgs();
+      expect(args.mediaUrls).toEqual(mediaUrls);
+      expect(requireRecord(args.payload).mediaUrls).toEqual(mediaUrls);
+      expect(requireRecord(args.payload)).not.toHaveProperty("attachments");
     },
   );
 
   it.each([false, true])(
     "rejects a later invalid media hint before any dispatch (sandbox=%s)",
     async (sandboxed) => {
-      setTestPlugin(workspacePlugin, "workspace");
       await withSandbox(async (sandboxDir) => {
         await expect(
           runDrySend({
-            cfg: workspaceConfig,
             actionParams: {
-              channel: "workspace",
-              target: "12345678",
               message: "must not send partially",
               mediaUrls: [
                 "https://example.com/first.png",
@@ -435,14 +398,11 @@ describe("runMessageAction media access", () => {
           sandboxRoot: sandboxDir,
         });
 
-        expect(result.kind).toBe("send");
-        if (result.kind !== "send") {
-          throw new Error("expected send result");
-        }
-        if (!result.sendResult) {
+        const sent = sendResult(result);
+        if (!sent) {
           throw new Error("Expected send result payload");
         }
-        expect(result.sendResult.channel).toBe("profile-demo");
+        expect(sent.channel).toBe("profile-demo");
       });
     });
   });
@@ -457,34 +417,15 @@ describe("runMessageAction media access", () => {
     });
 
     it.each([
-      {
-        name: "media absolute path",
-        mediaField: "media" as const,
-        media: "/etc/passwd",
-      },
-      {
-        name: "mediaUrl absolute path",
-        mediaField: "mediaUrl" as const,
-        media: "/etc/passwd",
-      },
-      {
-        name: "mediaUrl file URL",
-        mediaField: "mediaUrl" as const,
-        media: "file:///etc/passwd",
-      },
-      {
-        name: "fileUrl file URL",
-        mediaField: "fileUrl" as const,
-        media: "file:///etc/passwd",
-      },
-    ])("rejects out-of-sandbox media reference: $name", async ({ mediaField, media }) => {
+      ["media", "/etc/passwd"],
+      ["mediaUrl", "/etc/passwd"],
+      ["mediaUrl", "file:///etc/passwd"],
+      ["fileUrl", "file:///etc/passwd"],
+    ])("rejects out-of-sandbox %s reference: %s", async (mediaField, media) => {
       await withSandbox(async (sandboxDir) => {
         await expect(
           runDrySend({
-            cfg: workspaceConfig,
             actionParams: {
-              channel: "workspace",
-              target: "12345678",
               [mediaField]: media,
               message: "",
             },
@@ -497,10 +438,7 @@ describe("runMessageAction media access", () => {
     it("prefers media over mediaUrl when both aliases are present", async () => {
       await withSandbox(async (sandboxDir) => {
         const result = await runDrySend({
-          cfg: workspaceConfig,
           actionParams: {
-            channel: "workspace",
-            target: "12345678",
             media: "./data/primary.txt",
             mediaUrl: "./data/secondary.txt",
             message: "",
@@ -508,44 +446,26 @@ describe("runMessageAction media access", () => {
           sandboxRoot: sandboxDir,
         });
 
-        expect(result.kind).toBe("send");
-        if (result.kind !== "send") {
-          throw new Error("expected send result");
-        }
-        expect(result.sendResult?.mediaUrl).toBe(path.join(sandboxDir, "data", "primary.txt"));
+        const sent = sendResult(result);
+        expect(sent?.mediaUrl).toBe(path.join(sandboxDir, "data", "primary.txt"));
       });
     });
 
-    it.each([
-      {
-        name: "mediaUrl",
-        mediaField: "mediaUrl" as const,
-      },
-      {
-        name: "fileUrl",
-        mediaField: "fileUrl" as const,
-      },
-    ])(
-      "keeps remote HTTP $name aliases unchanged under sandbox validation",
-      async ({ mediaField }) => {
+    it.each(["mediaUrl", "fileUrl"])(
+      "keeps remote HTTP %s aliases unchanged under sandbox validation",
+      async (mediaField) => {
         await withSandbox(async (sandboxDir) => {
           const remoteUrl = "https://example.com/files/report.pdf?sig=1";
           const result = await runDrySend({
-            cfg: workspaceConfig,
             actionParams: {
-              channel: "workspace",
-              target: "12345678",
               [mediaField]: remoteUrl,
               message: "",
             },
             sandboxRoot: sandboxDir,
           });
 
-          expect(result.kind).toBe("send");
-          if (result.kind !== "send") {
-            throw new Error("expected send result");
-          }
-          expect(result.sendResult?.mediaUrl).toBe(remoteUrl);
+          const sent = sendResult(result);
+          expect(sent?.mediaUrl).toBe(remoteUrl);
         });
       },
     );
@@ -569,11 +489,8 @@ describe("runMessageAction media access", () => {
           dryRun: true,
         });
 
-        expect(result.kind).toBe("send");
-        if (result.kind !== "send") {
-          throw new Error("expected send result");
-        }
-        expect(result.sendResult?.mediaUrl).toBe(path.resolve(tmpFile));
+        const sent = sendResult(result);
+        expect(sent?.mediaUrl).toBe(path.resolve(tmpFile));
         const hostTmpOutsideOpenClaw = path.join(os.tmpdir(), "outside-openclaw", "test-media.png");
         await expect(
           runMessageAction({
