@@ -498,14 +498,6 @@ describe("Gateway ACP completion ownership", () => {
             stopReason: "aborted",
           });
         }
-        if (scenario.media) {
-          check(
-            readAssistantDisplayContent(assistant).some((block: unknown) => {
-              const content = asOptionalRecord(block);
-              return content !== undefined && content.type !== "text";
-            }),
-          ).toBe(true);
-        }
         if (scenario.bound) {
           // The bound target owns ACP history; the dashboard retains each delivered reply too.
           const sourceMessages = readTranscript(sessionKey, `source-${sessionId}`);

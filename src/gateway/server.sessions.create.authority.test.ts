@@ -57,16 +57,19 @@ function guestConfig(storePath: string, role: Partial<GatewayOperatorRoleDefinit
   };
 }
 
+function authenticatedProfile(profileId: string, displayName: string | null, updatedAt: number) {
+  return { profileId, displayName, hasAvatar: false, updatedAt };
+}
+
 function operatorClient(profile: ReturnType<typeof ensureProfileForEmail>, systemActor = false) {
   return {
     ...(systemActor ? { internal: { operatorRoleActor: { kind: "system" } } } : {}),
     connect: { role: "operator", scopes: ["operator.read", "operator.write"] },
-    authenticatedUserProfile: {
-      profileId: profile.id,
-      displayName: profile.displayName,
-      hasAvatar: false,
-      updatedAt: profile.updatedAt,
-    },
+    authenticatedUserProfile: authenticatedProfile(
+      profile.id,
+      profile.displayName,
+      profile.updatedAt,
+    ),
   } as never;
 }
 
@@ -77,6 +80,7 @@ function pluginClient() {
   } as never;
 }
 const reservedNamespace = "Session key namespace is reserved for agent harness-owned sessions.";
+const harnessKey = "agent:main:harness:codex:supervision:native-thread";
 function expectInvalid(
   result: Awaited<ReturnType<typeof directSessionReq>>,
   message = reservedNamespace,
@@ -114,8 +118,7 @@ test("required operator sandbox follows new session ownership across create, pat
     if (!systemActor) {
       setUserProfileRole(profile.id, "guest");
     }
-    const client = operatorClient(profile, systemActor);
-    const req = sessionRequests({ client, context });
+    const req = sessionRequests({ client: operatorClient(profile, systemActor), context });
     const key = `agent:main:dashboard:role-sandbox-${suffix}`;
     const request =
       method === "sessions.create"
@@ -131,8 +134,10 @@ test("required operator sandbox follows new session ownership across create, pat
       expect(created.payload?.outcomes).toEqual([{ ok: true, key }]);
     }
     const createdEntry = read(key, "main");
-    expect(createdEntry).toMatchObject({
-      createdActor: { type: "human", source: "profile", id: profile.id },
+    expect(createdEntry?.createdActor).toMatchObject({
+      type: "human",
+      source: "profile",
+      id: profile.id,
     });
     expect(createdEntry?.sandbox).toBe(systemActor ? undefined : "required");
 
@@ -221,37 +226,27 @@ test("sessions.create revalidates parent participation before committing a fork 
   const parentKey = "agent:main:dashboard:participation-race-parent";
   const parentId = "participation-race-parent-session";
   const childKey = "agent:main:dashboard:participation-race-child";
+  const parentScope = { agentId: "main", sessionKey: parentKey, storePath };
   await seed(parentKey, parentId, {
     visibility: "read-only",
     createdActor: { type: "human", source: "profile", id: "owner" },
   });
   await seedSessionTranscript({
-    agentId: "main",
+    ...parentScope,
     sessionId: parentId,
-    sessionKey: parentKey,
-    storePath,
     messages: [{ role: "user", content: "private parent context" }],
   });
-  sessionMembers.addSessionMember(
-    { agentId: "main", sessionKey: parentKey, storePath },
-    { identityId: "member", addedBy: "owner", expectedSessionId: parentId },
-  );
+  sessionMembers.addSessionMember(parentScope, {
+    identityId: "member",
+    addedBy: "owner",
+    expectedSessionId: parentId,
+  });
   const client = {
     authenticatedUserId: "member@example.com",
-    authenticatedUserProfile: {
-      profileId: "member",
-      displayName: "Member",
-      hasAvatar: false,
-      updatedAt: 1,
-    },
+    authenticatedUserProfile: authenticatedProfile("member", "Member", 1),
     connect: { role: "operator", scopes: ["operator.write"] },
   } as never;
-  const requestParams = {
-    agentId: "main",
-    key: childKey,
-    parentSessionKey: parentKey,
-    fork: true,
-  };
+  const requestParams = { agentId: "main", key: childKey, parentSessionKey: parentKey, fork: true };
   const authorization = await resolveSessionMutationAuthorizationAsync({
     client,
     method: "sessions.create",
@@ -281,12 +276,8 @@ test("sessions.create revalidates parent participation before committing a fork 
     agentId: "main",
     ...(resolvedStore.path ? { path: resolvedStore.path } : {}),
   });
-  const transcriptCount = () =>
-    (
-      database.db.prepare("SELECT count(*) AS count FROM transcript_events").get() as {
-        count: number;
-      }
-    ).count;
+  const countTranscripts = database.db.prepare("SELECT count(*) AS count FROM transcript_events");
+  const transcriptCount = () => (countTranscripts.get() as { count: number }).count;
   const beforeTranscriptCount = transcriptCount();
   const firstGuard = createDeferredCore();
   const { createGatewaySession } = await import("./session-create-service.js");
@@ -302,12 +293,7 @@ test("sessions.create revalidates parent participation before committing a fork 
 
   try {
     await firstGuard.promise;
-    sessionMembers.removeSessionMember(
-      { agentId: "main", sessionKey: parentKey, storePath },
-      "member",
-      undefined,
-      parentId,
-    );
+    sessionMembers.removeSessionMember(parentScope, "member", undefined, parentId);
   } finally {
     releaseWriter.resolve();
     await heldWriter;
@@ -330,12 +316,10 @@ test("createGatewaySession rejects explicit and key-derived unconfigured creatio
     [{ parentSessionKey: "agent:retired:main" }, "retired"],
     [{ agentId: "   ", parentSessionKey: "agent:ops:main" }, "   "],
   ] as const) {
-    await expect(
-      createGatewaySession({ cfg, ...owner, commandSource: "test", prepareLifecycle }),
-    ).resolves.toMatchObject({
-      ok: false,
-      error: { code: "INVALID_REQUEST", message: `Unknown agent id "${agentId}"` },
-    });
+    expectInvalid(
+      await createGatewaySession({ cfg, ...owner, commandSource: "test", prepareLifecycle }),
+      `Unknown agent id "${agentId}"`,
+    );
   }
 
   expect(prepareLifecycle).not.toHaveBeenCalled();
@@ -367,10 +351,7 @@ test.each([undefined, "agent:main:dashboard:memory-core-parent"])(
     expect(read(key)).toMatchObject({ pluginOwnerId: "memory-core" });
 
     await expectOk(req("sessions.patch", { key, label: "Plugin-owned root" }));
-    expect(read(key)).toMatchObject({
-      label: "Plugin-owned root",
-      pluginOwnerId: "memory-core",
-    });
+    expect(read(key)).toMatchObject({ label: "Plugin-owned root", pluginOwnerId: "memory-core" });
   },
 );
 
@@ -408,10 +389,7 @@ test("sessions.create prevents plugin runtimes from adopting, linking, or forkin
 test("public session mutations reserve agent harness-owned session keys", async () => {
   const { read } = await createStore();
 
-  for (const key of [
-    "harness:codex:supervision:native-thread",
-    "agent:main:harness:codex:supervision:native-thread",
-  ]) {
+  for (const key of ["harness:codex:supervision:native-thread", harnessKey]) {
     for (const [method, params] of [
       ["sessions.create", { agentId: "main", key }],
       ["sessions.patch", { agentId: "main", key, label: "Public overwrite" }],
@@ -421,12 +399,12 @@ test("public session mutations reserve agent harness-owned session keys", async 
     }
   }
 
-  const ordinary = await directSessionReq<{ key: string }>("sessions.create", {
+  const ordinary = await directSessionReq("sessions.create", {
     agentId: "main",
     key: "ordinary-session",
   });
   expect(ordinary).toMatchObject({ ok: true, payload: { key: "agent:main:ordinary-session" } });
-  expect(read("agent:main:harness:codex:supervision:native-thread")).toBeUndefined();
+  expect(read(harnessKey)).toBeUndefined();
   expect(read("agent:main:ordinary-session")).toBeDefined();
 });
 
@@ -434,19 +412,14 @@ test.each([false, true])(
   "sessions.create adopts existing harness sessions only when unlocked (locked=%s)",
   async (locked) => {
     const { read, seed } = await createStore();
-    const key = locked
-      ? "agent:main:harness:codex:supervision:native-thread"
-      : "agent:main:harness:legacy-notes";
+    const key = locked ? harnessKey : "agent:main:harness:legacy-notes";
     await seed(
       key,
       locked ? "locked-session" : "legacy-session",
       locked ? { agentHarnessId: "codex", modelSelectionLocked: true } : { label: "Legacy notes" },
     );
 
-    const created = await directSessionReq<{
-      key: string;
-      sessionId: string;
-    }>("sessions.create", {
+    const created = await directSessionReq("sessions.create", {
       agentId: "main",
       key,
       ...(locked ? {} : { label: "Updated notes" }),
@@ -457,10 +430,7 @@ test.each([false, true])(
       return;
     }
     expect(created).toMatchObject({ ok: true, payload: { key, sessionId: "legacy-session" } });
-    expect(read(key)).toMatchObject({
-      sessionId: "legacy-session",
-      label: "Updated notes",
-    });
+    expect(read(key)).toMatchObject({ sessionId: "legacy-session", label: "Updated notes" });
   },
 );
 
@@ -474,13 +444,12 @@ test("sessions.create rejects children of model-selection-locked sessions", asyn
   });
 
   for (const options of [{}, { fork: true }, { emitCommandHooks: true }]) {
-    const created = await directSessionReq("sessions.create", {
-      agentId: "main",
-      parentSessionKey: "main",
-      ...options,
-    });
     expectInvalid(
-      created,
+      await directSessionReq("sessions.create", {
+        agentId: "main",
+        parentSessionKey: "main",
+        ...options,
+      }),
       "Model-selection-locked sessions cannot create child sessions from parent context.",
     );
   }

@@ -377,18 +377,13 @@ async function createSessionPortalProof() {
           const controller = new AbortController();
           controllers.set(frame.id, controller);
           track(
-            (async () => {
-              try {
-                await invokeNodeWorkerPortalStream({
-                  paramsJSON: frame.paramsJSON,
-                  gatewayUrl: `ws://127.0.0.1:${port}`,
-                  signal: controller.signal,
-                });
-                await reportResult(frame, { status: "closed" });
-              } finally {
-                controllers.delete(frame.id);
-              }
-            })(),
+            invokeNodeWorkerPortalStream({
+              paramsJSON: frame.paramsJSON,
+              gatewayUrl: `ws://127.0.0.1:${port}`,
+              signal: controller.signal,
+            })
+              .then(() => reportResult(frame, { status: "closed" }))
+              .finally(() => controllers.delete(frame.id)),
           );
         });
         // Hello precedes pairing bookkeeping; this manual RPC does not use the node host's retry owner.

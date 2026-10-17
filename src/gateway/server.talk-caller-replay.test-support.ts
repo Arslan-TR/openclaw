@@ -71,6 +71,8 @@ export async function runTalkCallerReplay({
     reader: loadDeviceIdentity("replay-reader"),
   };
   type Caller = keyof typeof identities;
+  const callerForDevice = (deviceId: string | undefined) =>
+    (["writer", "reader"] as const).find((who) => identities[who].identity.deviceId === deviceId);
   const sockets: Array<Awaited<ReturnType<typeof harness.openWs>>> = [];
   const connect = async (who: Caller, requestedScopes?: string[]) => {
     const scopes =
@@ -102,9 +104,7 @@ export async function runTalkCallerReplay({
   const observeCaller = vi
     .spyOn(callerContext, "resolveChatSendCallerContext")
     .mockImplementation((client, ...rest) => {
-      const who = (Object.keys(identities) as Caller[]).find(
-        (key) => identities[key].identity.deviceId === client?.connect.device?.id,
-      );
+      const who = callerForDevice(client?.connect.device?.id);
       if (who && client) {
         expect(client.internal?.authenticatedOperator).toBe(true);
         expect(client.internal?.syntheticClient).toBeUndefined();
@@ -152,9 +152,7 @@ export async function runTalkCallerReplay({
     return result;
   });
   runEmbeddedAgent.mockImplementation(async (params) => {
-    const caller = (Object.keys(identities) as Caller[]).find(
-      (key) => identities[key].identity.deviceId === params.approvalReviewerDeviceId,
-    );
+    const caller = callerForDevice(params.approvalReviewerDeviceId);
     if (!caller) {
       throw new Error("Backend lost authenticated requester device");
     }
@@ -201,12 +199,11 @@ export async function runTalkCallerReplay({
         ),
       );
       const execTool = tools.find((tool) => tool.name === "exec");
-      const attempt = {
+      attempts.push({
         caller,
         runId: params.runId,
         exec: Boolean(execTool),
-      };
-      attempts.push(attempt);
+      });
       const gate = hold;
       gate?.started.resolve();
       await gate?.release.promise;
@@ -277,6 +274,12 @@ export async function runTalkCallerReplay({
       if (result.ok) {
         await waitRun(result.payload?.runId);
       }
+    };
+    const runFresh = async (callId: string, legacy = false, observer = peers.writer) => {
+      const result = await consult("writer", callId, peers.writer, legacy);
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      await waitRun(result.payload?.runId, observer);
+      return result;
     };
     const expectCompletedReplay = async (
       result: Awaited<ReturnType<typeof consult>>,
@@ -377,9 +380,7 @@ export async function runTalkCallerReplay({
     }
     expect(clients.get("writer")?.connect.scopes).not.toContain("operator.approvals");
     const beforeFresh = attempts.length;
-    const fresh = await consult("writer", "genuinely-new-call");
-    await finishAccepted(fresh);
-    expect(fresh.ok).toBe(true);
+    const fresh = await runFresh("genuinely-new-call");
     expect(fresh.payload?.runId).not.toBe(first.payload?.runId);
     expect(attempts).toHaveLength(beforeFresh + 1);
     expect(await effects()).toBe("effect\neffect\n");
@@ -391,9 +392,7 @@ export async function runTalkCallerReplay({
     const beforeReadOnlyEffects = await effects();
     const readOnlyRetry = await consult("writer", "active-shared");
     await expectCompletedReplay(readOnlyRetry, beforeReadOnly, beforeReadOnlyEffects);
-    const readOnlyFresh = await consult("writer", "new-read-only-call");
-    expect(readOnlyFresh.ok).toBe(true);
-    await waitRun(readOnlyFresh.payload?.runId, runObserver);
+    const readOnlyFresh = await runFresh("new-read-only-call", false, runObserver);
     expect(attempts).toHaveLength(beforeReadOnly + 1);
     expect(attempts.at(-1)).toMatchObject({
       caller: "writer",
@@ -429,9 +428,7 @@ export async function runTalkCallerReplay({
     // must not turn a retransmitted call into another native effect.
     await reconnectWriter();
     const beforeLegacy = attempts.length;
-    const legacy = await consult("writer", "legacy-retry", peers.writer, true);
-    expect(legacy.ok, JSON.stringify(legacy)).toBe(true);
-    await waitRun(legacy.payload?.runId);
+    await runFresh("legacy-retry", true);
     const originalLegacyVoice = legacyBinding();
     legacyVoiceForCleanup = originalLegacyVoice;
     const legacyEffects = await effects();
@@ -446,9 +443,7 @@ export async function runTalkCallerReplay({
     expect(legacyRetry.ok).toBe(false);
     expect(attempts).toHaveLength(beforeLegacy + 1);
     expect(await effects()).toBe(legacyEffects);
-    const freshLegacy = await consult("writer", "legacy-new-call", peers.writer, true);
-    expect(freshLegacy.ok, JSON.stringify(freshLegacy)).toBe(true);
-    await waitRun(freshLegacy.payload?.runId);
+    await runFresh("legacy-new-call", true);
     expect(attempts).toHaveLength(beforeLegacy + 2);
     expect(await effects()).toBe(`${legacyEffects}effect\n`);
   } finally {
