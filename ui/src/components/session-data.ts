@@ -242,6 +242,7 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
       this.stopRoster?.();
       this.roster = roster;
       this.stopRoster = roster?.subscribe(this.requestSessionDataUpdate);
+      void this.scheduleSidebarSessions();
     }
     this.lineage.synchronize();
     const scope = this.readPresentationScope();
@@ -387,6 +388,7 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
 
     if (
       agentChanged &&
+      this.inputs.sidebarAgentsMode !== "roster" &&
       context?.gateway.snapshot.phase === "connected" &&
       hasSidebarListFilter(this.inputs)
     ) {
@@ -551,7 +553,11 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
 
   private bindFilteredSessions(): void {
     const sessions = this.context?.sessions;
-    if (!sessions || !hasSidebarListFilter(this.inputs)) {
+    if (
+      !sessions ||
+      this.inputs.sidebarAgentsMode === "roster" ||
+      !hasSidebarListFilter(this.inputs)
+    ) {
       this.retireFilteredSessions();
       return;
     }
@@ -576,6 +582,9 @@ export class SessionDataOwner implements SessionCatalogDataOwner {
   }
 
   refreshSidebarSessions(affectedAgentId?: string): Promise<void> {
+    if (this.inputs.sidebarAgentsMode === "roster") {
+      return rosterActivityStore(this.context).refresh();
+    }
     this.bindFilteredSessions();
     return refreshSidebarSessionList(this, { affectedAgentId });
   }

@@ -11,6 +11,7 @@ import {
   Show,
   untrack,
 } from "solid-js";
+import { rosterActivityStore } from "../lib/agents/roster-activity-store.ts";
 import { useApplication, useOptionalApplication } from "../lib/reactive/context.ts";
 import { listen } from "../lib/reactive/listener.ts";
 import { createParkedProjection } from "../lib/reactive/parked-projection.ts";
@@ -121,7 +122,9 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     { equals: false },
   );
   createSessionOwnerFilterQuery(owner.sessionOwnerFilter, prepared, () =>
-    context.sessions.listSnapshot(owner.sessionData.sessionListQuery(owner.expandedAgentId())),
+    owner.sidebarAgentsMode === "roster"
+      ? rosterActivityStore(context).snapshot
+      : context.sessions.listSnapshot(owner.sessionData.sessionListQuery(owner.expandedAgentId())),
   );
   const narrationEnabled = createMemo(() => {
     // Preparation reads narration while synchronizing the session projection.
