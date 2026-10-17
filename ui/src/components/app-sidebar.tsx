@@ -172,6 +172,8 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
       Object.values(props);
       snapshotPending();
       snapshotModel();
+      // Router context can reveal parked rows without an owner publication.
+      void owner.contextualSidebar;
       return projection.revision();
     },
     () => props.navigationVisible,
