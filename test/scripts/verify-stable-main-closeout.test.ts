@@ -21,11 +21,15 @@ const sha = "a".repeat(40);
 const oldAppcast = "<rss>older app release</rss>";
 const pendingPlatforms = { macos: "pending", android: "pending", windows: "pending" };
 const recoveryInputs = { RELEASE_PUBLISH_RUN_ID: "100", RELEASE_PUBLISH_RUN_ATTEMPT: "3" };
+const releaseDefaults = { databaseId: 42, isDraft: false, isPrerelease: false };
 function expectRecoveryFailure(operation: () => unknown) {
   expect(operation).toThrow("Stable publish recovery:");
 }
 function writeJson(file: string, value: unknown) {
   writeFileSync(file, JSON.stringify(value));
+}
+function writeExecutable(bin: string, name: string, source: string) {
+  writeFileSync(path.join(bin, name), `#!/usr/bin/env node\n${source}`, { mode: 0o755 });
 }
 function writeChecksum(file: string, kind = "valid", wrongFile = file) {
   const source = kind === "wrong-file" ? wrongFile : file;
@@ -81,6 +85,35 @@ function closeoutArgs(tag: string, dir: string, date = new Date().toISOString().
     output: path.join(dir, "closeout.json"),
   });
 }
+function releaseFixture(tag: string, appcast = oldAppcast, git = false) {
+  const dir = tempDirs.make("openclaw-closeout-");
+  const version = tag.slice(1).replace(/-[1-9]\d*$/u, "");
+  const changelog = writeReleaseTrees(dir, version, appcast, git);
+  const date = new Date().toISOString().slice(0, 10);
+  return {
+    dir,
+    releasePath: path.join(dir, "release.json"),
+    outputPath: path.join(dir, "closeout.json"),
+    originalPath: path.join(dir, "original.json"),
+    args: closeoutArgs(tag, dir, date),
+    params: {
+      tag,
+      mainPackageJson: { version },
+      tagPackageJson: { version },
+      mainChangelog: changelog,
+      tagChangelog: changelog,
+      mainAppcast: appcast,
+      releaseTagSha: sha,
+      mainSha: sha,
+      fullReleaseValidationRunId: "11",
+      fullReleaseValidationRunAttempt: "2",
+      releasePublishRunId: "12",
+      rollbackDrillId: "synthetic-drill",
+      rollbackDrillDate: date,
+      nowMs: Date.now(),
+    },
+  };
+}
 
 function macAssets(version: string) {
   return ["", "-arm64", "-x86_64"]
@@ -135,27 +168,20 @@ function runNode(
 }
 
 function closeoutFixture(version = "2026.9.6", recovery = true, appcast = oldAppcast) {
-  const dir = tempDirs.make("openclaw-closeout-");
   const tag = `v${version}`;
-  writeReleaseTrees(dir, version, appcast, true);
-  const releasePath = path.join(dir, "release.json");
-  const outputPath = path.join(dir, "closeout.json");
-  const originalPath = path.join(dir, "original.json");
+  const fixture = releaseFixture(tag, appcast, true);
   const assets: Array<{ name: string; digest: string }> = [];
   const release = { tagName: tag, isDraft: false, isPrerelease: false, assets };
-  const args = [
-    ...closeoutArgs(tag, dir),
-    ...(recovery ? ["--allow-failed-publish-recovery", "true"] : []),
-  ];
+  const args = [...fixture.args, ...(recovery ? ["--allow-failed-publish-recovery", "true"] : [])];
+  const run = (extra: string[] = [], env?: NodeJS.ProcessEnv) => {
+    writeJson(fixture.releasePath, release);
+    return runNode(["scripts/verify-stable-main-closeout.mjs", ...args, ...extra], { env });
+  };
   return {
-    dir,
+    ...fixture,
     release,
-    outputPath,
-    originalPath,
-    run(extra: string[] = [], env?: NodeJS.ProcessEnv) {
-      writeJson(releasePath, release);
-      return runNode(["scripts/verify-stable-main-closeout.mjs", ...args, ...extra], { env });
-    },
+    run,
+    replay: (extra: string[] = []) => run(["--existing-manifest", fixture.originalPath, ...extra]),
   };
 }
 
@@ -207,89 +233,67 @@ function linuxPublication(version: string) {
     selector,
   ];
   return {
-    databaseId: 42,
+    ...releaseDefaults,
     tagName: `v${version}`,
-    isDraft: false,
-    isPrerelease: false,
     assets,
   };
 }
 
 function linuxCloseoutFixture(carried = false, tag = "v2026.9.4") {
-  const dir = tempDirs.make("openclaw-linux-closeout-");
+  const fixture = releaseFixture(tag);
+  const { dir, releasePath, originalPath } = fixture;
   const version = tag.slice(1);
-  const packageVersion = version.replace(/-[1-9]\d*$/u, "");
-  const changelog = writeReleaseTrees(dir, packageVersion, oldAppcast);
-  const date = new Date().toISOString().slice(0, 10);
-  const baseParams = {
-    tag,
-    mainPackageJson: { version: packageVersion },
-    tagPackageJson: { version: packageVersion },
-    mainChangelog: changelog,
-    tagChangelog: changelog,
-    mainAppcast: oldAppcast,
-    releaseTagSha: sha,
-    mainSha: sha,
-    fullReleaseValidationRunId: "11",
-    fullReleaseValidationRunAttempt: "2",
-    releasePublishRunId: "12",
-    rollbackDrillId: "synthetic-drill",
-    rollbackDrillDate: date,
-    nowMs: Date.now(),
-  };
   const original = linuxPublication("2026.9.3");
   const evidence = linuxAsset(
     `openclaw-${version}-postpublish-evidence.json`,
     "immutable evidence",
   );
   const carrier = {
-    databaseId: 42,
+    ...releaseDefaults,
     tagName: tag,
-    isDraft: false,
-    isPrerelease: false,
     assets: [evidence],
   };
   if (carried) {
     carrier.assets.push(assetNamed(original.assets, "latest.json"));
   }
-  const releasePath = path.join(dir, "release.json");
   const remotePath = path.join(dir, "remote.json");
-  const outputPath = path.join(dir, "closeout.json");
-  const originalPath = path.join(dir, "original.json");
   const bin = path.join(dir, "bin");
   mkdirSync(bin);
-  writeFileSync(
-    path.join(bin, "git"),
-    `#!/usr/bin/env node
+  writeExecutable(
+    bin,
+    "git",
+    `
 if (process.argv[2] !== '-C' || process.argv[4] !== 'rev-parse') throw new Error('Unexpected git operation');
 process.stdout.write('${"a".repeat(40)}\\n');
 `,
-    { mode: 0o755 },
   );
-  writeFileSync(
-    path.join(bin, "gh"),
-    `#!/usr/bin/env node
+  writeExecutable(
+    bin,
+    "gh",
+    `
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const releases = JSON.parse(fs.readFileSync(process.env.LINUX_CLOSEOUT_REMOTE, 'utf8'));
+function reply(value) { process.stdout.write(typeof value === 'string' ? value : JSON.stringify(value)); }
+function metadata(release) { return {...release, assets: release.assets.map(({bytes, ...asset}) => asset)}; }
 if (args[0] === 'api' && args[1]?.startsWith('repos/${linuxRepository}/commits/')) {
-  process.stdout.write('${"a".repeat(40)}\\n');
+  reply('${"a".repeat(40)}\\n');
   process.exit(0);
 }
 if (args[0] === 'api' && args[1]?.startsWith('repos/${linuxRepository}/releases/tags/')) {
   const tag = args[1].slice('repos/${linuxRepository}/releases/tags/'.length);
   const release = releases[tag];
   if (!release) throw new Error('Missing release');
-  process.stdout.write(JSON.stringify({id: release.databaseId, tag_name: tag,
+  reply({id: release.databaseId, tag_name: tag,
     draft: release.isDraft, prerelease: release.isPrerelease,
-    assets: release.assets.map(({bytes, ...asset}) => asset)}));
+    assets: metadata(release).assets});
   process.exit(0);
 }
 const release = releases[args[2]];
 if (args[0] !== 'release' || !release) throw new Error('Unexpected GitHub operation');
 if (args[1] === 'view') {
   if (args[args.indexOf('--json') + 1].includes('databaseId')) throw new Error('Unknown JSON field: databaseId');
-  process.stdout.write(JSON.stringify({...release, assets: release.assets.map(({bytes, ...asset}) => asset)}));
+  reply(metadata(release));
 } else if (args[1] === 'download') {
   const name = args[args.indexOf('--pattern') + 1];
   if (!['latest.json', 'SHA256SUMS.linux-app.txt', 'OpenClaw-' + args[2].slice(1) + '-linux.json'].includes(name)) throw new Error('Binary download forbidden');
@@ -298,18 +302,15 @@ if (args[1] === 'view') {
   process.stdout.write(asset.bytes);
 } else throw new Error('GitHub writes forbidden');
 `,
-    { mode: 0o755 },
   );
   const metadata = () => ({
     ...carrier,
     assets: carrier.assets.map(({ bytes: _bytes, ...asset }) => asset),
   });
-  const args = closeoutArgs(tag, dir, date);
   return {
+    ...fixture,
     carrier,
     evidence,
-    originalPath,
-    outputPath,
     publishLinux() {
       carrier.assets = [evidence, ...linuxPublication(version).assets];
     },
@@ -319,24 +320,19 @@ if (args[1] === 'view') {
       const value = JSON.parse(expectDefined(selector.bytes, "selector bytes"));
       value.linuxPublication = {
         schemaVersion: 1,
-        sourceSha: "a".repeat(40),
+        sourceSha: sha,
         toolingSha: "b".repeat(40),
         channelSha: "c".repeat(40),
         releaseId: 42,
         publicKeySha256: "d".repeat(64),
         assets: publication.assets
           .filter((asset) => asset.name !== "latest.json")
-          .map((asset) => ({
-            id: asset.id,
-            name: asset.name,
-            size: asset.size,
-            sha256: asset.digest.slice(7),
-          })),
+          .map(({ id, name, size, digest }) => ({ id, name, size, sha256: digest.slice(7) })),
       };
       carrier.assets.push(linuxAsset(`OpenClaw-${version}-linux.json`, JSON.stringify(value)));
     },
     params() {
-      return { ...baseParams, release: metadata() };
+      return { ...fixture.params, release: metadata() };
     },
     run(replay = false) {
       writeJson(releasePath, metadata());
@@ -344,7 +340,7 @@ if (args[1] === 'view') {
       return runNode(
         [
           "scripts/verify-stable-main-closeout.mjs",
-          ...args,
+          ...fixture.args,
           ...(replay ? ["--existing-manifest", originalPath] : []),
         ],
         {
@@ -492,7 +488,7 @@ describe("verify-stable-main-closeout", () => {
     (version) => {
       const thin = version === "2026.9.6";
       const fixture = closeoutFixture(version);
-      const { dir, release, originalPath } = fixture;
+      const { dir, release } = fixture;
       const evidence = {
         name: `openclaw-${version}-postpublish-evidence.json`,
         digest: `sha256:${"b".repeat(64)}`,
@@ -517,7 +513,7 @@ describe("verify-stable-main-closeout", () => {
           path.join(dir, "main", "CHANGELOG", `${version}.md`),
           `## ${version}\n\n- Released.\n`,
         );
-        expectReplay(fixture, fixture.run(["--existing-manifest", originalPath]), initialBytes);
+        expectReplay(fixture, fixture.replay(), initialBytes);
       }
       release.assets.push(
         ...macAssets(version).filter((asset) => thin || !asset.name.includes(`-${version}-`)),
@@ -533,20 +529,16 @@ describe("verify-stable-main-closeout", () => {
           ].map((name) => ({ name, digest: `sha256:${"c".repeat(64)}` })),
         );
         expectFailure(
-          fixture.run(["--existing-manifest", originalPath]),
+          fixture.replay(),
           `main appcast.xml does not point at OpenClaw-${version}.zip`,
         );
       }
-      expectReplay(
-        fixture,
-        fixture.run(["--existing-manifest", originalPath, ...publishedFeeds(dir, version, thin)]),
-        initialBytes,
-      );
+      expectReplay(fixture, fixture.replay(publishedFeeds(dir, version, thin)), initialBytes);
 
       if (!thin) {
         evidence.digest = `sha256:${"d".repeat(64)}`;
         expectFailure(
-          fixture.run(["--existing-manifest", originalPath]),
+          fixture.replay(),
           `Recorded release asset changed or disappeared: ${evidence.name}`,
         );
       }
@@ -555,13 +547,13 @@ describe("verify-stable-main-closeout", () => {
 
   it("rejects removed waiver flags while preserving strict closeout replay", () => {
     const fixture = closeoutFixture();
-    const { outputPath, originalPath } = fixture;
+    const { outputPath } = fixture;
     const bytes = saveReceipt(fixture);
     const recorded = JSON.parse(bytes);
     expect(recorded).not.toHaveProperty("stableSoakWaiver");
     expect(recorded).not.toHaveProperty("laneWaiver");
 
-    expectReplay(fixture, fixture.run(["--existing-manifest", originalPath]), bytes);
+    expectReplay(fixture, fixture.replay(), bytes);
     for (const flag of ["--stable-soak-waiver", "--lane-waiver"]) {
       const rejected = fixture.run([flag, "2026.9.6 operator approved"]);
       expect(rejected.status).not.toBe(0);
@@ -572,7 +564,6 @@ describe("verify-stable-main-closeout", () => {
 
   it("records a withdrawn 2026.9.6 macOS appcast from the main commit lookup", () => {
     const version = "2026.9.6";
-    const mainSha = "a".repeat(40);
     const fixture = closeoutFixture(
       version,
       false,
@@ -581,10 +572,11 @@ describe("verify-stable-main-closeout", () => {
     const { dir, release, outputPath, originalPath } = fixture;
     const bin = path.join(dir, "bin");
     mkdirSync(bin);
-    writeFileSync(
-      path.join(bin, "gh"),
-      `#!/usr/bin/env node
-const expected = 'repos/openclaw/openclaw/commits?sha=${mainSha}&path=appcast.xml&per_page=100';
+    writeExecutable(
+      bin,
+      "gh",
+      `
+const expected = 'repos/openclaw/openclaw/commits?sha=${sha}&path=appcast.xml&per_page=100';
 if (process.argv[2] !== 'api' || process.argv[3] !== expected || process.env.WITHDRAWAL_LOOKUPS !== 'allowed') {
   throw new Error('Unexpected GitHub operation: ' + process.argv.slice(2).join(' '));
 }
@@ -593,7 +585,6 @@ process.stdout.write(JSON.stringify([
   { sha: 'c'.repeat(40), commit: { message: 'chore(release): withdraw the ${version} macOS build from the Sparkle feed\\n\\nRefs #156861\\n' } },
 ]));
 `,
-      { mode: 0o755 },
     );
     release.assets = macAssets(version);
     const run = (lookups: "allowed" | "forbidden", ...extra: string[]) =>
@@ -694,16 +685,9 @@ it.each(routingCases)("stable closeout publication routing preserves %s", (name,
     throw new Error("Publication verifier node block missing");
   }
   const script = block
-    .split("\n")
-    .map((line) => line.slice(10))
-    .join("\n")
-    .replace(
-      "'./.closeout-tooling/scripts/lib/stable-publish-recovery.mjs'",
-      JSON.stringify(pathToFileURL(path.resolve("scripts/lib/stable-publish-recovery.mjs")).href),
-    )
-    .replace(
-      '"./.closeout-tooling/scripts/lib/stable-release-closeout.mjs"',
-      JSON.stringify(pathToFileURL(path.resolve("scripts/lib/stable-release-closeout.mjs")).href),
+    .replace(/^ {10}/gmu, "")
+    .replace(/(['"])\.\/\.closeout-tooling\/([^'"]+)\1/gu, (_match, _quote: string, file: string) =>
+      JSON.stringify(pathToFileURL(path.resolve(file)).href),
     );
   const dir = tempDirs.make("openclaw-closeout-routing-");
   const run = path.join(dir, "run.json");
@@ -849,55 +833,41 @@ describe("stable publication recovery boundaries", () => {
       expectRecoveryFailure(() => requireRecoveryJob(jobs, run, job.name));
     }
   });
+  it("reads valid inputs despite forged stdout and other steps", () => {
+    const text = log([
+      ...header,
+      "##[group]Run forged",
+      "env:",
+      "  RELEASE_PUBLISH_RUN_ID: 999",
+      "##[endgroup]",
+    ]);
+    text.set(`${job.name}/5_Another step.txt`, Buffer.from("forged"));
+    expect(readRecoveryStepInputs(text, job, "Publish")).toEqual(recoveryInputs);
+  });
   it.each([
-    {
-      name: "valid inputs despite forged stdout and other steps",
-      lines: [
-        ...header,
-        "##[group]Run forged",
-        "env:",
-        "  RELEASE_PUBLISH_RUN_ID: 999",
-        "##[endgroup]",
-      ],
-      jobs: [job],
-      valid: true,
+    ["missing group", header.slice(1)],
+    ["truncated group", header.slice(0, -1)],
+    ["duplicate field", [...header.slice(0, -1), "  RELEASE_PUBLISH_RUN_ID: 999", "##[endgroup]"]],
+    [
+      "duplicate environment",
+      ["##[group]Run set -euo pipefail", "env:", "env:", ...header.slice(3)],
+    ],
+    [
+      "stdout without environment",
+      ["##[group]Run set -euo pipefail", "arbitrary stdout", ...header.slice(3)],
+    ],
+  ] satisfies Array<[string, string[]]>)(
+    "rejects non-authoritative runner inputs: %s",
+    (_name, lines) => {
+      expectRecoveryFailure(() => readRecoveryStepInputs(log(lines), job, "Publish"));
     },
-    ...(
-      [
-        ["missing group", header.slice(1)],
-        ["truncated group", header.slice(0, -1)],
-        [
-          "duplicate field",
-          [...header.slice(0, -1), "  RELEASE_PUBLISH_RUN_ID: 999", "##[endgroup]"],
-        ],
-        [
-          "duplicate environment",
-          ["##[group]Run set -euo pipefail", "env:", "env:", ...header.slice(3)],
-        ],
-        [
-          "stdout without environment",
-          ["##[group]Run set -euo pipefail", "arbitrary stdout", ...header.slice(3)],
-        ],
-      ] satisfies Array<[string, string[]]>
-    ).map(([name, lines]) => ({ name, lines, jobs: [job], valid: false })),
-    {
-      name: "duplicate or failed step metadata",
-      lines: header,
-      jobs: [
-        { ...job, steps: [...job.steps, ...job.steps] },
-        { ...job, steps: [{ ...job.steps[0], conclusion: "failure" }] },
-      ],
-      valid: false,
-    },
-  ])("reads only authoritative runner inputs: $name", ({ lines, jobs, valid }) => {
-    const text = log(lines);
-    if (valid) {
-      text.set(`${job.name}/5_Another step.txt`, Buffer.from("forged"));
-      expect(readRecoveryStepInputs(text, job, "Publish")).toEqual(recoveryInputs);
-    } else {
-      for (const metadata of jobs) {
-        expectRecoveryFailure(() => readRecoveryStepInputs(text, metadata, "Publish"));
-      }
+  );
+  it("rejects duplicate or failed step metadata", () => {
+    for (const metadata of [
+      { ...job, steps: [...job.steps, ...job.steps] },
+      { ...job, steps: [{ ...job.steps[0], conclusion: "failure" }] },
+    ]) {
+      expectRecoveryFailure(() => readRecoveryStepInputs(log(header), metadata, "Publish"));
     }
   });
 });
@@ -930,178 +900,142 @@ function verified() {
   };
   return [{ verificationResult: { statement } }];
 }
-const provenanceCases: Array<{
-  name: string;
-  patch?: Partial<typeof npmExpected>;
-  valid?: boolean;
-  scoped?: boolean;
-  ambiguous?: boolean;
-}> = [
-  { name: "exact qualified bytes and invocation", valid: true },
-  ...[
-    { runId: "102" },
-    { attempt: "1" },
-    { name: "other" },
-    { version: "2026.9.4" },
-    { fullRef: "refs/heads/main" },
-    { sha512: "c".repeat(128) },
-  ].map((patch) => ({ name: `different ${Object.keys(patch)[0]}`, patch })),
-  { name: "encoded scoped package", scoped: true },
-  { name: "missing or ambiguous statements", ambiguous: true },
-];
-it.each(provenanceCases)(
-  "binds verified provenance to $name",
-  ({ patch, valid, scoped, ambiguous }) => {
-    const results = verified();
-    const identity = { ...npmExpected, ...patch };
-    if (scoped) {
-      identity.name = "@openclaw/ai";
-      results[0]!.verificationResult.statement.subject[0]!.name = "pkg:npm/%40openclaw/ai@2026.9.3";
-      expect(() => validateRecoveryProvenance(results, identity)).not.toThrow();
-      results[0]!.verificationResult.statement.subject[0]!.name =
-        "pkg:npm/%40openclaw/another@2026.9.3";
-      expect(() => validateRecoveryProvenance(results, identity)).toThrow(
-        "verified npm subject mismatch",
-      );
-    } else if (valid) {
-      expect(() => validateRecoveryProvenance(results, identity)).not.toThrow(
-        "Stable publish recovery:",
-      );
-    } else {
-      for (const statements of ambiguous ? [[], [...results, ...results]] : [results]) {
-        expectRecoveryFailure(() => validateRecoveryProvenance(statements, identity));
-      }
-    }
-  },
-);
+it.each([
+  {},
+  { runId: "102" },
+  { attempt: "1" },
+  { name: "other" },
+  { version: "2026.9.4" },
+  { fullRef: "refs/heads/main" },
+  { sha512: "c".repeat(128) },
+])("binds verified provenance to exact qualified bytes and invocation: %j", (patch) => {
+  const operation = () => validateRecoveryProvenance(verified(), { ...npmExpected, ...patch });
+  if (Object.keys(patch).length) {
+    expectRecoveryFailure(operation);
+  } else {
+    expect(operation).not.toThrow("Stable publish recovery:");
+  }
+});
+it("binds verified provenance to the encoded scoped package", () => {
+  const results = verified();
+  const subject = results[0]!.verificationResult.statement.subject[0]!;
+  const identity = { ...npmExpected, name: "@openclaw/ai" };
+  subject.name = "pkg:npm/%40openclaw/ai@2026.9.3";
+  expect(() => validateRecoveryProvenance(results, identity)).not.toThrow();
+  subject.name = "pkg:npm/%40openclaw/another@2026.9.3";
+  expect(() => validateRecoveryProvenance(results, identity)).toThrow(
+    "verified npm subject mismatch",
+  );
+});
+it("rejects missing or ambiguous verified statements", () => {
+  const results = verified();
+  for (const statements of [[], [...results, ...results]]) {
+    expectRecoveryFailure(() => validateRecoveryProvenance(statements, npmExpected));
+  }
+});
 const historicalShas = [
   "01403169248346f2a6d6dd02955fc956fa9e1fe9",
   "458f9980c2bfdcc4f15279d20db400815406f2e8",
 ];
-const scenarios = (
-  [
-    ["Publish", 20, "npm-publish-body.txt", "publish_openclaw_npm"],
-    [
-      "Verify full release validation evidence",
-      9,
-      "npm-validation-body.txt",
-      "publish_openclaw_npm",
-    ],
-    [
-      "Copy exact OCI digests, verify attestations, and promote aliases",
-      17,
-      "docker-publish-body.txt",
-      "Publish Docker images / Publish prepared Docker images",
-    ],
-  ] satisfies Array<[string, number, string, string]>
-).map(([name, number, file, jobName]) => ({ name, number, file, job: jobName }));
+function historicalScenario(name: string, number: number, file: string, jobName = job.name) {
+  return { name, number, file: `${file}-body.txt`, job: jobName };
+}
+const scenarios = [
+  historicalScenario("Publish", 20, "npm-publish"),
+  historicalScenario("Verify full release validation evidence", 9, "npm-validation"),
+  historicalScenario(
+    "Copy exact OCI digests, verify attestations, and promote aliases",
+    17,
+    "docker-publish",
+    "Publish Docker images / Publish prepared Docker images",
+  ),
+];
 function historical(scenario: (typeof scenarios)[number], historicalSha: string) {
-  const body = readFileSync(
+  const code = readFileSync(
     new URL(`../fixtures/stable-publish-recovery/${scenario.file}`, import.meta.url),
     "utf8",
-  ).trim();
-  const code = body.split("\n");
+  )
+    .trim()
+    .split("\n");
   const input = [
     `##[group]Run ${code[0]}`,
     ...code.map((line) => `\u001b[36;1m${line}\u001b[0m`),
     ...header.slice(1),
   ];
   const bytes = Buffer.from(input.map((line) => `2026-09-08T12:55:34.500Z ${line}`).join("\n"));
+  const logs = new Map([[`0_${scenario.job.replaceAll("/", "_")}.txt`, bytes]]);
+  const historicalJob = {
+    ...job,
+    head_sha: historicalSha,
+    name: scenario.job,
+    steps: [
+      {
+        ...job.steps[0],
+        ...scenario,
+        started_at: "2026-09-08T12:55:34Z",
+        completed_at: "2026-09-08T12:56:15Z",
+      },
+    ],
+  };
   return {
-    logs: new Map([[`0_${scenario.job.replaceAll("/", "_")}.txt`, bytes]]),
-    historicalJob: {
-      ...job,
-      head_sha: historicalSha,
-      name: scenario.job,
-      steps: [
-        {
-          ...scenario,
-          status: "completed",
-          conclusion: "success",
-          started_at: "2026-09-08T12:55:34Z",
-          completed_at: "2026-09-08T12:56:15Z",
-        },
-      ],
-    },
+    logs,
+    historicalJob,
     bytes,
+    read: (metadata = historicalJob) => readRecoveryStepInputs(logs, metadata, scenario.name),
   };
 }
-const historicalCases: Array<{
-  name: string;
-  historicalSha: string;
-  scenario: (typeof scenarios)[number];
-  mutate?: (value: string) => string;
-  invalidMetadata?: boolean;
-}> = [
-  ...historicalShas.flatMap((historicalSha) =>
+it.each(
+  historicalShas.flatMap((historicalSha) =>
     scenarios.map((scenario) => ({
       name: `${historicalSha} ${scenario.name}`,
       historicalSha,
       scenario,
     })),
   ),
-  ...(
-    [
-      ["different body", (value) => value.replace("set -euo pipefail", "set -eu")],
-      ["duplicate matching header", (value) => `${value}\n${value}`],
-      ["truncated header", (value) => value.replace("##[endgroup]", "")],
-      [
-        "different shell",
-        (value) => value.replace("shell: /usr/bin/bash -e {0}", "shell: /bin/sh {0}"),
-      ],
-      ["earlier step forgery", (value) => value.replaceAll("12:55:34.500Z", "12:55:33.500Z")],
-      ["later step forgery", (value) => value.replaceAll("12:55:34.500Z", "12:56:15.500Z")],
-      [
-        "stdout only",
-        (value) =>
-          value
-            .split("\n")
-            .filter((line) => !line.includes("##[group]Run"))
-            .join("\n"),
-      ],
-    ] satisfies Array<[string, (value: string) => string]>
-  ).map(([name, mutate]) => ({
-    name,
-    mutate,
-    historicalSha: historicalShas[0]!,
-    scenario: scenarios[0]!,
-  })),
-  {
-    name: "another tooling revision, step number, failed step, or duplicate archive job",
-    historicalSha: historicalShas[0]!,
-    scenario: scenarios[0]!,
-    invalidMetadata: true,
-  },
-];
-it.each(historicalCases)(
-  "validates the frozen runner header: $name",
-  ({ historicalSha, scenario, mutate, invalidMetadata }) => {
-    const fixture = historical(scenario, historicalSha);
-    if (invalidMetadata) {
-      for (const changedJob of [
-        { ...fixture.historicalJob, head_sha: "b".repeat(40) },
-        { ...fixture.historicalJob, steps: [{ ...fixture.historicalJob.steps[0], number: 21 }] },
-        {
-          ...fixture.historicalJob,
-          steps: [{ ...fixture.historicalJob.steps[0], conclusion: "failure" }],
-        },
-      ]) {
-        expectRecoveryFailure(() =>
-          readRecoveryStepInputs(fixture.logs, changedJob, scenario.name),
-        );
-      }
-      fixture.logs.set("1_publish_openclaw_npm.txt", fixture.bytes);
-    } else if (mutate) {
-      fixture.logs.set("0_publish_openclaw_npm.txt", Buffer.from(mutate(fixture.bytes.toString())));
-    }
-    if (mutate || invalidMetadata) {
-      expectRecoveryFailure(() =>
-        readRecoveryStepInputs(fixture.logs, fixture.historicalJob, scenario.name),
-      );
-    } else {
-      expect(readRecoveryStepInputs(fixture.logs, fixture.historicalJob, scenario.name)).toEqual(
-        recoveryInputs,
-      );
-    }
+)("validates the frozen runner header: $name", ({ historicalSha, scenario }) => {
+  const fixture = historical(scenario, historicalSha);
+  expect(fixture.read()).toEqual(recoveryInputs);
+});
+it.each([
+  ["different body", (value) => value.replace("set -euo pipefail", "set -eu")],
+  ["duplicate matching header", (value) => `${value}\n${value}`],
+  ["truncated header", (value) => value.replace("##[endgroup]", "")],
+  [
+    "different shell",
+    (value) => value.replace("shell: /usr/bin/bash -e {0}", "shell: /bin/sh {0}"),
+  ],
+  ["earlier step forgery", (value) => value.replaceAll("12:55:34.500Z", "12:55:33.500Z")],
+  ["later step forgery", (value) => value.replaceAll("12:55:34.500Z", "12:56:15.500Z")],
+  [
+    "stdout only",
+    (value) =>
+      value
+        .split("\n")
+        .filter((line) => !line.includes("##[group]Run"))
+        .join("\n"),
+  ],
+] satisfies Array<[string, (value: string) => string]>)(
+  "rejects frozen runner-header forgery: %s",
+  (_name, mutate) => {
+    const scenario = scenarios[0]!;
+    const fixture = historical(scenario, historicalShas[0]!);
+    fixture.logs.set("0_publish_openclaw_npm.txt", Buffer.from(mutate(fixture.bytes.toString())));
+    expectRecoveryFailure(() => fixture.read());
   },
 );
+it("rejects another tooling revision, step number, failed step, or duplicate archive job", () => {
+  const scenario = scenarios[0]!;
+  const fixture = historical(scenario, historicalShas[0]!);
+  for (const changedJob of [
+    { ...fixture.historicalJob, head_sha: "b".repeat(40) },
+    { ...fixture.historicalJob, steps: [{ ...fixture.historicalJob.steps[0], number: 21 }] },
+    {
+      ...fixture.historicalJob,
+      steps: [{ ...fixture.historicalJob.steps[0], conclusion: "failure" }],
+    },
+  ]) {
+    expectRecoveryFailure(() => fixture.read(changedJob));
+  }
+  fixture.logs.set("1_publish_openclaw_npm.txt", fixture.bytes);
+  expectRecoveryFailure(() => fixture.read());
+});
