@@ -1,3 +1,4 @@
+import "./session-authority.test-support.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -263,6 +264,80 @@ it("denies bound messages and session tools after the plugin-state owner publish
     resetPluginStateStoreForTests();
   }
 });
+
+it.each(["unchanged", "revoked", "replaced"] as const)(
+  "uses published %s authority when a channel rename resumes without synchronous state reads",
+  async (change) => {
+    const f = generationFixture();
+    const sessionKey = "agent:main:prepared-rename";
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    let renaming: Promise<void> | undefined;
+    try {
+      await f.service.open(sessionKey);
+      const binding = await getClickClackDiscussionBindingStore(f.runtime).getAsync(sessionKey);
+      if (!binding) {
+        throw new Error("Expected the persisted discussion binding");
+      }
+      f.runtime.state.openSyncKeyedStore = () => {
+        throw new Error("Synchronous plugin-state reads are unavailable");
+      };
+      f.setSessionEntry({ label: "Updated title" });
+      f.channels.mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return [];
+      });
+      renaming = f.service.reconcile(sessionKey);
+      await entered.promise;
+      if (change === "revoked") {
+        const revocations = createPluginStateSyncKeyedStoreForTests("clickclack", {
+          namespace: "discussion-revoked-channels",
+          maxEntries: 100_000,
+          overflowPolicy: "reject-new",
+          env: f.env,
+        });
+        revocations.register(`${binding.serverBaseUrl}\0${binding.channelId}`, {
+          accountId: binding.accountId,
+          serverBaseUrl: binding.serverBaseUrl,
+          channelId: binding.channelId,
+          revokedAt: Date.now(),
+        });
+      } else if (change === "replaced") {
+        const bindings = createPluginStateSyncKeyedStoreForTests("clickclack", {
+          namespace: "discussion-bindings",
+          maxEntries: 10_000,
+          overflowPolicy: "reject-new",
+          env: f.env,
+        });
+        bindings.register(sessionKey, { ...binding, channelId: "chn_replacement" });
+      }
+      release.resolve();
+      if (change === "unchanged") {
+        await renaming;
+        expect(f.updateChannel).toHaveBeenCalledWith(
+          binding.channelId,
+          expect.objectContaining({ name: "updated-title", display_title: "Updated title" }),
+        );
+        expect(
+          await getClickClackDiscussionBindingStore(f.runtime).getAsync(sessionKey),
+        ).toMatchObject({ label: "Updated title" });
+        await expect(f.service.readLatestMessages(sessionKey, 5)).resolves.toMatchObject({
+          text: "The bound discussion has no messages yet.",
+        });
+      } else {
+        await expect(renaming).rejects.toThrow("authority changed before channel update");
+        expect(f.updateChannel).not.toHaveBeenCalled();
+      }
+    } finally {
+      release.resolve();
+      await renaming?.catch(() => undefined);
+      await f.service.cleanup();
+      await closeOpenClawStateDatabaseAsync();
+      resetPluginStateStoreForTests();
+    }
+  },
+);
 
 it("denies synchronous session targets while a binding write is pending or has unknown settlement", async () => {
   const f = generationFixture();
