@@ -2296,7 +2296,7 @@ src/plugins/managed-npm-retention.ts	4
 src/plugins/manifest-install-owner.ts	1
 src/plugins/manifest-setup-normalizers.ts	4
 src/plugins/manifest.ts	2
-src/plugins/marketplace.ts	6
+src/plugins/marketplace.ts	5
 src/plugins/memory-runtime.ts	1
 src/plugins/native-module-require.ts	2
 src/plugins/official-external-provider-endpoints.ts	1
@@ -2413,7 +2413,6 @@ src/shared/store-writer-queue.ts	1
 src/shared/worker-bundle-archive.ts	1
 src/skills/lifecycle/clawhub-install-core.ts	1
 src/skills/lifecycle/clawhub-store.ts	4
-src/skills/lifecycle/upload-store.ts	1
 src/skills/lifecycle/workspace-skill-write.ts	1
 src/skills/loading/frontmatter.ts	1
 src/skills/loading/workspace-skill-sync.runtime.ts	1
