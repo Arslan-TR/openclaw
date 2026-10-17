@@ -127,7 +127,8 @@ it("keeps repeated sessions isolated by their admitted input bounds", async () =
         throw new Error(`Expected persisted input anchor for ${entryId}`);
       }
       return {
-        ...request,
+        absPath: request.absPath,
+        options: request.options,
         admission: { ...anchor, logicalTurnId: entryId, role: "user" as const },
       };
     });
