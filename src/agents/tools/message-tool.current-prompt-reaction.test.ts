@@ -368,8 +368,9 @@ describe("admitted WebChat prompt reactions", () => {
   it("keeps source-reply-only tools send-only even with a current-prompt grant", async () => {
     await persist();
     const selected = tool({ sourceReplyOnly: true });
+    // The definition matches ordinary turns; source-only delivery is enforced per call.
+    expect(selected.parameters).toEqual(tool({}).parameters);
     expect(Check(selected.parameters, { action: "send", message: "Done" })).toBe(true);
-    expect(Check(selected.parameters, { action: "react", emoji: "👍" })).toBe(false);
     await expect(execute({ final: true }, selected)).rejects.toThrow('permit only action "send"');
     expect(broadcast).not.toHaveBeenCalled();
     expect(external).not.toHaveBeenCalled();
