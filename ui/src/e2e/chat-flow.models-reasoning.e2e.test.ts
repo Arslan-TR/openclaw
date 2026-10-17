@@ -520,13 +520,13 @@ suite.define(() => {
       const modelSelect = main.locator('[data-chat-model-select="true"]').first();
       await modelSelect.waitFor({ state: "visible", timeout: 10_000 });
       expect(await modelSelect.textContent()).toContain("Claude Opus 4.5");
+      await modelSelect.click();
       await expect
         .poll(() =>
           main.locator('[data-chat-model-default="true"]').first().getAttribute("aria-selected"),
         )
         .toBe("true");
 
-      await modelSelect.click();
       await selectChatModelOption(main.locator('[data-chat-model-option="openai/gpt-5.5"]'));
       const firstPatch = await gateway.waitForRequest("sessions.patch");
       expect(requireRecord(firstPatch.params)).toEqual({
