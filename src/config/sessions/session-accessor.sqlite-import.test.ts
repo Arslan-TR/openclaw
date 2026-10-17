@@ -39,6 +39,25 @@ const message = {
   parentId: null,
   message: { role: "user", content: "preserved" },
 };
+function turn(
+  id: string,
+  parentId: string | null | undefined,
+  role: "user" | "assistant",
+  content: string | { type: "text"; text: string }[],
+) {
+  return {
+    type: "message",
+    id,
+    ...(parentId === undefined ? {} : { parentId }),
+    message: { role, content },
+  };
+}
+function header(id: string) {
+  return { type: "session", version: 3, id, timestamp: "2026-08-30T00:00:00Z", cwd: "/fixture" };
+}
+function readEvents(events: unknown[]) {
+  return (append: (event: unknown) => void) => events.forEach(append);
+}
 afterEach(() => vi.restoreAllMocks());
 
 it("preserves a current session introduced after staging while importing unrelated rows", async () => {
@@ -77,73 +96,56 @@ function observeStages() {
     );
 }
 
-it.each(["append"])(
-  "leaves canonical rows unchanged and removes private staging after %s failure",
-  async (phase) => {
-    await withOpenClawTestState({ label: "import-rollback" }, async (state) => {
-      const first = target(state, "first");
-      const second = target(state, "second");
-      await importSqliteSessionRows({
-        ...first,
-        readTranscriptEvents: (append) => {
-          append(message);
-        },
-      });
-      const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
-      const before = database.db.prepare("SELECT * FROM transcript_events").all();
-      const entriesBefore = database.db.prepare("SELECT * FROM session_nodes").all();
-      const stages = observeStages();
-      const exec = database.db.exec.bind(database.db);
-      if (phase === "append") {
-        database.db.exec(`
+it("leaves canonical rows unchanged and removes private staging after append failure", async () => {
+  await withOpenClawTestState({ label: "import-rollback" }, async (state) => {
+    const first = target(state, "first");
+    const second = target(state, "second");
+    await importSqliteSessionRows({
+      ...first,
+      readTranscriptEvents: (append) => {
+        append(message);
+      },
+    });
+    const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+    const before = database.db.prepare("SELECT * FROM transcript_events").all();
+    const entriesBefore = database.db.prepare("SELECT * FROM session_nodes").all();
+    const stages = observeStages();
+    database.db.exec(`
           CREATE TRIGGER fail_second_import BEFORE INSERT ON transcript_events
           WHEN NEW.session_id = 'second'
           BEGIN SELECT RAISE(ABORT, 'injected append failure'); END;
         `);
-      }
-      if (phase === "commit") {
-        vi.spyOn(database.db, "exec").mockImplementation((sql) => {
-          if (sql === "COMMIT") {
-            throw new Error("injected commit failure");
-          }
-          exec(sql);
-        });
-      }
-      await expect(
-        importSqliteSessionRowsBatch([
-          {
-            ...first,
-            entry: { ...first.entry, updatedAt: 100 },
-            readTranscriptEvents: (append) => {
-              append({ ...message, id: "two", parentId: "one" });
-            },
+    await expect(
+      importSqliteSessionRowsBatch([
+        {
+          ...first,
+          entry: { ...first.entry, updatedAt: 100 },
+          readTranscriptEvents: (append) => {
+            append({ ...message, id: "two", parentId: "one" });
           },
-          {
-            ...second,
-            readTranscriptEvents: (append) => {
-              expect(database.db.isTransaction).toBe(false);
-              expect(stages()).toHaveLength(1);
-              if (process.platform !== "win32") {
-                expect(fs.statSync(stages()[0]!).mode & 0o777).toBe(0o700);
-                expect(
-                  fs.statSync(path.join(stages()[0]!, "transcripts.sqlite")).mode & 0o777,
-                ).toBe(0o600);
-              }
-              append(message);
-              if (phase === "prepare") {
-                throw new Error("injected prepare failure");
-              }
-            },
+        },
+        {
+          ...second,
+          readTranscriptEvents: (append) => {
+            expect(database.db.isTransaction).toBe(false);
+            expect(stages()).toHaveLength(1);
+            if (process.platform !== "win32") {
+              expect(fs.statSync(stages()[0]!).mode & 0o777).toBe(0o700);
+              expect(fs.statSync(path.join(stages()[0]!, "transcripts.sqlite")).mode & 0o777).toBe(
+                0o600,
+              );
+            }
+            append(message);
           },
-        ]),
-      ).rejects.toThrow(`injected ${phase} failure`);
-      expect(database.db.isTransaction).toBe(false);
-      expect(database.db.prepare("SELECT * FROM transcript_events").all()).toEqual(before);
-      expect(database.db.prepare("SELECT * FROM session_nodes").all()).toEqual(entriesBefore);
-      expect(stages().every((dir) => !fs.existsSync(dir))).toBe(true);
-    });
-  },
-);
+        },
+      ]),
+    ).rejects.toThrow("injected append failure");
+    expect(database.db.isTransaction).toBe(false);
+    expect(database.db.prepare("SELECT * FROM transcript_events").all()).toEqual(before);
+    expect(database.db.prepare("SELECT * FROM session_nodes").all()).toEqual(entriesBefore);
+    expect(stages().every((dir) => !fs.existsSync(dir))).toBe(true);
+  });
+});
 
 it("revalidates an earlier source after later batch readers finish", async () => {
   await withOpenClawTestState({ label: "import-source-change" }, async (state) => {
@@ -223,21 +225,17 @@ it("deduplicates existing and incoming bytes and identities, preserves aliases, 
     const second = { ...message, id: "two", parentId: "one", timestamp: 30 };
     const rejected = { ...second, timestamp: 99 };
     const opaque = { custom: "no identity", timestamp: 25 };
-    const readTranscriptEvents = (append: (event: unknown) => void) => {
-      for (const event of [
-        first,
-        first,
-        { ...first, timestamp: 20, message: { role: "user", content: "same id loses" } },
-        opaque,
-        opaque,
-        second,
-        rejected,
-        { ...second, timestamp: 50 },
-        rejected,
-      ]) {
-        append(event);
-      }
-    };
+    const readTranscriptEvents = readEvents([
+      first,
+      first,
+      { ...first, timestamp: 20, message: { role: "user", content: "same id loses" } },
+      opaque,
+      opaque,
+      second,
+      rejected,
+      { ...second, timestamp: 50 },
+      rejected,
+    ]);
     const stages = observeStages();
     await importSqliteSessionRows({ ...params, readTranscriptEvents: (append) => append(first) });
     const db = openOpenClawAgentDatabase({ agentId: "main", env: state.env }).db;
@@ -295,21 +293,11 @@ it("keeps legacy Codex assistant rows that precede later transcript rows during 
     });
     const events = [
       { type: "session", id: "codex", version: 3 },
-      { type: "message", id: "user-1", parentId: null, message: { role: "user", content: "hi" } },
+      turn("user-1", null, "user", "hi"),
       codexReply("reply-1", "user-1", "a"),
-      {
-        type: "message",
-        id: "user-2",
-        parentId: "reply-1",
-        message: { role: "user", content: "b" },
-      },
+      turn("user-2", "reply-1", "user", "b"),
       codexReply("reply-2", "user-2", "c"),
-      {
-        type: "message",
-        id: "user-3",
-        parentId: "reply-2",
-        message: { role: "user", content: "d" },
-      },
+      turn("user-3", "reply-2", "user", "d"),
     ];
 
     expect(
@@ -421,34 +409,23 @@ it.each(["implicit", "root", "opaque"])(
     const leafControl = mode !== "implicit";
     await withOpenClawTestState({ label: "import-branch-repair" }, async (state) => {
       const scope = target(state, "repair");
-      const turn = (
+      const textTurn = (
         id: string,
         parentId: string | null | undefined,
         role: "user" | "assistant",
         text: string,
-      ) => ({
-        type: "message",
-        id,
-        ...(parentId === undefined ? {} : { parentId }),
-        message: { role, content: [{ type: "text", text }] },
-      });
-      const parentless = mode === "parentless";
-      const hasOpaque = mode === "opaque" || parentless;
-      const parent = turn("parent", parentless ? undefined : null, "assistant", "previous");
-      const original = turn(
+      ) => turn(id, parentId, role, [{ type: "text", text }]);
+      const hasOpaque = mode === "opaque";
+      const parent = textTurn("parent", null, "assistant", "previous");
+      const original = textTurn(
         "original",
         leafControl ? "parent" : undefined,
         "user",
         "hello\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nretired context\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
       );
-      const abandoned = turn("abandoned", "original", "assistant", "hidden answer");
-      const visible = turn(
-        "visible",
-        leafControl && !parentless ? "parent" : undefined,
-        "user",
-        "hello",
-      );
-      const answer = turn("answer", parentless ? undefined : "visible", "assistant", "answer");
+      const abandoned = textTurn("abandoned", "original", "assistant", "hidden answer");
+      const visible = textTurn("visible", leafControl ? "parent" : undefined, "user", "hello");
+      const answer = textTurn("answer", "visible", "assistant", "answer");
       const opaque = [
         { type: "metadata", id: "append-root", parentId: "abandoned", payload: { keep: "root" } },
         { type: "metadata", id: "append-tail", parentId: "append-root", payload: { keep: "tail" } },
@@ -459,21 +436,11 @@ it.each(["implicit", "root", "opaque"])(
         parentId: "append-tail",
         payload: { keep: "after" },
       };
-      const header = {
-        type: "session",
-        version: 3,
-        id: "repair",
-        timestamp: "2026-08-30T00:00:00Z",
-        cwd: "/fixture",
-      };
+      const sessionHeader = header("repair");
       const events = [
-        header,
-        ...(parentless
-          ? [parent, visible, answer, original, abandoned]
-          : leafControl
-            ? [parent, original, abandoned, visible, answer]
-            : [original, visible]),
-        ...(mode === "opaque" ? opaque : parentless ? [{ ...opaque[0], parentId: null }] : []),
+        sessionHeader,
+        ...(leafControl ? [parent, original, abandoned, visible, answer] : [original, visible]),
+        ...(hasOpaque ? opaque : []),
         ...(leafControl
           ? [
               {
@@ -481,13 +448,7 @@ it.each(["implicit", "root", "opaque"])(
                 id: "selection",
                 parentId: "abandoned",
                 targetId: "answer",
-                ...(mode === "root"
-                  ? { appendParentId: null }
-                  : mode === "opaque"
-                    ? { appendParentId: "append-tail" }
-                    : parentless
-                      ? { appendParentId: "append-root" }
-                      : {}),
+                appendParentId: hasOpaque ? "append-tail" : null,
               },
             ]
           : []),
@@ -503,18 +464,9 @@ it.each(["implicit", "root", "opaque"])(
       expect(result.recovery).toMatchObject({ complete: !hasOpaque, repaired: true });
       const transcript = { ...scope, sessionId: "repair" };
       const persisted = loadTranscriptEventsSync(transcript);
-      const appendParentId =
-        mode === "root"
-          ? null
-          : mode === "opaque"
-            ? "post-leaf"
-            : parentless
-              ? "append-root"
-              : leafControl
-                ? "answer"
-                : "visible";
+      const appendParentId = hasOpaque ? "post-leaf" : leafControl ? null : "visible";
       expect(persisted).toEqual([
-        header,
+        sessionHeader,
         ...(leafControl ? [{ ...parent, parentId: null }] : []),
         leafControl ? { ...visible, parentId: "parent" } : visible,
         ...(leafControl ? [{ ...answer, parentId: "visible" }] : []),
@@ -525,7 +477,7 @@ it.each(["implicit", "root", "opaque"])(
               {
                 type: "leaf",
                 id: "selection",
-                parentId: mode === "opaque" ? "post-leaf" : parentless ? "append-root" : "answer",
+                parentId: hasOpaque ? "post-leaf" : "answer",
                 targetId: "answer",
                 appendParentId,
               },
@@ -564,27 +516,12 @@ it("repairs an identical repeated event and reruns idempotently", async () => {
   await withOpenClawTestState({ label: "import-identical-replay" }, async (state) => {
     const scope = target(state, "identical-replay");
     const events = [
-      {
-        type: "session",
-        version: 3,
-        id: "identical-replay",
-        timestamp: "2026-08-30T00:00:00Z",
-        cwd: "/fixture",
-      },
-      {
-        type: "message",
-        id: "root",
-        parentId: null,
-        message: { role: "user", content: "root" },
-      },
+      header("identical-replay"),
+      turn("root", null, "user", "root"),
       repeated,
       repeated,
     ];
-    const readTranscriptEvents = (append: (event: unknown) => void) => {
-      for (const event of events) {
-        append(event);
-      }
-    };
+    const readTranscriptEvents = readEvents(events);
 
     const imported = await importSqliteSessionRows({
       ...scope,

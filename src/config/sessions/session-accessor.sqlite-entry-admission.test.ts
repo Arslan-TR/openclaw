@@ -103,10 +103,23 @@ function own<T>(promise: Promise<T>): Promise<T> {
   return promise;
 }
 
-function fixture(sessionKey = "agent:main:admission") {
-  const root = roots.make("session-patch-admission-");
+function stateRoot(label = "session-patch-admission-") {
+  const root = roots.make(label);
   const env = { OPENCLAW_STATE_DIR: root };
   vi.stubEnv("OPENCLAW_STATE_DIR", root);
+  return { root, env };
+}
+
+function patch(
+  scope: Parameters<typeof patchSessionEntryCore>[0],
+  update: Parameters<typeof patchSessionEntryCore>[1],
+  options: Parameters<typeof patchSessionEntryCore>[2] = {},
+) {
+  return own(patchSessionEntryCore(scope, update, { skipMaintenance: true, ...options }));
+}
+
+function fixture(sessionKey = "agent:main:admission") {
+  const { root, env } = stateRoot();
   const scope = { agentId: "main", env, sessionKey };
   replaceSessionEntrySync(scope, { sessionId: "original", updatedAt: 1 });
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(scope)));
@@ -114,9 +127,7 @@ function fixture(sessionKey = "agent:main:admission") {
 }
 
 async function memoryFixture() {
-  const root = roots.make("session-memory-patch-admission-");
-  const env = { OPENCLAW_STATE_DIR: root };
-  vi.stubEnv("OPENCLAW_STATE_DIR", root);
+  const { root, env } = stateRoot("session-memory-patch-admission-");
   const scope = { agentId: "main", env, sessionKey: "agent:main:dashboard:incognito-admission" };
   await createSessionEntryWithTranscript(scope, () => ({
     ok: true,
@@ -191,9 +202,7 @@ async function expectAdmission(
 it.each(["sessions.json", "custom.json"])(
   "keeps concurrent first writes in one custom store (%s)",
   async (filename) => {
-    const root = roots.make("session-patch-first-writes-");
-    const env = { OPENCLAW_STATE_DIR: root };
-    vi.stubEnv("OPENCLAW_STATE_DIR", root);
+    const { root, env } = stateRoot("session-patch-first-writes-");
     const storePath = path.join(root, "custom-store", filename);
     const entries = ["first", "second", "third"].map((name) => ({
       sessionKey: `agent:main:${name}`,
@@ -233,7 +242,7 @@ it.each([
   };
   const operation = own(
     kind === "entry"
-      ? patchSessionEntryCore(f.scope, update, { skipMaintenance: true })
+      ? patch(f.scope, update)
       : patchSessionEntryTarget(
           {
             agentId: "main",
@@ -255,18 +264,15 @@ it.each(["worker", "legacy callback", "incognito"] as const)(
     const f = mode === "incognito" ? await memoryFixture() : fixture();
     const native = vi.spyOn(integrity, "assertSqliteIntegrityInWorker");
     let called = false;
-    const operation = own(
-      patchSessionEntryCore(
-        f.scope,
-        () => {
-          called = true;
-          return { label: mode };
-        },
-        {
-          skipMaintenance: true,
-          assertCommitAllowed: mode === "legacy callback" ? () => {} : undefined,
-        },
-      ),
+    const operation = patch(
+      f.scope,
+      () => {
+        called = true;
+        return { label: mode };
+      },
+      {
+        assertCommitAllowed: mode === "legacy callback" ? () => {} : undefined,
+      },
     );
     await expect(operation).resolves.toMatchObject({ label: mode });
     expect(called).toBe(true);
@@ -294,52 +300,39 @@ it("returns an accepted unchanged patch receipt without publishing a new source"
   expect(loadSessionEntry(f.scope)).toEqual(committed);
 });
 
-it.each([true])(
-  "captures the queued state owner before admission (ambient=%s)",
-  async (ambient) => {
-    const f = fixture();
-    const original = { ...f.scope, env: { ...f.env } };
-    const successor = roots.make("session-patch-successor-");
-    const release = createDeferred();
-    releases.push(() => release.resolve());
-    const blocker = own(
-      runExclusiveSqliteSessionWrite(
-        resolveSqliteScope(original),
-        async () => {
-          await release.promise;
-        },
-        "session.transcript.batch",
-      ),
-    );
-    const scope = ambient ? { agentId: "main", sessionKey: original.sessionKey } : f.scope;
-    const operation = own(
-      patchSessionEntryCore(
-        scope,
-        () => {
-          expect(
-            getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: f.databasePath }),
-          ).toBeUndefined();
-          return { label: "original owner" };
-        },
-        { skipMaintenance: true },
-      ),
-    );
-    if (ambient) {
-      vi.stubEnv("OPENCLAW_STATE_DIR", successor);
-    } else {
-      f.env.OPENCLAW_STATE_DIR = successor;
-    }
-    evictHandle(f.databasePath);
-    release.resolve();
-    await blocker;
-    await expect(operation).resolves.toMatchObject({
-      sessionId: "original",
-      label: "original owner",
-    });
-    expect(loadSessionEntry(original)).toMatchObject({ label: "original owner" });
-    expect(fs.readdirSync(successor)).toEqual([]);
-  },
-);
+it("captures the queued ambient state owner before admission", async () => {
+  const f = fixture();
+  const original = { ...f.scope, env: { ...f.env } };
+  const successor = roots.make("session-patch-successor-");
+  const release = createDeferred();
+  releases.push(() => release.resolve());
+  const blocker = own(
+    runExclusiveSqliteSessionWrite(
+      resolveSqliteScope(original),
+      async () => {
+        await release.promise;
+      },
+      "session.transcript.batch",
+    ),
+  );
+  const scope = { agentId: "main", sessionKey: original.sessionKey };
+  const operation = patch(scope, () => {
+    expect(
+      getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: f.databasePath }),
+    ).toBeUndefined();
+    return { label: "original owner" };
+  });
+  vi.stubEnv("OPENCLAW_STATE_DIR", successor);
+  evictHandle(f.databasePath);
+  release.resolve();
+  await blocker;
+  await expect(operation).resolves.toMatchObject({
+    sessionId: "original",
+    label: "original owner",
+  });
+  expect(loadSessionEntry(original)).toMatchObject({ label: "original owner" });
+  expect(fs.readdirSync(successor)).toEqual([]);
+});
 
 it("keeps the physical database owner for logical rows in a shared store", async () => {
   const f = fixture();
@@ -351,18 +344,10 @@ it("keeps the physical database owner for logical rows in a shared store", async
   replaceSessionEntrySync(secondary, { sessionId: "secondary", updatedAt: 1 });
   evictHandle(storePath);
   await expect(
-    own(
-      patchSessionEntryCore(
-        secondary,
-        () => {
-          expect(
-            getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: storePath }),
-          ).toBeUndefined();
-          return { label: "shared owner" };
-        },
-        { skipMaintenance: true },
-      ),
-    ),
+    patch(secondary, () => {
+      expect(getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: storePath })).toBeUndefined();
+      return { label: "shared owner" };
+    }),
   ).resolves.toMatchObject({ sessionId: "secondary", label: "shared owner" });
   expect(loadSessionEntry(main)).toMatchObject({ sessionId: "kept" });
   expect(
@@ -393,34 +378,30 @@ it("retains FIFO, caller context and publication across cold admission", async (
     }
   });
   try {
-    const first = own(
-      contexts.run("first", () =>
-        patchSessionEntryCore(
-          f.scope,
-          async () => {
-            order.push(`update:${contexts.getStore()}`);
-            enteredUpdater.resolve();
-            if (holdUpdater) {
-              await updateRelease.promise;
-            }
-            return { sessionId: "first" };
-          },
-          { skipMaintenance: true, onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
-        ),
+    const first = contexts.run("first", () =>
+      patch(
+        f.scope,
+        async () => {
+          order.push(`update:${contexts.getStore()}`);
+          enteredUpdater.resolve();
+          if (holdUpdater) {
+            await updateRelease.promise;
+          }
+          return { sessionId: "first" };
+        },
+        { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
       ),
     );
     await expectAdmission(gate, first);
     holdUpdater = true;
-    const second = own(
-      contexts.run("second", () =>
-        patchSessionEntryCore(
-          f.scope,
-          (entry) => {
-            order.push(`update:${contexts.getStore()}:${entry.sessionId}`);
-            return { sessionId: "second" };
-          },
-          { skipMaintenance: true, onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
-        ),
+    const second = contexts.run("second", () =>
+      patch(
+        f.scope,
+        (entry) => {
+          order.push(`update:${contexts.getStore()}:${entry.sessionId}`);
+          return { sessionId: "second" };
+        },
+        { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
       ),
     );
     expect(order).toEqual([]);
@@ -453,9 +434,7 @@ it.each(["dispose", "physical replacement"] as const)(
     const gate = holdWorkerValidation(f.databasePath);
     const update = vi.fn(() => ({ label: "must not commit" }));
     const committed = vi.fn();
-    const operation = own(
-      patchSessionEntryCore(f.scope, update, { skipMaintenance: true, onCommitted: committed }),
-    );
+    const operation = patch(f.scope, update, { onCommitted: committed });
     try {
       await expectAdmission(gate, operation);
       expect(update).not.toHaveBeenCalled();
@@ -471,11 +450,9 @@ it.each(["dispose", "physical replacement"] as const)(
       expect(update).not.toHaveBeenCalled();
       expect(committed).not.toHaveBeenCalled();
       expect(loadSessionEntry(f.scope)).not.toHaveProperty("label");
-      await expect(
-        own(
-          patchSessionEntryCore(f.scope, () => ({ label: "successor" }), { skipMaintenance: true }),
-        ),
-      ).resolves.toMatchObject({ label: "successor" });
+      await expect(patch(f.scope, () => ({ label: "successor" }))).resolves.toMatchObject({
+        label: "successor",
+      });
     } finally {
       gate.release.resolve();
     }
@@ -490,24 +467,21 @@ it.each(["cancel", "revoke"] as const)(
     let allowed = true;
     const revoked = new Error("authority revoked during commit admission");
     const committed = vi.fn();
-    const operation = own(
-      patchSessionEntryCore(
-        f.scope,
-        () => {
-          closeCold(f);
-          return { sessionId: "uncommitted" };
+    const operation = patch(
+      f.scope,
+      () => {
+        closeCold(f);
+        return { sessionId: "uncommitted" };
+      },
+      {
+        shouldCommit: () => mode !== "cancel" || allowed,
+        assertCommitAllowed: () => {
+          if (!allowed && mode === "revoke") {
+            throw revoked;
+          }
         },
-        {
-          skipMaintenance: true,
-          shouldCommit: () => mode !== "cancel" || allowed,
-          assertCommitAllowed: () => {
-            if (!allowed && mode === "revoke") {
-              throw revoked;
-            }
-          },
-          onCommitted: committed,
-        },
-      ),
+        onCommitted: committed,
+      },
     );
     try {
       await expectAdmission(gate, operation);
@@ -529,64 +503,55 @@ it.each(["cancel", "revoke"] as const)(
   },
 );
 
-it.each(["relative native reopen"] as const)(
-  "pins the selected root for %s patch work",
-  async () => {
-    const home = roots.make("session-patch-root-selection-");
-    const ownerRoot = path.join(home, "state");
-    const successor = path.join(home, "next-cwd");
-    fs.mkdirSync(ownerRoot);
-    fs.mkdirSync(successor);
-    const cwd = vi.spyOn(process, "cwd").mockReturnValue(home);
-    const env: NodeJS.ProcessEnv = {
-      HOME: home,
-      OPENCLAW_HOME: home,
-      OPENCLAW_CONFIG_PATH: path.join(ownerRoot, "openclaw.json"),
-      OPENCLAW_STATE_DIR: "state",
-    };
-    vi.stubEnv("OPENCLAW_STATE_DIR", ownerRoot);
-    const scope = { agentId: "main", env, sessionKey: "agent:main:root-selection" };
-    const original = { ...scope, env: { ...env, OPENCLAW_STATE_DIR: ownerRoot } };
-    expect(resolveStateDir(env)).toBe(ownerRoot);
-    replaceSessionEntrySync(original, { sessionId: "original", updatedAt: 1 });
-    const database = openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(original)));
-    const selectedPath = database.path;
-    const shiftOwner = () => {
+it("pins the selected root for relative native reopen patch work", async () => {
+  const home = roots.make("session-patch-root-selection-");
+  const ownerRoot = path.join(home, "state");
+  const successor = path.join(home, "next-cwd");
+  fs.mkdirSync(ownerRoot);
+  fs.mkdirSync(successor);
+  const cwd = vi.spyOn(process, "cwd").mockReturnValue(home);
+  const env: NodeJS.ProcessEnv = {
+    HOME: home,
+    OPENCLAW_HOME: home,
+    OPENCLAW_CONFIG_PATH: path.join(ownerRoot, "openclaw.json"),
+    OPENCLAW_STATE_DIR: "state",
+  };
+  vi.stubEnv("OPENCLAW_STATE_DIR", ownerRoot);
+  const scope = { agentId: "main", env, sessionKey: "agent:main:root-selection" };
+  const original = { ...scope, env: { ...env, OPENCLAW_STATE_DIR: ownerRoot } };
+  expect(resolveStateDir(env)).toBe(ownerRoot);
+  replaceSessionEntrySync(original, { sessionId: "original", updatedAt: 1 });
+  const database = openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(original)));
+  const selectedPath = database.path;
+  const updaterEntered = createDeferred();
+  const operation = patch(
+    scope,
+    () => {
+      evictHandle(selectedPath);
       cwd.mockReturnValue(successor);
-    };
-    const updaterEntered = createDeferred();
-    const operation = own(
-      patchSessionEntryCore(
-        scope,
-        () => {
-          evictHandle(selectedPath);
-          shiftOwner();
-          updaterEntered.resolve();
-          return { label: "retained selected root" };
-        },
-        {
-          skipMaintenance: true,
-          assertCommitAllowed: () => {},
-        },
-      ),
-    );
-    await awaitGateBeforeSettlement(
-      updaterEntered.promise,
-      operation,
-      "Patch settled before its root-selection updater",
-    );
-    // Control: unchanged caller inputs now resolve elsewhere; the operation must use
-    // its private resolved root, not repeat ambient selection after its await.
-    expect(resolveStateDir(env)).toBe(path.join(successor, "state"));
-    await expect(operation).resolves.toMatchObject({
-      sessionId: "original",
-      label: "retained selected root",
-    });
-    expect(loadSessionEntry(original)).toMatchObject({
-      sessionId: "original",
-      label: "retained selected root",
-    });
-    expect(env.OPENCLAW_STATE_DIR).toBe("state");
-    expect(fs.readdirSync(successor, { recursive: true })).toEqual([]);
-  },
-);
+      updaterEntered.resolve();
+      return { label: "retained selected root" };
+    },
+    {
+      assertCommitAllowed: () => {},
+    },
+  );
+  await awaitGateBeforeSettlement(
+    updaterEntered.promise,
+    operation,
+    "Patch settled before its root-selection updater",
+  );
+  // Control: unchanged caller inputs now resolve elsewhere; the operation must use
+  // its private resolved root, not repeat ambient selection after its await.
+  expect(resolveStateDir(env)).toBe(path.join(successor, "state"));
+  await expect(operation).resolves.toMatchObject({
+    sessionId: "original",
+    label: "retained selected root",
+  });
+  expect(loadSessionEntry(original)).toMatchObject({
+    sessionId: "original",
+    label: "retained selected root",
+  });
+  expect(env.OPENCLAW_STATE_DIR).toBe("state");
+  expect(fs.readdirSync(successor, { recursive: true })).toEqual([]);
+});

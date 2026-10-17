@@ -78,13 +78,17 @@ afterAll(async () => {
   seed = undefined;
 });
 
-async function createHotRaceSeed(state: OpenClawTestState) {
-  const scope = {
+function raceScope(state: OpenClawTestState) {
+  return {
     agentId: "main",
     env: state.env,
     sessionId: "cold-race",
     sessionKey: "agent:main:cold-race",
   };
+}
+
+async function createHotRaceSeed(state: OpenClawTestState) {
+  const scope = raceScope(state);
   await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 1 });
   await replaceTranscriptEvents(scope, [
     { type: "session", id: scope.sessionId, version: 3 },
@@ -156,12 +160,7 @@ async function prepareRace(state: OpenClawTestState) {
   if (!seed) {
     throw new Error("Cold read seed was not prepared");
   }
-  const scope = {
-    agentId: "main",
-    env: state.env,
-    sessionId: "cold-race",
-    sessionKey: "agent:main:cold-race",
-  };
+  const scope = raceScope(state);
   const options = { agentId: scope.agentId, env: state.env };
   const storePath = resolveOpenClawAgentSqlitePath(options);
   const descriptor = structuredClone(seed.descriptor);
@@ -204,28 +203,17 @@ async function prepareRace(state: OpenClawTestState) {
       if (!matches(query)) {
         return statement;
       }
-      const nativeGet = statement.get.bind(statement);
-      vi.spyOn(statement, "get").mockImplementation(
-        new Proxy(nativeGet, {
-          apply(get, _receiver, args) {
-            const row = get(...args);
-            commitArchive();
-            afterArchive?.();
-            return row;
-          },
-        }),
-      );
-      const nativeAll = statement.all.bind(statement);
-      vi.spyOn(statement, "all").mockImplementation(
-        new Proxy(nativeAll, {
-          apply(all, _receiver, args) {
-            const rows = all(...args);
+      const afterRead = <T extends (...args: never[]) => unknown>(read: T): T =>
+        new Proxy(read, {
+          apply(target, receiver, args) {
+            const rows = Reflect.apply(target, receiver, args);
             commitArchive();
             afterArchive?.();
             return rows;
           },
-        }),
-      );
+        });
+      vi.spyOn(statement, "get").mockImplementation(afterRead(statement.get.bind(statement)));
+      vi.spyOn(statement, "all").mockImplementation(afterRead(statement.all.bind(statement)));
       const iterate = statement.iterate.bind(statement);
       vi.spyOn(statement, "iterate").mockImplementation(function* (...args) {
         yield* iterate(...args);
@@ -243,6 +231,7 @@ async function prepareRace(state: OpenClawTestState) {
     commitArchive,
     commitAfterMarkerRead,
     committed: () => committed,
+    readRows: () => loadTranscriptEventRowsAfterSeqInDatabase(database, scope.sessionId, -1),
   };
 }
 
@@ -266,8 +255,7 @@ async function withRace(
 
 it("detects an archive committed before a warm incremental read begins", async () => {
   await withRace("warm-read-before-begin", async (race) => {
-    const read = () =>
-      loadTranscriptEventRowsAfterSeqInDatabase(race.database, race.scope.sessionId, -1);
+    const read = race.readRows;
     const original = read();
     expect(original.length).toBeGreaterThan(0);
     const nativeExec = race.database.db.exec.bind(race.database.db);
@@ -289,8 +277,7 @@ it("detects an archive committed before a warm incremental read begins", async (
 
 it("joins a caller's hot read snapshot without a savepoint and observes the next foreign archive", async () => {
   await withRace("nested-hot-read-snapshot", async (race) => {
-    const read = () =>
-      loadTranscriptEventRowsAfterSeqInDatabase(race.database, race.scope.sessionId, -1);
+    const read = race.readRows;
     const original = read();
     expect(original.length).toBeGreaterThan(0);
     runSqliteDeferredTransactionSync(race.database.db, () => {
@@ -313,9 +300,7 @@ it("joins a caller's hot read snapshot without a savepoint and observes the next
 });
 
 it("identifies a slow transcript matcher while retaining its hot read snapshot", async () => {
-  await withOpenClawTestState({ label: "hot-read-attribution" }, async (state) => {
-    await captureRuntimeConfigAsyncReader()();
-    const race = await prepareRace(state);
+  await withRace("hot-read-attribution", async (race, state) => {
     const file = state.path("hot-read.log");
     setLoggerOverride({ level: "info", consoleLevel: "silent", file });
     let clock = Date.now();
@@ -360,7 +345,6 @@ it("identifies a slow transcript matcher while retaining its hot read snapshot",
       ]);
     } finally {
       vi.restoreAllMocks();
-      race.writer.close();
       await flushLogger();
       setLoggerOverride(null);
     }
