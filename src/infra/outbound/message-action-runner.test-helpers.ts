@@ -1,6 +1,5 @@
-// Shared runner-facade test harness. These mocks isolate message-action routing,
-// execution, and send coordination from real channel and gateway runtimes.
-import { afterEach, beforeEach, expect, vi } from "vitest";
+// Isolate runner routing and send coordination from channel/Gateway runtimes.
+import { afterEach, beforeEach, expect, vi, type MockInstance } from "vitest";
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import { jsonResult } from "../../agents/tools/common.js";
 import { dispatchChannelMessageAction } from "../../channels/plugins/message-action-dispatch.js";
@@ -22,9 +21,8 @@ import {
 
 type ChannelActionHandler = NonNullable<NonNullable<ChannelPlugin["actions"]>["handleAction"]>;
 
-// Factories can run during static imports, before the exported alias initializes.
-// Use the hoisted binding directly so resets and imports share the same functions.
-const hoistedMessageActionRunnerMocks = vi.hoisted(() => ({
+// Mock factories run before the exported alias initializes; use the hoisted binding.
+const runnerMocks = vi.hoisted(() => ({
   resolveOutboundChannelPlugin: vi.fn(),
   executeSendAction: vi.fn(),
   executePollAction: vi.fn(),
@@ -42,43 +40,38 @@ const hoistedMessageActionRunnerMocks = vi.hoisted(() => ({
   loadWebMedia: vi.fn<typeof import("../../media/web-media.js").loadWebMedia>(),
 }));
 
-export const messageActionRunnerMocks = hoistedMessageActionRunnerMocks;
+export const messageActionRunnerMocks = runnerMocks;
 
 vi.mock("./channel-resolution.js", () => ({
   normalizeDeliverableOutboundChannel: (value?: string | null) =>
     typeof value === "string" ? value.trim().toLowerCase() || undefined : undefined,
-  resolveOutboundChannelPlugin: hoistedMessageActionRunnerMocks.resolveOutboundChannelPlugin,
+  resolveOutboundChannelPlugin: runnerMocks.resolveOutboundChannelPlugin,
   resetOutboundChannelResolutionStateForTest: vi.fn(),
 }));
 
 vi.mock("./outbound-send-service.js", () => ({
-  executeSendAction: hoistedMessageActionRunnerMocks.executeSendAction,
-  executePollAction: hoistedMessageActionRunnerMocks.executePollAction,
-  hasCorePresentationDelivery: hoistedMessageActionRunnerMocks.hasCorePresentationDelivery,
-  materializeMessagePresentationFallback:
-    hoistedMessageActionRunnerMocks.materializeMessagePresentationFallback,
+  executeSendAction: runnerMocks.executeSendAction,
+  executePollAction: runnerMocks.executePollAction,
+  hasCorePresentationDelivery: runnerMocks.hasCorePresentationDelivery,
+  materializeMessagePresentationFallback: runnerMocks.materializeMessagePresentationFallback,
 }));
 
 vi.mock("./message.gateway.runtime.js", () => ({
-  callGateway: hoistedMessageActionRunnerMocks.callGateway,
-  callGatewayLeastPrivilege: hoistedMessageActionRunnerMocks.callGatewayLeastPrivilege,
-  isGatewayTransportError: hoistedMessageActionRunnerMocks.isGatewayTransportError,
-  randomIdempotencyKey: hoistedMessageActionRunnerMocks.randomIdempotencyKey,
+  callGateway: runnerMocks.callGateway,
+  callGatewayLeastPrivilege: runnerMocks.callGatewayLeastPrivilege,
+  isGatewayTransportError: runnerMocks.isGatewayTransportError,
+  randomIdempotencyKey: runnerMocks.randomIdempotencyKey,
 }));
 
 vi.mock("./source-reply-mirror.js", () => ({
-  beginTerminalSourceReplyDelivery:
-    hoistedMessageActionRunnerMocks.beginTerminalSourceReplyDelivery,
-  cancelTerminalSourceReplyDelivery:
-    hoistedMessageActionRunnerMocks.cancelTerminalSourceReplyDelivery,
-  isDeliveredCurrentSourceReplyAsync:
-    hoistedMessageActionRunnerMocks.isDeliveredCurrentSourceReplyAsync,
-  reconcileTerminalSourceReplyDelivery:
-    hoistedMessageActionRunnerMocks.reconcileTerminalSourceReplyDelivery,
+  beginTerminalSourceReplyDelivery: runnerMocks.beginTerminalSourceReplyDelivery,
+  cancelTerminalSourceReplyDelivery: runnerMocks.cancelTerminalSourceReplyDelivery,
+  isDeliveredCurrentSourceReplyAsync: runnerMocks.isDeliveredCurrentSourceReplyAsync,
+  reconcileTerminalSourceReplyDelivery: runnerMocks.reconcileTerminalSourceReplyDelivery,
 }));
 
 vi.mock("../../tts/tts.runtime.js", () => ({
-  maybeApplyTtsToPayload: hoistedMessageActionRunnerMocks.maybeApplyTtsToPayload,
+  maybeApplyTtsToPayload: runnerMocks.maybeApplyTtsToPayload,
 }));
 
 vi.mock("./outbound-session.js", () => ({
@@ -103,7 +96,7 @@ vi.mock("../../channels/plugins/bootstrap-registry.js", () => ({
 
 vi.mock("../../media/web-media.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../media/web-media.js")>()),
-  loadWebMedia: hoistedMessageActionRunnerMocks.loadWebMedia,
+  loadWebMedia: runnerMocks.loadWebMedia,
 }));
 
 type RunMessageAction = typeof import("./message-action-runner.js").runMessageAction;
@@ -123,26 +116,22 @@ export function createWorkspaceMediaTestPlugin(): ChannelPlugin {
       id: "workspace",
       label: "Workspace",
       config: {
-        listAccountIds: () => ["default"],
         resolveAccount: (cfg) => cfg.channels?.workspace ?? {},
-        isConfigured: async (account) =>
-          typeof (account as { botToken?: unknown }).botToken === "string" &&
-          (account as { botToken?: string }).botToken!.trim() !== "" &&
-          typeof (account as { appToken?: unknown }).appToken === "string" &&
-          (account as { appToken?: string }).appToken!.trim() !== "",
+        isConfigured: async (account) => {
+          const { botToken, appToken } = account as { botToken?: unknown; appToken?: unknown };
+          return [botToken, appToken].every(
+            (token) => typeof token === "string" && token.trim() !== "",
+          );
+        },
       },
     }),
     outbound: {
       deliveryMode: "direct",
       resolveTarget: ({ to }) => {
         const trimmed = to?.trim() ?? "";
-        if (!trimmed) {
-          return {
-            ok: false,
-            error: new Error("missing target for workspace"),
-          };
-        }
-        return { ok: true, to: trimmed };
+        return trimmed
+          ? { ok: true, to: trimmed }
+          : { ok: false, error: new Error("missing target for workspace") };
       },
       sendText: async () => ({ channel: "workspace", messageId: "msg-test" }),
       sendMedia: async () => ({ channel: "workspace", messageId: "msg-test" }),
@@ -160,7 +149,7 @@ export function createAlwaysConfiguredPluginConfig(
   };
 }
 
-function actionPluginBase(id: string, label: string, blurb: string): ChannelPlugin {
+export function createActionPluginBase(id: string, label: string, blurb: string): ChannelPlugin {
   const base = createChannelTestPluginBase({
     id,
     label,
@@ -170,11 +159,25 @@ function actionPluginBase(id: string, label: string, blurb: string): ChannelPlug
 }
 
 function createActionHubPluginFixture() {
+  const actions: ChannelMessageActionName[] = [
+    "pin",
+    "unpin",
+    "list-pins",
+    "member-info",
+    "channel-info",
+    "edit",
+    "thread-create",
+    "thread-reply",
+  ];
+  const targetAliases = () => ({
+    aliases: ["messageId", "chatId", "chat_id", "channel_id"],
+    deliveryTargetAliases: ["chatId", "chat_id", "channel_id"],
+  });
   const handleAction = vi.fn(async ({ params }: { params: Record<string, unknown> }) =>
     jsonResult({ ok: true, params }),
   );
   const plugin: ChannelPlugin = {
-    ...actionPluginBase("actionhub", "Action Hub", "Action Hub action dispatch test plugin."),
+    ...createActionPluginBase("actionhub", "Action Hub", "Action Hub action dispatch test plugin."),
     capabilities: { chatTypes: ["direct", "channel"] },
     messaging: {
       targetPrefixes: ["actionhub", "actionhub-alias"],
@@ -184,42 +187,14 @@ function createActionHubPluginFixture() {
       },
     },
     actions: {
-      describeMessageTool: () => ({
-        actions: [
-          "pin",
-          "unpin",
-          "list-pins",
-          "member-info",
-          "channel-info",
-          "edit",
-          "thread-create",
-          "thread-reply",
-        ],
-      }),
+      describeMessageTool: () => ({ actions }),
       messageActionTargetAliases: {
         "list-pins": { aliases: ["chatId"] },
-        edit: {
-          aliases: ["messageId", "chatId", "chat_id", "channel_id"],
-          deliveryTargetAliases: ["chatId", "chat_id", "channel_id"],
-        },
-        pin: {
-          aliases: ["messageId", "chatId", "chat_id", "channel_id"],
-          deliveryTargetAliases: ["chatId", "chat_id", "channel_id"],
-        },
-        unpin: {
-          aliases: ["messageId", "chatId", "chat_id", "channel_id"],
-          deliveryTargetAliases: ["chatId", "chat_id", "channel_id"],
-        },
+        edit: targetAliases(),
+        pin: targetAliases(),
+        unpin: targetAliases(),
       },
-      supportsAction: ({ action }) =>
-        action === "pin" ||
-        action === "unpin" ||
-        action === "list-pins" ||
-        action === "member-info" ||
-        action === "channel-info" ||
-        action === "edit" ||
-        action === "thread-create" ||
-        action === "thread-reply",
+      supportsAction: ({ action }) => actions.includes(action),
       handleAction,
     },
   };
@@ -240,7 +215,7 @@ export function createGatewayActionPlugin(params: {
   const actions = new Set(params.actions);
   const gatewayActions = new Set(params.gatewayActions ?? params.actions);
   return {
-    ...actionPluginBase(params.pluginId, params.label, params.blurb),
+    ...createActionPluginBase(params.pluginId, params.label, params.blurb),
     capabilities: params.capabilities ?? { chatTypes: ["direct"] },
     messaging: params.messaging,
     threading: params.threading,
@@ -260,7 +235,7 @@ export function createPollForwardingPlugin(params: {
   handleAction: ChannelActionHandler;
 }): ChannelPlugin {
   return {
-    ...actionPluginBase(params.pluginId, params.label, params.blurb),
+    ...createActionPluginBase(params.pluginId, params.label, params.blurb),
     messaging: {
       targetResolver: {
         looksLikeId: () => true,
@@ -274,30 +249,33 @@ export function createPollForwardingPlugin(params: {
   };
 }
 
-async function executePluginAction(params: {
+type SendParams = Parameters<typeof import("./outbound-send-service.js").executeSendAction>[0];
+
+async function executePluginAction({
+  action,
+  ctx,
+}: {
   action: "send" | "poll";
-  ctx: Parameters<typeof import("./outbound-send-service.js").executeSendAction>[0]["ctx"];
+  ctx: SendParams["ctx"];
 }) {
   const handled = await dispatchChannelMessageAction({
-    channel: params.ctx.channel,
-    action: params.action,
-    cfg: params.ctx.cfg,
-    params: params.ctx.params,
-    mediaAccess: params.ctx.mediaAccess,
-    mediaLocalRoots: params.ctx.mediaAccess?.localRoots ?? [],
+    channel: ctx.channel,
+    action,
+    cfg: ctx.cfg,
+    params: ctx.params,
+    mediaAccess: ctx.mediaAccess,
+    mediaLocalRoots: ctx.mediaAccess?.localRoots ?? [],
     mediaReadFile:
-      typeof params.ctx.mediaAccess?.readFile === "function"
-        ? params.ctx.mediaAccess.readFile
-        : undefined,
-    accountId: params.ctx.accountId ?? undefined,
-    gateway: params.ctx.gateway,
-    toolContext: params.ctx.input.toolContext,
-    inboundEventKind: params.ctx.input.inboundEventKind,
-    dryRun: params.ctx.dryRun,
-    agentId: params.ctx.agentId,
+      typeof ctx.mediaAccess?.readFile === "function" ? ctx.mediaAccess.readFile : undefined,
+    accountId: ctx.accountId ?? undefined,
+    gateway: ctx.gateway,
+    toolContext: ctx.input.toolContext,
+    inboundEventKind: ctx.input.inboundEventKind,
+    dryRun: ctx.dryRun,
+    agentId: ctx.agentId,
   });
   if (!handled) {
-    throw new Error(`expected plugin to handle ${params.action}`);
+    throw new Error(`expected plugin to handle ${action}`);
   }
   return {
     handledBy: "plugin" as const,
@@ -306,37 +284,40 @@ async function executePluginAction(params: {
   };
 }
 
+function resetMock<F extends (...args: never[]) => unknown>(
+  mock: MockInstance<F>,
+  implementation: NonNullable<ReturnType<MockInstance<F>["getMockImplementation"]>>,
+) {
+  mock.mockReset();
+  mock.mockImplementation(implementation);
+}
+const resolveTestPlugin = ({ channel }: { channel: string }) =>
+  getActivePluginRegistry()?.channels.find((entry) => entry?.plugin?.id === channel)?.plugin;
+
 export function resetMessageActionRunnerMocks() {
   const mocks = messageActionRunnerMocks;
-  mocks.resolveOutboundChannelPlugin.mockReset();
-  mocks.resolveOutboundChannelPlugin.mockImplementation(
-    ({ channel }: { channel: string }) =>
-      getActivePluginRegistry()?.channels.find((entry) => entry?.plugin?.id === channel)?.plugin,
-  );
-  mocks.executeSendAction.mockReset();
-  mocks.executeSendAction.mockImplementation(
-    async ({ ctx }: { ctx: Parameters<typeof executePluginAction>[0]["ctx"] }) =>
+  resetMock(mocks.resolveOutboundChannelPlugin, resolveTestPlugin);
+  resetMock(
+    mocks.executeSendAction,
+    async ({ ctx }: { ctx: SendParams["ctx"] }) =>
       await executePluginAction({ action: "send", ctx }),
   );
-  mocks.executePollAction.mockReset();
-  mocks.executePollAction.mockImplementation(
-    async ({ ctx }: { ctx: Parameters<typeof executePluginAction>[0]["ctx"] }) =>
+  resetMock(
+    mocks.executePollAction,
+    async ({ ctx }: { ctx: SendParams["ctx"] }) =>
       await executePluginAction({ action: "poll", ctx }),
   );
-  mocks.hasCorePresentationDelivery.mockReset();
-  mocks.hasCorePresentationDelivery.mockImplementation(
+  resetMock(
+    mocks.hasCorePresentationDelivery,
     (outbound?: { sendPayload?: unknown; sendText?: unknown; sendFormattedText?: unknown }) =>
       Boolean(outbound?.sendPayload || outbound?.sendText || outbound?.sendFormattedText),
   );
-  mocks.materializeMessagePresentationFallback.mockReset();
-  mocks.materializeMessagePresentationFallback.mockImplementation(
+  resetMock(
+    mocks.materializeMessagePresentationFallback,
     (params: { payload: { presentation?: unknown; text?: string }; text?: string }) => {
       const presentation = normalizeMessagePresentation(params.payload.presentation);
       const text = (params.text ?? params.payload.text ?? "").trim();
-      if (!presentation) {
-        return text;
-      }
-      const fallback = renderMessagePresentationFallbackText({ presentation });
+      const fallback = presentation ? renderMessagePresentationFallbackText({ presentation }) : "";
       return !fallback || text.includes(fallback)
         ? text
         : [text, fallback].filter(Boolean).join("\n\n");
@@ -344,15 +325,12 @@ export function resetMessageActionRunnerMocks() {
   );
   mocks.callGateway.mockReset();
   mocks.callGatewayLeastPrivilege.mockReset();
-  mocks.isGatewayTransportError.mockReset();
-  mocks.isGatewayTransportError.mockImplementation(
+  resetMock(
+    mocks.isGatewayTransportError,
     (value: unknown) => value instanceof Error && (value as { kind?: unknown }).kind === "timeout",
   );
   mocks.randomIdempotencyKey.mockClear();
-  mocks.maybeApplyTtsToPayload.mockReset();
-  mocks.maybeApplyTtsToPayload.mockImplementation(
-    async (params: { payload: unknown }) => params.payload,
-  );
+  resetMock(mocks.maybeApplyTtsToPayload, async (params: { payload: unknown }) => params.payload);
   mocks.beginTerminalSourceReplyDelivery.mockReset();
   mocks.cancelTerminalSourceReplyDelivery.mockReset();
   mocks.reconcileTerminalSourceReplyDelivery.mockReset();
@@ -367,26 +345,10 @@ export async function resetMessageActionMediaMocks() {
   vi.restoreAllMocks();
   vi.clearAllMocks();
   const mocks = messageActionRunnerMocks;
-  mocks.resolveOutboundChannelPlugin.mockReset();
-  mocks.resolveOutboundChannelPlugin.mockImplementation(
-    ({ channel }: { channel: string }) =>
-      getActivePluginRegistry()?.channels.find((entry) => entry?.plugin?.id === channel)?.plugin,
-  );
-  mocks.executeSendAction.mockReset();
-  mocks.executeSendAction.mockImplementation(
-    async ({
-      ctx,
-      to,
-      message,
-      mediaUrl,
-      mediaUrls,
-    }: {
-      ctx: { channel: string; dryRun: boolean };
-      to: string;
-      message: string;
-      mediaUrl?: string;
-      mediaUrls?: string[];
-    }) => ({
+  resetMock(mocks.resolveOutboundChannelPlugin, resolveTestPlugin);
+  resetMock(
+    mocks.executeSendAction,
+    async ({ ctx, to, message, mediaUrl, mediaUrls }: SendParams) => ({
       handledBy: "core" as const,
       payload: {
         channel: ctx.channel,
@@ -404,47 +366,31 @@ export async function resetMessageActionMediaMocks() {
       },
     }),
   );
-  mocks.executePollAction.mockReset();
-  mocks.executePollAction.mockImplementation(async () => {
+  resetMock(mocks.executePollAction, async () => {
     throw new Error("executePollAction should not run in media tests");
   });
-  mocks.loadWebMedia.mockReset();
-  mocks.loadWebMedia.mockImplementation(actualLoadWebMedia);
+  resetMock(mocks.loadWebMedia, actualLoadWebMedia);
 }
+
+type RecordedCalls = { mock: { calls: unknown[][] } };
 
 const requireRecord = createRequireRecord("record", "expected-non-array-record");
 const requireLabeledRecord = createRequireRecord("record", "expected-label");
 
-export function readFirstPluginCall(mock: {
-  mock: { calls: unknown[][] };
-}): Record<string, unknown> {
-  return readPluginCall(mock, 0);
-}
+export const readFirstPluginCall = (mock: RecordedCalls) => readPluginCall(mock, 0);
 
-export function readPluginCall(
-  mock: { mock: { calls: unknown[][] } },
-  callIndex: number,
-): Record<string, unknown> {
+export function readPluginCall(mock: RecordedCalls, callIndex: number): Record<string, unknown> {
   return requireRecord(mock.mock.calls[callIndex]?.[0]);
 }
 
-export function readLastPluginCall(mock: {
-  mock: { calls: unknown[][] };
-}): Record<string, unknown> {
-  return readPluginCall(mock, mock.mock.calls.length - 1);
-}
+export const readLastPluginCall = (mock: RecordedCalls) =>
+  readPluginCall(mock, mock.mock.calls.length - 1);
 
-export function readMockCallArg(
-  mock: { mock: { calls: unknown[][] } },
-  label: string,
-  callIndex = 0,
-): Record<string, unknown> {
-  return requireLabeledRecord(mock.mock.calls[callIndex]?.[0], label);
-}
+export const readMockCallArg = (mock: RecordedCalls, label: string, callIndex = 0) =>
+  requireLabeledRecord(mock.mock.calls[callIndex]?.[0], label);
 
-export function readRecordField(record: Record<string, unknown>, key: string, label: string) {
-  return requireLabeledRecord(record[key], label);
-}
+export const readRecordField = (record: Record<string, unknown>, key: string, label: string) =>
+  requireLabeledRecord(record[key], label);
 
 export function expectRecordFields(
   record: Record<string, unknown>,
@@ -456,9 +402,9 @@ export function expectRecordFields(
   }
 }
 
-export function createEnabledMessageActionConfig(channel: string): OpenClawConfig {
-  return { channels: { [channel]: { enabled: true } } };
-}
+export const createEnabledMessageActionConfig = (channel: string): OpenClawConfig => ({
+  channels: { [channel]: { enabled: true } },
+});
 
 export function useActionHubPluginFixture() {
   const fixture = createActionHubPluginFixture();

@@ -1,5 +1,3 @@
-// Covers core message-action send fallback, TTS application, and durable send
-// policy after plugin preparation is absent.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GATEWAY_CLIENT_MODES,
@@ -107,9 +105,7 @@ describe("runMessageAction core send routing", () => {
       registerTestChatPlugin({ deliveryMode: "direct", sendText });
 
       const result = await runMessageAction({
-        params: {
-          message: "hello",
-        },
+        params: { message: "hello" },
         gateway: {
           clientName: GATEWAY_CLIENT_NAMES.CLI,
           mode: GATEWAY_CLIENT_MODES.CLI,
@@ -134,13 +130,9 @@ describe("runMessageAction core send routing", () => {
     const sendText = vi.fn().mockRejectedValue(new Error("provider rejected the message"));
     registerTestChatPlugin({ deliveryMode: "direct", sendText });
 
-    await expect(
-      runMessageAction({
-        params: {
-          message: "hello",
-        },
-      }),
-    ).rejects.toThrow("provider rejected the message");
+    await expect(runMessageAction({ params: { message: "hello" } })).rejects.toThrow(
+      "provider rejected the message",
+    );
     expect(sendText).toHaveBeenCalledOnce();
   });
 
@@ -168,9 +160,10 @@ describe("runMessageAction core send routing", () => {
 
     expect(result.kind).toBe("send");
     expect(sendMedia).toHaveBeenCalledOnce();
-    const mediaInput = mockFirstRecordArg(sendMedia, "send media");
-    expect(mediaInput.text).toBe("hello");
-    expect(mediaInput.mediaUrl).toBe("https://example.com/file.txt");
+    expect(mockFirstRecordArg(sendMedia, "send media")).toMatchObject({
+      text: "hello",
+      mediaUrl: "https://example.com/file.txt",
+    });
   });
 
   it("preserves an explicit provider reply target with its canonical thread root", async () => {
@@ -341,22 +334,38 @@ describe("runMessageAction core send routing", () => {
     });
   });
 
-  it("does not double-apply responsePrefix when the text already carries it", async () => {
+  it.each([
+    {
+      name: "does not double-apply an existing prefix",
+      prefix: "[Nexus]",
+      message: "[Nexus] already prefixed",
+      expected: "[Nexus] already prefixed",
+    },
+    {
+      name: "resolves identity templates",
+      prefix: "[{identity.name}]",
+      message: "hello world",
+      expected: "[Nexus] hello world",
+      agents: { entries: { main: { identity: { name: "Nexus" } } } },
+    },
+    {
+      name: "drops unresolved model templates",
+      prefix: "[{provider}/{model}]",
+      message: "hello world",
+      expected: "hello world",
+    },
+  ])("responsePrefix $name", async ({ prefix, message, expected, agents }) => {
     const sendText = registerSlackTextPlugin();
-
     await runMessageAction({
       cfg: {
-        channels: { slack: { enabled: true, responsePrefix: "[Nexus]" } },
+        channels: { slack: { enabled: true, responsePrefix: prefix } },
+        ...(agents ? { agents } : {}),
       } as OpenClawConfig,
-      params: {
-        channel: "slack",
-        target: "channel:OTHER",
-        message: "[Nexus] already prefixed",
-      },
+      params: { channel: "slack", target: "channel:OTHER", message },
+      ...(agents ? { agentId: "main" } : {}),
     });
-
     expect(sendText).toHaveBeenCalledOnce();
-    expect(mockFirstRecordArg(sendText, "send text").text).toBe("[Nexus] already prefixed");
+    expect(mockFirstRecordArg(sendText, "send text").text).toBe(expected);
   });
 
   it("leaves media-only sends without a responsePrefix", async () => {
@@ -390,46 +399,6 @@ describe("runMessageAction core send routing", () => {
 
     expect(sendMedia).toHaveBeenCalledOnce();
     expect(mockFirstRecordArg(sendMedia, "send media").text ?? "").toBe("");
-  });
-
-  it("resolves identity templates in responsePrefix on message-tool sends", async () => {
-    const sendText = registerSlackTextPlugin();
-
-    await runMessageAction({
-      cfg: {
-        channels: { slack: { enabled: true, responsePrefix: "[{identity.name}]" } },
-        agents: { entries: { main: { identity: { name: "Nexus" } } } },
-      } as OpenClawConfig,
-      params: {
-        channel: "slack",
-        target: "channel:OTHER",
-        message: "hello world",
-      },
-      agentId: "main",
-    });
-
-    expect(sendText).toHaveBeenCalledOnce();
-    expect(mockFirstRecordArg(sendText, "send text").text).toBe("[Nexus] hello world");
-  });
-
-  it("skips responsePrefix on tool sends when a model template cannot be resolved", async () => {
-    const sendText = registerSlackTextPlugin();
-
-    await runMessageAction({
-      cfg: {
-        channels: { slack: { enabled: true, responsePrefix: "[{provider}/{model}]" } },
-      } as OpenClawConfig,
-      params: {
-        channel: "slack",
-        target: "channel:OTHER",
-        message: "hello world",
-      },
-    });
-
-    expect(sendText).toHaveBeenCalledOnce();
-    // A tool send performs no live model selection, so the unresolved template is dropped
-    // rather than leaked as a literal `{provider}/{model}` prefix.
-    expect(mockFirstRecordArg(sendText, "send text").text).toBe("hello world");
   });
 
   it("preserves structured speech through response prefixes when automatic TTS is off", async () => {
@@ -470,24 +439,19 @@ describe("runMessageAction core send routing", () => {
         }),
       }),
     );
-    const ttsCall = mockFirstRecordArg(ttsMocks.maybeApplyTtsToPayload, "TTS payload");
-    const ttsPayload = ttsCall.payload;
+    const ttsPayload = mockFirstRecordArg(ttsMocks.maybeApplyTtsToPayload, "TTS payload").payload;
     expect(typeof ttsPayload === "object" && ttsPayload !== null).toBe(true);
     expect(getReplyPayloadMetadata(ttsPayload as object)?.tts).toEqual({
       tagged: true,
       text: "hello there",
-      directives: [
-        {
-          provider: "mock",
-          values: { voiceid: "voice-7" },
-        },
-      ],
+      directives: [{ provider: "mock", values: { voiceid: "voice-7" } }],
     });
     expect(sendMedia).toHaveBeenCalledOnce();
-    const mediaInput = mockFirstRecordArg(sendMedia, "send media");
-    expect(mediaInput.text).toBe("");
-    expect(mediaInput.mediaUrl).toBe("file:///tmp/openclaw-voice.ogg");
-    expect(mediaInput.audioAsVoice).toBe(true);
+    expect(mockFirstRecordArg(sendMedia, "send media")).toMatchObject({
+      text: "",
+      mediaUrl: "file:///tmp/openclaw-voice.ogg",
+      audioAsVoice: true,
+    });
   });
 
   it("forwards inbound audio context to message-tool TTS", async () => {
@@ -502,9 +466,7 @@ describe("runMessageAction core send routing", () => {
         channels: { testchat: { enabled: true } },
         tts: { auto: "inbound" },
       } as OpenClawConfig,
-      params: {
-        message: "voice reply",
-      },
+      params: { message: "voice reply" },
       sessionKey: "agent:main:testchat:channel:abc",
       inboundAudio: true,
     });

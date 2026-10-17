@@ -1,13 +1,11 @@
-// Covers send validation for target/channel mismatches, configured channel
-// availability, and explicit target requirements.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelOutboundContext } from "../../channels/plugins/outbound.types.js";
+import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { runMessageAction } from "./message-action-runner.js";
 import {
-  forumTestPlugin,
   runDrySend as runFixtureDrySend,
   workspaceConfig,
   workspaceTestPlugin,
@@ -24,50 +22,34 @@ const runDrySend = (actionParams: Record<string, unknown>, cross = false) =>
     actionParams: { ...target, ...actionParams },
     toolContext: cross ? crossContext : toolContext,
   });
+const register = (...plugins: ChannelPlugin[]) =>
+  setActivePluginRegistry(
+    createTestRegistry(plugins.map((plugin) => ({ pluginId: plugin.id, source: "test", plugin }))),
+  );
+const runSend = (params: Record<string, unknown>) =>
+  runMessageAction({ cfg: workspaceConfig, action: "send", params: { ...target, ...params } });
 
 function captureWorkspaceSend(messageId = "workspace-test-message") {
   const sentText: string[] = [];
-  setActivePluginRegistry(
-    createTestRegistry([
-      {
-        pluginId: "workspace",
-        source: "test",
-        plugin: {
-          ...workspaceTestPlugin,
-          outbound: {
-            ...workspaceTestPlugin.outbound,
-            sendText: async (ctx: ChannelOutboundContext) => {
-              sentText.push(ctx.text);
-              return { channel: "workspace", messageId };
-            },
-          },
-        },
+  register({
+    ...workspaceTestPlugin,
+    outbound: {
+      ...workspaceTestPlugin.outbound,
+      sendText: async (ctx: ChannelOutboundContext) => {
+        sentText.push(ctx.text);
+        return { channel: "workspace", messageId };
       },
-    ]),
-  );
+    },
+  });
   return sentText;
 }
 
 describe("runMessageAction send validation", () => {
-  beforeEach(() => {
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "workspace",
-          source: "test",
-          plugin: workspaceTestPlugin,
-        },
-        {
-          pluginId: "forum",
-          source: "test",
-          plugin: forumTestPlugin,
-        },
-      ]),
-    );
-  });
+  beforeEach(() => register(workspaceTestPlugin));
 
   afterEach(() => {
     setActivePluginRegistry(createTestRegistry([]));
+    vi.restoreAllMocks();
   });
   it("requires message when no media hint is provided", async () => {
     await expect(runDrySend({})).rejects.toThrow(/message required/i);
@@ -122,14 +104,7 @@ describe("runMessageAction send validation", () => {
   it("strips unsupported citation control markers from normal channel sends", async () => {
     const sentText = captureWorkspaceSend();
 
-    const result = await runMessageAction({
-      cfg: workspaceConfig,
-      action: "send",
-      params: {
-        ...target,
-        message: "v2026.5.20 release note citeturn2view0",
-      },
-    });
+    const result = await runSend({ message: "v2026.5.20 release note citeturn2view0" });
 
     expect(result).toMatchObject({
       kind: "send",
@@ -151,7 +126,6 @@ describe("runMessageAction send validation", () => {
     {
       name: "structured poll params",
       actionParams: {
-        ...target,
         message: "hi",
         pollQuestion: "Ready?",
         pollOption: ["Yes", "No"],
@@ -160,7 +134,6 @@ describe("runMessageAction send validation", () => {
     {
       name: "snake_case content poll params",
       actionParams: {
-        ...target,
         message: "hi",
         poll_question: "Ready?",
         poll_option: ["Yes", "No"],
@@ -179,25 +152,6 @@ describe("runMessageAction send validation", () => {
       }),
     ).rejects.toThrow("location must be an object");
   });
-});
-describe("message body alias normalization", () => {
-  beforeEach(() => {
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "workspace",
-          source: "test",
-          plugin: workspaceTestPlugin,
-        },
-      ]),
-    );
-  });
-
-  afterEach(() => {
-    setActivePluginRegistry(createTestRegistry([]));
-    vi.restoreAllMocks();
-  });
-
   it.each([
     {
       name: "mixed reasoning preamble alias",
@@ -210,11 +164,7 @@ describe("message body alias normalization", () => {
     { name: "caption fallback", body: { message: "", caption: "    indented body" } },
   ])("delivers code indentation through $name", async ({ body }) => {
     const sentText = captureWorkspaceSend("body-whitespace");
-    const result = await runMessageAction({
-      cfg: workspaceConfig,
-      action: "send",
-      params: { ...target, ...body },
-    });
+    const result = await runSend(body);
     expect(result.kind).toBe("send");
     expect(sentText).toEqual(["    indented body"]);
   });
@@ -229,15 +179,12 @@ describe("message body alias normalization", () => {
       SendMessage: "Reasoning:\n_internal plan_\n\nVisible answer",
     },
   ])("sanitizes SendMessage alias $name before delivery", async ({ SendMessage }) => {
+    register(workspaceTestPlugin);
     const result = await runMessageAction({
       cfg: emptyConfig,
       action: "send",
-      params: {
-        SendMessage,
-      },
-      toolContext: {
-        currentChannelProvider: "webchat",
-      },
+      params: { SendMessage },
+      toolContext: { currentChannelProvider: "webchat" },
       sessionKey: "agent:main:main",
       sourceReplyDeliveryMode: "message_tool_only",
     });
