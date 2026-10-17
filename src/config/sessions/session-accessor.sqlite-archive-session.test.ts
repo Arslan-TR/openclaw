@@ -28,6 +28,7 @@ import {
 } from "../../test-utils/openclaw-test-state.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
 import {
+  createSessionEntryWithTranscript,
   deleteSessionEntryLifecycle,
   loadSessionEntry,
   loadTranscriptEvents,
@@ -180,7 +181,7 @@ describe("SQLite transcript archive sessions", () => {
     }
   });
 
-  it("reuses one archive worker across deletion generations and joins it before returning", async () => {
+  it("reuses one archive worker across deletion generations and joins it at database close", async () => {
     const sessionKey = "agent:main:durable-delete";
     const sessionIds = ["durable-delete-first", "durable-delete-second", "durable-delete-current"];
     const events = sessionIds.map((sessionId) =>
@@ -221,7 +222,7 @@ describe("SQLite transcript archive sessions", () => {
       "published",
     ]);
     expect(new Set(archiveWorkers.replies.map(({ worker }) => worker)).size).toBe(1);
-    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
+    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId > 0)).toBe(true);
     expect(publicationRows).toEqual(sessionIds.map(() => ({ session_key: sessionKey })));
     expect(result.deleted).toBe(true);
     expect(result.archivedTranscripts).toHaveLength(sessionIds.length);
@@ -240,6 +241,44 @@ describe("SQLite transcript archive sessions", () => {
     ).toEqual(
       sessionIds.map(() => ({ published_at: expect.any(Number), session_key: sessionKey })),
     );
+    await closeOpenClawAgentDatabaseByPathAsync(database.path);
+    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
+  });
+
+  it("reuses one archive worker across sequential deletions of newly created sessions", async () => {
+    const database = openLifecycleTestDatabase(storePath);
+    const archiveWorkers = observeArchiveSessionWorkers();
+    try {
+      for (const sessionId of ["empty-first", "empty-second"]) {
+        const sessionKey = `agent:main:${sessionId}`;
+        const scope = { sessionKey, sessionId, storePath };
+        await createSessionEntryWithTranscript(scope, () => ({
+          ok: true,
+          entry: { sessionId, updatedAt: Date.now() },
+        }));
+        const events = await loadTranscriptEvents(scope);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ type: "session", id: sessionId });
+        const result = await deleteArchivedSession(sessionKey);
+        expect(result.deleted).toBe(true);
+        expect(result.archivedTranscripts).toHaveLength(1);
+        expect(readArchiveLines(result.archivedTranscripts[0]?.archivedPath)).toEqual(
+          events.map((event) => JSON.stringify(event)),
+        );
+      }
+      expect(archiveWorkers.replies.map(({ message }) => message.type)).toEqual([
+        "done",
+        "published",
+        "done",
+        "published",
+      ]);
+      expect(new Set(archiveWorkers.replies.map(({ worker }) => worker)).size).toBe(1);
+      expect(archiveWorkers.replies.every(({ worker }) => worker.threadId > 0)).toBe(true);
+      await closeOpenClawAgentDatabaseByPathAsync(database.path);
+      expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
+    } finally {
+      archiveWorkers.stop();
+    }
   });
 
   it("publishes archive metadata off the main thread even inside a native deletion scope", async () => {
@@ -437,7 +476,7 @@ describe("SQLite transcript archive sessions", () => {
       }
       secondDeletion = deleteScope(second);
       const secondResult = await secondDeletion;
-      expect(firstWorker?.threadId).toBe(-1);
+      expect(firstWorker?.threadId === -1).toBe(exited);
       expect(readArchiveLines(secondResult.archivedTranscripts[0]?.archivedPath)).toEqual([
         JSON.stringify(events[1]),
       ]);
@@ -465,8 +504,9 @@ describe("SQLite transcript archive sessions", () => {
         ["published", second.sessionId],
         ["published", first.sessionId],
       ]);
-      expect(observedWorkers.size).toBe(exited ? 3 : 2);
+      expect(observedWorkers.size).toBe(exited ? 2 : 1);
       expect(activeWorkersAtReply).toEqual([1, 1, 1, 1]);
+      await closeOpenClawAgentDatabasesAsync(tempDir);
       expect([...observedWorkers].every((worker) => worker.threadId === -1)).toBe(true);
     } finally {
       releasePublication.resolve();
