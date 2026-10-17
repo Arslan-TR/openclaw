@@ -15,10 +15,7 @@ import { runOutsideAsyncWorkScope } from "../../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import * as writerQueue from "../../../shared/store-writer-queue.js";
 import { releaseOpenClawAgentDatabaseReadValidation } from "../../../state/openclaw-agent-db-validation-cache.js";
-import type {
-  AgentDatabaseExecutionScope,
-  OpenClawAgentDatabaseExecution,
-} from "../../../state/openclaw-agent-execution-contract.js";
+import type { OpenClawAgentDatabaseExecution } from "../../../state/openclaw-agent-execution-contract.js";
 import * as executionOwner from "../../../state/openclaw-agent-execution.js";
 import { SQLITE_SESSION_WRITER_QUEUES } from "../../../state/openclaw-agent-write-admission-state.js";
 import { enqueueSwarmRun, isSwarmRunActive } from "../swarm/swarm-scheduler.js";
@@ -36,6 +33,174 @@ beforeEach(async () => {
   await captureRuntimeConfigAsyncReader()();
 });
 
+function holdMetadataPublication(
+  signal: AbortSignal,
+  consumerScope: AsyncLocalStorage<boolean>,
+  beforeHeld?: () => Promise<void>,
+  afterReleased?: () => void,
+) {
+  const producerScope = new AsyncLocalStorage<boolean>();
+  const nativeHeld = createDeferredCore();
+  const releaseNative = createDeferredCore();
+  const state = { holdingResult: false, joinedPublication: false };
+  let producerPath: string | undefined;
+  const release = () => releaseNative.resolve();
+  signal.addEventListener("abort", release, { once: true });
+  const runQueued = writerQueue.runQueuedStoreWrite;
+  vi.spyOn(writerQueue, "runQueuedStoreWrite").mockImplementation((params) => {
+    if (params.queues !== SQLITE_SESSION_WRITER_QUEUES) {
+      return runQueued(params);
+    }
+    if (producerScope.getStore()) {
+      producerPath ??= params.storePath;
+    }
+    const joining =
+      consumerScope.getStore() &&
+      !producerScope.getStore() &&
+      state.holdingResult &&
+      params.storePath === producerPath;
+    const before = joining
+      ? new Set(params.queues.get(params.storePath)?.pending ?? [])
+      : undefined;
+    const result = runQueued(params);
+    if (
+      before &&
+      params.queues.get(params.storePath)?.pending.some((entry) => !before.has(entry))
+    ) {
+      state.joinedPublication = true;
+      release();
+    }
+    return result;
+  });
+  const wrapExecution = (execution: OpenClawAgentDatabaseExecution) => {
+    if (!producerScope.getStore()) {
+      return execution;
+    }
+    const runExisting: typeof execution.runExisting = (source, operation, options) =>
+      execution.runExisting(
+        source,
+        (scope) =>
+          operation({
+            execute(command, commandOptions) {
+              const pending = scope.execute(command, commandOptions);
+              if (command.type !== "session.entries.replace" || state.holdingResult) {
+                return pending;
+              }
+              state.holdingResult = true;
+              // Hold settlement after the native commit has granted publication custody.
+              return pending.then(async (value) => {
+                if (beforeHeld) {
+                  await beforeHeld();
+                }
+                nativeHeld.resolve();
+                await releaseNative.promise;
+                afterReleased?.();
+                return value;
+              });
+            },
+          }),
+        options,
+      );
+    return new Proxy(execution, {
+      get(original, key, receiver) {
+        return key === "runExisting" ? runExisting : Reflect.get(original, key, receiver);
+      },
+    });
+  };
+  const capture = executionOwner.captureOpenClawAgentDatabaseExecution;
+  vi.spyOn(executionOwner, "captureOpenClawAgentDatabaseExecution").mockImplementation((...args) =>
+    wrapExecution(capture(...args)),
+  );
+  const prepare = executionOwner.captureOpenClawAgentDatabasePreparationExecution;
+  vi.spyOn(executionOwner, "captureOpenClawAgentDatabasePreparationExecution").mockImplementation(
+    (...args) => wrapExecution(prepare(...args)),
+  );
+  return {
+    producerScope,
+    nativeHeld,
+    state,
+    release,
+    dispose() {
+      signal.removeEventListener("abort", release);
+      producerScope.disable();
+      consumerScope.disable();
+    },
+  };
+}
+
+function publishMetadata(params: {
+  producerScope: AsyncLocalStorage<boolean>;
+  storePath: string;
+  childKey: string;
+  sessionId: string;
+  signal: AbortSignal;
+  replacement?: boolean;
+}) {
+  const { producerScope, storePath, childKey, sessionId, signal, replacement } = params;
+  const update = () =>
+    applySessionEntryExactReplacements({
+      agentId: "main",
+      storePath,
+      sessionKeys: [childKey],
+      activeSessionKey: childKey,
+      skipMaintenance: true,
+      requireWriteSuccess: true,
+      update(entries) {
+        const row = entries.find((entry) => entry.sessionKey === childKey);
+        if (!row || row.entry.sessionId !== sessionId) {
+          throw new Error("Metadata producer lost its child");
+        }
+        return {
+          result: undefined,
+          replacements: [
+            {
+              sessionKey: childKey,
+              entry: {
+                ...row.entry,
+                sessionId: replacement ? `${sessionId}-replacement` : sessionId,
+                label: "metadata survived",
+              },
+            },
+          ],
+        };
+      },
+    });
+  return runOutsideAsyncWorkScope(() =>
+    runWithGatewayIndependentRootWorkAdmission(
+      () => producerScope.run(true, update),
+      "test:pending-metadata",
+      signal,
+    ),
+  );
+}
+
+async function registerPublicationRun(runId: string, collect?: boolean) {
+  const childKey = `agent:main:subagent:${runId}`;
+  const sessionId = `${runId}-session`;
+  const parentKey = "agent:main:main";
+  const storePath = await writeSubagentSessionEntry({
+    stateDir: fixture.stateDir,
+    agentId: "main",
+    sessionKey: childKey,
+    defaultSessionId: sessionId,
+    lifecycleRevision: `${sessionId}-revision`,
+  });
+  await registerSubagentRun({
+    runId,
+    childSessionKey: childKey,
+    childAgentId: "main",
+    sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey: childKey })?.entry,
+    requesterSessionKey: parentKey,
+    requesterAgentId: "main",
+    requesterDisplayKey: parentKey,
+    task: collect ? "held collector publication" : "held metadata publication",
+    ...(collect ? { collect: true, queued: false } : {}),
+    cleanup: "keep",
+    expectsCompletionMessage: false,
+  });
+  return { childKey, sessionId, parentKey, storePath };
+}
+
 it.for([
   { replacement: true, competingIdle: false, publication: "tombstone" },
   { replacement: false, competingIdle: true, publication: "tombstone" },
@@ -45,29 +210,8 @@ it.for([
 ])(
   "joins a pending session publication before cancellation $publication (replacement=$replacement, competing idle=$competingIdle)",
   async ({ replacement, competingIdle, publication }, { signal }) => {
-    const parentKey = "agent:main:main";
-    const childKey = "agent:main:subagent:pending-kill-publication";
     const runId = "pending-kill-publication";
-    const sessionId = "pending-kill-publication-session";
-    const storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey: childKey,
-      defaultSessionId: sessionId,
-      lifecycleRevision: `${sessionId}-revision`,
-    });
-    await registerSubagentRun({
-      runId,
-      childSessionKey: childKey,
-      childAgentId: "main",
-      sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey: childKey })?.entry,
-      requesterSessionKey: parentKey,
-      requesterAgentId: "main",
-      requesterDisplayKey: parentKey,
-      task: "held metadata publication",
-      cleanup: "keep",
-      expectsCompletionMessage: false,
-    });
+    const { parentKey, childKey, sessionId, storePath } = await registerPublicationRun(runId);
     let peerExecution:
       | ReturnType<typeof executionOwner.captureOpenClawAgentDatabaseExecution>
       | undefined;
@@ -103,18 +247,23 @@ it.for([
       childPhysicalPath = childExecution.path;
       await childExecution.release();
     }
-    const producerScope = new AsyncLocalStorage<boolean>();
     const killScope = new AsyncLocalStorage<boolean>();
-    const nativeHeld = createDeferredCore();
-    const releaseNative = createDeferredCore();
-    let producerPath: string | undefined;
-    let holdingResult = false;
-    let joinedPublication = false;
     let peerReleasedDuringPublication = false;
     let producer: Promise<void> | undefined;
     let producerOutcome: Promise<unknown> | undefined;
-    const release = () => releaseNative.resolve();
-    signal.addEventListener("abort", release, { once: true });
+    const peer = peerExecution;
+    const { producerScope, nativeHeld, state, release, dispose } = holdMetadataPublication(
+      signal,
+      killScope,
+      peer
+        ? async () => {
+            // Drop transferable validation without retiring the borrowed native writer.
+            releaseOpenClawAgentDatabaseReadValidation([{ path: childPhysicalPath! }]);
+            await peer.release();
+            peerReleasedDuringPublication = true;
+          }
+        : undefined,
+    );
     if (publication === "discovery") {
       const prepareGeneration = sessionGeneration.prepareSessionGenerationFacts;
       vi.spyOn(sessionGeneration, "prepareSessionGenerationFacts").mockImplementation(
@@ -125,15 +274,15 @@ it.for([
             assertCurrent: () => {
               // Let the native writer settle after this synchronous observation.
               // An unprepared discovery still sees the genuinely pending publication.
-              if (holdingResult) {
+              if (state.holdingResult) {
                 release();
               }
               facts.assertCurrent();
             },
             prepareRead: () => {
               const pending = facts.prepareRead();
-              if (holdingResult && pending) {
-                joinedPublication = true;
+              if (state.holdingResult && pending) {
+                state.joinedPublication = true;
                 release();
               }
               return pending;
@@ -142,118 +291,16 @@ it.for([
         },
       );
     }
-    const runQueued = writerQueue.runQueuedStoreWrite;
-    vi.spyOn(writerQueue, "runQueuedStoreWrite").mockImplementation((params) => {
-      if (params.queues !== SQLITE_SESSION_WRITER_QUEUES) {
-        return runQueued(params);
-      }
-      if (producerScope.getStore()) {
-        producerPath ??= params.storePath;
-      }
-      const joining =
-        killScope.getStore() &&
-        !producerScope.getStore() &&
-        holdingResult &&
-        params.storePath === producerPath;
-      const before = joining
-        ? new Set(params.queues.get(params.storePath)?.pending ?? [])
-        : undefined;
-      const result = runQueued(params);
-      if (
-        before &&
-        params.queues.get(params.storePath)?.pending.some((entry) => !before.has(entry))
-      ) {
-        joinedPublication = true;
-        release();
-      }
-      return result;
-    });
-    const wrapExecution = (execution: OpenClawAgentDatabaseExecution) => {
-      if (!producerScope.getStore()) {
-        return execution;
-      }
-      const runExisting: typeof execution.runExisting = (source, operation, options) =>
-        execution.runExisting(
-          source,
-          (scope) => {
-            const wrapped: AgentDatabaseExecutionScope = {
-              execute(command, commandOptions) {
-                const pending = scope.execute(command, commandOptions);
-                if (command.type !== "session.entries.replace" || holdingResult) {
-                  return pending;
-                }
-                holdingResult = true;
-                return pending.then(async (value) => {
-                  if (peerExecution) {
-                    // Read-cache cleanup may drop transferable validation without retiring
-                    // the live native writer. Reopening then requires registration again.
-                    releaseOpenClawAgentDatabaseReadValidation([{ path: childPhysicalPath! }]);
-                    // Occupy the idle slot while the child's native writer is still borrowed.
-                    await peerExecution.release();
-                    peerReleasedDuringPublication = true;
-                  }
-                  nativeHeld.resolve();
-                  await releaseNative.promise;
-                  return value;
-                });
-              },
-            };
-            return operation(wrapped);
-          },
-          options,
-        );
-      return new Proxy(execution, {
-        get(original, key, receiver) {
-          return key === "runExisting" ? runExisting : Reflect.get(original, key, receiver);
-        },
-      });
-    };
-    const captureExecution = executionOwner.captureOpenClawAgentDatabaseExecution;
-    vi.spyOn(executionOwner, "captureOpenClawAgentDatabaseExecution").mockImplementation(
-      (...args) => wrapExecution(captureExecution(...args)),
-    );
-    const capturePreparation = executionOwner.captureOpenClawAgentDatabasePreparationExecution;
-    vi.spyOn(executionOwner, "captureOpenClawAgentDatabasePreparationExecution").mockImplementation(
-      (...args) => wrapExecution(capturePreparation(...args)),
-    );
     const startProducer = async () => {
       if (!producer) {
-        producer = runOutsideAsyncWorkScope(() =>
-          runWithGatewayIndependentRootWorkAdmission(
-            () =>
-              producerScope.run(true, () =>
-                applySessionEntryExactReplacements({
-                  agentId: "main",
-                  storePath,
-                  sessionKeys: [childKey],
-                  activeSessionKey: childKey,
-                  skipMaintenance: true,
-                  requireWriteSuccess: true,
-                  update(entries) {
-                    const row = entries.find((entry) => entry.sessionKey === childKey);
-                    if (!row || row.entry.sessionId !== sessionId) {
-                      throw new Error("Metadata producer lost its child");
-                    }
-                    return {
-                      result: undefined,
-                      replacements: [
-                        {
-                          sessionKey: childKey,
-                          entry: {
-                            ...row.entry,
-                            sessionId: replacement ? `${sessionId}-replacement` : sessionId,
-                            label: "metadata survived",
-                          },
-                        },
-                      ],
-                    };
-                  },
-                }),
-              ),
-            "test:kill-pending-metadata",
-            signal,
-          ),
-        );
+        producer = publishMetadata({
+          producerScope,
+          storePath,
+          childKey,
+          sessionId,
+          signal,
+          replacement,
+        });
         producerOutcome = producer.then(
           () => ({ ok: true }),
           (error: unknown) => ({ error }),
@@ -265,11 +312,7 @@ it.for([
         );
       }
     };
-    const acquire = vi.spyOn(
-      SubagentLifecycleController.prototype,
-      "acquireTerminalCompletionLock",
-    );
-    acquire.mockRestore();
+    const acquire = SubagentLifecycleController.prototype.acquireTerminalCompletionLock;
     vi.spyOn(
       SubagentLifecycleController.prototype,
       "acquireTerminalCompletionLock",
@@ -342,11 +385,14 @@ it.for([
       if (!replacement && publication !== "result") {
         expect(result, JSON.stringify(result)).toMatchObject({ status: "ok", killed: 1 });
       }
-      expect(holdingResult).toBe(true);
-      expect(joinedPublication).toBe(true);
+      expect(state).toEqual({ holdingResult: true, joinedPublication: true });
       expect(peerReleasedDuringPublication).toBe(competingIdle);
       expect(await producerOutcome).toEqual({ ok: true });
       const persisted = loadExactSessionEntryReadOnly({ storePath, sessionKey: childKey })?.entry;
+      expect(persisted).toMatchObject({
+        sessionId: replacement ? `${sessionId}-replacement` : sessionId,
+        label: "metadata survived",
+      });
       if (publication === "result") {
         expect(onResult).toHaveBeenCalledExactlyOnceWith(result);
         expect(result).toMatchObject({ found: true, killed: true });
@@ -359,26 +405,14 @@ it.for([
             targetState: { state: "terminal", task: { status: "cancelled" } },
           });
         }
-        expect(persisted).toMatchObject({
-          sessionId: replacement ? `${sessionId}-replacement` : sessionId,
-          label: "metadata survived",
-        });
         return;
       }
       if (replacement) {
         expect(result, JSON.stringify(result)).toMatchObject({ status: "error", killed: 0 });
-        expect(persisted).toMatchObject({
-          sessionId: `${sessionId}-replacement`,
-          label: "metadata survived",
-        });
         expect(persisted?.abortedLastRun).not.toBe(true);
         expect(subagentRuns.get(runId)?.endedReason).not.toBe("subagent-killed");
       } else {
-        expect(persisted).toMatchObject({
-          sessionId,
-          label: "metadata survived",
-          abortedLastRun: true,
-        });
+        expect(persisted?.abortedLastRun).toBe(true);
         expect(subagentRuns.get(runId)).toMatchObject({
           endedReason: "subagent-killed",
           execution: { status: "terminal" },
@@ -388,39 +422,14 @@ it.for([
       release();
       await producerOutcome;
       await peerExecution?.release();
-      signal.removeEventListener("abort", release);
-      producerScope.disable();
-      killScope.disable();
+      dispose();
     }
   },
 );
 
 it("joins a pending session publication before a collector terminal commit", async ({ signal }) => {
-  const parentKey = "agent:main:main";
-  const childKey = "agent:main:subagent:pending-collector-publication";
   const runId = "pending-collector-publication";
-  const sessionId = "pending-collector-publication-session";
-  const storePath = await writeSubagentSessionEntry({
-    stateDir: fixture.stateDir,
-    agentId: "main",
-    sessionKey: childKey,
-    defaultSessionId: sessionId,
-    lifecycleRevision: `${sessionId}-revision`,
-  });
-  await registerSubagentRun({
-    runId,
-    childSessionKey: childKey,
-    childAgentId: "main",
-    sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey: childKey })?.entry,
-    requesterSessionKey: parentKey,
-    requesterAgentId: "main",
-    requesterDisplayKey: parentKey,
-    task: "held collector publication",
-    collect: true,
-    queued: false,
-    cleanup: "keep",
-    expectsCompletionMessage: false,
-  });
+  const { childKey, sessionId, storePath } = await registerPublicationRun(runId, true);
   enqueueSwarmRun({
     groupId: "pending-collector-publication",
     runId: "pending-collector-sibling",
@@ -429,83 +438,17 @@ it("joins a pending session publication before a collector terminal commit", asy
     maxConcurrent: 1,
     onStartFailure: () => true,
   });
-  const producerScope = new AsyncLocalStorage<boolean>();
   const completionScope = new AsyncLocalStorage<boolean>();
-  const nativeHeld = createDeferredCore();
-  const releaseNative = createDeferredCore();
-  let producerPath: string | undefined;
-  let holdingResult = false;
-  let joinedPublication = false;
   let statusWhileJoined: string | undefined;
   let producerOutcome: Promise<unknown> | undefined;
-  const release = () => releaseNative.resolve();
-  signal.addEventListener("abort", release, { once: true });
-  const runQueued = writerQueue.runQueuedStoreWrite;
-  vi.spyOn(writerQueue, "runQueuedStoreWrite").mockImplementation((params) => {
-    if (params.queues !== SQLITE_SESSION_WRITER_QUEUES) {
-      return runQueued(params);
-    }
-    if (producerScope.getStore()) {
-      producerPath ??= params.storePath;
-    }
-    const joining =
-      completionScope.getStore() &&
-      !producerScope.getStore() &&
-      holdingResult &&
-      params.storePath === producerPath;
-    const before = joining
-      ? new Set(params.queues.get(params.storePath)?.pending ?? [])
-      : undefined;
-    const result = runQueued(params);
-    if (
-      before &&
-      params.queues.get(params.storePath)?.pending.some((entry) => !before.has(entry))
-    ) {
-      joinedPublication = true;
-      release();
-    }
-    return result;
-  });
-  const wrapExecution = (execution: OpenClawAgentDatabaseExecution) => {
-    if (!producerScope.getStore()) {
-      return execution;
-    }
-    const runExisting: typeof execution.runExisting = (source, operation, options) =>
-      execution.runExisting(
-        source,
-        (scope) =>
-          operation({
-            execute(command, commandOptions) {
-              const pending = scope.execute(command, commandOptions);
-              if (command.type !== "session.entries.replace" || holdingResult) {
-                return pending;
-              }
-              holdingResult = true;
-              // The native commit granted publication custody; hold its settlement.
-              return pending.then(async (value) => {
-                nativeHeld.resolve();
-                await releaseNative.promise;
-                // The waiting commit keeps its staged terminal row off-registry.
-                statusWhileJoined = subagentRuns.get(runId)?.execution.status;
-                return value;
-              });
-            },
-          }),
-        options,
-      );
-    return new Proxy(execution, {
-      get(original, key, receiver) {
-        return key === "runExisting" ? runExisting : Reflect.get(original, key, receiver);
-      },
-    });
-  };
-  const captureExecution = executionOwner.captureOpenClawAgentDatabaseExecution;
-  vi.spyOn(executionOwner, "captureOpenClawAgentDatabaseExecution").mockImplementation((...args) =>
-    wrapExecution(captureExecution(...args)),
-  );
-  const capturePreparation = executionOwner.captureOpenClawAgentDatabasePreparationExecution;
-  vi.spyOn(executionOwner, "captureOpenClawAgentDatabasePreparationExecution").mockImplementation(
-    (...args) => wrapExecution(capturePreparation(...args)),
+  const { producerScope, nativeHeld, state, release, dispose } = holdMetadataPublication(
+    signal,
+    completionScope,
+    undefined,
+    () => {
+      // The waiting commit keeps its staged terminal row off-registry.
+      statusWhileJoined = subagentRuns.get(runId)?.execution.status;
+    },
   );
   const prepareSession = controlSession.prepareSubagentKillSession;
   vi.spyOn(controlSession, "prepareSubagentKillSession").mockImplementation(async (...args) => {
@@ -515,45 +458,16 @@ it("joins a pending session publication before a collector terminal commit", asy
     }
     // Completion retained generation facts; a child metadata writer now reaches its
     // native commit before the terminal registry commit.
-    const producer = runOutsideAsyncWorkScope(() =>
-      runWithGatewayIndependentRootWorkAdmission(
-        () =>
-          producerScope.run(true, () =>
-            applySessionEntryExactReplacements({
-              agentId: "main",
-              storePath,
-              sessionKeys: [childKey],
-              activeSessionKey: childKey,
-              skipMaintenance: true,
-              requireWriteSuccess: true,
-              update(entries) {
-                const row = entries.find((entry) => entry.sessionKey === childKey);
-                if (!row || row.entry.sessionId !== sessionId) {
-                  throw new Error("Metadata producer lost its child");
-                }
-                return {
-                  result: undefined,
-                  replacements: [
-                    { sessionKey: childKey, entry: { ...row.entry, label: "metadata survived" } },
-                  ],
-                };
-              },
-            }),
-          ),
-        "test:collector-pending-metadata",
-        signal,
-      ),
-    );
+    const producer = publishMetadata({ producerScope, storePath, childKey, sessionId, signal });
     producerOutcome = producer.then(
       () => ({ ok: true }),
       (error: unknown) => ({ error }),
     );
-    await Promise.race([
+    await awaitGateBeforeSettlement(
       nativeHeld.promise,
-      producer.then(() => {
-        throw new Error("Metadata publication was not held");
-      }),
-    ]);
+      producer,
+      "Metadata publication was not held",
+    );
     return {
       ...session,
       // A failed commit still releases its session; never strand the held producer.
@@ -575,8 +489,7 @@ it("joins a pending session publication before a collector terminal commit", asy
       }),
     );
     await fixture.settle();
-    expect(holdingResult).toBe(true);
-    expect(joinedPublication).toBe(true);
+    expect(state).toEqual({ holdingResult: true, joinedPublication: true });
     expect(startedStatus).not.toBe("terminal");
     expect(statusWhileJoined).toBe(startedStatus);
     expect(await producerOutcome).toEqual({ ok: true });
@@ -588,8 +501,6 @@ it("joins a pending session publication before a collector terminal commit", asy
   } finally {
     release();
     await producerOutcome;
-    signal.removeEventListener("abort", release);
-    producerScope.disable();
-    completionScope.disable();
+    dispose();
   }
 });

@@ -43,6 +43,53 @@ import { writeSubagentSessionEntry } from "./subagent-registry.persistence.test-
 import { getSubagentRunByChildSessionKey } from "./subagent-registry.test-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
+const stopContext = (SessionKey: string, Provider = "stop-lookup", room = "room") =>
+  buildTestCtx({
+    CommandBody: "/stop",
+    RawBody: "/stop",
+    CommandAuthorized: true,
+    Provider,
+    Surface: Provider,
+    SessionKey,
+    From: `${Provider}:${room}`,
+    To: `${Provider}:${room}`,
+  });
+
+function holdConversationLookup(entered: () => void, released: Promise<void>, failure?: Error) {
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: "stop-lookup",
+        source: "test",
+        plugin: {
+          ...createChannelTestPluginBase({ id: "stop-lookup" }),
+          conversationBindings: { supportsCurrentConversationBinding: true },
+        },
+      },
+    ]),
+  );
+  const service = getSessionBindingService();
+  const resolve = service.resolveByConversationAsync.bind(service);
+  const lookup = vi
+    .spyOn(service, "resolveByConversationAsync")
+    .mockImplementationOnce(async (c) => {
+      expect(c).toMatchObject({ channel: "stop-lookup", conversationId: "room" });
+      entered();
+      await released;
+      if (failure) {
+        throw failure;
+      }
+      return resolve(c);
+    });
+  return () => lookup.mockRestore();
+}
+
+const awaitLookup = (gate: Promise<void>, stop: Promise<unknown>, signal: AbortSignal) =>
+  withinTest(
+    awaitGateBeforeSettlement(gate, stop, "Stop completed before its ACP lookup boundary"),
+    signal,
+  );
+
 export function registerQueuedStopControlTests({
   addRun,
   controllerFor,
@@ -179,53 +226,12 @@ export function registerQueuedStopControlTests({
             }),
           ).toMatchObject({ found: true, killed: true, cascadeKilled: 1 });
         } else if (duringLookup) {
-          setActivePluginRegistry(
-            createTestRegistry([
-              {
-                pluginId: "stop-lookup",
-                source: "test",
-                plugin: {
-                  ...createChannelTestPluginBase({ id: "stop-lookup" }),
-                  conversationBindings: { supportsCurrentConversationBinding: true },
-                },
-              },
-            ]),
-          );
-          const service = getSessionBindingService();
-          const resolve = service.resolveByConversationAsync.bind(service);
-          const lookup = vi
-            .spyOn(service, "resolveByConversationAsync")
-            .mockImplementationOnce(async (conversation) => {
-              expect(conversation).toMatchObject({
-                channel: "stop-lookup",
-                conversationId: "room",
-              });
-              lookupEntered.resolve();
-              await releaseLookup.promise;
-              return resolve(conversation);
-            });
-          restoreLookup = () => lookup.mockRestore();
+          restoreLookup = holdConversationLookup(lookupEntered.resolve, releaseLookup.promise);
           stopDuringLookup = tryFastAbortFromMessage({
             cfg,
-            ctx: buildTestCtx({
-              CommandBody: "/stop",
-              RawBody: "/stop",
-              CommandAuthorized: true,
-              Provider: "stop-lookup",
-              Surface: "stop-lookup",
-              SessionKey: controllerSessionKey,
-              From: "stop-lookup:room",
-              To: "stop-lookup:room",
-            }),
+            ctx: stopContext(controllerSessionKey),
           });
-          await withinTest(
-            awaitGateBeforeSettlement(
-              lookupEntered.promise,
-              stopDuringLookup,
-              "Stop completed before its ACP lookup boundary",
-            ),
-            signal,
-          );
+          await awaitLookup(lookupEntered.promise, stopDuringLookup, signal);
           expect(parent?.abortSignal.aborted).toBe(false);
           const later = await addRun({
             runId: "later-human-native-root",
@@ -260,16 +266,7 @@ export function registerQueuedStopControlTests({
           expect(
             await tryFastAbortFromMessage({
               cfg,
-              ctx: buildTestCtx({
-                CommandBody: "/stop",
-                RawBody: "/stop",
-                CommandAuthorized: true,
-                Provider: "telegram",
-                Surface: "telegram",
-                SessionKey: controllerSessionKey,
-                From: "telegram:queue-owner",
-                To: "telegram:queue-owner",
-              }),
+              ctx: stopContext(controllerSessionKey, "telegram", "queue-owner"),
             }),
           ).toMatchObject({ handled: true, stoppedSubagents: 2, failedSubagents: 0 });
           expect(parent?.abortSignal.aborted).toBe(true);
@@ -359,55 +356,18 @@ export function registerRequestFrontierControlTests(fixture: { readonly stateDir
         );
         expect(captureExecRequestCancellation(identity).owners).toEqual(owners);
         expect(subagentRuns.size).toBe(0);
-        setActivePluginRegistry(
-          createTestRegistry([
-            {
-              pluginId: "stop-lookup",
-              source: "test",
-              plugin: {
-                ...createChannelTestPluginBase({ id: "stop-lookup" }),
-                conversationBindings: { supportsCurrentConversationBinding: true },
-              },
-            },
-          ]),
-        );
-        const service = getSessionBindingService();
-        const resolve = service.resolveByConversationAsync.bind(service);
         const lookupFailure = new Error("ACP lookup failed");
-        const lookup = vi
-          .spyOn(service, "resolveByConversationAsync")
-          .mockImplementationOnce(async (conversation) => {
-            expect(conversation).toMatchObject({ channel: "stop-lookup", conversationId: "room" });
-            lookupEntered.resolve();
-            await releaseLookup.promise;
-            if (phase === "lookup rejected") {
-              throw lookupFailure;
-            }
-            return resolve(conversation);
-          });
-        restoreLookup = () => lookup.mockRestore();
+        restoreLookup = holdConversationLookup(
+          lookupEntered.resolve,
+          releaseLookup.promise,
+          phase === "lookup rejected" ? lookupFailure : undefined,
+        );
         stopping = tryFastAbortFromMessage({
           cfg,
           isCommandTargetCurrent: () => current,
-          ctx: buildTestCtx({
-            CommandBody: "/stop",
-            RawBody: "/stop",
-            CommandAuthorized: true,
-            Provider: "stop-lookup",
-            Surface: "stop-lookup",
-            SessionKey: identity.sessionKey,
-            From: "stop-lookup:room",
-            To: "stop-lookup:room",
-          }),
+          ctx: stopContext(identity.sessionKey),
         });
-        await withinTest(
-          awaitGateBeforeSettlement(
-            lookupEntered.promise,
-            stopping,
-            "Stop completed before its ACP lookup boundary",
-          ),
-          signal,
-        );
+        await awaitLookup(lookupEntered.promise, stopping, signal);
         const runId = "frontier-original-child";
         for (const queuedId of [runId, "frontier-outside"]) {
           enqueueSwarmRun({

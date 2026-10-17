@@ -1,14 +1,13 @@
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
 import { useSubagentControlFixture } from "./subagent-control.test-support.js";
-import { beforeEach, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   awaitGateBeforeSettlement,
   createDeferred,
   withinTest,
 } from "../../../../test/helpers/promise.js";
 import { getRuntimeConfig } from "../../../config/config.js";
-import { setRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
 import { loadExactSessionEntryReadOnly } from "../../../config/sessions/session-accessor.js";
 import { reactivateCompletedSubagentSession } from "../../../gateway/session-subagent-reactivation.js";
 import * as lifecycleAdmission from "../../../sessions/session-lifecycle-admission.js";
@@ -32,30 +31,87 @@ import { finalizeInterruptedSubagentRun } from "./subagent-registry.test-helpers
 import { resolveSubagentSessionStatus } from "./subagent-session-metrics.js";
 
 const fixture = useSubagentControlFixture();
-beforeEach(() => {
-  setRuntimeConfigSnapshot({ agents: { defaults: { workspace: fixture.stateDir } } });
-});
 
-it("does not transfer a selected task cancellation to an admitted follow-up generation", async () => {
-  const owner = "agent:main:main";
-  const sessionKey = "agent:main:subagent:selected-generation";
-  const sessionId = "selected-generation-session";
-  const storePath = await writeSubagentSessionEntry({
+const requesterKey = "agent:main:main";
+const key = (id: string) => `agent:main:subagent:${id}`;
+type RunOptions = Partial<Parameters<typeof registerSubagentRun>[0]>;
+
+async function writeSession(id: string, lifecycleRevision = `${id}-revision`) {
+  return writeSubagentSessionEntry({
     stateDir: fixture.stateDir,
     agentId: "main",
-    sessionKey,
-    defaultSessionId: sessionId,
-    lifecycleRevision: `${sessionId}-revision`,
+    sessionKey: key(id),
+    defaultSessionId: `${id}-session`,
+    lifecycleRevision,
   });
+}
+
+async function register(id: string, storePath: string, options: RunOptions = {}) {
   await registerSubagentRun({
-    runId: "selected-original",
-    childSessionKey: sessionKey,
+    runId: id,
+    childSessionKey: key(id),
     childAgentId: "main",
-    sessionEntry: loadExactSessionEntryReadOnly({ agentId: "main", storePath, sessionKey })?.entry,
-    requesterSessionKey: owner,
-    requesterDisplayKey: owner,
-    task: "Original work",
+    sessionEntry: loadExactSessionEntryReadOnly({ agentId: "main", storePath, sessionKey: key(id) })
+      ?.entry,
+    requesterSessionKey: requesterKey,
+    requesterAgentId: "main",
+    requesterDisplayKey: "main",
+    task: id,
     cleanup: "keep",
+    expectsCompletionMessage: false,
+    ...options,
+  });
+}
+
+async function seed(id: string, options: RunOptions = {}) {
+  const storePath = await writeSession(id, `${id}-session-revision`);
+  await register(id, storePath, options);
+  return { storePath, sessionKey: key(id), sessionId: `${id}-session`, runId: options.runId ?? id };
+}
+
+function admit(
+  storePath: string,
+  sessionKey: string,
+  sessionId: string,
+  onInterrupt: Parameters<typeof beginSessionWorkAdmission>[0]["onInterrupt"],
+) {
+  return beginSessionWorkAdmission({
+    scope: storePath,
+    identities: [sessionKey, sessionId],
+    assertAllowed: () => {},
+    onInterrupt,
+  });
+}
+
+async function block(enabled: boolean, scope: string, identities: string[]) {
+  const entered = createDeferred();
+  const release = createDeferred();
+  const pending = enabled
+    ? runExclusiveSessionLifecycleMutation("subagent-kill", {
+        scope,
+        identities,
+        run: async () => {
+          entered.resolve();
+          await release.promise;
+        },
+      })
+    : Promise.resolve();
+  if (enabled) {
+    await entered.promise;
+  }
+  return { pending, release: release.resolve };
+}
+
+function expectIdle() {
+  expect(getActiveSessionWorkAdmissionCount()).toBe(0);
+  expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+}
+
+it("does not transfer a selected task cancellation to an admitted follow-up generation", async () => {
+  const { sessionKey, sessionId } = await seed("selected-generation", {
+    runId: "selected-original",
+    requesterDisplayKey: requesterKey,
+    task: "Original work",
     spawnMode: "session",
     expectsCompletionMessage: true,
   });
@@ -68,7 +124,7 @@ it("does not transfer a selected task cancellation to an admitted follow-up gene
     await release.promise;
     return killNative(...args);
   });
-  const tool = createSubagentsTool({ agentSessionKey: owner, config: getRuntimeConfig() });
+  const tool = createSubagentsTool({ agentSessionKey: requesterKey, config: getRuntimeConfig() });
   const pending = tool.execute("cancel-original", { action: "cancel", runId: original.runId });
   const controller = new AbortController();
   const handle = createEmbeddedRunHandle({
@@ -76,12 +132,11 @@ it("does not transfer a selected task cancellation to an admitted follow-up gene
     abort: () => controller.abort(),
   });
   try {
-    await Promise.race([
+    await awaitGateBeforeSettlement(
       entered.promise,
-      pending.then(() => {
-        throw new Error("Cancellation never reached its runtime handoff.");
-      }),
-    ]);
+      pending,
+      "Cancellation never reached its runtime handoff.",
+    );
     expect(
       await finalizeInterruptedSubagentRun({
         runId: original.runId,
@@ -112,28 +167,9 @@ it("does not transfer a selected task cancellation to an admitted follow-up gene
 it.each(["before interruption", "after interruption", "after abort"] as const)(
   "revalidates caller control for new stops and settles accepted stops when revoked %s",
   async (revocation) => {
-    const sessionKey = "agent:main:subagent:caller-control";
-    const sessionId = "caller-control-session";
-    const runId = "caller-control-run";
-    const storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey,
-      defaultSessionId: sessionId,
-      lifecycleRevision: `${sessionId}-revision`,
-    });
-    await registerSubagentRun({
-      runId,
-      childSessionKey: sessionKey,
-      childAgentId: "main",
-      sessionEntry: loadExactSessionEntryReadOnly({ agentId: "main", storePath, sessionKey })
-        ?.entry,
-      requesterSessionKey: "agent:main:main",
-      requesterAgentId: "main",
-      requesterDisplayKey: "main",
+    const { storePath, sessionKey, sessionId, runId } = await seed("caller-control", {
+      runId: "caller-control-run",
       task: "keep running until an authorized stop",
-      cleanup: "keep",
-      expectsCompletionMessage: false,
     });
     let callerControlsAncestor = true;
     const controller = new AbortController();
@@ -152,28 +188,11 @@ it.each(["before interruption", "after interruption", "after abort"] as const)(
         admission.release();
       }
     });
-    const admission = await beginSessionWorkAdmission({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      assertAllowed: () => {},
-      onInterrupt,
-    });
-    const blockerEntered = createDeferred();
-    const releaseBlocker = createDeferred();
-    const blocker =
-      revocation === "before interruption"
-        ? runExclusiveSessionLifecycleMutation("subagent-kill", {
-            scope: storePath,
-            identities: [sessionKey, sessionId],
-            run: async () => {
-              blockerEntered.resolve();
-              await releaseBlocker.promise;
-            },
-          })
-        : Promise.resolve();
-    if (revocation === "before interruption") {
-      await blockerEntered.promise;
-    }
+    const admission = await admit(storePath, sessionKey, sessionId, onInterrupt);
+    const blocker = await block(revocation === "before interruption", storePath, [
+      sessionKey,
+      sessionId,
+    ]);
     const pending = killSubagentRunAdmin(
       {
         cfg: getRuntimeConfig(),
@@ -192,7 +211,7 @@ it.each(["before interruption", "after interruption", "after abort"] as const)(
     try {
       if (revocation === "before interruption") {
         callerControlsAncestor = false;
-        releaseBlocker.resolve();
+        blocker.release();
       } else if (revocation === "after interruption") {
         await interrupted.promise;
         expect(subagentRuns.get(runId)?.killIntent).toBeDefined();
@@ -206,12 +225,11 @@ it.each(["before interruption", "after interruption", "after abort"] as const)(
       expect(onInterrupt).toHaveBeenCalledTimes(Number(revocation !== "before interruption"));
       expect(subagentRuns.get(runId)?.killIntent).toBeUndefined();
     } finally {
-      releaseBlocker.resolve();
+      blocker.release();
       admission.release();
-      await Promise.allSettled([blocker, pending]);
+      await Promise.allSettled([blocker.pending, pending]);
       clearActiveEmbeddedRun(sessionId, handle, sessionKey);
-      expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-      expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+      expectIdle();
     }
   },
 );
@@ -224,28 +242,9 @@ it.each([
 ] as const)(
   "prepares cancellation facts while $phase and settles $outcome (terminal=$terminal)",
   async ({ phase, outcome, terminal }) => {
-    const sessionKey = "agent:main:subagent:readiness";
-    const sessionId = "readiness-session";
-    const runId = "readiness-run";
-    const storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey,
-      defaultSessionId: sessionId,
-      lifecycleRevision: `${sessionId}-revision`,
-    });
-    await registerSubagentRun({
-      runId,
-      childSessionKey: sessionKey,
-      childAgentId: "main",
-      sessionEntry: loadExactSessionEntryReadOnly({ agentId: "main", storePath, sessionKey })
-        ?.entry,
-      requesterSessionKey: "agent:main:main",
-      requesterAgentId: "main",
-      requesterDisplayKey: "main",
+    const { storePath, sessionKey, sessionId, runId } = await seed("readiness", {
+      runId: "readiness-run",
       task: "Retain cancellation ownership during preparation",
-      cleanup: "keep",
-      expectsCompletionMessage: false,
     });
     const controller = new AbortController();
     const aborted = vi.fn();
@@ -253,35 +252,15 @@ it.each([
     const handle = createEmbeddedRunHandle({ runId, abort: () => controller.abort() });
     setActiveEmbeddedRun(sessionId, handle, sessionKey);
     const interrupted = createDeferred();
-    const admission = await beginSessionWorkAdmission({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      assertAllowed: () => {},
-      onInterrupt: () => {
-        controller.abort();
-        interrupted.resolve();
-        if (phase === "queued") {
-          admission.release();
-        }
-        return { runId };
-      },
+    const admission = await admit(storePath, sessionKey, sessionId, () => {
+      controller.abort();
+      interrupted.resolve();
+      if (phase === "queued") {
+        admission.release();
+      }
+      return { runId };
     });
-    const blockerEntered = createDeferred();
-    const releaseBlocker = createDeferred();
-    const blocker =
-      phase === "queued"
-        ? runExclusiveSessionLifecycleMutation("subagent-kill", {
-            scope: storePath,
-            identities: [sessionKey, sessionId],
-            run: async () => {
-              blockerEntered.resolve();
-              await releaseBlocker.promise;
-            },
-          })
-        : Promise.resolve();
-    if (phase === "queued") {
-      await blockerEntered.promise;
-    }
+    const blocker = await block(phase === "queued", storePath, [sessionKey, sessionId]);
     const mutationQueued = createDeferred();
     if (phase === "queued") {
       const mutate = lifecycleAdmission.runExclusiveSessionLifecycleMutation;
@@ -332,21 +311,19 @@ it.each([
       settled = true;
     });
     try {
-      await Promise.race([
+      await awaitGateBeforeSettlement(
         phase === "accepted" ? interrupted.promise : mutationQueued.promise,
-        pending.then(() => {
-          throw new Error("Cancellation never reached its selected lifecycle phase.");
-        }),
-      ]);
+        pending,
+        "Cancellation never reached its selected lifecycle phase.",
+      );
       needsRead = true;
-      releaseBlocker.resolve();
+      blocker.release();
       admission.release();
-      await Promise.race([
+      await awaitGateBeforeSettlement(
         readEntered.promise,
-        pending.then(() => {
-          throw new Error("Cancellation skipped pending caller preparation.");
-        }),
-      ]);
+        pending,
+        "Cancellation skipped pending caller preparation.",
+      );
       expect(settled).toBe(false);
       expect(aborted).toHaveBeenCalledTimes(phase === "accepted" ? 1 : 0);
       expect(getActiveSessionLifecycleMutationCount()).toBeGreaterThan(0);
@@ -372,13 +349,12 @@ it.each([
         stopped ? "killed" : "running",
       );
     } finally {
-      releaseBlocker.resolve();
+      blocker.release();
       releaseRead.resolve();
       admission.release();
-      await Promise.allSettled([blocker, pending]);
+      await Promise.allSettled([blocker.pending, pending]);
       clearActiveEmbeddedRun(sessionId, handle, sessionKey);
-      expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-      expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+      expectIdle();
     }
   },
 );
@@ -387,37 +363,19 @@ it("admin cancellation interrupts every sibling before waiting for any sibling t
   signal,
 }) => {
   const requester = "agent:main:main";
-  const sessionKey = (id: string) => `agent:main:subagent:${id}`;
-  const owner = sessionKey("root");
+  const sessionKey = key;
+  const owner = key("root");
   const running = Array.from({ length: 8 }, (_, index) => `running-${index}`);
   const queued = ["queued-0", "queued-1"];
   const selected = [...running, ...queued];
   let storePath = "";
   for (const id of ["root", ...selected]) {
-    storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey: sessionKey(id),
-      defaultSessionId: `${id}-session`,
-      lifecycleRevision: `${id}-revision`,
-    });
-    await registerSubagentRun({
-      runId: id,
-      childSessionKey: sessionKey(id),
-      childAgentId: "main",
-      sessionEntry: loadExactSessionEntryReadOnly({
-        agentId: "main",
-        storePath,
-        sessionKey: sessionKey(id),
-      })?.entry,
+    storePath = await writeSession(id);
+    await register(id, storePath, {
       requesterSessionKey: id === "root" ? requester : owner,
-      requesterAgentId: "main",
       requesterDisplayKey: requester,
-      task: id,
-      cleanup: "keep",
       collect: true,
       queued: queued.includes(id),
-      expectsCompletionMessage: false,
     });
   }
   const start = vi.fn(async () => {});
@@ -452,19 +410,14 @@ it("admin cancellation interrupts every sibling before waiting for any sibling t
   for (const { runId, handle } of activeRuns) {
     setActiveEmbeddedRun(`${runId}-session`, handle, sessionKey(runId));
     leases.push(
-      await beginSessionWorkAdmission({
-        scope: storePath,
-        identities: [sessionKey(runId), `${runId}-session`],
-        assertAllowed: () => {},
-        onInterrupt: () => {
-          interrupted.push(runId);
-          if (interrupted.length === running.length) {
-            allInterrupted.resolve();
-          }
-          // Cancellation releases real scheduler capacity while these admissions
-          // remain held. Selected queued children must still never dispatch.
-          expect(releaseSwarmRun(runId)).toBe(true);
-        },
+      await admit(storePath, sessionKey(runId), `${runId}-session`, () => {
+        interrupted.push(runId);
+        if (interrupted.length === running.length) {
+          allInterrupted.resolve();
+        }
+        // Cancellation releases real scheduler capacity while these admissions
+        // remain held. Selected queued children must still never dispatch.
+        expect(releaseSwarmRun(runId)).toBe(true);
       }),
     );
   }
@@ -526,50 +479,30 @@ it("admin cancellation interrupts every sibling before waiting for any sibling t
     for (const { runId, handle } of activeRuns) {
       clearActiveEmbeddedRun(`${runId}-session`, handle, sessionKey(runId));
     }
-    expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-    expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+    expectIdle();
   }
 });
 
 it("keeps a late descendant queued when registered before capacity release on an independent sibling that releases first", async ({
   signal,
 }) => {
-  const owner = "agent:main:main";
-  const key = (id: string) => `agent:main:subagent:${id}`;
+  const owner = requesterKey;
   const parents = { a: owner, b: owner, d: key("a"), x: key("d"), g: key("d") };
   let storePath = "";
-  const register = (id: keyof typeof parents, queued = false) =>
-    registerSubagentRun({
-      runId: id,
-      childSessionKey: key(id),
-      childAgentId: "main",
-      sessionEntry: loadExactSessionEntryReadOnly({
-        agentId: "main",
-        storePath,
-        sessionKey: key(id),
-      })?.entry,
+  const registerChild = (id: keyof typeof parents, queued = false) =>
+    register(id, storePath, {
       requesterSessionKey: parents[id],
       controllerSessionKey: parents[id],
       swarmRequesterSessionKey: parents[id],
-      requesterAgentId: "main",
       requesterDisplayKey: parents[id],
       groupId: "shared-name",
-      task: id,
-      cleanup: "keep",
       collect: true,
       queued,
-      expectsCompletionMessage: false,
     });
   for (const id of ["a", "b", "d", "x", "g"] as const) {
-    storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey: key(id),
-      defaultSessionId: `${id}-session`,
-      lifecycleRevision: `${id}-revision`,
-    });
+    storePath = await writeSession(id);
     if (id !== "g") {
-      await register(id);
+      await registerChild(id);
     }
   }
   const unrelatedStarted = createDeferred();
@@ -589,28 +522,13 @@ it("keeps a late descendant queued when registered before capacity release on an
   const aInterrupted = createDeferred();
   const bInterrupted = createDeferred();
   const bReleased = createDeferred();
-  const admissionA = await beginSessionWorkAdmission({
-    scope: storePath,
-    identities: [key("a"), "a-session"],
-    assertAllowed: () => {},
-    onInterrupt: () => aInterrupted.resolve(),
-  });
-  const admissionB = await beginSessionWorkAdmission({
-    scope: storePath,
-    identities: [key("b"), "b-session"],
-    assertAllowed: () => {},
-    onInterrupt: () => bInterrupted.resolve(),
-  });
+  const admissionA = await admit(storePath, key("a"), "a-session", () => aInterrupted.resolve());
+  const admissionB = await admit(storePath, key("b"), "b-session", () => bInterrupted.resolve());
   const interruptD = vi.fn(() => admissionD.release());
-  const admissionD = await beginSessionWorkAdmission({
-    scope: storePath,
-    identities: [key("d"), "d-session"],
-    assertAllowed: () => {},
-    onInterrupt: interruptD,
-  });
+  const admissionD = await admit(storePath, key("d"), "d-session", interruptD);
   const registerG = () =>
     admissionD.run(async () => {
-      const pendingRegistration = register("g", true);
+      const pendingRegistration = registerChild("g", true);
       // Keep G queued before B releases capacity, without detaching its durable registration.
       enqueueSwarmRun({
         groupId: JSON.stringify(["main", key("d"), "shared-name"]),
@@ -678,7 +596,6 @@ it("keeps a late descendant queued when registered before capacity release on an
     await Promise.all([pending, lateRegistration]);
     clearActiveEmbeddedRun("b-session", handleB, key("b"));
     clearActiveEmbeddedRun("x-session", handleX, key("x"));
-    expect(getActiveSessionWorkAdmissionCount()).toBe(0);
-    expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+    expectIdle();
   }
 });

@@ -3,7 +3,7 @@
 import { useSubagentControlFixture } from "./subagent-control.test-support.js";
 /** A transient discovery failure must survive successful runtime cancellation. */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { beforeEach, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../../../test/helpers/promise.js";
 import { getRuntimeConfig, setRuntimeConfigSnapshot } from "../../../config/config.js";
 import * as sessions from "../../../config/sessions/session-accessor.js";
@@ -31,9 +31,47 @@ import { resolveSubagentSessionStatus } from "./subagent-session-metrics.js";
 
 const fixture = useSubagentControlFixture();
 
-beforeEach(() => {
-  setRuntimeConfigSnapshot({ agents: { defaults: { workspace: fixture.stateDir } } });
+const owner = "agent:main:main";
+const sessionIdentity = (runId: string) => ({
+  sessionId: `${runId}-session`,
+  lifecycleRevision: `${runId}-revision`,
 });
+const writeSession = (runId: string, sessionKey: string, agentId = "main") =>
+  writeSubagentSessionEntry({
+    stateDir: fixture.stateDir,
+    agentId,
+    sessionKey,
+    defaultSessionId: sessionIdentity(runId).sessionId,
+    lifecycleRevision: sessionIdentity(runId).lifecycleRevision,
+  });
+const registerRun = (
+  runId: string,
+  childSessionKey: string,
+  requesterSessionKey = owner,
+  overrides: Partial<Parameters<typeof registerSubagentRun>[0]> = {},
+) =>
+  registerSubagentRun({
+    runId,
+    childSessionKey,
+    childAgentId: "main",
+    sessionEntry: sessionIdentity(runId),
+    requesterSessionKey,
+    controllerSessionKey: requesterSessionKey,
+    requesterAgentId: "main",
+    requesterDisplayKey: requesterSessionKey,
+    task: runId,
+    cleanup: "keep",
+    collect: true,
+    expectsCompletionMessage: false,
+    ...overrides,
+  });
+const controller = {
+  controllerSessionKey: owner,
+  controllerAgentId: "main",
+  callerSessionKey: owner,
+  callerIsSubagent: false,
+  controlScope: "children" as const,
+};
 
 it.for(["complete", "reject undefined"] as const)(
   "coalesces fresh refresh batches in the enclosing scope before %s",
@@ -55,31 +93,13 @@ it.for(["complete", "reject undefined"] as const)(
     const key = (id: string) =>
       id === "root" ? rootKey : sharedRawKey ? "global" : "agent:main:subagent:refresh-" + id;
     const register = (id: string) =>
-      registerSubagentRun({
-        runId: "refresh-" + id,
+      registerRun("refresh-" + id, key(id), id === "root" ? owner : rootKey, {
         childAgentId: agentId(id),
-        childSessionKey: key(id),
-        sessionEntry: {
-          sessionId: "refresh-" + id + "-session",
-          lifecycleRevision: "refresh-" + id + "-revision",
-        },
-        requesterSessionKey: id === "root" ? "agent:main:main" : rootKey,
-        controllerSessionKey: id === "root" ? "agent:main:main" : rootKey,
-        requesterAgentId: "main",
         requesterDisplayKey: "main",
         task: id,
-        cleanup: "keep",
-        collect: true,
-        expectsCompletionMessage: false,
       });
     for (const id of ["root", "first", "second"]) {
-      await writeSubagentSessionEntry({
-        stateDir: fixture.stateDir,
-        agentId: agentId(id),
-        sessionKey: key(id),
-        defaultSessionId: "refresh-" + id + "-session",
-        lifecycleRevision: "refresh-" + id + "-revision",
-      });
+      await writeSession("refresh-" + id, key(id), agentId(id));
     }
     await register("root");
     const lane = new AsyncLocalStorage<string>();
@@ -219,28 +239,11 @@ it("retires queued refreshes after an escaping native failure and an undefined c
   signal,
 }) => {
   const rootKey = "agent:main:subagent:refresh-failure";
-  await writeSubagentSessionEntry({
-    stateDir: fixture.stateDir,
-    agentId: "main",
-    sessionKey: rootKey,
-    defaultSessionId: "refresh-failure-session",
-    lifecycleRevision: "refresh-failure-revision",
-  });
-  await registerSubagentRun({
-    runId: "refresh-failure",
-    childSessionKey: rootKey,
-    childAgentId: "main",
-    sessionEntry: {
-      sessionId: "refresh-failure-session",
-      lifecycleRevision: "refresh-failure-revision",
-    },
-    requesterSessionKey: "agent:main:main",
-    requesterAgentId: "main",
+  await writeSession("refresh-failure", rootKey);
+  await registerRun("refresh-failure", rootKey, owner, {
+    controllerSessionKey: undefined,
     requesterDisplayKey: "main",
     task: "failed discovery",
-    cleanup: "keep",
-    collect: true,
-    expectsCompletionMessage: false,
   });
   const ready = createDeferred<killScope.KillScope>();
   const entered = createDeferred();
@@ -326,7 +329,6 @@ it("retires queued refreshes after an escaping native failure and an undefined c
 });
 
 it("retains a captured child prefix when the next child's session preparation fails", async () => {
-  const owner = "agent:main:main";
   const rootKey = "agent:main:subagent:prefix-root";
   const firstKey = "agent:main:subagent:prefix-first";
   const secondKey = "agent:main:subagent:prefix-second";
@@ -338,28 +340,8 @@ it("retains a captured child prefix when the next child's session preparation fa
     ["prefix-second", secondKey, rootKey, true],
     ["prefix-healthy", healthyKey, owner, false],
   ] as const) {
-    storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey,
-      defaultSessionId: `${runId}-session`,
-      lifecycleRevision: `${runId}-revision`,
-    });
-    await registerSubagentRun({
-      runId,
-      childSessionKey: sessionKey,
-      childAgentId: "main",
-      sessionEntry: { sessionId: `${runId}-session`, lifecycleRevision: `${runId}-revision` },
-      requesterSessionKey,
-      controllerSessionKey: requesterSessionKey,
-      requesterAgentId: "main",
-      requesterDisplayKey: requesterSessionKey,
-      task: runId,
-      cleanup: "keep",
-      collect: true,
-      queued,
-      expectsCompletionMessage: false,
-    });
+    storePath = await writeSession(runId, sessionKey);
+    await registerRun(runId, sessionKey, requesterSessionKey, { queued });
   }
   const firstStart = vi.fn(async () => {});
   const secondStart = vi.fn(async () => {});
@@ -402,13 +384,7 @@ it("retains a captured child prefix when the next child's session preparation fa
   });
   const result = await killAllControlledSubagentRuns({
     cfg: getRuntimeConfig(),
-    controller: {
-      controllerSessionKey: owner,
-      controllerAgentId: "main",
-      callerSessionKey: owner,
-      callerIsSubagent: false,
-      controlScope: "children",
-    },
+    controller,
     runs: [subagentRuns.get("prefix-root")!, subagentRuns.get("prefix-healthy")!],
     beforeKill: () => {
       releaseSwarmRun("unrelated-active");
@@ -442,7 +418,6 @@ it.each([
 ])(
   "reports retained identity check $faultAt failure after $phase without losing descendant accounting",
   async ({ phase, faultAt }) => {
-    const owner = "agent:main:main";
     const aKey = "agent:main:subagent:ancestor";
     const dKey = "agent:main:subagent:active-child";
     const gKey = "agent:main:subagent:late-grandchild";
@@ -454,61 +429,31 @@ it.each([
       ["healthy", healthyKey, owner],
       ["g", gKey, dKey],
     ] as const) {
-      storePath = await writeSubagentSessionEntry({
-        stateDir: fixture.stateDir,
-        agentId: "main",
-        sessionKey,
-        defaultSessionId: `${runId}-session`,
-        lifecycleRevision: `${runId}-revision`,
-      });
+      storePath = await writeSession(runId, sessionKey);
       if (runId !== "g") {
-        await registerSubagentRun({
-          runId,
-          childSessionKey: sessionKey,
-          childAgentId: "main",
-          sessionEntry: {
-            sessionId: `${runId}-session`,
-            lifecycleRevision: `${runId}-revision`,
-          },
-          requesterSessionKey,
-          controllerSessionKey: requesterSessionKey,
-          requesterAgentId: "main",
-          requesterDisplayKey: requesterSessionKey,
-          task: runId,
-          cleanup: "keep",
-          expectsCompletionMessage: false,
-          collect: true,
-        });
+        await registerRun(runId, sessionKey, requesterSessionKey);
       }
     }
     const a = subagentRuns.get("a")!;
     const d = subagentRuns.get("d")!;
     const healthy = subagentRuns.get("healthy")!;
+    const admit = (sessionKey: string, sessionId: string, onInterrupt: () => void) =>
+      beginSessionWorkAdmission({
+        scope: storePath,
+        identities: [sessionKey, sessionId],
+        assertAllowed: () => {},
+        onInterrupt,
+      });
     const entered = createDeferred();
-    const admissionA = await beginSessionWorkAdmission({
-      scope: storePath,
-      identities: [aKey, "a-session"],
-      assertAllowed: () => {},
-      onInterrupt: () => entered.resolve(),
-    });
+    const admissionA = await admit(aKey, "a-session", entered.resolve);
     const interruptD = vi.fn(() => admissionD.release());
-    const admissionD = await beginSessionWorkAdmission({
-      scope: storePath,
-      identities: [dKey, "d-session"],
-      assertAllowed: () => {},
-      onInterrupt: interruptD,
-    });
+    const admissionD = await admit(dKey, "d-session", interruptD);
     const healthyEntered = createDeferred();
-    const admissionHealthy = await beginSessionWorkAdmission({
-      scope: storePath,
-      identities: [healthyKey, "healthy-session"],
-      assertAllowed: () => {},
-      onInterrupt: () => {
-        healthyEntered.resolve();
-        if (phase === "ancestor drain") {
-          admissionHealthy.release();
-        }
-      },
+    const admissionHealthy = await admit(healthyKey, "healthy-session", () => {
+      healthyEntered.resolve();
+      if (phase === "ancestor drain") {
+        admissionHealthy.release();
+      }
     });
     const abortA = vi.fn();
     const abortD = vi.fn(() => {
@@ -556,13 +501,7 @@ it.each([
     });
     const pending = killAllControlledSubagentRuns({
       cfg: getRuntimeConfig(),
-      controller: {
-        controllerSessionKey: owner,
-        controllerAgentId: "main",
-        callerSessionKey: owner,
-        callerIsSubagent: false,
-        controlScope: "children",
-      },
+      controller,
       runs: [a, healthy],
     });
     const awaitProgress = (signal: Promise<void>, label: string) =>
@@ -581,19 +520,8 @@ it.each([
       expect(subagentRuns.has("g")).toBe(false);
       // D, not the interrupted ancestor A, owns this accepted late registration.
       await admissionD.run(async () => {
-        await registerSubagentRun({
-          runId: "g",
-          childSessionKey: gKey,
-          childAgentId: "main",
-          sessionEntry: { sessionId: "g-session", lifecycleRevision: "g-revision" },
-          requesterSessionKey: dKey,
-          controllerSessionKey: dKey,
-          requesterAgentId: "main",
-          requesterDisplayKey: dKey,
+        await registerRun("g", gKey, dKey, {
           task: "late grandchild",
-          cleanup: "keep",
-          expectsCompletionMessage: false,
-          collect: true,
           queued: true,
         });
         enqueueSwarmRun({
@@ -640,19 +568,7 @@ it.each([
         expect(
           sessions.loadExactSessionEntryReadOnly({ storePath, sessionKey: aKey })?.entry.sessionId,
         ).toBe("a-session");
-        const observation = JSON.stringify({
-          phase,
-          faultAt,
-          failedReads,
-          aKilled: subagentRuns.get(a.runId)?.endedReason,
-          dKilled: subagentRuns.get(d.runId)?.endedReason,
-          healthyKilled: subagentRuns.get(healthy.runId)?.endedReason,
-          gTask: resolveSubagentSessionStatus(subagentRuns.get("g")),
-          gExecution: subagentRuns.get("g")?.execution.status,
-          gDispatches: startG.mock.calls.length,
-          result,
-        });
-        expect(result, observation).toMatchObject({
+        expect(result).toMatchObject({
           status: "error",
           failed: 1,
           error: expect.stringContaining(failure),

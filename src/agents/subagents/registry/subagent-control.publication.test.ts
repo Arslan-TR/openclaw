@@ -2,10 +2,9 @@
 // oxfmt-ignore
 import { useSubagentControlFixture } from "./subagent-control.test-support.js";
 /** A cancellation result cannot publish a predecessor's task outcome after admitted reactivation. */
-import { beforeEach, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../../test/helpers/promise.js";
+import { expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../../test/helpers/promise.js";
 import { getRuntimeConfig } from "../../../config/config.js";
-import { setRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
 import { loadExactSessionEntryReadOnly } from "../../../config/sessions/session-accessor.js";
 import { reactivateCompletedSubagentSession } from "../../../gateway/session-subagent-reactivation.js";
 import {
@@ -30,11 +29,36 @@ import {
 import { resolveSubagentSessionStatus } from "./subagent-session-metrics.js";
 
 const fixture = useSubagentControlFixture();
-beforeEach(() => {
-  setRuntimeConfigSnapshot({ agents: { defaults: { workspace: fixture.stateDir } } });
-});
 const rootKey = "agent:main:subagent:publication-root";
 const childKey = "agent:main:subagent:publication-drain";
+
+async function registerPublicationRun(
+  runId: string,
+  sessionKey: string,
+  options: Partial<Parameters<typeof registerSubagentRun>[0]>,
+) {
+  const target = {
+    stateDir: fixture.stateDir,
+    agentId: "main",
+    sessionKey,
+    defaultSessionId: `${runId}-session`,
+    lifecycleRevision: `${runId}-revision`,
+  };
+  const storePath = await writeSubagentSessionEntry(target);
+  await registerSubagentRun({
+    runId,
+    childSessionKey: sessionKey,
+    childAgentId: "main",
+    sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey })?.entry,
+    requesterSessionKey: "agent:main:main",
+    requesterAgentId: "main",
+    requesterDisplayKey: "main",
+    task: runId,
+    cleanup: "keep",
+    ...options,
+  });
+  return { target, storePath };
+}
 
 it("does not refresh session metadata when an owned abort marker is already persisted", async () => {
   const sessionId = "idempotent-abort-session";
@@ -68,24 +92,8 @@ it("does not refresh session metadata when an owned abort marker is already pers
 });
 
 it("revalidates the session after held publication preparation permits retirement", async () => {
-  const target = {
-    stateDir: fixture.stateDir,
-    agentId: "main",
-    sessionKey: rootKey,
-    defaultSessionId: "prepared-publication-session",
-    lifecycleRevision: "prepared-publication-revision",
-  };
-  const storePath = await writeSubagentSessionEntry(target);
-  await registerSubagentRun({
-    runId: "prepared-publication",
-    childSessionKey: rootKey,
-    childAgentId: "main",
-    sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey: rootKey })?.entry,
-    requesterSessionKey: "agent:main:main",
-    requesterAgentId: "main",
-    requesterDisplayKey: "main",
+  const { target } = await registerPublicationRun("prepared-publication", rootKey, {
     task: "publication ownership",
-    cleanup: "keep",
   });
   const onResult = vi.fn();
   let transitioned = false;
@@ -139,26 +147,9 @@ it.each([
       expect(["publication-b0", "publication-b1"]).toContain(runId);
       return await (runId === "publication-b0" ? previousWait : nextWait).promise;
     });
-    const storePath = await writeSubagentSessionEntry({
-      stateDir: fixture.stateDir,
-      agentId: "main",
-      sessionKey: rootKey,
-      defaultSessionId: "publication-root-session",
-      lifecycleRevision: "publication-root-revision",
-    });
-    await registerSubagentRun({
+    const { storePath } = await registerPublicationRun("publication-root", rootKey, {
       runId: "publication-b0",
-      childSessionKey: rootKey,
-      childAgentId: "main",
-      sessionEntry: {
-        sessionId: "publication-root-session",
-        lifecycleRevision: "publication-root-revision",
-      },
-      requesterSessionKey: "agent:main:main",
-      requesterAgentId: "main",
-      requesterDisplayKey: "main",
       task: "original task",
-      cleanup: "keep",
       expectsCompletionMessage: true,
     });
     const b0 = subagentRuns.get("publication-b0")!;
@@ -244,23 +235,8 @@ it.each([
       ["publication-child", childKey],
     ];
     for (const [runId, sessionKey] of children) {
-      await writeSubagentSessionEntry({
-        stateDir: fixture.stateDir,
-        agentId: "main",
-        sessionKey,
-        defaultSessionId: `${runId}-session`,
-        lifecycleRevision: `${runId}-revision`,
-      });
-      await registerSubagentRun({
-        runId,
-        childSessionKey: sessionKey,
-        childAgentId: "main",
-        sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey })?.entry,
+      await registerPublicationRun(runId, sessionKey, {
         requesterSessionKey: rootKey,
-        requesterAgentId: "main",
-        requesterDisplayKey: "main",
-        task: runId,
-        cleanup: "keep",
         collect: true,
         queued: true,
         expectsCompletionMessage: false,
@@ -327,23 +303,12 @@ it.each([
       }
       return result;
     });
-    const admin = vi.fn<typeof killSubagentRunAdmin>((params, control) =>
-      killSubagentRunAdmin(
-        {
-          ...params,
-          onResult: (result) => {
-            params.onResult?.(result);
-          },
-        },
-        control,
-      ),
-    );
     const originalEndedAt = Date.now();
     // The earlier producer result arrives only after cancellation enters descendant drain.
     const cancellationClock = completeDuringDrain
       ? vi.spyOn(Date, "now").mockReturnValue(originalEndedAt + 1)
       : undefined;
-    const pending = admin({
+    const pending = killSubagentRunAdmin({
       cfg: getRuntimeConfig(),
       sessionKey: rootKey,
       expectedRunId: b0.runId,
@@ -352,12 +317,11 @@ it.each([
     });
     const followupInterrupted = vi.fn();
     try {
-      await Promise.race([
+      await awaitGateBeforeSettlement(
         entered.promise,
-        pending.then((result) => {
-          throw new Error(`Cancellation never entered descendant drain: ${JSON.stringify(result)}`);
-        }),
-      ]);
+        pending,
+        "Cancellation never entered descendant drain",
+      );
       if (completeDuringDrain) {
         previousWait.resolve({
           status: "ok",
@@ -370,12 +334,11 @@ it.each([
         expect(subagentRuns.get(b0.runId)?.killReconciliation).toBeUndefined();
         childAdmission.release();
 
-        await Promise.race([
+        await awaitGateBeforeSettlement(
           markerCleared.promise,
-          pending.then((result) => {
-            throw new Error(`Cancellation never reached marker cleanup: ${JSON.stringify(result)}`);
-          }),
-        ]);
+          pending,
+          "Cancellation never reached marker cleanup",
+        );
         expect(
           loadExactSessionEntryReadOnly({ storePath, sessionKey: rootKey })?.entry.abortedLastRun,
         ).toBe(false);
@@ -417,14 +380,13 @@ it.each([
       childAdmission.release();
       releaseMarker.resolve();
       releaseFirstChildCleanup.resolve();
-      await pending;
+      const published = await pending;
       if (handoff) {
         expect(observedTarget, "admin resolved its root outcome").toBe(true);
         expect(handoffOrder, "admin captured its owner outcome").not.toEqual([]);
         await handoffComplete.promise;
         expect(handoffOrder.slice(0, 2)).toEqual(["captured outcome", "replacement"]);
       }
-      const published = await admin.mock.results[0]!.value;
       expect(markerWaits).toBe(completeDuringDrain ? 1 : 0);
       if (!handoff) {
         expect.soft(published).not.toHaveProperty("targetState");
