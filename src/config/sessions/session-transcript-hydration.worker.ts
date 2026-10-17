@@ -14,6 +14,11 @@ import type { WorkerTaskChannel } from "../../infra/worker-task-server.js";
 import { assertOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import { classifyOpenClawAgentDatabaseReadError } from "../../state/openclaw-agent-db-read-error.js";
 import { openOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
+import { selectConversationRowsFromDatabase } from "./session-accessor.sqlite-conversation-read.js";
+import {
+  readSessionEntryRow,
+  readSessionKeyBySessionIdInDatabase,
+} from "./session-accessor.sqlite-entry-read.js";
 import { prepareTranscriptEventReadQuery } from "./session-accessor.sqlite-read.js";
 import { toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
 import { readTranscriptContextStateInTransaction } from "./session-accessor.sqlite-transcript-state.js";
@@ -65,6 +70,29 @@ export async function streamSessionTranscriptHydration(
       if (coldArchive) {
         throw new SessionTranscriptColdError(request.resolvedScope.sessionId);
       }
+      const compaction = request.compaction
+        ? (() => {
+            const requestedKey = request.target.sessionKey ?? "";
+            const sessionKey =
+              readSessionKeyBySessionIdInDatabase(database, request.resolvedScope.sessionId) ??
+              requestedKey;
+            const sessionTarget = {
+              agentId: request.resolvedScope.agentId,
+              sessionId: request.resolvedScope.sessionId,
+              sessionKey,
+              storePath: request.database.path,
+            };
+            const entry = readSessionEntryRow(database, requestedKey)?.entry;
+            const runtimeEntry =
+              requestedKey === sessionKey
+                ? entry
+                : readSessionEntryRow(database, sessionKey)?.entry;
+            const [primaryConversation] = selectConversationRowsFromDatabase(database, {
+              primarySession: { sessionId: sessionTarget.sessionId, sessionKey: requestedKey },
+            });
+            return { sessionTarget, entry, runtimeEntry, primaryConversation };
+          })()
+        : undefined;
       const encoding = readTranscriptStorageEncoding(database.db);
       const PAGE_ROWS = isPostgresSqlConnection(database.db) ? 16 : 256;
       const source = prepareTranscriptEventReadQuery(database, request.resolvedScope.sessionId, {
@@ -195,7 +223,9 @@ export async function streamSessionTranscriptHydration(
       }
       await flush();
       control.throwIfCancelled();
-      outcome = { value: { kind: "full", version, eventCount } };
+      outcome = {
+        value: { kind: "full", version, eventCount, ...(compaction ? { compaction } : {}) },
+      };
     } catch (error) {
       outcome = {
         error:
