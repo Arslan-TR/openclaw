@@ -11,6 +11,7 @@ import {
 } from "./run-entry.test-support.js";
 
 type EntryParams = Parameters<typeof runEmbeddedAgentEntry>[0];
+const fallback = { provider: "fallback-provider", model: "fallback-model" };
 function runEntry(runCandidate: EntryParams["runCandidate"], overrides: Partial<EntryParams> = {}) {
   return runEmbeddedAgentEntry({
     selection: { cfg: {}, provider: "provider", model: "model" },
@@ -55,6 +56,11 @@ async function requesterFixture(runId: string, childId: string) {
     child,
     subagentRuns,
     readChild: () => loadSubagentRegistryFromSqlite().get(childId),
+    expectSettled() {
+      const expected = { runId: childId, requesterTurnRunId: undefined };
+      expect(subagentRuns.get(childId)).toMatchObject(expected);
+      expect(loadSubagentRegistryFromSqlite().get(childId)).toMatchObject(expected);
+    },
     acceptChild: () =>
       mergeAcceptedSessionSpawnsForRun(admission.operationalRunInstance, [
         {
@@ -121,17 +127,15 @@ export function registerRunEntryFailureTests(state: {
               classification: "empty",
               meta: {
                 executionTrace: { runner: runtime, attempts: [], fallbackUsed: true },
-                ...(errorResult
-                  ? {
-                      error: {
-                        kind: "incomplete_turn" as const,
-                        message: "candidate incomplete",
-                        fallbackSafe: true,
-                      },
-                    }
-                  : {}),
               },
             });
+            if (errorResult) {
+              candidate.meta.error = {
+                kind: "incomplete_turn",
+                message: "candidate incomplete",
+                fallbackSafe: true,
+              };
+            }
             const result = await withLocalSessionPlacementTurnSettlement(
               identity,
               async () => {
@@ -154,26 +158,15 @@ export function registerRunEntryFailureTests(state: {
               isFinalFallbackAttempt: false,
             }),
           ).rejects.toBe(error);
-          const result = await params.run("fallback-provider", "fallback-model", {
+          const result = await params.run(fallback.provider, fallback.model, {
             ...fallbackAttemptOptions(params, "server_error"),
             isFinalFallbackAttempt: false,
           });
-          const classification = await params.classifyResult?.({
-            result,
-            provider: "fallback-provider",
-            model: "fallback-model",
-            attempt: 2,
-            total: 3,
-          });
-          expect(classification).toBeNull();
+          expect(
+            await params.classifyResult?.({ result, ...fallback, attempt: 2, total: 3 }),
+          ).toBeNull();
           expect(child.requesterTurnRunId).toBe(identity.runId);
-          return {
-            outcome: "completed",
-            result,
-            provider: "fallback-provider",
-            model: "fallback-model",
-            attempts: [],
-          };
+          return { outcome: "completed", result, ...fallback, attempts: [] };
         });
         const run = runEntry(runCandidate, { preparedRunAdmission: admission, identity });
         if (revokeAtCleanup) {
@@ -187,10 +180,7 @@ export function registerRunEntryFailureTests(state: {
         expect(placementReleased).toBe(true);
         expect(runCandidate).toHaveBeenCalledTimes(2);
         expect(result.result.acceptedSessionSpawns).toHaveLength(1);
-        expect(f.readChild()).toMatchObject({
-          runId: child.runId,
-          requesterTurnRunId: undefined,
-        });
+        f.expectSettled();
       } finally {
         restoreCleanup?.();
       }
@@ -199,7 +189,7 @@ export function registerRunEntryFailureTests(state: {
 
   it("settles terminal failure when later candidates are skipped", async () => {
     await using f = await requesterFixture("failed-entry", "entry-failure-child");
-    const { identity, admission, child, subagentRuns } = f;
+    const { identity, admission, child } = f;
     await f.seed();
     const providerError = new Error("provider failed");
     const exhausted = new Error("all candidates failed or were skipped");
@@ -222,14 +212,7 @@ export function registerRunEntryFailureTests(state: {
     ).rejects.toBe(exhausted);
     expect(runCandidate).toHaveBeenCalledOnce();
     expect(child.requesterTurnRunId).toBe(identity.runId);
-    expect(subagentRuns.get(child.runId)).toMatchObject({
-      runId: child.runId,
-      requesterTurnRunId: undefined,
-    });
-    expect(f.readChild()).toMatchObject({
-      runId: child.runId,
-      requesterTurnRunId: undefined,
-    });
+    f.expectSettled();
   });
 
   it("does not finalize any candidate when fallback is exhausted", async () => {
@@ -240,15 +223,14 @@ export function registerRunEntryFailureTests(state: {
         initialAttemptOptions(params),
       );
       const latestResult = await params.run(
-        "fallback-provider",
-        "fallback-model",
+        fallback.provider,
+        fallback.model,
         fallbackAttemptOptions(params, "unknown"),
       );
       return {
         outcome: "exhausted" as const,
         result: params.mergeExhaustedResult?.({ latestResult, preferredResult }) ?? latestResult,
-        provider: "fallback-provider",
-        model: "fallback-model",
+        ...fallback,
         attempts: [],
       };
     });
@@ -289,9 +271,7 @@ export function registerRunEntryFailureTests(state: {
   it("does not replay a thrown channel-delivery attempt that already delivered its reply (#113788)", async () => {
     const failure = new Error("insufficient quota");
     state.runWithModelFallback.mockImplementationOnce(async (params: FallbackRunnerParams) => {
-      // Mirror the fallback loop's thrown-error exit: the attempt error bypasses
-      // result classification, so the error-path backstop is the only guard that
-      // can stop the next candidate from replaying the delivered turn.
+      // Thrown attempts bypass classification; the error backstop must block replay.
       await expect(
         params.run(params.provider, params.model, initialAttemptOptions(params)),
       ).rejects.toBe(failure);

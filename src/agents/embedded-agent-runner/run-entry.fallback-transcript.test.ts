@@ -184,28 +184,23 @@ describe("run entry durable fallback notices", () => {
     expect(f.candidates).toEqual(["openai/gpt-4.1-mini", "anthropic/claude-haiku-3-5"]);
   });
 
+  const replacements = [
+    { sessionId: "replacement-session" },
+    { activeWriterRunId: "replacement-run" },
+    { lifecycleRevision: "replacement-revision" },
+  ];
   it.each(
     [false, true].flatMap((writerContext) =>
-      (["session reset", "writer replacement", "lifecycle reset"] as const).map((change) => ({
-        writerContext,
-        change,
-      })),
+      replacements.map((replacement) => ({ writerContext, replacement })),
     ),
   )(
-    "refuses a notice after $change with bound writer=$writerContext",
-    async ({ writerContext, change }) => {
+    "refuses a notice after $replacement with bound writer=$writerContext",
+    async ({ writerContext, replacement }) => {
       using f = await fixture({
         writerContext,
         onStep: async (step) => {
           if (step.fallbackStepFinalOutcome === "next_fallback") {
-            await replaceSessionEntry(f.scope, {
-              ...f.entry,
-              ...(change === "session reset"
-                ? { sessionId: "replacement-session" }
-                : change === "writer replacement"
-                  ? { activeWriterRunId: "replacement-run" }
-                  : { lifecycleRevision: "replacement-revision" }),
-            });
+            await replaceSessionEntry(f.scope, { ...f.entry, ...replacement });
           }
         },
       });
@@ -217,35 +212,35 @@ describe("run entry durable fallback notices", () => {
     },
   );
 
-  it("does not write a transition after cancellation", async () => {
-    const controller = new AbortController();
-    using f = await fixture({
-      abortSignal: controller.signal,
-      onStep: (step) => {
-        if (step.fallbackStepFinalOutcome === "next_fallback") {
-          controller.abort(new Error("cancelled fallback"));
-        }
-      },
-    });
-    await expect(f.run()).rejects.toThrow("cancelled fallback");
-    expect(await loadTranscriptEvents(f.scope)).toEqual([]);
-    expect(f.candidates).toEqual(["openai/gpt-4.1-mini"]);
-  });
-
-  it("rechecks cancellation at the canonical write boundary", async () => {
-    const controller = new AbortController();
-    using f = await fixture({ abortSignal: controller.signal });
-    const append = transcript.appendAssistantMessageToSessionTranscript;
-    vi.spyOn(transcript, "appendAssistantMessageToSessionTranscript").mockImplementationOnce(
-      async (params) => {
-        controller.abort(new Error("cancelled before notice commit"));
-        return append(params);
-      },
-    );
-    await expect(f.run()).rejects.toThrow("cancelled before notice commit");
-    expect(await loadTranscriptEvents(f.scope)).toEqual([]);
-    expect(f.candidates).toEqual(["openai/gpt-4.1-mini"]);
-  });
+  it.each(["observer", "commit"] as const)(
+    "rechecks cancellation at the %s boundary",
+    async (boundary) => {
+      const controller = new AbortController();
+      const message =
+        boundary === "observer" ? "cancelled fallback" : "cancelled before notice commit";
+      const abort = () => controller.abort(new Error(message));
+      using f = await fixture({
+        abortSignal: controller.signal,
+        onStep: (step) => {
+          if (boundary === "observer" && step.fallbackStepFinalOutcome === "next_fallback") {
+            abort();
+          }
+        },
+      });
+      if (boundary === "commit") {
+        const append = transcript.appendAssistantMessageToSessionTranscript;
+        vi.spyOn(transcript, "appendAssistantMessageToSessionTranscript").mockImplementationOnce(
+          async (params) => {
+            abort();
+            return append(params);
+          },
+        );
+      }
+      await expect(f.run()).rejects.toThrow(message);
+      expect(await loadTranscriptEvents(f.scope)).toEqual([]);
+      expect(f.candidates).toEqual(["openai/gpt-4.1-mini"]);
+    },
+  );
 
   it.each(["maintenance", "missingSession", "omitSessionKey"] as const)(
     "skips durable notices for %s contexts",
