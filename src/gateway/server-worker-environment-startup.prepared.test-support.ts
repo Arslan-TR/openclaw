@@ -42,6 +42,13 @@ async function createPreparedNodeAcknowledgement(root: string) {
   const home = path.join(root, "node-home");
   await fs.mkdir(home);
   const startup = await loadGatewayWorkerEnvironmentStartupState();
+  const environmentId = "prepared-wire-environment";
+  type Transition = Parameters<typeof startup.store.transition>[0];
+  const transition = (
+    from: Transition["from"],
+    to: Transition["to"],
+    patch?: Transition["patch"],
+  ) => startup.store.transition({ environmentId, from, to, patch });
   const factory = vi.spyOn(serviceModule, "createWorkerEnvironmentService");
   const registry = createEmptyPluginRegistry();
   const owned: {
@@ -114,7 +121,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
     const preparationKey = "a".repeat(64);
     const cacheKey = "c".repeat(64);
     const seedKey = "b".repeat(64);
-    let seed = path.join(home, ".openclaw-worker", "git-seeds", namespace, seedKey);
+    const seed = path.join(home, ".openclaw-worker", "git-seeds", namespace, seedKey);
     await fs.mkdir(seed, { recursive: true });
     await requireGit(seed, ["init", "--quiet"]);
     await fs.writeFile(path.join(seed, "source.txt"), "pristine source\n");
@@ -133,17 +140,11 @@ async function createPreparedNodeAcknowledgement(root: string) {
     const project = { key: seedKey, root: seed, baseCommit };
     const admittedSeed = path.join(path.dirname(seed), workerProjectSeedKey(project));
     await fs.rename(seed, admittedSeed);
-    seed = admittedSeed;
-    project.root = seed;
+    project.root = admittedSeed;
     const operation = createWorkerProjectPreparation({
       project,
       namespace,
-      preparation: {
-        key: preparationKey,
-        cacheKey,
-        purpose: "session",
-        demandAtMs: 0,
-      },
+      preparation: { key: preparationKey, cacheKey, purpose: "session", demandAtMs: 0 },
       requireCurrent: () => {},
     });
     const runScript = async (script: string) =>
@@ -153,7 +154,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
         timeout: 30_000,
         stdio: ["ignore", "pipe", "pipe"],
       });
-    const result = await operation.project
+    const { preparedWorkspace } = await operation.project
       .prepare({
         runScript,
         runScriptWithBudget: (createScript) => runScript(createScript(30_000)),
@@ -162,15 +163,14 @@ async function createPreparedNodeAcknowledgement(root: string) {
         },
       })
       .finally(() => operation.close());
-    const environmentId = "prepared-wire-environment";
     const prepared = parseNodeWorkerPreparedWorkspaceResult({
-      ...result.preparedWorkspace,
+      ...preparedWorkspace,
       gatewayNamespace: namespace,
       environmentId,
       preparationKey,
       cacheKey,
     });
-    assert(prepared, "Project setup did not produce a valid workspace");
+    assert(prepared && preparedWorkspace, "Project setup did not produce a valid workspace");
     const env = { ...process.env, HOME: home, OPENCLAW_STATE_DIR: path.join(root, "node-state") };
     const workspace = new NodeWorkerWorkspaceRuntime({ env, ephemeral: true });
     owned.workspace = workspace;
@@ -216,13 +216,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
             platform: "test",
             mode: "node",
           },
-          device: {
-            id: nodeId,
-            publicKey: "fixture",
-            signature: "fixture",
-            signedAt: 1,
-            nonce: "fixture",
-          },
+          device: { id: nodeId, publicKey: "x", signature: "x", signedAt: 1, nonce: "x" },
           commands: [],
         },
       },
@@ -298,9 +292,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
       profileSnapshot: {
         settings: {},
         project: {
-          key: seedKey,
-          root: seed,
-          baseCommit,
+          ...project,
           preparation: {
             key: preparationKey,
             cacheKey,
@@ -320,54 +312,32 @@ async function createPreparedNodeAcknowledgement(root: string) {
       provisionOperationId: "prepared-wire",
     });
     await startup.store.ensureNodeEnrollment(environmentId);
-    const record = await startup.store.transition({
-      environmentId,
-      from: "requested",
-      to: "provisioning",
-      patch: { nodeDeviceId: nodeId },
-    });
+    const record = await transition("requested", "provisioning", { nodeDeviceId: nodeId });
 
     const register = (signal?: AbortSignal) =>
       options.registerPreparedWorkspace!({
         record,
         deviceId: nodeId,
-        workspace: {
-          preparationKey,
-          cacheKey,
-          workspaceDir: prepared.workspaceDir,
-          homeDir: prepared.homeDir,
-          sourceManifestRef: prepared.sourceManifestRef,
-          preparedManifestRef: prepared.preparedManifestRef,
-        },
+        workspace: preparedWorkspace,
         assertCurrent: () => {},
         signal,
       });
     const attach = async () => {
-      await startup.store.transition({
-        environmentId,
-        from: "provisioning",
-        to: "ready",
-        patch: {
-          leaseId: "prepared-wire-lease",
-          nodeDeviceId: nodeId,
-          sharedHost: false,
-          bootstrapReceipt: {
-            bundleHash: "a".repeat(64),
-            openclawVersion: "2026.8.1",
-            protocolFeatures: [],
-            installKind: "bundle",
-          },
-          credential: workerStartupCredential("prepared-ack-credential"),
+      await transition("provisioning", "ready", {
+        leaseId: "prepared-wire-lease",
+        nodeDeviceId: nodeId,
+        sharedHost: false,
+        bootstrapReceipt: {
+          bundleHash: "a".repeat(64),
+          openclawVersion: "2026.8.1",
+          protocolFeatures: [],
+          installKind: "bundle",
         },
+        credential: workerStartupCredential("prepared-ack-credential"),
       });
-      const attached = await startup.store.transition({
-        environmentId,
-        from: "ready",
-        to: "attached",
-        patch: {
-          attachedSessionIds: [binding.sessionId],
-          credential: workerStartupCredential("prepared-bound-credential", binding.sessionId),
-        },
+      const attached = await transition("ready", "attached", {
+        attachedSessionIds: [binding.sessionId],
+        credential: workerStartupCredential("prepared-bound-credential", binding.sessionId),
       });
       binding.ownerEpoch = attached.ownerEpoch;
       let placement = await startup.placementStore.startDispatch({
