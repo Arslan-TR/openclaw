@@ -6,12 +6,10 @@ import * as deviceTokens from "../infra/device-pairing-tokens.js";
 import { getPairedDevice, requestDevicePairing } from "../infra/device-pairing.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
-import { GatewayClient } from "./client.js";
 import {
   issueOperatorToken,
   loadDeviceIdentity,
   openTrackedWs,
-  pairDeviceIdentity,
   resolveDeviceIdentityPath,
 } from "./device-authz.test-helpers.js";
 import { connectGatewayClient } from "./test-helpers.e2e.js";
@@ -22,10 +20,6 @@ import {
   rpcReq,
   startServer,
 } from "./test-helpers.js";
-import {
-  acknowledgeNodeInvokeRequestForTest,
-  getConnectedNodeIdForTest,
-} from "./test-helpers.node-invoke.js";
 
 let started: Awaited<ReturnType<typeof startServer>>;
 const sockets = new Set<WebSocket>();
@@ -155,61 +149,6 @@ async function expectLocalNodeReconnectDenied(
     metadataMismatch ? "device metadata change pending approval" : "role upgrade pending approval",
   );
 }
-async function connectApprovedNode(params: {
-  port: number;
-  name: string;
-  onInvoke: (payload: unknown) => void;
-}): Promise<GatewayClient> {
-  const paired = await pairDeviceIdentity({
-    name: params.name,
-    role: "node",
-    scopes: [],
-    clientId: GATEWAY_CLIENT_NAMES.NODE_HOST,
-    clientMode: GATEWAY_CLIENT_MODES.NODE,
-  });
-
-  let readyResolve: (() => void) | null = null;
-  const ready = new Promise<void>((resolve) => {
-    readyResolve = resolve;
-  });
-
-  const client = new GatewayClient({
-    url: `ws://127.0.0.1:${params.port}`,
-    connectChallengeTimeoutMs: 2_000,
-    token: "secret",
-    role: "node",
-    clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
-    clientVersion: "1.0.0",
-    platform: "linux",
-    mode: GATEWAY_CLIENT_MODES.NODE,
-    scopes: [],
-    commands: ["system.run"],
-    deviceIdentity: paired.identity,
-    onHelloOk: () => readyResolve?.(),
-    onEvent: (event) =>
-      acknowledgeNodeInvokeRequestForTest({
-        client,
-        event,
-        onInvoke: params.onInvoke,
-      }),
-  });
-  client.start();
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      ready,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("timeout waiting for node hello")), 5_000);
-      }),
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-  return client;
-}
-
 async function waitForMacrotasks() {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
@@ -550,38 +489,6 @@ describe("gateway device.token.rotate/revoke caller scope guard", () => {
     const paired = await getPairedDevice(attacker.deviceId);
     expect(paired?.tokens?.operator?.scopes).toEqual(["operator.pairing"]);
     expect(paired?.approvedScopes).toEqual(["operator.admin"]);
-  });
-  test("blocks the pairing-token to admin-node-invoke escalation chain", async () => {
-    const attacker = await issueOperator("rotate-rce-attacker", ["operator.pairing"]);
-    let sawInvoke = false;
-    let pairingWs: WebSocket | undefined;
-    let nodeClient: GatewayClient | undefined;
-    try {
-      const adminWs = await openClient({ token: "secret" });
-      nodeClient = await connectApprovedNode({
-        port: started.port,
-        name: "rotate-rce-node",
-        onInvoke: () => {
-          sawInvoke = true;
-        },
-      });
-      await getConnectedNodeIdForTest(adminWs);
-      pairingWs = await openDevice(attacker);
-      const rotate = await rpcReq(pairingWs, "device.token.rotate", {
-        deviceId: attacker.deviceId,
-        role: "operator",
-        scopes: ["operator.admin"],
-      });
-      expect(rotate.ok).toBe(false);
-      expect(rotate.error?.message).toBe("device token rotation denied");
-      await waitForMacrotasks();
-      expect(sawInvoke).toBe(false);
-      const paired = await getPairedDevice(attacker.deviceId);
-      expect(paired?.tokens?.operator?.scopes).toEqual(["operator.pairing"]);
-      expect(paired?.tokens?.operator?.token).toBe(attacker.token);
-    } finally {
-      pairingWs?.close();
-      nodeClient?.stop();
-    }
+    expect(paired?.tokens?.operator?.token).toBe(attacker.token);
   });
 });

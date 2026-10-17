@@ -35,6 +35,29 @@ const { createSessionStoreDir, withSessionTestState } = setupSessionCreateHandle
   },
 );
 
+function profileIdentity(profile: ReturnType<typeof ensureProfileForEmail>) {
+  return {
+    profileId: profile.id,
+    displayName: profile.displayName,
+    hasAvatar: false,
+    updatedAt: profile.updatedAt,
+  };
+}
+
+function sessionRequests(
+  client: GatewayClient,
+  context: Record<string, unknown>,
+  storePath: string,
+) {
+  return {
+    request: <T = unknown>(
+      method: Parameters<typeof directSessionReq>[0],
+      params: Record<string, unknown>,
+    ) => directSessionReq<T>(method, params, { client, context }),
+    read: (sessionKey: string) => loadSessionEntry({ sessionKey, storePath }),
+  };
+}
+
 async function createPersonalAccountSessionFixture() {
   const { storePath } = await createSessionStoreDir();
   const owner = ensureProfileForEmail("session-account-owner@example.test");
@@ -61,12 +84,7 @@ async function createPersonalAccountSessionFixture() {
       role: "operator",
       scopes: ["operator.write"],
     },
-    authenticatedUserProfile: {
-      profileId: owner.id,
-      displayName: owner.displayName,
-      hasAvatar: false,
-      updatedAt: owner.updatedAt,
-    },
+    authenticatedUserProfile: profileIdentity(owner),
   };
   const clients = new Set([client]);
   const catalog = [
@@ -88,13 +106,22 @@ async function createPersonalAccountSessionFixture() {
         [...clients].filter((current) => !filter || filter(current)).map(({ connId }) => connId),
       ),
   };
-  return { storePath, owner, authProfileId, connectAccount, client, clients, catalog, context };
+  return {
+    storePath,
+    owner,
+    authProfileId,
+    connectAccount,
+    client,
+    clients,
+    catalog,
+    context,
+    ...sessionRequests(client, context, storePath),
+  };
 }
 
 test("session creation provenance cannot authorize a fresh personal account", async () => {
   await withSessionTestState({ layout: "state-only" }, async () => {
-    const { storePath, owner, authProfileId, context } =
-      await createPersonalAccountSessionFixture();
+    const { read, owner, authProfileId, context } = await createPersonalAccountSessionFixture();
     const { createGatewaySession } = await import("./session-create-service.js");
     const key = "agent:main:dashboard:personal-provenance-only";
     const prepareLifecycle = vi.fn(async () => ({ ok: true, value: {} }) as const);
@@ -115,62 +142,63 @@ test("session creation provenance cannot authorize a fresh personal account", as
     expect(created).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
     expect(prepareLifecycle).not.toHaveBeenCalled();
     expect(context.loadGatewayModelCatalogSnapshot).not.toHaveBeenCalled();
-    expect(loadSessionEntry({ sessionKey: key, storePath })).toBeUndefined();
+    expect(read(key)).toBeUndefined();
   });
 });
 
 test("sessions.create preserves an explicit personal account across adoption and a collaborator fork", async () => {
   await withSessionTestState({ layout: "state-only" }, async () => {
-    const { storePath, authProfileId, connectAccount, client, context } =
+    const { read, request, authProfileId, connectAccount, client } =
       await createPersonalAccountSessionFixture();
     const key = "agent:main:dashboard:personal-owner";
 
-    const created = await directSessionReq(
-      "sessions.create",
-      {
-        key,
-        model: `openai/gpt-5.6-sol@${authProfileId}`,
-      },
-      { client, context },
-    );
+    const created = await request("sessions.create", {
+      key,
+      model: `openai/gpt-5.6-sol@${authProfileId}`,
+    });
 
     expect(created.ok, JSON.stringify(created.error)).toBe(true);
-    expect(loadSessionEntry({ sessionKey: key, storePath })).toMatchObject({
+    expect(read(key)).toMatchObject({
       authProfileOverride: authProfileId,
       authProfileOverrideSource: "user",
     });
 
     expect(connectAccount("next-account@example.test")).not.toBe(authProfileId);
-    const adopted = await directSessionReq("sessions.create", { key }, { client, context });
+    const adopted = await request("sessions.create", { key });
     expect(adopted.ok, JSON.stringify(adopted.error)).toBe(true);
-    expect(loadSessionEntry({ sessionKey: key, storePath })).toMatchObject({
+    expect(read(key)).toMatchObject({
       authProfileOverride: authProfileId,
       authProfileOverrideSource: "user",
     });
 
     const collaborator = ensureProfileForEmail("session-collaborator@example.test");
     connectAccount("collaborator-account@example.test", collaborator.id);
-    client.authenticatedUserProfile = {
-      profileId: collaborator.id,
-      displayName: collaborator.displayName,
-      hasAvatar: false,
-      updatedAt: collaborator.updatedAt,
-    };
+    client.authenticatedUserProfile = profileIdentity(collaborator);
     const forkKey = "agent:main:dashboard:personal-collaborator-fork";
-    const forked = await directSessionReq(
-      "sessions.create",
-      { key: forkKey, parentSessionKey: key, fork: true },
-      { client, context },
-    );
+    const forked = await request("sessions.create", {
+      key: forkKey,
+      parentSessionKey: key,
+      fork: true,
+    });
 
     expect(forked.ok, JSON.stringify(forked.error)).toBe(true);
-    expect(loadSessionEntry({ sessionKey: forkKey, storePath })).toMatchObject({
+    expect(read(forkKey)).toMatchObject({
       authProfileOverride: authProfileId,
       authProfileOverrideSource: "user",
       parentSessionKey: key,
     });
   });
 });
+
+const arceeModels = [
+  {
+    id: "trinity-large-thinking",
+    name: "Direct Arcee model",
+    baseUrl: "https://api.arcee.ai/api/v1",
+  },
+  { id: "trinity-large-preview", name: "Arcee model through OpenRouter" },
+];
+const arceeCatalog = arceeModels.map(({ id, name }) => ({ id, name, provider: "arcee" }));
 
 test.each([
   {
@@ -205,29 +233,17 @@ test.each([
               arcee: {
                 baseUrl: "https://openrouter.ai/api/v1",
                 api: "openai-completions",
-                models: [
-                  {
-                    id: "trinity-large-thinking",
-                    name: "Direct Arcee model",
-                    api: "openai-completions",
-                    baseUrl: "https://api.arcee.ai/api/v1",
-                    reasoning: true,
-                    input: ["text"],
-                    contextWindow: 32768,
-                    maxTokens: 2048,
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  },
-                  {
-                    id: "trinity-large-preview",
-                    name: "Arcee model through OpenRouter",
-                    api: "openai-completions",
-                    reasoning: true,
-                    input: ["text"],
-                    contextWindow: 32768,
-                    maxTokens: 2048,
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  },
-                ],
+                models: arceeModels.map(({ id, name, baseUrl }) => ({
+                  id,
+                  name,
+                  baseUrl,
+                  api: "openai-completions",
+                  reasoning: true,
+                  input: ["text"],
+                  contextWindow: 32768,
+                  maxTokens: 2048,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                })),
               },
             },
           },
@@ -282,17 +298,10 @@ test.each([
             const context = {
               getRuntimeConfig: () => cfg,
               modelAccountConnectService: service,
-              loadGatewayModelCatalogSnapshot: async () => {
-                const entries = [
-                  { id: "trinity-large-thinking", name: "Direct Arcee model", provider: "arcee" },
-                  {
-                    id: "trinity-large-preview",
-                    name: "Arcee model through OpenRouter",
-                    provider: "arcee",
-                  },
-                ];
-                return { entries, routeVariants: entries };
-              },
+              loadGatewayModelCatalogSnapshot: async () => ({
+                entries: arceeCatalog,
+                routeVariants: arceeCatalog,
+              }),
               getClientConnIds: (filter?: (current: GatewayClient) => boolean) =>
                 new Set(
                   [...clients]
@@ -300,6 +309,7 @@ test.each([
                     .map(({ connId }) => connId),
                 ),
             };
+            const { request } = sessionRequests(client, context, storePath);
             try {
               const linked = await directSessionReq(
                 "users.linkAuthProfile",
@@ -307,11 +317,7 @@ test.each([
                 { client: adminClient, context },
               );
               expect(linked.ok, JSON.stringify(linked.error)).toBe(true);
-              const linksBefore = await directSessionReq(
-                "users.listAuthLinks",
-                { profileId: owner.id },
-                { client, context },
-              );
+              const linksBefore = await request("users.listAuthLinks", { profileId: owner.id });
               expect(linksBefore.ok, JSON.stringify(linksBefore.error)).toBe(true);
               expect(linksBefore.payload).toMatchObject({
                 links: [{ provider: "arcee", authProfileId: "arcee:work" }],
@@ -340,42 +346,39 @@ test.each([
                 respond(true, { runId: "arcee-linked-default-first-turn", status: "started" });
               });
               try {
-                const created = await directSessionReq<{ runStarted: boolean }>(
-                  "sessions.create",
-                  { key, model: `arcee/${modelId}`, message: "Start the first turn" },
-                  { client, context },
-                );
+                const created = await request<{ runStarted: boolean }>("sessions.create", {
+                  key,
+                  model: `arcee/${modelId}`,
+                  message: "Start the first turn",
+                });
 
                 expect(created.ok, JSON.stringify(created.error)).toBe(true);
                 expect(created.payload?.runStarted).toBe(true);
-                expect.soft(observedSelections).toEqual([
-                  {
-                    provider: "arcee",
-                    model: modelId,
-                    profile: expectedPin,
-                    source: expectedSource,
-                  },
-                ]);
+                const expectedSelection = {
+                  provider: "arcee",
+                  model: modelId,
+                  profile: expectedPin,
+                  source: expectedSource,
+                };
+                expect.soft(observedSelections).toEqual([expectedSelection]);
                 const saved = loadSessionEntry({
                   sessionKey: key,
                   storePath,
                   readConsistency: "latest",
                 });
                 expect
-                  .soft(resolveSessionModelRef(cfg, saved, "main"))
-                  .toEqual({ provider: "arcee", model: modelId });
-                expect.soft(saved?.authProfileOverride).toBe(expectedPin);
-                expect.soft(saved?.authProfileOverrideSource).toBe(expectedSource);
+                  .soft({
+                    ...resolveSessionModelRef(cfg, saved, "main"),
+                    profile: saved?.authProfileOverride,
+                    source: saved?.authProfileOverrideSource,
+                  })
+                  .toEqual(expectedSelection);
                 expect(
                   ensureAuthProfileStoreWithoutExternalProfiles(state.agentDir(), {
                     readOnly: true,
                   }).profiles["arcee:work"],
                 ).toEqual(credential);
-                const linksAfter = await directSessionReq(
-                  "users.listAuthLinks",
-                  { profileId: owner.id },
-                  { client, context },
-                );
+                const linksAfter = await request("users.listAuthLinks", { profileId: owner.id });
                 expect(linksAfter.ok, JSON.stringify(linksAfter.error)).toBe(true);
                 expect(linksAfter.payload).toEqual(linksBefore.payload);
                 expect(JSON.parse(await fs.readFile(state.configPath, "utf8"))).toEqual(
@@ -399,7 +402,7 @@ test.each([
 
 test("sessions.create does not donate a personal default to an unpinned adoption or fork", async () => {
   await withSessionTestState({ layout: "state-only" }, async () => {
-    const { storePath, client, context } = await createPersonalAccountSessionFixture();
+    const { storePath, read, request } = await createPersonalAccountSessionFixture();
     const key = "agent:main:dashboard:unpinned-existing";
     const sessionId = "unpinned-existing-session";
     await writeSessionStore({
@@ -418,19 +421,16 @@ test("sessions.create does not donate a personal default to an unpinned adoption
     });
     for (const fork of [false, true]) {
       const target = fork ? `${key}-fork` : key;
-      const result = await directSessionReq(
-        "sessions.create",
-        { key: target, ...(fork ? { parentSessionKey: key, fork: true } : {}) },
-        { client, context },
-      );
+      const result = await request("sessions.create", {
+        key: target,
+        ...(fork ? { parentSessionKey: key, fork: true } : {}),
+      });
       expect(result.ok, JSON.stringify(result.error)).toBe(true);
-      expect(loadSessionEntry({ sessionKey: target, storePath })).toMatchObject({
+      expect(read(target)).toMatchObject({
         providerOverride: "openai",
         modelOverride: "gpt-5.6-sol",
       });
-      expect(
-        loadSessionEntry({ sessionKey: target, storePath })?.authProfileOverride,
-      ).toBeUndefined();
+      expect(read(target)?.authProfileOverride).toBeUndefined();
     }
   });
 });
@@ -441,7 +441,7 @@ test.each(["foreign admin", "unidentified admin", "synthetic owner"] as const)(
     await withSessionTestState({ layout: "state-only" }, async (state) => {
       const workspace = await copyGitWorkspace(gitWorkspaceTemplate, state.root);
       testState.agentConfig = { workspace };
-      const { storePath, authProfileId, client, context } =
+      const { storePath, read, request, authProfileId, client, context } =
         await createPersonalAccountSessionFixture();
       client.connect.scopes = ["operator.admin"];
       const key = "agent:main:dashboard:personal-denied-worktree";
@@ -454,19 +454,12 @@ test.each(["foreign admin", "unidentified admin", "synthetic owner"] as const)(
         storePath,
         messages: [{ role: "user", content: "Review the deployment plan" }],
       });
-      await expect(
-        directSessionReq("sessions.describe", { key }, { client, context }),
-      ).resolves.toMatchObject({ ok: true });
+      await expect(request("sessions.describe", { key })).resolves.toMatchObject({ ok: true });
       context.loadGatewayModelCatalogSnapshot.mockClear();
-      const before = loadSessionEntry({ sessionKey: key, storePath });
+      const before = read(key);
       if (kind === "foreign admin") {
         const other = ensureProfileForEmail("session-other-person@example.test");
-        client.authenticatedUserProfile = {
-          profileId: other.id,
-          displayName: other.displayName,
-          hasAvatar: false,
-          updatedAt: other.updatedAt,
-        };
+        client.authenticatedUserProfile = profileIdentity(other);
       } else if (kind === "unidentified admin") {
         delete client.authenticatedUserProfile;
       } else {
@@ -476,16 +469,16 @@ test.each(["foreign admin", "unidentified admin", "synthetic owner"] as const)(
         };
       }
       try {
-        const created = await directSessionReq(
-          "sessions.create",
-          { key, model: `openai/gpt-5.6-sol@${authProfileId}`, worktree: true },
-          { client, context },
-        );
+        const created = await request("sessions.create", {
+          key,
+          model: `openai/gpt-5.6-sol@${authProfileId}`,
+          worktree: true,
+        });
 
         expect(created).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
         expect(context.loadGatewayModelCatalogSnapshot).not.toHaveBeenCalled();
         expect(dashboardTitleGenerationMocks.generate).not.toHaveBeenCalled();
-        expect(loadSessionEntry({ sessionKey: key, storePath })).toEqual(before);
+        expect(read(key)).toEqual(before);
         expect(await managedWorktrees.findLiveByOwner("session", key)).toBeUndefined();
       } finally {
         const worktree = await managedWorktrees.findLiveByOwner("session", key);
@@ -566,10 +559,11 @@ test("sessions.create names an adopted worktree with its committed account befor
     testState.agentConfig = { workspace, model: { primary: "openai/gpt-5.6-sol" } };
     const {
       storePath,
+      read,
+      request,
       authProfileId: previousAuthProfileId,
       connectAccount,
       client,
-      context,
     } = await createPersonalAccountSessionFixture();
     const selectedAuthProfileId = connectAccount("next-account@example.test");
     client.connect.scopes = ["operator.admin"];
@@ -594,22 +588,22 @@ test("sessions.create names an adopted worktree with its committed account befor
     });
     let profileAtNaming: string | undefined;
     dashboardTitleGenerationMocks.generate.mockImplementationOnce(async () => {
-      profileAtNaming = loadSessionEntry({ sessionKey: key, storePath })?.authProfileOverride;
+      profileAtNaming = read(key)?.authProfileOverride;
       return "Account Transition";
     });
     try {
-      const created = await directSessionReq(
-        "sessions.create",
-        { key, model: `openai/gpt-5.6-sol@${selectedAuthProfileId}`, worktree: true },
-        { client, context },
-      );
+      const created = await request("sessions.create", {
+        key,
+        model: `openai/gpt-5.6-sol@${selectedAuthProfileId}`,
+        worktree: true,
+      });
 
       expect(created.ok, JSON.stringify(created.error)).toBe(true);
       expect(profileAtNaming).toBe(previousAuthProfileId);
       expect(
-        dashboardTitleGenerationMocks.generate.mock.calls.map(([request]) => ({
-          regularModelRef: request.regularModelRef,
-          preferredProfile: request.preferredProfile,
+        dashboardTitleGenerationMocks.generate.mock.calls.map(([input]) => ({
+          regularModelRef: input.regularModelRef,
+          preferredProfile: input.preferredProfile,
         })),
       ).toEqual([
         {
@@ -617,7 +611,7 @@ test("sessions.create names an adopted worktree with its committed account befor
           preferredProfile: previousAuthProfileId,
         },
       ]);
-      expect(loadSessionEntry({ sessionKey: key, storePath })).toMatchObject({
+      expect(read(key)).toMatchObject({
         authProfileOverride: selectedAuthProfileId,
         authProfileOverrideSource: "user",
         displayName: "Account Transition",

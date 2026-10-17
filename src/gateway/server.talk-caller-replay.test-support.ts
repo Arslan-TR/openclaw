@@ -135,7 +135,6 @@ export async function runTalkCallerReplay({
       }
     | undefined;
   const approvals: unknown[] = [];
-  const outcomes: unknown[] = [];
   const workspace = expectDefined(config.agents?.defaults?.workspace, "suite workspace");
   // Removing an effect marker must not wipe an attested workspace between cells.
   await fs.mkdir(workspace, { recursive: true });
@@ -243,6 +242,14 @@ export async function runTalkCallerReplay({
   let legacyVoiceForCleanup: string | undefined;
   try {
     const peers = { writer: await connect("writer"), reader: await connect("reader") };
+    const reconnectWriter = async (scopes?: string[]) => {
+      const closed = once(peers.writer, "close");
+      peers.writer.close();
+      await closed;
+      peers.writer = await connect("writer", scopes);
+    };
+    const steer = (socket: (typeof peers)[Caller]) =>
+      rpcReq(socket, "talk.client.steer", { sessionKey, text: "status", mode: "status" });
     const consult = (who: Caller, callId: string, socket = peers[who], legacy = false) =>
       rpcReq<{ runId: string }>(socket, "talk.client.toolCall", {
         sessionKey,
@@ -261,6 +268,20 @@ export async function runTalkCallerReplay({
       expect(result.ok, JSON.stringify(result)).toBe(true);
       expect(result.payload?.status, JSON.stringify(result)).toBe("ok");
       await settled();
+    };
+    const expectCompletedReplay = async (
+      result: Awaited<ReturnType<typeof consult>>,
+      dispatches: number,
+      effectText: string,
+    ) => {
+      if (result.ok) {
+        await waitRun(result.payload?.runId);
+      }
+      await settled();
+      expect(result.ok).toBe(false);
+      expect(result.error?.message).toContain("completed before the tool result subscription");
+      expect(attempts).toHaveLength(dispatches);
+      expect(await effects()).toBe(effectText);
     };
     for (const order of [
       ["writer", "reader"],
@@ -298,7 +319,6 @@ export async function runTalkCallerReplay({
           });
         }
       }
-      outcomes.push(cell);
       expect.soft(cell).toEqual({
         order,
         firstOk: true,
@@ -321,26 +341,14 @@ export async function runTalkCallerReplay({
       }),
     ]);
     const retransmit = await consult("writer", "active-shared");
-    const foreignControl = await rpcReq(peers.reader, "talk.client.steer", {
-      sessionKey,
-      text: "status",
-      mode: "status",
-    });
+    const foreignControl = await steer(peers.reader);
     // A lower-grant socket of the same signed device may observe its existing
     // intent, but must not acquire the original connection's control custody.
     const narrowedActivePeer = await connect("writer", ["operator.read", "operator.talk"]);
     const narrowedActive = await consult("writer", "active-shared", narrowedActivePeer);
-    const narrowedControl = await rpcReq(narrowedActivePeer, "talk.client.steer", {
-      sessionKey,
-      text: "status",
-      mode: "status",
-    });
+    const narrowedControl = await steer(narrowedActivePeer);
     const pendingOther = consult("reader", "active-shared");
-    const ownControl = await rpcReq(peers.writer, "talk.client.steer", {
-      sessionKey,
-      text: "status",
-      mode: "status",
-    });
+    const ownControl = await steer(peers.writer);
     const effectsBeforeRelease = await effects();
     hold.release.resolve();
     hold = undefined;
@@ -361,11 +369,6 @@ export async function runTalkCallerReplay({
       effectsBeforeRelease,
     };
     await settled();
-    outcomes.push({
-      active,
-      admitted: attempts.slice(beforeHeld).map(({ caller, exec }) => ({ caller, exec })),
-      effects: await effects(),
-    });
     expect.soft(active).toEqual({
       sameCallerSameRun: true,
       differentCallerDifferentRun: true,
@@ -381,71 +384,23 @@ export async function runTalkCallerReplay({
     expect(await effects()).toBe("effect\n");
     // A new socket with the same signed identity/grants replays accepted work.
     const beforeReconnect = attempts.length;
-    const closed = once(peers.writer, "close");
-    peers.writer.close();
-    await closed;
-    peers.writer = await connect("writer", [
+    await reconnectWriter([
       "operator.approvals",
       "operator.talk",
       "operator.write",
       "operator.read",
     ]);
     const replay = await consult("writer", "active-shared");
-    await settled();
-    expect(replay.ok).toBe(false);
-    expect(replay.error?.message).toContain("completed before the tool result subscription");
-    expect(attempts).toHaveLength(beforeReconnect);
-    expect(await effects()).toBe("effect\n");
-    const equivalentClosed = once(peers.writer, "close");
-    peers.writer.close();
-    await equivalentClosed;
-    peers.writer = await connect("writer", ["operator.write", "operator.approvals"]);
+    await expectCompletedReplay(replay, beforeReconnect, "effect\n");
+    await reconnectWriter(["operator.write", "operator.approvals"]);
     const equivalentReplay = await consult("writer", "active-shared");
-    if (equivalentReplay.ok) {
-      await waitRun(equivalentReplay.payload?.runId);
-    }
-    await settled();
-    const equivalentCell = {
-      equivalentReconnectAcceptedAsNew: equivalentReplay.ok,
-      equivalentReconnectDispatches: attempts.length - beforeReconnect,
-      effects: await effects(),
-      approvals: approvals.length,
-    };
-    console.info("Equivalent-grant reconnect observed:", JSON.stringify(equivalentCell));
-    expect(equivalentCell).toEqual({
-      equivalentReconnectAcceptedAsNew: false,
-      equivalentReconnectDispatches: 0,
-      effects: "effect\n",
-      approvals: 0,
-    });
-    expect(equivalentReplay.error?.message).toContain(
-      "completed before the tool result subscription",
-    );
-    const replayDispatches = attempts.length - beforeReconnect;
+    await expectCompletedReplay(equivalentReplay, beforeReconnect, "effect\n");
+    expect(approvals).toHaveLength(0);
     // A changed grant is not a new logical request from the same signed caller.
-    const narrowedClosed = once(peers.writer, "close");
-    peers.writer.close();
-    await narrowedClosed;
-    peers.writer = await connect("writer", ["operator.write"]);
+    await reconnectWriter(["operator.write"]);
     const narrowed = await consult("writer", "active-shared");
-    if (narrowed.ok) {
-      await waitRun(narrowed.payload?.runId);
-    }
-    await settled();
-    const narrowedCell = {
-      narrowedRetryAcceptedAsNew: narrowed.ok,
-      narrowedRetryDispatches: attempts.length - beforeReconnect,
-      effects: await effects(),
-      approvals: approvals.length,
-    };
-    console.info("Narrowed-grant retry observed:", JSON.stringify(narrowedCell));
-    expect(narrowedCell).toEqual({
-      narrowedRetryAcceptedAsNew: false,
-      narrowedRetryDispatches: 0,
-      effects: "effect\n",
-      approvals: 0,
-    });
-    expect(narrowed.error?.message).toContain("completed before the tool result subscription");
+    await expectCompletedReplay(narrowed, beforeReconnect, "effect\n");
+    expect(approvals).toHaveLength(0);
     expect(clients.get("writer")?.connect.scopes).not.toContain("operator.approvals");
     const beforeFresh = attempts.length;
     const fresh = await consult("writer", "genuinely-new-call");
@@ -456,13 +411,6 @@ export async function runTalkCallerReplay({
     expect(fresh.payload?.runId).not.toBe(first.payload?.runId);
     expect(attempts).toHaveLength(beforeFresh + 1);
     expect(await effects()).toBe("effect\neffect\n");
-    outcomes.push({
-      reconnectReplayDispatches: replayDispatches,
-      narrowedRetryDispatches: narrowedCell.narrowedRetryDispatches,
-      newRequestDispatches: attempts.length - beforeFresh,
-      effects: await effects(),
-      approvals: approvals.length,
-    });
     // Keep a separate, genuinely write-authorized observer solely for agent.wait.
     // The read-only action below is still admitted from its own signed socket.
     const runObserver = peers.writer;
@@ -470,9 +418,7 @@ export async function runTalkCallerReplay({
     const beforeReadOnly = attempts.length;
     const beforeReadOnlyEffects = await effects();
     const readOnlyRetry = await consult("writer", "active-shared");
-    expect(readOnlyRetry.ok).toBe(false);
-    expect(readOnlyRetry.error?.message).toContain("completed before the tool result subscription");
-    expect(attempts).toHaveLength(beforeReadOnly);
+    await expectCompletedReplay(readOnlyRetry, beforeReadOnly, beforeReadOnlyEffects);
     const readOnlyFresh = await consult("writer", "new-read-only-call");
     expect(readOnlyFresh.ok).toBe(true);
     await waitRun(readOnlyFresh.payload?.runId, runObserver);
@@ -486,10 +432,7 @@ export async function runTalkCallerReplay({
       text: "Caller has no exec capability.",
     });
     expect(await effects()).toBe(beforeReadOnlyEffects);
-    const readOnlyClosed = once(peers.writer, "close");
-    peers.writer.close();
-    await readOnlyClosed;
-    peers.writer = await connect("writer", ["operator.read"]);
+    await reconnectWriter(["operator.read"]);
     const deniedRetry = await consult("writer", "active-shared");
     const deniedFresh = await consult("writer", "new-without-talk");
     for (const result of [deniedRetry, deniedFresh]) {
@@ -498,13 +441,6 @@ export async function runTalkCallerReplay({
     }
     expect(attempts).toHaveLength(beforeReadOnly + 1);
     expect(await effects()).toBe(beforeReadOnlyEffects);
-    outcomes.push({
-      readOnlyRetryDispatches: attempts.length - beforeReadOnly - 1,
-      freshReadOnlyExec: attempts.at(-1)?.exec,
-      methodDeniedRetry: !deniedRetry.ok,
-      methodDeniedFresh: !deniedFresh.ok,
-      effectsUnchanged: (await effects()) === beforeReadOnlyEffects,
-    });
     expect(clients.size).toBe(2);
     expect(clients.get("writer")?.connect.client.id).toBe(clients.get("reader")?.connect.client.id);
     expect(clients.get("writer")?.connect.device?.id).not.toBe(
@@ -518,10 +454,7 @@ export async function runTalkCallerReplay({
     expect(approvals).toHaveLength(0);
     // Legacy clients omit the logical voice ID. Retiring its inferred record
     // must not turn a retransmitted call into another native effect.
-    const legacyClosed = once(peers.writer, "close");
-    peers.writer.close();
-    await legacyClosed;
-    peers.writer = await connect("writer");
+    await reconnectWriter();
     const beforeLegacy = attempts.length;
     const legacy = await consult("writer", "legacy-retry", peers.writer, true);
     expect(legacy.ok, JSON.stringify(legacy)).toBe(true);
@@ -537,10 +470,7 @@ export async function runTalkCallerReplay({
       voiceSessionId: expectDefined(originalLegacyVoice, "legacy voice binding"),
     });
     expect(closeLegacyVoice.ok, JSON.stringify(closeLegacyVoice)).toBe(true);
-    const reconnectLegacy = once(peers.writer, "close");
-    peers.writer.close();
-    await reconnectLegacy;
-    peers.writer = await connect("writer");
+    await reconnectWriter();
     const legacyRetry = await consult("writer", "legacy-retry", peers.writer, true);
     if (legacyRetry.ok) {
       await waitRun(legacyRetry.payload?.runId);
@@ -555,18 +485,11 @@ export async function runTalkCallerReplay({
     expect(legacyRetry.ok).toBe(false);
     expect(attempts).toHaveLength(beforeLegacy + 1);
     expect(await effects()).toBe(legacyEffects);
-    console.info("Legacy regenerated-session retry observed:", {
-      regeneratedVoiceSession: regeneratedLegacyVoice !== originalLegacyVoice,
-      retryAcceptedAsNew: legacyRetry.ok,
-      retryDispatches: attempts.length - beforeLegacy - 1,
-      effectsUnchanged: (await effects()) === legacyEffects,
-    });
     const freshLegacy = await consult("writer", "legacy-new-call", peers.writer, true);
     expect(freshLegacy.ok, JSON.stringify(freshLegacy)).toBe(true);
     await waitRun(freshLegacy.payload?.runId);
     expect(attempts).toHaveLength(beforeLegacy + 2);
     expect(await effects()).toBe(`${legacyEffects}effect\n`);
-    console.info("Authenticated caller replay observed:", JSON.stringify(outcomes));
   } finally {
     hold?.release.resolve();
     observeCaller.mockRestore();

@@ -126,11 +126,7 @@ describe("Gateway ACP completion ownership", () => {
     { name: "live block replies", live: true },
     { name: "widget tool progress", widget: true },
     { name: "post-hook widget suppression", widget: true, suppressed: true, transform: () => null },
-    {
-      name: "bound target media",
-      bound: true,
-      media: true,
-    },
+    { name: "bound target media", bound: true, media: true },
     { name: "suppressed runtime errors", fail: true, transform: () => null },
     { name: "suppressed runtime timeout", timeout: true, transform: () => null },
     { name: "persistence errors", persistFail: true },
@@ -160,6 +156,8 @@ describe("Gateway ACP completion ownership", () => {
     const sessionKey = `agent:main:acp-completion-${suffix}`;
     const targetSessionKey = scenario.bound ? `agent:main:bound-${suffix}` : sessionKey;
     const sessionId = `acp-completion-session-${suffix}`;
+    const readTranscript = (key: string, id: string) =>
+      readTranscriptMessages({ agentId: "main", sessionKey: key, sessionId: id, storePath });
     expect((await rpcReq(ws, "sessions.subscribe", {})).ok).toBe(true);
     let turnStarted = createDeferred();
     let releaseTurn = createDeferred();
@@ -345,6 +343,7 @@ describe("Gateway ACP completion ownership", () => {
       // Preserve the observed order: one cold turn, then the same session and
       // reply through the now-loaded lifecycle subscriber.
       for (const [index, temperature] of ["cold", "warm"].entries()) {
+        const check = (value: unknown) => expect.soft(value, temperature);
         const runId = `acp-completion-${suffix}-${temperature}`;
         activeRunId = runId;
         const admissionCapture = createDeferred<CapturedAdmission>();
@@ -399,53 +398,49 @@ describe("Gateway ACP completion ownership", () => {
           },
           { timeout: 10_000 },
         );
-        expect.soft(replayPayload, JSON.stringify(replayPayload)).toMatchObject({
+        check(replayPayload).toMatchObject({
           runId,
           status: expectedStatus,
         });
         if (scenario.cancel) {
-          expect
-            .soft(replayPayload)
-            .toMatchObject({ summary: "aborted", endedAt: expect.any(Number) });
+          check(replayPayload).toMatchObject({ summary: "aborted", endedAt: expect.any(Number) });
         }
         expect(runtime.runTurn).toHaveBeenCalledTimes(index + 1);
         const waited = await rpcReq(ws, "agent.wait", { runId, timeoutMs: 5_000 });
-        expect.soft(waited.payload).toMatchObject({
+        check(waited.payload).toMatchObject({
           status: scenario.cancel ? "error" : expectedStatus,
         });
         // Run settlement does not join the asynchronous lifecycle subscriber.
         await withinTest(lifecycleDelivered.promise, signal);
-        const finals = frames.filter(
+        const runFrames = frames.filter((frame) => frame.payload?.runId === runId);
+        const finals = runFrames.filter(
           (frame) =>
             frame.event === "chat" &&
-            frame.payload?.runId === runId &&
-            ["final", "error", "aborted"].includes(frame.payload.state ?? ""),
+            ["final", "error", "aborted"].includes(frame.payload?.state ?? ""),
         );
-        expect.soft(finals, temperature).toHaveLength(1);
-        expect.soft(finals[0]?.payload?.state).toBe(expectedState);
-        const terminalIndex = frames.findIndex((frame) => frame === finals[0]);
+        check(finals).toHaveLength(1);
+        const final = finals[0]?.payload;
+        check(final?.state).toBe(expectedState);
+        const terminalIndex = runFrames.findIndex((frame) => frame === finals[0]);
         const priorSequence = Math.max(
           0,
-          ...frames
-            .slice(0, terminalIndex)
-            .filter((frame) => frame.payload?.runId === runId)
-            .map((frame) => frame.payload?.seq ?? 0),
+          ...runFrames.slice(0, terminalIndex).map((frame) => frame.payload?.seq ?? 0),
         );
-        expect.soft(finals[0]?.payload?.seq).toBeGreaterThan(priorSequence);
+        check(final?.seq).toBeGreaterThan(priorSequence);
         if (scenario.timeout) {
-          expect.soft(finals[0]?.payload?.errorKind).toBe("timeout");
+          check(final?.errorKind).toBe("timeout");
         }
         if (expectedState !== "error" && !scenario.rpcAbort) {
-          expect
-            .soft(extractFirstTextBlock(finals[0]?.payload?.message), temperature)
-            .toBe(scenario.suppressed ? undefined : (scenario.text ?? "same accepted reply"));
+          check(extractFirstTextBlock(final?.message)).toBe(
+            scenario.suppressed ? undefined : (scenario.text ?? "same accepted reply"),
+          );
         }
         if (scenario.widget) {
-          const content = asOptionalRecord(finals[0]?.payload?.message)?.content;
+          const content = asOptionalRecord(final?.message)?.content;
           if (scenario.suppressed) {
-            expect.soft(content).toBeUndefined();
+            check(content).toBeUndefined();
           } else {
-            expect.soft(content).toEqual([
+            check(content).toEqual([
               { type: "text", text: "same accepted reply" },
               {
                 type: "canvas",
@@ -463,98 +458,69 @@ describe("Gateway ACP completion ownership", () => {
             ]);
           }
         }
-        const lifecycle = frames.filter(
-          (frame) =>
-            frame.event === "agent" &&
-            frame.payload?.runId === runId &&
-            frame.payload.stream === "lifecycle",
+        const lifecycle = runFrames.filter(
+          (frame) => frame.event === "agent" && frame.payload?.stream === "lifecycle",
         );
-        expect
-          .soft(lifecycle.map((frame) => frame.payload?.data?.phase))
-          .toEqual(["start", expectedState === "error" ? "error" : "end"]);
+        check(lifecycle.map((frame) => frame.payload?.data?.phase)).toEqual([
+          "start",
+          expectedState === "error" ? "error" : "end",
+        ]);
         if (scenario.rpcAbort) {
-          expect.soft(lifecycle.at(-1)?.payload?.data).toMatchObject({
+          check(lifecycle.at(-1)?.payload?.data).toMatchObject({
             phase: "end",
             status: "cancelled",
             aborted: true,
             stopReason: "rpc",
           });
           // This terminal-only reply was never shown; there is no visible partial to save.
-          expect
-            .soft(
-              frames.filter(
-                (frame) =>
-                  frame.payload?.runId === runId &&
-                  (frame.payload.stream === "assistant" || frame.payload.state === "delta"),
-              ),
-            )
-            .toEqual([]);
-          expect.soft(finals[0]?.payload?.message).toBeUndefined();
-        }
-        expect
-          .soft(
-            frames.filter(
-              (frame) =>
-                frame.payload?.runId === runId && frame.payload?.data?.reason === "seq gap",
+          check(
+            runFrames.filter(
+              (frame) => frame.payload?.stream === "assistant" || frame.payload?.state === "delta",
             ),
-          )
-          .toEqual([]);
-        const messages = readTranscriptMessages({
-          agentId: "main",
-          sessionId: scenario.rebound ? `${sessionId}-replaced-${index + 1}` : sessionId,
-          sessionKey: targetSessionKey,
-          storePath,
-        }).filter((message) => message.role === "user" || message.role === "assistant");
-        if (scenario.widget) {
-          const persisted = messages.findLast((message) => message.role === "assistant");
-          expect
-            .soft(asOptionalRecord(persisted)?.content)
-            .toEqual([{ type: "text", text: "same accepted reply" }]);
+          ).toEqual([]);
+          check(final?.message).toBeUndefined();
         }
-        expect
-          .soft(
-            messages.map((message) => message.role),
-            temperature,
-          )
-          .toEqual(
-            scenario.rebound
-              ? []
-              : Array.from({ length: index + 1 }, () =>
-                  scenario.persistFail ? ["user"] : ["user", "assistant"],
-                ).flat(),
-          );
+        check(runFrames.filter((frame) => frame.payload?.data?.reason === "seq gap")).toEqual([]);
+        const messages = readTranscript(
+          targetSessionKey,
+          scenario.rebound ? `${sessionId}-replaced-${index + 1}` : sessionId,
+        ).filter((message) => message.role === "user" || message.role === "assistant");
+        const assistant = messages.findLast((message) => message.role === "assistant");
+        if (scenario.widget) {
+          check(asOptionalRecord(assistant)?.content).toEqual([
+            { type: "text", text: "same accepted reply" },
+          ]);
+        }
+        check(messages.map((message) => message.role)).toEqual(
+          scenario.rebound
+            ? []
+            : Array.from({ length: index + 1 }, () =>
+                scenario.persistFail ? ["user"] : ["user", "assistant"],
+              ).flat(),
+        );
         if (scenario.cancel && !scenario.rpcAbort) {
-          const assistant = messages.findLast((message) => message.role === "assistant");
-          expect.soft(assistant, temperature).toMatchObject({
+          check(assistant).toMatchObject({
             idempotencyKey: runId,
             model: "acp-runtime",
             stopReason: "aborted",
           });
-          expect.soft(extractFirstTextBlock(assistant), temperature).toBe("same accepted reply");
-          expect.soft(finals[0]?.payload?.message, temperature).toMatchObject({
+          check(extractFirstTextBlock(assistant)).toBe("same accepted reply");
+          check(final?.message).toMatchObject({
             stopReason: "aborted",
           });
         }
         if (scenario.media) {
-          const assistant = messages.findLast((message) => message.role === "assistant");
-          expect
-            .soft(
-              readAssistantDisplayContent(assistant).some((block: unknown) => {
-                const content = asOptionalRecord(block);
-                return content !== undefined && content.type !== "text";
-              }),
-            )
-            .toBe(true);
+          check(
+            readAssistantDisplayContent(assistant).some((block: unknown) => {
+              const content = asOptionalRecord(block);
+              return content !== undefined && content.type !== "text";
+            }),
+          ).toBe(true);
         }
         if (scenario.bound) {
           // The bound target owns ACP history; the dashboard retains each delivered reply too.
-          const sourceMessages = readTranscriptMessages({
-            agentId: "main",
-            sessionId: `source-${sessionId}`,
-            sessionKey,
-            storePath,
-          });
-          expect.soft(sourceMessages).toMatchObject(
+          const sourceMessages = readTranscript(sessionKey, `source-${sessionId}`);
+          check(sourceMessages).toMatchObject(
             ["cold", "warm"].slice(0, index + 1).flatMap((turn) => [
               {
                 role: "user",
@@ -574,24 +540,22 @@ describe("Gateway ACP completion ownership", () => {
           ] as const) {
             // Media is copied into each transcript owner's namespace, not shared by URL.
             const mediaPrefix = `/api/chat/media/outgoing/${encodeURIComponent(ownerKey)}/`;
-            expect
-              .soft(
-                readAssistantDisplayContent(
-                  transcript.findLast((message) => message.role === "assistant"),
-                ),
-              )
-              .toMatchObject([
-                { type: "text", text: "same accepted reply" },
-                {
-                  type: "image",
-                  mimeType: "image/png",
-                  sizeBytes: 68,
-                  width: 1,
-                  height: 1,
-                  url: expect.stringContaining(mediaPrefix),
-                  openUrl: expect.stringContaining(mediaPrefix),
-                },
-              ]);
+            check(
+              readAssistantDisplayContent(
+                transcript.findLast((message) => message.role === "assistant"),
+              ),
+            ).toMatchObject([
+              { type: "text", text: "same accepted reply" },
+              {
+                type: "image",
+                mimeType: "image/png",
+                sizeBytes: 68,
+                width: 1,
+                height: 1,
+                url: expect.stringContaining(mediaPrefix),
+                openUrl: expect.stringContaining(mediaPrefix),
+              },
+            ]);
           }
         }
       }

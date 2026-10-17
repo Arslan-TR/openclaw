@@ -6,6 +6,7 @@ import {
   runExclusiveSqliteSessionWrite,
 } from "../config/sessions/session-accessor.sqlite-scope.js";
 import * as sessionMembers from "../config/sessions/session-sharing-store.native.js";
+import type { GatewayOperatorRoleDefinition } from "../config/types.gateway.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import { setUserProfileRole } from "../state/user-profile-writes.worker.js";
@@ -27,14 +28,13 @@ import {
 
 const { createSessionStoreDir } = setupSessionCreateTestHarness();
 
-test("required operator sandbox follows new session ownership across create, patch, and patchMany", async () => {
-  const { storePath } = await createSessionStoreDir();
-
-  const cfg = {
-    ...getRuntimeConfig(),
-    session: { ...getRuntimeConfig().session, store: storePath },
+function guestConfig(storePath: string, role: Partial<GatewayOperatorRoleDefinition>) {
+  const cfg = getRuntimeConfig();
+  return {
+    ...cfg,
+    session: { ...cfg.session, store: storePath },
     gateway: {
-      ...getRuntimeConfig().gateway,
+      ...cfg.gateway,
       roles: {
         default: "guest",
         definitions: {
@@ -42,12 +42,38 @@ test("required operator sandbox follows new session ownership across create, pat
             sessions: { others: "view" as const },
             agents: ["main"],
             scopes: ["operator.read" as const, "operator.write" as const],
-            sandbox: "required" as const,
+            ...role,
           },
         },
       },
     },
   };
+}
+
+function operatorClient(profile: ReturnType<typeof ensureProfileForEmail>, systemActor = false) {
+  return {
+    ...(systemActor ? { internal: { operatorRoleActor: { kind: "system" } } } : {}),
+    connect: { role: "operator", scopes: ["operator.read", "operator.write"] },
+    authenticatedUserProfile: {
+      profileId: profile.id,
+      displayName: profile.displayName,
+      hasAvatar: false,
+      updatedAt: profile.updatedAt,
+    },
+  } as never;
+}
+
+function pluginClient() {
+  return {
+    connect: { scopes: ["operator.write"] },
+    internal: { pluginRuntimeOwnerId: "memory-core" },
+  } as never;
+}
+const reservedNamespace = "Session key namespace is reserved for agent harness-owned sessions.";
+
+test("required operator sandbox follows new session ownership across create, patch, and patchMany", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const cfg = guestConfig(storePath, { sandbox: "required" });
   const context = { getRuntimeConfig: () => cfg };
 
   for (const [method, suffix, systemActor] of [
@@ -64,16 +90,7 @@ test("required operator sandbox follows new session ownership across create, pat
     if (!systemActor) {
       setUserProfileRole(profile.id, "guest");
     }
-    const client = {
-      ...(systemActor ? { internal: { operatorRoleActor: { kind: "system" } } } : {}),
-      connect: { role: "operator", scopes: ["operator.read", "operator.write"] },
-      authenticatedUserProfile: {
-        profileId: profile.id,
-        displayName: profile.displayName,
-        hasAvatar: false,
-        updatedAt: profile.updatedAt,
-      },
-    } as never;
+    const client = operatorClient(profile, systemActor);
     const key = `agent:main:dashboard:role-sandbox-${suffix}`;
     const request =
       method === "sessions.create"
@@ -116,32 +133,8 @@ test("operator role agent allowlists protect creation without blocking existing 
   const { storePath } = await createSessionStoreDir();
   const profile = ensureProfileForEmail("restricted-session-creator@example.com");
   setUserProfileRole(profile.id, "guest");
-  const cfg = {
-    ...getRuntimeConfig(),
-    session: { ...getRuntimeConfig().session, store: storePath },
-    gateway: {
-      ...getRuntimeConfig().gateway,
-      roles: {
-        default: "guest",
-        definitions: {
-          guest: {
-            sessions: { others: "view" as const },
-            agents: ["guest-only"],
-            scopes: ["operator.read" as const, "operator.write" as const],
-          },
-        },
-      },
-    },
-  };
-  const client = {
-    connect: { role: "operator", scopes: ["operator.read", "operator.write"] },
-    authenticatedUserProfile: {
-      profileId: profile.id,
-      displayName: profile.displayName,
-      hasAvatar: false,
-      updatedAt: profile.updatedAt,
-    },
-  } as never;
+  const cfg = guestConfig(storePath, { agents: ["guest-only"] });
+  const client = operatorClient(profile);
   const requestOptions = { client, context: { getRuntimeConfig: () => cfg } };
   const deniedKey = "agent:main:dashboard:role-denied";
 
@@ -346,24 +339,18 @@ test("createGatewaySession rejects explicit and key-derived unconfigured creatio
   const cfg = { agents: { ownership: "explicit" as const, entries: { ops: {} } } };
   const prepareLifecycle = vi.fn();
 
-  for (const { owner, message } of [
-    { owner: { agentId: "main" }, message: 'Unknown agent id "main"' },
-    {
-      owner: { key: "agent:main:dashboard:unconfigured-owner" },
-      message: 'Unknown agent id "main"',
-    },
-    { owner: { agentId: "   " }, message: 'Unknown agent id "   "' },
-    { owner: { parentSessionKey: "agent:retired:main" }, message: 'Unknown agent id "retired"' },
-    {
-      owner: { agentId: "   ", parentSessionKey: "agent:ops:main" },
-      message: 'Unknown agent id "   "',
-    },
-  ]) {
+  for (const [owner, agentId] of [
+    [{ agentId: "main" }, "main"],
+    [{ key: "agent:main:dashboard:unconfigured-owner" }, "main"],
+    [{ agentId: "   " }, "   "],
+    [{ parentSessionKey: "agent:retired:main" }, "retired"],
+    [{ agentId: "   ", parentSessionKey: "agent:ops:main" }, "   "],
+  ] as const) {
     await expect(
       createGatewaySession({ cfg, ...owner, commandSource: "test", prepareLifecycle }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "INVALID_REQUEST", message },
+      error: { code: "INVALID_REQUEST", message: `Unknown agent id "${agentId}"` },
     });
   }
 
@@ -374,6 +361,7 @@ test.each([undefined, "agent:main:dashboard:memory-core-parent"])(
   "sessions.create gives plugin runtimes owned sessions with parent %s",
   async (parentSessionKey) => {
     const { storePath } = await createSessionStoreDir();
+    const client = pluginClient();
     await writeSessionStore({
       entries: parentSessionKey
         ? {
@@ -383,16 +371,11 @@ test.each([undefined, "agent:main:dashboard:memory-core-parent"])(
           }
         : { main: sessionStoreEntry("operator-owned-main") },
     });
-    const pluginClient = {
-      connect: { scopes: ["operator.write"] },
-      internal: { pluginRuntimeOwnerId: "memory-core" },
-    } as never;
-
     const created = await directSessionReq<{
       key: string;
       entry: { parentSessionKey?: string; pluginOwnerId?: string };
     }>("sessions.create", parentSessionKey ? { parentSessionKey } : { agentId: "main" }, {
-      client: pluginClient,
+      client,
     });
 
     expect(created.ok, JSON.stringify(created.error)).toBe(true);
@@ -412,7 +395,7 @@ test.each([undefined, "agent:main:dashboard:memory-core-parent"])(
     const patched = await directSessionReq(
       "sessions.patch",
       { key, label: "Plugin-owned root" },
-      { client: pluginClient },
+      { client },
     );
 
     expect(patched.ok, JSON.stringify(patched.error)).toBe(true);
@@ -425,6 +408,7 @@ test.each([undefined, "agent:main:dashboard:memory-core-parent"])(
 
 test("sessions.create prevents plugin runtimes from adopting, linking, or forking foreign sessions", async () => {
   const { storePath } = await createSessionStoreDir();
+  const client = pluginClient();
   await writeSessionStore({
     entries: {
       "agent:main:dashboard:foreign-owned": sessionStoreEntry("foreign-session", {
@@ -433,47 +417,22 @@ test("sessions.create prevents plugin runtimes from adopting, linking, or forkin
       "agent:main:dashboard:operator-owned": sessionStoreEntry("operator-session"),
     },
   });
-  const pluginClient = {
-    connect: { scopes: ["operator.write"] },
-    internal: { pluginRuntimeOwnerId: "memory-core" },
-  } as never;
-
-  for (const { name, params, action, target } of [
-    {
-      name: "forking a foreign plugin transcript",
-      params: { parentSessionKey: "agent:main:dashboard:foreign-owned", fork: true },
-      action: "fork",
-      target: "agent:main:dashboard:foreign-owned",
-    },
-    {
-      name: "linking a foreign plugin parent",
-      params: { parentSessionKey: "agent:main:dashboard:foreign-owned" },
-      action: "link",
-      target: "agent:main:dashboard:foreign-owned",
-    },
-    {
-      name: "forking an operator-owned transcript",
-      params: { parentSessionKey: "agent:main:dashboard:operator-owned", fork: true },
-      action: "fork",
-      target: "agent:main:dashboard:operator-owned",
-    },
-    {
-      name: "adopting a foreign plugin session",
-      params: { key: "agent:main:dashboard:foreign-owned" },
-      action: "adopt",
-      target: "agent:main:dashboard:foreign-owned",
-    },
-    {
-      name: "adopting an operator-owned session",
-      params: { key: "agent:main:dashboard:operator-owned" },
-      action: "adopt",
-      target: "agent:main:dashboard:operator-owned",
-    },
+  for (const [action, suffix] of [
+    ["fork", "foreign-owned"],
+    ["link", "foreign-owned"],
+    ["fork", "operator-owned"],
+    ["adopt", "foreign-owned"],
+    ["adopt", "operator-owned"],
   ]) {
-    const created = await directSessionReq("sessions.create", params, { client: pluginClient });
+    const target = `agent:main:dashboard:${suffix}`;
+    const params =
+      action === "adopt"
+        ? { key: target }
+        : { parentSessionKey: target, ...(action === "fork" ? { fork: true } : {}) };
+    const created = await directSessionReq("sessions.create", params, { client });
 
-    expect(created.ok, name).toBe(false);
-    expect(created.error, name).toMatchObject({
+    expect(created.ok, `${action} ${target}`).toBe(false);
+    expect(created.error).toMatchObject({
       code: "INVALID_REQUEST",
       message: `Plugin "memory-core" cannot ${action} session "${target}" because it did not create it.`,
     });
@@ -497,7 +456,7 @@ test("public session mutations reserve agent harness-owned session keys", async 
       expect(rejected.ok).toBe(false);
       expect(rejected.error).toMatchObject({
         code: "INVALID_REQUEST",
-        message: "Session key namespace is reserved for agent harness-owned sessions.",
+        message: reservedNamespace,
       });
     }
   }
@@ -549,7 +508,7 @@ test.each([false, true])(
       expect(created.ok).toBe(false);
       expect(created.error).toMatchObject({
         code: "INVALID_REQUEST",
-        message: "Session key namespace is reserved for agent harness-owned sessions.",
+        message: reservedNamespace,
       });
       return;
     }
@@ -575,26 +534,19 @@ test("sessions.create rejects children of model-selection-locked sessions", asyn
     },
   });
 
-  const linkedChild = await directSessionReq("sessions.create", {
-    agentId: "main",
-    parentSessionKey: "main",
-  });
-  const forkedChild = await directSessionReq("sessions.create", {
-    agentId: "main",
-    parentSessionKey: "main",
-    fork: true,
-  });
-  const resetParent = await directSessionReq("sessions.create", {
-    agentId: "main",
-    parentSessionKey: "main",
-    emitCommandHooks: true,
-  });
-
-  for (const created of [linkedChild, forkedChild, resetParent]) {
-    expect(created.ok).toBe(false);
-    expect(created.error).toMatchObject({
-      code: "INVALID_REQUEST",
-      message: "Model-selection-locked sessions cannot create child sessions from parent context.",
+  for (const options of [{}, { fork: true }, { emitCommandHooks: true }]) {
+    const created = await directSessionReq("sessions.create", {
+      agentId: "main",
+      parentSessionKey: "main",
+      ...options,
+    });
+    expect(created).toMatchObject({
+      ok: false,
+      error: {
+        code: "INVALID_REQUEST",
+        message:
+          "Model-selection-locked sessions cannot create child sessions from parent context.",
+      },
     });
   }
   testState.sessionConfig = undefined;

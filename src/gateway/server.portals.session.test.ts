@@ -228,6 +228,8 @@ async function createSessionPortalProof() {
       origin,
       cleanup,
       run: async (signal: AbortSignal) => {
+        const waitForGate = (gate: Promise<void>, pending: Promise<unknown>, message: string) =>
+          withinTest(awaitGateBeforeSettlement(gate, pending, message), signal);
         signal.throwIfAborted();
         const { config, registry } = createPluginRegistryFixture();
         registerVirtualTestPlugin({
@@ -344,6 +346,13 @@ async function createSessionPortalProof() {
           const allowed = await connect("writer", "preview-writer@example.test");
           const denied = await connect("outsider", "preview-outsider@example.test");
           const node = await connect("node", "preview-node@example.test", true);
+          const reportResult = (frame: { id: string; nodeId: string }, payload: unknown) =>
+            rpcReq(node.socket, "node.invoke.result", {
+              id: frame.id,
+              nodeId: frame.nodeId,
+              ok: true,
+              payloadJSON: JSON.stringify(payload),
+            });
           node.socket.on("message", (data) => {
             const event = JSON.parse(rawDataToString(data)) as {
               event?: string;
@@ -361,14 +370,11 @@ async function createSessionPortalProof() {
             }
             const frame = coerceNodeInvokePayload(event.payload);
             if (frame?.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND) {
-              const maintenance = (async () => {
-                await rpcReq(node.socket, "node.invoke.result", {
-                  id: frame.id,
-                  nodeId: frame.nodeId,
-                  ok: true,
-                  payloadJSON: JSON.stringify({ applied: true, deleted: 0, hasMore: false }),
-                });
-              })();
+              const maintenance = reportResult(frame, {
+                applied: true,
+                deleted: 0,
+                hasMore: false,
+              }).then(() => {});
               running.add(maintenance);
               void maintenance.finally(() => running.delete(maintenance)).catch(() => {});
               return;
@@ -384,12 +390,7 @@ async function createSessionPortalProof() {
                   gatewayUrl: `ws://127.0.0.1:${port}`,
                   signal: controller.signal,
                 });
-                await rpcReq(node.socket, "node.invoke.result", {
-                  id: frame.id,
-                  nodeId: frame.nodeId,
-                  ok: true,
-                  payloadJSON: JSON.stringify({ status: "closed" }),
-                });
+                await reportResult(frame, { status: "closed" });
               } finally {
                 controllers.delete(frame.id);
               }
@@ -499,13 +500,10 @@ async function createSessionPortalProof() {
             });
             let streaming: Response;
             try {
-              await withinTest(
-                awaitGateBeforeSettlement(
-                  committed.promise,
-                  maintenance,
-                  "Metadata maintenance settled before its commit was observed",
-                ),
-                signal,
+              await waitForGate(
+                committed.promise,
+                maintenance,
+                "Metadata maintenance settled before its commit was observed",
               );
               destination.once("connection", onTargetConnection);
               const requested = fetch(url, { signal });
@@ -539,13 +537,10 @@ async function createSessionPortalProof() {
               (result) => result.status,
               () => 0,
             );
-            await withinTest(
-              awaitGateBeforeSettlement(
-                pairingEntered.promise,
-                pending,
-                "Preview settled before node discovery",
-              ),
-              signal,
+            await waitForGate(
+              pairingEntered.promise,
+              pending,
+              "Preview settled before node discovery",
             );
             const persistenceEntered = createDeferred();
             const persistenceResume = createDeferred();
@@ -563,13 +558,10 @@ async function createSessionPortalProof() {
               });
             sharedHost = undefined;
             const reconcile = environments.reconcileOnce(environmentId);
-            await withinTest(
-              awaitGateBeforeSettlement(
-                persistenceEntered.promise,
-                reconcile,
-                "Inspection settled before persistence",
-              ),
-              signal,
+            await waitForGate(
+              persistenceEntered.promise,
+              reconcile,
+              "Inspection settled before persistence",
             );
             expect(qualification.aborted).toBe(true);
             expect(portals.list()).toEqual([]);
