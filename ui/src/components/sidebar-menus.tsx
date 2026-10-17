@@ -29,8 +29,8 @@ import type {
   SidebarSessionGroupMenuState,
   SidebarSessionMenuState,
 } from "./app-sidebar-session-types.ts";
+import type { SessionMenuWork } from "./session-menu-solid.tsx";
 import { fetchSessionMenuWork } from "./session-menu-work.ts";
-import type { SessionMenuWork } from "./session-menu.ts";
 import { SESSION_MENU_OPEN_EVENT } from "./session-progress-hovercard-target.ts";
 import type { SidebarMenusOwner, SidebarRouteView } from "./sidebar-menus-types.ts";
 import { Icon } from "./solid/icon.tsx";
