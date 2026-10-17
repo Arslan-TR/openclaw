@@ -4508,11 +4508,16 @@ jobs:
   postgres-conformance:
     permissions:
       contents: read
-    name: PostgreSQL conformance
+    name: PostgreSQL conformance (${{ matrix.shard }})
     needs: [preflight]
     if: needs.preflight.outputs.run_postgres_conformance == 'true'
     runs-on: *ubuntu_linux_runner
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [infra, integrations]
     steps:
       - *linux_node_checkout_step
       - *linux_node_setup_step
@@ -4527,7 +4532,7 @@ jobs:
           docker exec openclaw-postgres psql -U postgres -v ON_ERROR_STOP=1 -c \
             'CREATE EXTENSION unaccent WITH SCHEMA public; CREATE EXTENSION pg_trgm WITH SCHEMA public; CREATE EXTENSION vector WITH SCHEMA public;'
       - name: Run PostgreSQL conformance
-        run: node scripts/test-database-conformance.mjs --engine postgres --connection postgresql://postgres@127.0.0.1:5432/postgres
+        run: node scripts/test-database-conformance.mjs --engine postgres --connection postgresql://postgres@127.0.0.1:5432/postgres --shard ${{ matrix.shard }}
       - name: Stop PostgreSQL service
         if: always()
         run: docker rm --force openclaw-postgres
@@ -5829,7 +5834,7 @@ jobs:
       - *platform_checkout_step
 
       - name: Setup Ruby
-        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
         with:
           ruby-version: "3.4.11"
           bundler: "4.0.22"
