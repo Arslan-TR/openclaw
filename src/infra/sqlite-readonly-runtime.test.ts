@@ -104,3 +104,29 @@ it
     expect(() => session()).toThrow("Restart the Gateway.");
   },
 );
+
+it("publishes a removed runtime observed by readiness before another worker spawn", async () => {
+  const { registerChildRuntimeRecovery } = await import("./child-runtime-viability.js");
+  const executable = await runtime("echo v26.12.0");
+  const recover = vi.fn(async () => ({ status: "report-only" as const, reason: "test service" }));
+  const release = registerChildRuntimeRecovery(recover);
+  const readiness = createReadinessChecker({
+    startedAt: Date.now(),
+    channelManager: {
+      getRuntimeSnapshot: () => ({ channels: {}, channelAccounts: {} }),
+      getAutostartSuppression: () => null,
+      isAmbientAutostartSuppressed: () => false,
+    },
+  });
+  try {
+    expect(readiness().ready).toBe(true);
+    await fs.unlink(executable);
+    expect(readiness()).toMatchObject({ ready: false, failing: ["child-runtime"] });
+    expect(readiness().ready).toBe(false);
+    await Promise.resolve();
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(() => session()).toThrow("Restart the Gateway.");
+  } finally {
+    release();
+  }
+});

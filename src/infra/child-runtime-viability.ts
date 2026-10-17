@@ -62,11 +62,14 @@ export function readChildRuntimeViability(params?: {
     (params?.access ?? accessExecutable)(execPath);
   } catch (error) {
     available = !(hasErrnoCode(error, "ENOENT") || hasErrnoCode(error, "ENOTDIR"));
+    if (!available) {
+      recordUnavailableRuntime(execPath, error);
+    }
   }
   return { execPath, available };
 }
 
-/** The run loop owns recovery; worker pools only publish the first diagnosis. */
+/** The run loop owns recovery; runtime observations publish the first diagnosis. */
 export function registerChildRuntimeRecovery(
   recover: () => Promise<ChildRuntimeRecovery>,
 ): () => void {
@@ -134,6 +137,20 @@ export function assertChildRuntimeAvailable(): void {
   }
 }
 
+function recordUnavailableRuntime(execPath: string, cause?: unknown): Error {
+  if (runtime.execPath === execPath && runtime.failure) {
+    return runtime.failure;
+  }
+  runtime.execPath = execPath;
+  runtime.failure = Object.assign(
+    new Error(formatMissingChildRuntimeWarning({ execPath, available: false }), { cause }),
+    { code: "NODE_RUNTIME_UNAVAILABLE" },
+  );
+  createSubsystemLogger("gateway/runtime").error(runtime.failure.message);
+  recoverUnavailableRuntime();
+  return runtime.failure;
+}
+
 export function classifyChildRuntimeFailure(params: {
   execPath?: string;
   error?: unknown;
@@ -183,16 +200,7 @@ export function classifyChildRuntimeFailure(params: {
   if (!unavailable) {
     return undefined;
   }
-  runtime.execPath = execPath;
-  runtime.failure = Object.assign(
-    new Error(formatMissingChildRuntimeWarning({ execPath, available: false }), {
-      cause: params.error,
-    }),
-    { code: "NODE_RUNTIME_UNAVAILABLE" },
-  );
-  createSubsystemLogger("gateway/runtime").error(runtime.failure.message);
-  recoverUnavailableRuntime();
-  return runtime.failure;
+  return recordUnavailableRuntime(execPath, params.error);
 }
 
 /** Capture startup evidence; the owner reads the diagnosis after native completion. */

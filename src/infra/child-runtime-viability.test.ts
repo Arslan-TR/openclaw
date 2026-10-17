@@ -30,7 +30,7 @@ describe("child runtime viability", () => {
   it.each([
     { execPath: removedCellarPath, code: "ENOENT", available: false },
     { execPath: process.execPath, code: undefined, available: true },
-    { execPath: removedCellarPath, code: "EACCES", available: true },
+    { execPath: "/fixture/restricted-node", code: "EACCES", available: true },
   ])("classifies executable access $code", ({ execPath, code, available }) => {
     const viability = readChildRuntimeViability({
       execPath,

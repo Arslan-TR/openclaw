@@ -46,7 +46,7 @@ type RuntimeOwner = typeof import("./child-runtime-viability.js");
 type RecoveryOwner = typeof import("./process-respawn.js");
 let runtime: RuntimeOwner;
 let recovery: RecoveryOwner;
-let finished: ReturnType<typeof createDeferredCore>;
+let finished: ReturnType<typeof createDeferredCore<void>>;
 let release: (() => void) | undefined;
 const environment = captureEnv(["OPENCLAW_STATE_DIR", "NODE_OPTIONS"]);
 const serviceRuntime = "/fixture/current/bin/node";
