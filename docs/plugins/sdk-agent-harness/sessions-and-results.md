@@ -88,12 +88,16 @@ invoke this hook and continues to preserve native thread continuity.
 
 ### Fresh native thread seeds
 
-The optional `hostCapabilities.prepareBoundedSeed({ assertCurrent, signal })`
+The optional `hostCapabilities.prepareBoundedSeed({ assertCurrent, signal, tokenBudget })`
 returns a readonly `AgentMessage[]` for a fresh native thread. Call it only
 after deciding not to reuse a native thread, before injecting history. The
 host fixes the session, byte budget, source authority, and atomic summary
 persistence. It attempts one host compaction only if bounding would omit
-unsummarized history, then returns the bounded view. Pass the native binding's
+unsummarized history, then returns the bounded view. Pass the final reserved
+history allowance as `tokenBudget`; valid smaller values narrow the captured
+host budget, while larger, invalid, or non-finite values cannot widen it.
+The host bounds the post-summary result again and retains the original task
+and completed-message handoff during a runtime refresh. Pass the native binding's
 current-authority assertion and cancellation signal. A retired capability
 rejects; it cannot target another session. Explicit context engines retain
 their own projections rather than receiving this host-history capability.

@@ -103,8 +103,12 @@ describe("Codex configured assembled-history delivery", () => {
     const { params, assemble } = seedParams();
     delete params.authoredContextTokenCap;
     const harness = selectedHarness();
-    const prepareBoundedSeed = vi.fn(async ({ assertCurrent }: { assertCurrent: () => void }) => {
+    const prepareBoundedSeed = vi.fn<
+      NonNullable<EmbeddedRunAttemptParams["hostCapabilities"]["prepareBoundedSeed"]>
+    >(async ({ assertCurrent, tokenBudget }) => {
       assertCurrent();
+      expect(tokenBudget).toBeGreaterThan(0);
+      expect(tokenBudget).toBeLessThan(500_000);
       expect(harness.requests.some(({ method }) => method === "thread/start")).toBe(true);
       return [userMessage("BOUNDED_SELECTED_HISTORY", 1)];
     });

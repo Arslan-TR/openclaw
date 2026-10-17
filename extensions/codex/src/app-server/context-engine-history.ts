@@ -143,20 +143,11 @@ export async function prepareCodexContextEngineHistory(params: {
             await prepareSeed({
               assertCurrent: assertSeedCurrent,
               signal: params.runtimeParams.abortSignal,
+              tokenBudget: params.historyTokenBudget,
             }),
             (message) => sanitizeCodexHistoryImagePayloads(message, "codex fresh thread seed"),
           ).filter(includeMessage);
           assertSeedCurrent();
-          if (seed.length < messages.length) {
-            seed.unshift({
-              role: "custom",
-              customType: "openclaw.history-omission",
-              content:
-                "Earlier history was summarized or omitted to bound this fresh thread's seed. Resend essential missing details.",
-              display: true,
-              timestamp: 0,
-            });
-          }
           return buildSeed(seed);
         }
       : await buildSeed(messages);

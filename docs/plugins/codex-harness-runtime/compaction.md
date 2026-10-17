@@ -33,8 +33,9 @@ healthy thread does not discard native context because the mirror grew.
 A fresh seed keeps whole recent turns and tool/result pairs. If it would omit
 history not already covered by a host summary, OpenClaw makes one host
 compaction attempt and seeds from the bounded result. Oversized history may
-still be omitted, with a notice in the seed; system instructions and the current
-request remain intact. Stored transcript history is not deleted.
+still be omitted, with a user-visible bounded-context notice. System instructions
+and the current request, including a runtime-refresh handoff, remain intact.
+Stored transcript history is not deleted.
 
 Native rollout-size and token fuses remain unchanged. An owning context engine
 also keeps its engine-first compaction and eligible native follow-up.

@@ -1,8 +1,8 @@
+import type { AgentMessage } from "../../../packages/agent-core/src/types.js";
 import type {
   ApprovalDecision,
   ApprovalTerminalReason,
 } from "../../../packages/gateway-protocol/src/schema/approvals.js";
-import type { AgentMessage } from "../runtime/index.js";
 import type { AnyAgentTool } from "../tools/common.js";
 
 type AgentHarnessHostApprovalResult = Readonly<{
@@ -48,6 +48,8 @@ export type AgentHarnessHostCapabilities = Readonly<{
     request: Readonly<{
       assertCurrent: () => void;
       signal?: AbortSignal;
+      /** Final delivery allowance; valid smaller values only narrow the captured host budget. */
+      tokenBudget?: number;
     }>,
   ) => Promise<readonly AgentMessage[]>;
   /**

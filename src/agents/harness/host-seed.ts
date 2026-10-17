@@ -1,11 +1,15 @@
+import type { AgentMessage } from "../../../packages/agent-core/src/types.js";
 import { persistCompactionBoundaryWithSessionEntryAsync } from "../../config/sessions/session-accessor.js";
 import { readSessionEntryReadOnlyInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import { withOwnedSessionTranscriptWrites } from "../../config/sessions/transcript-write-context.js";
 import { boundContextEngineAssembly } from "../../context-engine/bounded-context.js";
+import type { ContextEngineRuntimeContext } from "../../context-engine/types.js";
 import { resolveMaxActiveTranscriptBytes } from "../../context-engine/transcript-byte-limit.js";
+import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { requireCompactionWriterEntry } from "../embedded-agent-runner/compaction-successor.js";
 import { attachCompactionAccountingRecorder } from "../embedded-agent-runner/run/compaction-accounting-bridge.js";
 import type { EmbeddedRunAttemptInternalParams } from "../embedded-agent-runner/run/internal-params.js";
+import { normalizeContextTokenBudget } from "../embedded-agent-runner/utils.js";
 import { SessionManager } from "../sessions/session-manager.js";
 import type { AgentHarnessHostCapabilities } from "./host-capability-types.js";
 
@@ -33,6 +37,8 @@ export function bindBoundedSeed(
   ) {
     return undefined;
   }
+  const hostTokenBudget =
+    normalizeContextTokenBudget(input.contextTokenBudget) || DEFAULT_CONTEXT_TOKENS;
   const sessionTarget = {
     ...target,
     agentId: target.agentId,
@@ -52,6 +58,7 @@ export function bindBoundedSeed(
   const prepare: NonNullable<AgentHarnessHostCapabilities["prepareBoundedSeed"]> = async ({
     assertCurrent,
     signal: callerSignal,
+    tokenBudget: requestedTokenBudget,
   }) => {
     const signal =
       callerSignal && attempt.abortSignal
@@ -65,6 +72,20 @@ export function bindBoundedSeed(
     };
     assert();
     const admission = attempt.userTurnTranscriptRecorder?.getAdmissionReceipt();
+    const requested = normalizeContextTokenBudget(requestedTokenBudget);
+    const tokenBudget = requested && requested < hostTokenBudget ? requested : hostTokenBudget;
+    const maxSeedBytes = Math.min(maxBytes, tokenBudget * 4);
+    const admittedKey =
+      admission?.idempotencyKey ?? attempt.userTurnTranscriptRecorder?.message?.idempotencyKey;
+    const isAdmittedUser = (message: AgentMessage) =>
+      message.role === "user" &&
+      Boolean(admittedKey) &&
+      Reflect.get(message, "idempotencyKey") === admittedKey;
+    const refresh = attempt.pluginRuntimeRefreshMessages;
+    const handoff =
+      refresh || attempt.continuation
+        ? [...(refresh ?? []), ...(attempt.continuation?.messages ?? [])]
+        : undefined;
     const read = async () => {
       const history = await SessionManager.readSessionContextAsync(
         sessionTarget,
@@ -72,15 +93,22 @@ export function bindBoundedSeed(
         { signal },
       );
       assert();
-      return history.filter(
-        (message) =>
-          message.role !== "user" ||
-          !admission?.idempotencyKey ||
-          Reflect.get(message, "idempotencyKey") !== admission.idempotencyKey,
-      );
+      if (handoff) {
+        const current = history.findIndex(isAdmittedUser);
+        return [
+          ...(current < 0 ? history : history.slice(0, current)),
+          ...(refresh && current >= 0 && !handoff.some(isAdmittedUser) ? [history[current]!] : []),
+          ...handoff,
+        ];
+      }
+      return history.filter((message) => !isAdmittedUser(message));
     };
     let messages = await read();
-    let bounded = boundContextEngineAssembly({ messages, estimatedTokens: 0 }, maxBytes);
+    let bounded = boundContextEngineAssembly(
+      { messages, estimatedTokens: 0 },
+      maxSeedBytes,
+      tokenBudget,
+    );
     const omitted = messages.length - bounded.messages.length;
     if (
       config?.agents?.defaults?.compaction?.enabled !== false &&
@@ -105,7 +133,7 @@ export function bindBoundedSeed(
         expectedWriterRunId: expected.activeWriterRunId,
         expectedOwner: expected,
       };
-      const runtimeContext = { ...attempt.contextEngineRuntimeContext };
+      const runtimeContext: ContextEngineRuntimeContext = {};
       attachCompactionAccountingRecorder(runtimeContext, {
         pendingRequestState: "unresolved",
         pendingUserEntryId: admission?.entryId,
@@ -130,6 +158,10 @@ export function bindBoundedSeed(
               sessionTarget,
               workspaceDir,
               model: attempt.modelId,
+              senderId: attempt.senderId ?? undefined,
+              senderName: attempt.senderName ?? undefined,
+              senderUsername: attempt.senderUsername ?? undefined,
+              senderE164: attempt.senderE164 ?? undefined,
               contextEngineRuntimeContext: runtimeContext,
               trigger: "budget",
               force: true,
@@ -144,7 +176,11 @@ export function bindBoundedSeed(
       );
       assert();
       messages = await read();
-      bounded = boundContextEngineAssembly({ messages, estimatedTokens: 0 }, maxBytes);
+      bounded = boundContextEngineAssembly(
+        { messages, estimatedTokens: 0 },
+        maxSeedBytes,
+        tokenBudget,
+      );
     }
     assert();
     if (bounded.messages.length < messages.length) {
