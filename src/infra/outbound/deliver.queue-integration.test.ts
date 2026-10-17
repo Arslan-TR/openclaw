@@ -1,10 +1,10 @@
+import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
 import { onTrustedMessageAuditEventForTest as onTrustedMessageAuditEvent } from "../../audit/message-audit-events.test-support.js";
-import type { OpenClawConfig } from "../../config/config.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
@@ -63,6 +63,8 @@ describe("durable outbound queue delivery", () => {
     });
   const deliverMatrix = (params: MatrixParams = {}) =>
     deliverOutboundPayloads(matrixRequest(params));
+  const deliverStable = (params: MatrixParams = {}) =>
+    deliverOutboundPayloads(stableRequest(params));
   const enqueueMatrix = (
     params: Omit<Parameters<typeof enqueueDeliveryOnce>[0], "channel" | "to">,
     id = deliveryIntentId,
@@ -116,14 +118,12 @@ describe("durable outbound queue delivery", () => {
       maxRetries: 1,
     });
     const producerClaimId = await claimDeliveryPlatformSendAttempt(deliveryIntentId, tmpDir);
-    if (!producerClaimId) {
-      throw new Error("permanent live producer must claim the stable row");
-    }
+    assert.ok(producerClaimId, "permanent live producer must claim the stable row");
     await reserveDeliveryAttempt(deliveryIntentId, 1, tmpDir, producerClaimId);
     const deliver = vi.fn<DeliverFn>(async () => []);
     await drain(deliver);
     await recoverPendingDeliveries({
-      cfg: {} as OpenClawConfig,
+      cfg: {},
       deliver,
       log: createRecoveryLog(),
       stateDir: tmpDir,
@@ -139,12 +139,7 @@ describe("durable outbound queue delivery", () => {
 
   it("retains permanent receipts when stable delivery is intentionally suppressed", async () => {
     await expect(
-      deliverOutboundPayloads(
-        stableRequest({
-          payloads: [{ text: "" }],
-          completionRetention: "permanent",
-        }),
-      ),
+      deliverStable({ payloads: [{ text: "" }], completionRetention: "permanent" }),
     ).resolves.toEqual([]);
     expect(queueStatus()).toBe("completed");
     const recoveryIntentId = "permanent-matrix-suppressed-recovery";
@@ -206,13 +201,9 @@ describe("durable outbound queue delivery", () => {
       maxBytes: 1024 * 1024,
       stateDir: tmpDir,
     });
-    if (staged.status !== "staged") {
-      throw new Error("original media must be durably staged");
-    }
+    assert.ok(staged.status === "staged", "original media must be durably staged");
     const spoolPath = staged.artifacts[0];
-    if (!spoolPath) {
-      throw new Error("original media must have a queue-owned spool artifact");
-    }
+    assert.ok(spoolPath, "original media must have a queue-owned spool artifact");
     await enqueueMatrix({ payloads: staged.payloads }, deliveryIntentId, staged.mediaStageId);
     const queuedEntry = await pendingEntry();
     expect(
@@ -227,24 +218,23 @@ describe("durable outbound queue delivery", () => {
     let deliveredBytes: string | undefined;
     sendMatrix.mockImplementation(
       async (_to: string, _text: string, options?: Record<string, unknown>) => {
-        if (typeof options?.mediaUrl !== "string") {
-          throw new Error("Matrix must receive the staged attachment");
-        }
+        assert.ok(
+          typeof options?.mediaUrl === "string",
+          "Matrix must receive the staged attachment",
+        );
         deliveredBytes = await fs.readFile(options.mediaUrl, "utf8");
         return { messageId: "staged-media" };
       },
     );
     await expect(
-      deliverOutboundPayloads(
-        stableRequest({
-          payloads: [
-            {
-              text: "regenerated caption must never replace queue custody",
-              mediaUrl: path.join(tmpDir, "missing-regenerated.ogg"),
-            },
-          ],
-        }),
-      ),
+      deliverStable({
+        payloads: [
+          {
+            text: "regenerated caption must never replace queue custody",
+            mediaUrl: path.join(tmpDir, "missing-regenerated.ogg"),
+          },
+        ],
+      }),
     ).resolves.toMatchObject([{ messageId: "staged-media" }]);
     expect(sendMatrix).toHaveBeenCalledOnce();
     expect(sendMatrix).toHaveBeenCalledWith(

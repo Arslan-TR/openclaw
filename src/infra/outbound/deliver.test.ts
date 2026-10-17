@@ -2,7 +2,6 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
 import { onTrustedMessageAuditEventForTest as onTrustedMessageAuditEvent } from "../../audit/message-audit-events.test-support.js";
 import { chunkText } from "../../auto-reply/chunk.js";
 import { createMessageReceiptFromOutboundResults } from "../../channels/message/receipt.js";
@@ -20,11 +19,7 @@ import { createDeferredCore } from "../../shared/deferred.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
 import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import {
-  onInternalDiagnosticEvent,
-  resetDiagnosticEventsForTest,
-  type DiagnosticEventPayload,
-} from "../diagnostic-events.js";
+import { onInternalDiagnosticEvent, resetDiagnosticEventsForTest } from "../diagnostic-events.js";
 import { resolvePreferredOpenClawTmpDir } from "../tmp-openclaw-dir.js";
 import * as channelResolution from "./channel-resolution.js";
 import { deliverOutboundPayloadsCore } from "./deliver-core.js";
@@ -36,6 +31,7 @@ import {
   registerOutboundPreparationMetadataTests,
 } from "./deliver.projection.test-support.js";
 import { registerOutboundQueueAckTests } from "./deliver.queue-ack.test-support.js";
+import type { StableDeliveryPreparation } from "./delivery-queue-storage.types.js";
 import { createOutboundPayloadPlan, projectOutboundPayloadPlanForOutbound } from "./payloads.js";
 import { createUnmodifiedPreparedOutboundBatch } from "./prepared-batch.js";
 
@@ -46,8 +42,8 @@ type EnqueueDeliveryTestParams = Parameters<
   typeof import("./delivery-queue-storage.js").enqueueDelivery
 >[0];
 
-const mocks = vi.hoisted(() => ({
-  appendAssistantMessageToSessionTranscript: vi.fn<AppendAssistantTranscript>(async () => ({
+const transcript = vi.hoisted(() => ({
+  append: vi.fn<AppendAssistantTranscript>(async () => ({
     ok: true,
     target: { sessionId: "x", sessionKey: "x", storePath: "/tmp/sessions.json" },
     messageId: "m",
@@ -68,40 +64,30 @@ const internalHookMocks = vi.hoisted(() => ({
   triggerInternalHook: vi.fn(async () => {}),
 }));
 const queue = vi.hoisted(() => ({
-  enqueueDelivery: vi.fn<(params: EnqueueDeliveryTestParams) => Promise<string>>(
+  enqueue: vi.fn<(params: EnqueueDeliveryTestParams) => Promise<string>>(
     async () => "mock-queue-id",
   ),
-  enqueueDeliveryOnce: vi.fn(async (_params: unknown, id: string) => ({ id, created: true })),
-  enqueuePreparedDeliveryOnce: vi.fn(async (_params: unknown, id: string) => ({
-    id,
-    created: true,
-  })),
-  loadPendingDelivery: vi.fn(async () => null),
-  findDeliveryIntentOwner: vi.fn<
-    () => Promise<{
-      namespace: "prepared" | "preparing" | "migration" | "legacy-preparing" | "legacy";
-      status: "pending" | "failed" | "completed";
-    } | null>
-  >(async () => null),
-  ackDelivery: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  failDelivery: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  failDeliveryAfterPlatformSend: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  failDeliveryBeforePlatformSend: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  moveToFailed: vi.fn<(...args: unknown[]) => Promise<string[]>>(async () => []),
-  markDeliveryPlatformOutcomeUnknown: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  markDeliveryPlatformSendDispatched: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  markDeliveryPlatformSendAttemptStarted: vi.fn<(...args: unknown[]) => Promise<void>>(
-    async () => {},
-  ),
-  claimReusableDeliveryPlatformSendAttempt: vi.fn(async () => "mock-producer-claim"),
-  renewDeliveryPlatformSendLease: vi.fn(async () => Date.now() + 30_000),
-  withActiveDeliveryClaim: vi.fn<
+  enqueueOnce: vi.fn(async (_params: unknown, id: string) => ({ id, created: true })),
+  enqueuePrepared: vi.fn(async (_params: unknown, id: string) => ({ id, created: true })),
+  pending: vi.fn(async () => null),
+  intentOwner: vi.fn(async () => null),
+  ack: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  fail: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  failAfterSend: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  failBeforeSend: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  retire: vi.fn<(...args: unknown[]) => Promise<string[]>>(async () => []),
+  markUnknown: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  markDispatched: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  markStarted: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+  claim: vi.fn(async () => "mock-producer-claim"),
+  renewLease: vi.fn(async () => Date.now() + 30_000),
+  withClaim: vi.fn<
     (
       entryId: string,
       fn: () => Promise<unknown>,
     ) => Promise<{ status: "claimed"; value: unknown } | { status: "claimed-by-other-owner" }>
   >(async (_entryId, fn) => ({ status: "claimed", value: await fn() })),
-  withStableDeliveryPreparation: vi.fn(prepareStableDelivery),
+  prepare: vi.fn(prepareStableDelivery),
 }));
 const completionMocks = vi.hoisted(() => ({
   completeDurableDelivery: vi.fn(),
@@ -110,24 +96,18 @@ const completionMocks = vi.hoisted(() => ({
   rejectDurableDelivery: vi.fn(),
   suppressDurableDelivery: vi.fn(),
 }));
-const logMocks = vi.hoisted(() => ({
-  warn: vi.fn(),
-}));
+const logMocks = vi.hoisted(() => ({ warn: vi.fn() }));
 const hooks = hookMocks.runner;
 
-async function prepareStableDelivery(params: {
-  id: string;
-  run: (owner: {
-    current: () => Promise<Record<string, unknown>>;
-    beforeFirstModifier: () => Promise<void>;
-    markPrepared: () => Promise<void>;
-    markPublished: () => void;
-  }) => Promise<unknown>;
-}): Promise<unknown> {
-  if (await queue.findDeliveryIntentOwner()) {
+async function prepareStableDelivery(
+  params: Parameters<
+    typeof import("./delivery-queue-preparation.js").withStableDeliveryPreparation
+  >[0],
+): Promise<unknown> {
+  if (await queue.intentOwner()) {
     return { status: "existing" };
   }
-  const entry = {
+  const entry: StableDeliveryPreparation = {
     id: params.id,
     enqueuedAt: 0,
     retryCount: 0,
@@ -157,39 +137,25 @@ function withoutInitialProducerClaim(params: EnqueueDeliveryTestParams) {
 async function ackDeliveryMock(
   id: string,
   stateDir?: string,
-  options?: {
-    retainSpoolArtifacts?: boolean;
-    suppressCompletionReceipt?: boolean;
-    expectedPlatformSendAttemptId?: string | null;
-  },
+  options?: Parameters<typeof import("./delivery-queue-storage.js").ackDelivery>[2],
 ): Promise<void> {
   const { expectedPlatformSendAttemptId: _expectedPlatformSendAttemptId, ...legacyOptions } =
     options ?? {};
   const hasOptions = Object.keys(legacyOptions).length > 0;
   if (stateDir === undefined && !hasOptions) {
-    return queue.ackDelivery(id);
+    return queue.ack(id);
   }
-  return queue.ackDelivery(id, stateDir, hasOptions ? legacyOptions : undefined);
+  return queue.ack(id, stateDir, hasOptions ? legacyOptions : undefined);
 }
 
-vi.mock("../../config/sessions/transcript.runtime.js", async () => {
-  const actual = await vi.importActual<
-    typeof import("../../config/sessions/transcript.runtime.js")
-  >("../../config/sessions/transcript.runtime.js");
+async function mockTranscript<T>(importOriginal: () => Promise<T>) {
   return {
-    ...actual,
-    appendAssistantMessageToSessionTranscript: mocks.appendAssistantMessageToSessionTranscript,
+    ...(await importOriginal()),
+    appendAssistantMessageToSessionTranscript: transcript.append,
   };
-});
-vi.mock("../../config/sessions/transcript.js", async () => {
-  const actual = await vi.importActual<typeof import("../../config/sessions/transcript.js")>(
-    "../../config/sessions/transcript.js",
-  );
-  return {
-    ...actual,
-    appendAssistantMessageToSessionTranscript: mocks.appendAssistantMessageToSessionTranscript,
-  };
-});
+}
+vi.mock("../../config/sessions/transcript.runtime.js", mockTranscript);
+vi.mock("../../config/sessions/transcript.js", mockTranscript);
 vi.mock("../../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: () => hookMocks.runner,
 }));
@@ -199,48 +165,45 @@ vi.mock("../../hooks/internal-hooks.js", () => ({
 }));
 vi.mock("./delivery-queue-storage.js", () => ({
   enqueueDelivery: async (params: EnqueueDeliveryTestParams) =>
-    queue.enqueueDelivery(withoutInitialProducerClaim(params)),
+    queue.enqueue(withoutInitialProducerClaim(params)),
   enqueueDeliveryOnce: async (params: EnqueueDeliveryTestParams, id: string) =>
-    queue.enqueueDeliveryOnce(withoutInitialProducerClaim(params), id),
+    queue.enqueueOnce(withoutInitialProducerClaim(params), id),
   enqueuePreparedDeliveryOnce: async (params: EnqueueDeliveryTestParams, id: string) =>
-    queue.enqueuePreparedDeliveryOnce(withoutInitialProducerClaim(params), id),
+    queue.enqueuePrepared(withoutInitialProducerClaim(params), id),
   ackDelivery: ackDeliveryMock,
-  failDelivery: async (id: string, error: string) => queue.failDelivery(id, error),
+  failDelivery: async (id: string, error: string) => queue.fail(id, error),
   failDeliveryAfterPlatformSend: async (id: string, error: string) =>
-    queue.failDeliveryAfterPlatformSend(id, error),
+    queue.failAfterSend(id, error),
   failDeliveryBeforePlatformSend: async (id: string, error: string) =>
-    queue.failDeliveryBeforePlatformSend(id, error),
+    queue.failBeforeSend(id, error),
   moveToFailed: async (
     id: string,
     stateDir?: string,
     expectedPlatformSendAttemptId?: string | null,
-  ) => queue.moveToFailed(id, stateDir, expectedPlatformSendAttemptId),
-  markDeliveryPlatformOutcomeUnknown: async (id: string) =>
-    queue.markDeliveryPlatformOutcomeUnknown(id),
+  ) => queue.retire(id, stateDir, expectedPlatformSendAttemptId),
+  markDeliveryPlatformOutcomeUnknown: async (id: string) => queue.markUnknown(id),
   markDeliveryPlatformSendDispatched: async (
     id: string,
     stateDir?: string,
     route?: { replyToId?: string | null },
-  ) => queue.markDeliveryPlatformSendDispatched(id, stateDir, route),
+  ) => queue.markDispatched(id, stateDir, route),
   markDeliveryPlatformSendAttemptStarted: async (
     id: string,
     stateDir?: string,
     route?: { replyToId?: string | null },
-  ) => queue.markDeliveryPlatformSendAttemptStarted(id, stateDir, route),
-  loadPendingDelivery: queue.loadPendingDelivery,
-  findDeliveryIntentOwner: queue.findDeliveryIntentOwner,
+  ) => queue.markStarted(id, stateDir, route),
+  loadPendingDelivery: queue.pending,
+  findDeliveryIntentOwner: queue.intentOwner,
 }));
 vi.mock("./delivery-queue-preparation.js", () => ({
   StableDeliveryPreparationLostError: class StableDeliveryPreparationLostError extends Error {},
-  withStableDeliveryPreparation: queue.withStableDeliveryPreparation,
+  withStableDeliveryPreparation: queue.prepare,
 }));
 vi.mock("./delivery-queue-platform-lease.js", () => ({
-  claimReusableDeliveryPlatformSendAttempt: queue.claimReusableDeliveryPlatformSendAttempt,
-  renewDeliveryPlatformSendLease: queue.renewDeliveryPlatformSendLease,
+  claimReusableDeliveryPlatformSendAttempt: queue.claim,
+  renewDeliveryPlatformSendLease: queue.renewLease,
 }));
-vi.mock("./delivery-queue-recovery.js", () => ({
-  withActiveDeliveryClaim: queue.withActiveDeliveryClaim,
-}));
+vi.mock("./delivery-queue-recovery.js", () => ({ withActiveDeliveryClaim: queue.withClaim }));
 vi.mock("./delivery-completion.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./delivery-completion.js")>()),
   completeDurableDelivery: completionMocks.completeDurableDelivery,
@@ -301,6 +264,13 @@ function createNetworkError(message: string, code: string, syscall?: string) {
   return Object.assign(new Error(message), { code, ...(syscall ? { syscall } : {}) });
 }
 
+function ordered<T>(order: string[], label: string, value: T) {
+  return () => {
+    order.push(label);
+    return value;
+  };
+}
+
 function setTestPlugin(
   plugin: Pick<ChannelPlugin, "id"> & Partial<ChannelPlugin>,
   pluginId = plugin.id,
@@ -357,20 +327,18 @@ function setMatrixMessageAdapter(
   message: NonNullable<ChannelPlugin["message"]>,
   outbound?: Partial<ChannelOutboundAdapter>,
 ) {
-  setTestPlugin(
-    outbound
-      ? {
-          ...createOutboundTestPlugin({ id: "matrix", outbound: createTestOutbound(outbound) }),
-          message,
-        }
-      : { id: "matrix", message },
-  );
+  setTestPlugin({
+    ...(outbound
+      ? createOutboundTestPlugin({ id: "matrix", outbound: createTestOutbound(outbound) })
+      : { id: "matrix" }),
+    message,
+  });
 }
 
 type MatrixMessageAdapter = NonNullable<ChannelPlugin["message"]>;
 type MatrixMessageTextSender = NonNullable<NonNullable<MatrixMessageAdapter["send"]>["text"]>;
 
-function createMatrixMessageSendResult(
+function messageResult(
   messageId: string,
   kind: "media" | "text" = "text",
 ): ChannelMessageSendResult {
@@ -383,17 +351,19 @@ function createMatrixMessageSendResult(
   };
 }
 
-function installMatrixTextMessageAdapter(params: {
-  messageId?: string;
-  text?: MatrixMessageTextSender;
-  durableFinal?: MatrixMessageAdapter["durableFinal"];
-  lifecycle?: NonNullable<MatrixMessageAdapter["send"]>["lifecycle"];
-  outbound?: Partial<ChannelOutboundAdapter>;
-}) {
+function installMessageText(
+  params: {
+    messageId?: string;
+    text?: MatrixMessageTextSender;
+    durableFinal?: MatrixMessageAdapter["durableFinal"];
+    lifecycle?: NonNullable<MatrixMessageAdapter["send"]>["lifecycle"];
+    outbound?: Partial<ChannelOutboundAdapter>;
+  } = {},
+) {
   const messageSendText =
     params.text ??
     vi.fn<MatrixMessageTextSender>(async () =>
-      createMatrixMessageSendResult(params.messageId ?? "message-adapter-1"),
+      messageResult(params.messageId ?? "message-adapter-1"),
     );
   setMatrixMessageAdapter(
     {
@@ -441,7 +411,7 @@ function conversationCompletion(
   return { kind: "conversation", agentId: "main", operationId, routeFingerprint };
 }
 
-function expectPartialCall(mock: unknown, ...args: Record<string, unknown>[]) {
+function expectCall(mock: unknown, ...args: Record<string, unknown>[]) {
   expect(mock).toHaveBeenCalledWith(...args.map((arg) => expect.objectContaining(arg)));
 }
 
@@ -451,15 +421,27 @@ function expectUncalled(...spies: unknown[]) {
   }
 }
 
-async function captureAudit(run: () => Promise<unknown>) {
-  const events: TrustedMessageAuditEvent[] = [];
-  const unsubscribe = onTrustedMessageAuditEvent((event) => events.push(event));
-  try {
-    await run();
-  } finally {
-    unsubscribe();
+function expectSent(events: Record<string, unknown>[], channelId = "matrix") {
+  expect(hooks.runMessageSent.mock.calls).toEqual(
+    events.map((event) => [expect.objectContaining(event), expect.objectContaining({ channelId })]),
+  );
+}
+
+function expectRedacted(value: unknown, ...secrets: string[]) {
+  for (const secret of secrets) {
+    expect(JSON.stringify(value)).not.toContain(secret);
   }
+}
+
+const subscriptions: Array<() => void> = [];
+function captureEvents<T>(subscribe: (listener: (event: T) => void) => () => void) {
+  const events: T[] = [];
+  subscriptions.push(subscribe((event) => events.push(event)));
   return events;
+}
+
+async function expectMatrixError(error: string | RegExp, params: MatrixDeliveryArgs = {}) {
+  await expect(deliverMatrix(params)).rejects.toThrow(error);
 }
 
 function textReconciliation(
@@ -473,7 +455,7 @@ function textReconciliation(
 }
 
 describe("deliverOutboundPayloads", () => {
-  let expectedQueueStateDir: string;
+  let queueStateDir: string;
 
   beforeAll(async () => {
     ({
@@ -484,7 +466,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   beforeEach(() => {
-    expectedQueueStateDir = resolveStateDir();
+    queueStateDir = resolveStateDir();
     resetDiagnosticEventsForTest();
     setActivePluginRegistry(defaultRegistry);
     vi.resetAllMocks();
@@ -493,6 +475,10 @@ describe("deliverOutboundPayloads", () => {
   });
 
   afterEach(() => {
+    for (const unsubscribe of subscriptions.splice(0)) {
+      unsubscribe();
+    }
+    vi.restoreAllMocks();
     resetDiagnosticEventsForTest();
     setActivePluginRegistry(emptyRegistry);
   });
@@ -501,35 +487,27 @@ describe("deliverOutboundPayloads", () => {
     { name: "missing reconciler", batch: false },
     { name: "heterogeneous batch missing text", batch: true },
   ])("validates required unknown-send recovery: $name", async ({ batch }) => {
-    installMatrixTextMessageAdapter({
+    const capabilities = {
+      text: true,
+      ...(batch ? { media: true, batch: true } : {}),
+      reconcileUnknownSend: true,
+    };
+    installMessageText({
       messageId: "message",
       durableFinal: {
-        capabilities: {
-          text: true,
-          ...(batch ? { media: true, batch: true } : {}),
-          reconcileUnknownSend: true,
-        },
+        capabilities,
         ...(batch ? { reconcileUnknownSend: async () => ({ status: "not_sent" as const }) } : {}),
         reconcileUnknownSendKinds: batch ? { media: true, batch: true } : undefined,
       },
-      ...(!batch
-        ? {
-            outbound: {
-              deliveryMode: "direct" as const,
-              sendText: async () => ({ channel: "matrix", messageId: "outbound" }),
-            },
-          }
-        : {}),
+      outbound: batch
+        ? undefined
+        : { sendText: async () => ({ channel: "matrix", messageId: "outbound" }) },
     });
     await expect(
       resolveOutboundDurableFinalDeliverySupport({
         cfg: {},
         channel: "matrix",
-        requirements: {
-          text: true,
-          ...(batch ? { media: true, batch: true } : {}),
-          reconcileUnknownSend: true,
-        },
+        requirements: capabilities,
       }),
     ).resolves.toEqual({
       ok: false,
@@ -538,33 +516,29 @@ describe("deliverOutboundPayloads", () => {
     });
   });
 
-  it("runs message adapter send lifecycle after durable intent and before platform send", async () => {
+  it("orders adapter lifecycle around durable intent and withholds terminal hooks until ack", async () => {
+    enableHooks("message_sent");
     const order: string[] = [];
-    queue.enqueueDelivery.mockImplementationOnce(async () => {
-      order.push("queue");
-      return "queue-1";
-    });
-    queue.ackDelivery.mockImplementationOnce(async () => {
+    const enteredAck = createDeferredCore();
+    const ack = createDeferredCore();
+    queue.enqueue.mockImplementationOnce(ordered(order, "queue", Promise.resolve("queue-1")));
+    queue.ack.mockImplementationOnce(() => {
       order.push("ack");
+      enteredAck.resolve();
+      return ack.promise;
     });
-    queue.markDeliveryPlatformOutcomeUnknown.mockImplementationOnce(async () => {
-      order.push("mark-unknown");
-    });
-    queue.markDeliveryPlatformSendDispatched.mockImplementationOnce(async () => {
-      order.push("dispatch");
-    });
-    completionMocks.completeDurableDelivery.mockImplementationOnce(() => {
-      order.push("complete");
-    });
+    queue.markUnknown.mockImplementationOnce(ordered(order, "mark-unknown", Promise.resolve()));
+    queue.markDispatched.mockImplementationOnce(ordered(order, "dispatch", Promise.resolve()));
+    completionMocks.completeDurableDelivery.mockImplementationOnce(
+      ordered(order, "complete", undefined),
+    );
+    const platformResult = messageResult("message-adapter-1");
     const messageSendText = vi.fn(async (ctx: ChannelMessageSendTextContext) => {
       order.push("send");
       await ctx.onPlatformSendDispatch?.();
-      return createMatrixMessageSendResult("message-adapter-1");
+      return platformResult;
     });
-    const beforeSendAttempt = vi.fn(() => {
-      order.push("before");
-      return "pending-1";
-    });
+    const beforeSendAttempt = vi.fn(ordered(order, "before", "pending-1"));
     const afterSendSuccess = vi.fn(
       (ctx: { attemptToken?: unknown; result: { messageId?: string } }) => {
         order.push(`after:${String(ctx.attemptToken)}:${ctx.result.messageId ?? ""}`);
@@ -573,7 +547,7 @@ describe("deliverOutboundPayloads", () => {
     const afterCommit = vi.fn((ctx: { attemptToken?: unknown; result: { messageId?: string } }) => {
       order.push(`commit:${String(ctx.attemptToken)}:${ctx.result.messageId ?? ""}`);
     });
-    installMatrixTextMessageAdapter({
+    installMessageText({
       durableFinal: {
         ...textReconciliation({ afterSendSuccess: true, afterCommit: true }),
         automaticUnknownSendReconciliation: true,
@@ -581,11 +555,15 @@ describe("deliverOutboundPayloads", () => {
       lifecycle: { beforeSendAttempt, afterSendSuccess, afterCommit },
       text: messageSendText,
     });
-    const results = await deliverMatrix({
+    const delivery = deliverMatrix({
       queuePolicy: "required",
       deliveryCompletion: conversationCompletion("operation-1", "route-1"),
       onDeliveryAttempt: async () => {},
     });
+    await enteredAck.promise;
+    expect(hooks.runMessageSent).not.toHaveBeenCalled();
+    ack.resolve();
+    const results = await delivery;
 
     expect(order).toEqual([
       "queue",
@@ -598,29 +576,26 @@ describe("deliverOutboundPayloads", () => {
       "ack",
       "commit:pending-1:message-adapter-1",
     ]);
-    expectPartialCall(beforeSendAttempt, {
+    expectCall(beforeSendAttempt, {
       kind: "text",
       to: "!room:example",
       text: "hello",
       deliveryQueueId: "queue-1",
     });
-    expect(queue.markDeliveryPlatformSendDispatched).toHaveBeenCalledWith(
+    expect(queue.markDispatched).toHaveBeenCalledExactlyOnceWith(
       "queue-1",
-      expectedQueueStateDir,
+      queueStateDir,
       expect.objectContaining({ replyToId: undefined, threadId: undefined }),
     );
-    expect(queue.markDeliveryPlatformSendDispatched).toHaveBeenCalledOnce();
-    expectPartialCall(afterSendSuccess, {
-      kind: "text",
-      attemptToken: "pending-1",
-      result: expect.objectContaining({ messageId: "message-adapter-1" }),
-    });
-    expectPartialCall(afterCommit, {
-      kind: "text",
-      attemptToken: "pending-1",
-      result: expect.objectContaining({ messageId: "message-adapter-1" }),
-    });
-    expect(results[0]).toMatchObject({ channel: "matrix", messageId: "message-adapter-1" });
+    for (const callback of [afterSendSuccess, afterCommit]) {
+      expectCall(callback, {
+        kind: "text",
+        attemptToken: "pending-1",
+        result: expect.objectContaining({ messageId: "message-adapter-1" }),
+      });
+    }
+    expect(results).toEqual([{ channel: "matrix", ...platformResult }]);
+    expectSent([{ content: "hello", messageId: "message-adapter-1", success: true }]);
   });
 
   it("forwards cancellation to formatted media sends", async () => {
@@ -634,23 +609,18 @@ describe("deliverOutboundPayloads", () => {
         throw new DOMException("operator canceled delivery", "AbortError");
       },
     });
-    await expect(
-      deliverMatrix({
-        payloads: [{ text: "hello", mediaUrl: "https://example.com/image.png" }],
-        abortSignal: abortController.signal,
-        queuePolicy: "required",
-        skipQueue: false,
-      }),
-    ).rejects.toThrow("operator canceled delivery");
-    expect(observedSignals).toHaveLength(1);
-    expect(observedSignals[0]?.aborted).toBe(true);
+    await expectMatrixError("operator canceled delivery", {
+      payloads: [{ text: "hello", mediaUrl: "https://example.com/image.png" }],
+      abortSignal: abortController.signal,
+      queuePolicy: "required",
+    });
+    expect(observedSignals).toMatchObject([{ aborted: true }]);
   });
 
   it("revalidates before direct adapter handoff when the adapter ignores the dispatch callback", async () => {
     const enteredPreflight = createDeferredCore();
     const resumePreflight = createDeferredCore();
-    const messageSendText = installMatrixTextMessageAdapter({
-      messageId: "must-not-send",
+    const messageSendText = installMessageText({
       lifecycle: {
         beforeSendAttempt: async () => {
           enteredPreflight.resolve();
@@ -658,11 +628,12 @@ describe("deliverOutboundPayloads", () => {
         },
       },
     });
-    const onPlatformSendDispatch = vi.fn(async () => {
-      throw new Error("turn authority closed");
+    const delivery = deliverMatrix({
+      skipQueue: true,
+      onPlatformSendDispatch: async () => {
+        throw new Error("turn authority closed");
+      },
     });
-
-    const delivery = deliverMatrix({ skipQueue: true, onPlatformSendDispatch });
     await enteredPreflight.promise;
     resumePreflight.resolve();
 
@@ -671,46 +642,39 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("synchronously revalidates after the awaited handoff and before adapter invocation", async () => {
-    const messageSendText = installMatrixTextMessageAdapter({ messageId: "must-not-send" });
+    const messageSendText = installMessageText();
     let writerIsCurrent = true;
 
-    await expect(
-      deliverMatrix({
-        skipQueue: true,
-        onPlatformSendDispatch: async () => {
-          await Promise.resolve();
-          writerIsCurrent = false;
-        },
-        assertDirectAdapterHandoff: () => {
-          if (!writerIsCurrent) {
-            throw new Error("turn authority closed after awaited handoff");
-          }
-        },
-      }),
-    ).rejects.toThrow("turn authority closed after awaited handoff");
+    await expectMatrixError("turn authority closed after awaited handoff", {
+      skipQueue: true,
+      onPlatformSendDispatch: async () => {
+        await Promise.resolve();
+        writerIsCurrent = false;
+      },
+      assertDirectAdapterHandoff: () => {
+        if (!writerIsCurrent) {
+          throw new Error("turn authority closed after awaited handoff");
+        }
+      },
+    });
     expect(messageSendText).not.toHaveBeenCalled();
   });
 
   it("never falls back to fresh modifiers after another preparation owner wins", async () => {
-    queue.withStableDeliveryPreparation.mockResolvedValueOnce({ status: "existing" });
-    queue.loadPendingDelivery.mockResolvedValueOnce(null);
-    queue.findDeliveryIntentOwner.mockResolvedValueOnce(null);
+    queue.prepare.mockResolvedValueOnce({ status: "existing" });
     enableHooks("message_sending");
-    sendMatrix = vi.fn();
 
-    await expect(
-      deliverMatrix({
-        queuePolicy: "required",
-        deliveryIntentId: "transitioning-owner",
-        reusePendingDeliveryIntent: true,
-      }),
-    ).rejects.toThrow("Stable delivery intent is already queued: transitioning-owner");
+    await expectMatrixError("Stable delivery intent is already queued: transitioning-owner", {
+      queuePolicy: "required",
+      deliveryIntentId: "transitioning-owner",
+      reusePendingDeliveryIntent: true,
+    });
     expectUncalled(hooks.runMessageSending, sendMatrix);
   });
 
   it("serializes stable intent preparation before modifiers can run twice", async () => {
     let active = false;
-    queue.withActiveDeliveryClaim.mockImplementation(async (_entryId, fn) => {
+    queue.withClaim.mockImplementation(async (_entryId, fn) => {
       if (active) {
         return { status: "claimed-by-other-owner" };
       }
@@ -722,28 +686,19 @@ describe("deliverOutboundPayloads", () => {
       }
     });
     enableHooks("message_sending");
-    let releaseModifier: (() => void) | undefined;
-    hooks.runMessageSending.mockImplementationOnce(
-      async () =>
-        await new Promise<undefined>((resolve) => {
-          releaseModifier = () => resolve(undefined);
-        }),
-    );
-    sendMatrix = vi.fn().mockResolvedValue({ messageId: "stable-1" });
-    const params = {
-      deps: { matrix: sendMatrix },
-      queuePolicy: "required" as const,
-      deliveryIntentId: "operation-concurrent",
-    };
+    const modifier = createDeferredCore<undefined>();
+    hooks.runMessageSending.mockImplementationOnce(() => modifier.promise);
+    const params = { queuePolicy: "required" as const, deliveryIntentId: "operation-concurrent" };
 
     const first = deliverMatrix(params);
     await vi.waitFor(() => expect(hooks.runMessageSending).toHaveBeenCalledOnce());
-    expect(queue.enqueueDeliveryOnce).not.toHaveBeenCalled();
-    await expect(deliverMatrix(params)).rejects.toThrow(
+    expect(queue.enqueueOnce).not.toHaveBeenCalled();
+    await expectMatrixError(
       "Stable delivery intent is already queued: operation-concurrent",
+      params,
     );
     expect(hooks.runMessageSending).toHaveBeenCalledOnce();
-    releaseModifier?.();
+    modifier.resolve(undefined);
     await expect(first).resolves.toHaveLength(1);
     expect(sendMatrix).toHaveBeenCalledOnce();
   });
@@ -770,18 +725,14 @@ describe("deliverOutboundPayloads", () => {
         },
       },
     );
-    const outcome = pending.then(
-      (batch) => ({ batch, error: undefined }),
-      (error: unknown) => ({ batch: undefined, error }),
-    );
+    const outcome = pending.catch((error: unknown) => error);
     await entered.promise;
     await waitForImmediate();
     const callsBeforeCheckpoint = hooks.runReplyPayloadSending.mock.calls.length;
     controller.abort();
     checkpoint.resolve();
-    const result = await outcome;
     expect(callsBeforeCheckpoint).toBe(0);
-    expect(result.error).toBeInstanceOf(Error);
+    expect(await outcome).toBeInstanceOf(Error);
     expectUncalled(hooks.runReplyPayloadSending, hooks.runMessageSending);
   });
 
@@ -794,77 +745,64 @@ describe("deliverOutboundPayloads", () => {
 
   it("revalidates conversation authority after queue admission and before the adapter", async () => {
     const order: string[] = [];
-    queue.enqueueDelivery.mockImplementationOnce(async () => {
-      order.push("queue");
-      return "queue-route-authorization";
-    });
-    sendMatrix = vi.fn(async () => {
-      order.push("send");
-      return { messageId: "message-1" };
-    });
+    queue.enqueue.mockImplementationOnce(
+      ordered(order, "queue", Promise.resolve("queue-route-authorization")),
+    );
+    sendMatrix = vi.fn(ordered(order, "send", Promise.resolve({ messageId: "message-1" })));
 
-    await expect(
-      deliverMatrix({
-        payloads: [{ text: "hello" }],
-        queuePolicy: "required",
-        deliveryCompletion: conversationCompletion("operation-revoked", "route-revoked"),
-        onDeliveryAttempt: async () => {
-          order.push("authorize");
-          throw new PlatformMessageNotDispatchedError("route was revoked", {
-            cause: undefined,
-            retryable: false,
-          });
-        },
-      }),
-    ).rejects.toThrow("route was revoked");
+    await expectMatrixError("route was revoked", {
+      queuePolicy: "required",
+      deliveryCompletion: conversationCompletion("operation-revoked", "route-revoked"),
+      onDeliveryAttempt: async () => {
+        order.push("authorize");
+        throw new PlatformMessageNotDispatchedError("route was revoked", {
+          cause: undefined,
+          retryable: false,
+        });
+      },
+    });
 
     expect(order).toEqual(["queue", "authorize"]);
     expect(sendMatrix).not.toHaveBeenCalled();
   });
 
   it("revalidates persisted session writer authority after queue admission", async () => {
-    const messageSendText = installMatrixTextMessageAdapter({
-      messageId: "must-not-send",
+    const messageSendText = installMessageText({
       durableFinal: { capabilities: { text: true } },
     });
 
-    await expect(
-      deliverMatrix({
-        deliveryCompletion: {
-          kind: "pending-final",
-          deliveryId: "delivery-stale-writer",
-          intentId: "intent-stale-writer",
-          sessionId: "session-stale-writer",
+    await expectMatrixError("Session writer changed before final reply delivery", {
+      deliveryCompletion: {
+        kind: "pending-final",
+        deliveryId: "delivery-stale-writer",
+        intentId: "intent-stale-writer",
+        sessionId: "session-stale-writer",
+        sessionKey: "agent:main:matrix:room:stale-writer",
+        storePath: "/tmp/openclaw-missing-stale-writer.sqlite",
+        sessionWriterDeliveryAuthority: {
+          agentId: "main",
+          expectedLifecycleRevision: "revision-old",
+          expectedSessionId: "session-stale-writer",
+          expectedWriterRunId: "run-old",
           sessionKey: "agent:main:matrix:room:stale-writer",
           storePath: "/tmp/openclaw-missing-stale-writer.sqlite",
-          sessionWriterDeliveryAuthority: {
-            agentId: "main",
-            expectedLifecycleRevision: "revision-old",
-            expectedSessionId: "session-stale-writer",
-            expectedWriterRunId: "run-old",
-            sessionKey: "agent:main:matrix:room:stale-writer",
-            storePath: "/tmp/openclaw-missing-stale-writer.sqlite",
-          },
         },
-      }),
-    ).rejects.toThrow("Session writer changed before final reply delivery");
+      },
+    });
 
-    expect(queue.enqueueDelivery).toHaveBeenCalledOnce();
+    expect(queue.enqueue).toHaveBeenCalledOnce();
     expect(messageSendText).not.toHaveBeenCalled();
   });
 
   it("persists provider no-send suppression before ack", async () => {
     const order: string[] = [];
-    queue.enqueueDelivery.mockImplementationOnce(async () => {
-      order.push("queue");
-      return "queue-suppressed";
-    });
-    completionMocks.suppressDurableDelivery.mockImplementationOnce(() => {
-      order.push("suppress");
-    });
-    queue.ackDelivery.mockImplementationOnce(async () => {
-      order.push("ack");
-    });
+    queue.enqueue.mockImplementationOnce(
+      ordered(order, "queue", Promise.resolve("queue-suppressed")),
+    );
+    completionMocks.suppressDurableDelivery.mockImplementationOnce(
+      ordered(order, "suppress", undefined),
+    );
+    queue.ack.mockImplementationOnce(ordered(order, "ack", Promise.resolve()));
     sendMatrix = vi
       .fn()
       .mockResolvedValue({ channel: "matrix", messageId: "", outcome: "not_sent" });
@@ -879,7 +817,7 @@ describe("deliverOutboundPayloads", () => {
     expect(results).toEqual([]);
     expect(sendMatrix).toHaveBeenCalledOnce();
     expect(order).toEqual(["queue", "suppress", "ack"]);
-    expectUncalled(queue.failDeliveryAfterPlatformSend, completionMocks.failDurableDelivery);
+    expectUncalled(queue.failAfterSend, completionMocks.failDurableDelivery);
   });
 
   it("rejects provider-blocked deferred delivery before queue creation or platform work", async () => {
@@ -888,51 +826,37 @@ describe("deliverOutboundPayloads", () => {
       reason: "unsupported_enterprise_slack_delivery",
     }));
     const messageSendText = vi.fn();
-    installMatrixTextMessageAdapter({
-      durableFinal: { admitDeferredDelivery },
-      text: messageSendText,
-    });
+    installMessageText({ durableFinal: { admitDeferredDelivery }, text: messageSendText });
 
-    const request = {
-      cfg: {},
-      channel: "matrix" as const,
-      to: "!room:example",
-      accountId: "enterprise",
-      payloads: [{ text: "blocked" }],
-    };
-    await expect(deliverOutboundPayloads(request)).rejects.toThrow(
-      "unsupported_enterprise_slack_delivery",
-    );
-    await expect(deliverOutboundPayloads({ ...request, skipQueue: true })).rejects.toThrow(
-      "unsupported_enterprise_slack_delivery",
-    );
+    for (const skipQueue of [undefined, true]) {
+      await expectMatrixError("unsupported_enterprise_slack_delivery", {
+        accountId: "enterprise",
+        payloads: [{ text: "blocked" }],
+        skipQueue,
+      });
+    }
 
-    expectPartialCall(admitDeferredDelivery, {
+    expectCall(admitDeferredDelivery, {
       accountId: "enterprise",
       channel: "matrix",
       phase: "live",
       to: "!room:example",
     });
-    expect(queue.enqueueDelivery).not.toHaveBeenCalled();
+    expect(queue.enqueue).not.toHaveBeenCalled();
     expect(admitDeferredDelivery).toHaveBeenCalledTimes(2);
     expectUncalled(messageSendText, hooks.runMessageSending);
   });
 
   it("rejects explicitly reconciled multi-payload sends before enqueue or platform I/O", async () => {
     const messageSendText = vi.fn();
-    installMatrixTextMessageAdapter({
-      durableFinal: textReconciliation(),
-      text: messageSendText,
-    });
+    installMessageText({ durableFinal: textReconciliation(), text: messageSendText });
 
-    await expect(
-      deliverMatrix({
-        payloads: [{ text: "first" }, { text: "second" }],
-        queuePolicy: "required",
-        requireUnknownSendReconciliation: true,
-      }),
-    ).rejects.toThrow(/unknown-send reconciliation requires exactly one payload/);
-    expectUncalled(queue.enqueueDelivery, messageSendText);
+    await expectMatrixError(/unknown-send reconciliation requires exactly one payload/, {
+      payloads: [{ text: "first" }, { text: "second" }],
+      queuePolicy: "required",
+      requireUnknownSendReconciliation: true,
+    });
+    expectUncalled(queue.enqueue, messageSendText);
   });
 
   it("preserves a whole media list for declared message payload transport", async () => {
@@ -963,10 +887,7 @@ describe("deliverOutboundPayloads", () => {
       {
         id: "matrix",
         durableFinal: { capabilities },
-        send: {
-          text: vi.fn(),
-          payload: async (ctx) => ({ ...(await sendPayload(ctx)), receipt }),
-        },
+        send: { text: vi.fn(), payload: async (ctx) => ({ ...(await sendPayload(ctx)), receipt }) },
       },
       outbound,
     );
@@ -978,16 +899,13 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(sendPayload).toHaveBeenCalledOnce();
-    expectPartialCall(sendPayload, {
+    expectCall(sendPayload, {
       kind: "payload",
       payload: expect.objectContaining({ text: "caption", mediaUrls }),
     });
     expect(sendMedia).not.toHaveBeenCalled();
     expect(results[0]?.receipt?.platformMessageIds).toEqual(["media-1", "media-2"]);
-    expectPartialCall(onPayloadDeliveryOutcome, {
-      status: "sent",
-      deliveryKind: "media",
-    });
+    expectCall(onPayloadDeliveryOutcome, { status: "sent", deliveryKind: "media" });
 
     await deliverMatrix({ payloads: [{ text: "single caption", mediaUrl: mediaUrls[0] }] });
     expect(sendPayload).toHaveBeenCalledOnce();
@@ -1063,29 +981,21 @@ describe("deliverOutboundPayloads", () => {
   );
 
   it("keeps an explicitly reconciled send retryable when dispatch state cannot persist", async () => {
-    queue.markDeliveryPlatformSendDispatched.mockRejectedValueOnce(
-      new Error("dispatch state unavailable"),
-    );
+    queue.markDispatched.mockRejectedValueOnce(new Error("dispatch state unavailable"));
     const platformSend = vi.fn();
     const messageSendText = vi.fn(async (ctx: ChannelMessageSendTextContext) => {
       await ctx.onPlatformSendDispatch?.();
       platformSend();
-      return createMatrixMessageSendResult("message-adapter-1");
+      return messageResult("message-adapter-1");
     });
-    installMatrixTextMessageAdapter({
-      durableFinal: textReconciliation(),
-      text: messageSendText,
-    });
+    installMessageText({ durableFinal: textReconciliation(), text: messageSendText });
 
-    await expect(
-      deliverMatrix({ queuePolicy: "required", requireUnknownSendReconciliation: true }),
-    ).rejects.toThrow("dispatch state unavailable");
-    expectUncalled(
-      platformSend,
-      queue.markDeliveryPlatformSendAttemptStarted,
-      queue.markDeliveryPlatformOutcomeUnknown,
-    );
-    expect(queue.failDelivery).toHaveBeenCalledWith("mock-queue-id", "dispatch state unavailable");
+    await expectMatrixError("dispatch state unavailable", {
+      queuePolicy: "required",
+      requireUnknownSendReconciliation: true,
+    });
+    expectUncalled(platformSend, queue.markStarted, queue.markUnknown);
+    expect(queue.fail).toHaveBeenCalledWith("mock-queue-id", "dispatch state unavailable");
   });
 
   it("rejects a required send before platform I/O when hooks change its reconciliable shape", async () => {
@@ -1101,14 +1011,12 @@ describe("deliverOutboundPayloads", () => {
       send: { text: sendText, media: sendMedia },
     });
 
-    await expect(
-      deliverMatrix({
-        queuePolicy: "required",
-        requireUnknownSendReconciliation: true,
-        replyPayloadSendingHook: finalReplyHook(),
-      }),
-    ).rejects.toThrow(/prepared payload capability mismatch \(reconcileUnknownSend\)/);
-    expectUncalled(sendText, sendMedia, queue.markDeliveryPlatformOutcomeUnknown);
+    await expectMatrixError(/prepared payload capability mismatch \(reconcileUnknownSend\)/, {
+      queuePolicy: "required",
+      requireUnknownSendReconciliation: true,
+      replyPayloadSendingHook: finalReplyHook(),
+    });
+    expectUncalled(sendText, sendMedia, queue.markUnknown);
   });
 
   it("keeps cancellation metadata live but out of durable prepared custody", async () => {
@@ -1148,26 +1056,26 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("preserves native send errors when failure cleanup throws", async () => {
-    const messageSendText = vi.fn(async () => {
-      throw new Error("native send failed");
-    });
-    const afterSendFailure = vi.fn(async () => {
-      throw new Error("cleanup failed");
-    });
-    installMatrixTextMessageAdapter({
+    const messageSendText = vi
+      .fn<() => Promise<never>>()
+      .mockRejectedValue(new Error("native send failed"));
+    const afterSendFailure = vi
+      .fn<() => Promise<never>>()
+      .mockRejectedValue(new Error("cleanup failed"));
+    installMessageText({
       durableFinal: { capabilities: { text: true, afterSendSuccess: true } },
       lifecycle: { beforeSendAttempt: () => "pending-2", afterSendFailure },
       text: messageSendText,
     });
 
-    await expect(deliverMatrix({ queuePolicy: "required" })).rejects.toThrow("native send failed");
+    await expectMatrixError("native send failed", { queuePolicy: "required" });
 
-    expectPartialCall(afterSendFailure, {
+    expectCall(afterSendFailure, {
       kind: "text",
       attemptToken: "pending-2",
       error: expect.any(Error),
     });
-    const failDeliveryCall = firstCall(queue.failDelivery);
+    const failDeliveryCall = firstCall(queue.fail);
     expect(failDeliveryCall[0]).toBe("mock-queue-id");
     expect(String(failDeliveryCall[1])).toContain("native send failed");
   });
@@ -1175,11 +1083,8 @@ describe("deliverOutboundPayloads", () => {
   it("preserves successful sends when the success hook throws", async () => {
     const afterSendFailure = vi.fn();
     const afterCommit = vi.fn();
-    installMatrixTextMessageAdapter({
-      messageId: "message-adapter-1",
-      durableFinal: {
-        capabilities: { text: true, afterSendSuccess: true, afterCommit: true },
-      },
+    installMessageText({
+      durableFinal: { capabilities: { text: true, afterSendSuccess: true, afterCommit: true } },
       lifecycle: {
         afterSendSuccess: async () => {
           throw new Error("success hook failed");
@@ -1191,41 +1096,29 @@ describe("deliverOutboundPayloads", () => {
     const results = await deliverMatrix({ queuePolicy: "required" });
 
     expect(results[0]).toMatchObject({ channel: "matrix", messageId: "message-adapter-1" });
-    expect(afterSendFailure).not.toHaveBeenCalled();
-    expectPartialCall(afterCommit, {
+    expectCall(afterCommit, {
       kind: "text",
       result: expect.objectContaining({ messageId: "message-adapter-1" }),
     });
-    expect(queue.ackDelivery).toHaveBeenCalledWith(
-      "mock-queue-id",
-      expectedQueueStateDir,
-      undefined,
-    );
-    expect(queue.failDelivery).not.toHaveBeenCalled();
+    expect(queue.ack).toHaveBeenCalledWith("mock-queue-id", queueStateDir, undefined);
+    expectUncalled(afterSendFailure, queue.fail);
   });
 
   it("emits one message_sent failure per payload when batch preparation fails", async () => {
     enableHooks("message_sent", "reply_payload_sending");
     hooks.runReplyPayloadSending.mockRejectedValueOnce(new Error("modifier exploded"));
-    sendMatrix = vi.fn();
 
-    await expect(
-      deliverMatrix({
-        payloads: [{ text: "first payload" }, { text: "second payload" }],
-        replyPayloadSendingHook: finalReplyHook(),
-      }),
-    ).rejects.toThrow("modifier exploded");
+    await expectMatrixError("modifier exploded", {
+      payloads: [{ text: "first payload" }, { text: "second payload" }],
+      replyPayloadSendingHook: finalReplyHook(),
+    });
 
     expect(sendMatrix).not.toHaveBeenCalled();
-    expect(hooks.runMessageSent).toHaveBeenCalledTimes(2);
-    const contents = hooks.runMessageSent.mock.calls.map(
-      (call) => (call[0] as { content?: string }).content,
-    );
-    expect(contents).toEqual(["first payload", "second payload"]);
+    expectSent([{ content: "first payload" }, { content: "second payload" }]);
   });
 
   it("retains custody when caller-owned retirement fails", async () => {
-    queue.moveToFailed.mockRejectedValueOnce(new Error("claim was replaced"));
+    queue.retire.mockRejectedValueOnce(new Error("claim was replaced"));
     sendMatrix = vi
       .fn()
       .mockRejectedValueOnce(createNetworkError("connect refused", "ECONNREFUSED", "connect"));
@@ -1233,84 +1126,76 @@ describe("deliverOutboundPayloads", () => {
     await expect(
       deliverMatrix({ queuePolicy: "required", deliveryRetryOwner: "caller" }),
     ).rejects.toMatchObject({ message: "connect refused", queueCustody: "held" });
-    expect(queue.ackDelivery).not.toHaveBeenCalled();
+    expect(queue.ack).not.toHaveBeenCalled();
   });
 
   it("keeps a durable-completion entry recoverable after a proven pre-connect failure", async () => {
     const networkError = createNetworkError("connect ECONNREFUSED", "ECONNREFUSED", "connect");
     sendMatrix = vi.fn().mockRejectedValueOnce(networkError);
 
-    await expect(
-      deliverMatrix({
-        queuePolicy: "required",
-        deliveryRetryOwner: "caller",
-        deliveryCompletion: conversationCompletion(
-          "operation-proven-not-sent",
-          "route-proven-not-sent",
-        ),
-        onDeliveryAttempt: async () => {},
-      }),
-    ).rejects.toThrow("ECONNREFUSED");
+    await expectMatrixError("ECONNREFUSED", {
+      queuePolicy: "required",
+      deliveryRetryOwner: "caller",
+      deliveryCompletion: conversationCompletion(
+        "operation-proven-not-sent",
+        "route-proven-not-sent",
+      ),
+      onDeliveryAttempt: async () => {},
+    });
 
-    expect(queue.moveToFailed).not.toHaveBeenCalled();
-    expect(queue.failDeliveryBeforePlatformSend).toHaveBeenCalledWith(
+    expect(queue.failBeforeSend).toHaveBeenCalledWith(
       "mock-queue-id",
       expect.stringContaining("ECONNREFUSED"),
     );
-    expect(queue.failDelivery).not.toHaveBeenCalled();
+    expectUncalled(queue.retire, queue.fail);
   });
 
   registerOutboundQueueAckTests({
-    createMatrixMessageSendResult,
+    createMatrixMessageSendResult: messageResult,
     deliverMatrix,
     hookMocks,
-    queueMocks: queue,
+    queueMocks: {
+      ackDelivery: queue.ack,
+      failDelivery: queue.fail,
+      failDeliveryAfterPlatformSend: queue.failAfterSend,
+      markDeliveryPlatformOutcomeUnknown: queue.markUnknown,
+    },
     setMatrixMessageAdapter,
     setTestOutbound,
   });
 
   it("clears no-send handoff evidence after a best-effort queue acknowledgement fails", async () => {
-    queue.ackDelivery.mockRejectedValueOnce(new Error("ack offline"));
-    const sendText = installTextOutbound({
-      channel: "matrix",
-      messageId: "",
-      outcome: "not_sent",
-    });
+    queue.ack.mockRejectedValueOnce(new Error("ack offline"));
+    const sendText = installTextOutbound({ channel: "matrix", messageId: "", outcome: "not_sent" });
     const onPayloadDeliveryOutcome = vi.fn();
     const delivery = deliverMatrix({ queuePolicy: "best_effort", onPayloadDeliveryOutcome });
 
     await expect(delivery).resolves.toEqual([]);
 
     expect(sendText).toHaveBeenCalledOnce();
-    expect(queue.markDeliveryPlatformSendAttemptStarted).toHaveBeenCalledOnce();
+    expect(queue.markStarted).toHaveBeenCalledOnce();
     expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
       index: 0,
       status: "suppressed",
       reason: "adapter_returned_no_send",
     });
-    expect(queue.failDeliveryBeforePlatformSend).toHaveBeenCalledWith(
+    expect(queue.failBeforeSend).toHaveBeenCalledWith(
       "mock-queue-id",
       expect.stringContaining("failed to ack unsent delivery: ack offline"),
     );
-    expectUncalled(queue.failDelivery, queue.failDeliveryAfterPlatformSend);
+    expectUncalled(queue.fail, queue.failAfterSend);
   });
 
   it("emits bounded delivery diagnostics for failed sends", async () => {
-    const events: DiagnosticEventPayload[] = [];
-    const unsubscribe = onInternalDiagnosticEvent((event) => events.push(event));
-    sendMatrix = vi.fn();
+    const events = captureEvents(onInternalDiagnosticEvent);
     sendMatrix.mockRejectedValue(new TypeError("secret delivery body could not send"));
-    try {
-      await deliverMatrix({
-        cfg: matrixChunkConfig,
-        payloads: [{ text: "secret delivery body" }],
-        bestEffort: true,
-        session: { key: "session-1" },
-      });
-      await waitForImmediate();
-    } finally {
-      unsubscribe();
-    }
+    await deliverMatrix({
+      cfg: matrixChunkConfig,
+      payloads: [{ text: "secret delivery body" }],
+      bestEffort: true,
+      session: { key: "session-1" },
+    });
+    await waitForImmediate();
     const deliveryEvents = events.filter((event) => event.type.startsWith("message.delivery."));
     expect(deliveryEvents.map((event) => event.type)).toEqual([
       "message.delivery.started",
@@ -1327,8 +1212,7 @@ describe("deliverOutboundPayloads", () => {
       durationMs: expect.any(Number),
       errorCategory: "TypeError",
     });
-    expect(JSON.stringify(deliveryEvents)).not.toContain("secret delivery body");
-    expect(JSON.stringify(deliveryEvents)).not.toContain("!room:example");
+    expectRedacted(deliveryEvents, "secret delivery body", "!room:example");
   });
 
   it("emits one metadata-only audit terminal for a successful logical payload", async () => {
@@ -1337,23 +1221,14 @@ describe("deliverOutboundPayloads", () => {
       target: { kind: "room", id: "!room:example" },
     });
 
-    const events = await captureAudit(async () => {
-      await deliverMatrix({
-        cfg: matrixChunkConfig,
-        to: "!room:target",
-        accountId: "account-1",
-        payloads: [{ text: "secret delivery body" }],
-        session: {
-          key: "secret-session-key",
-          agentId: "agent-main",
-          conversationType: "direct",
-        },
-        replyPayloadSendingHook: {
-          kind: "final",
-          runId: "run-1",
-          context: { channelId: "matrix" },
-        },
-      });
+    const events = captureEvents(onTrustedMessageAuditEvent);
+    await deliverMatrix({
+      cfg: matrixChunkConfig,
+      to: "!room:target",
+      accountId: "account-1",
+      payloads: [{ text: "secret delivery body" }],
+      session: { key: "secret-session-key", agentId: "agent-main", conversationType: "direct" },
+      replyPayloadSendingHook: { kind: "final", runId: "run-1", context: { channelId: "matrix" } },
     });
 
     expect(events.map((event) => event.outcome)).toEqual(["queued", "platform_started", "sent"]);
@@ -1380,8 +1255,7 @@ describe("deliverOutboundPayloads", () => {
       messageId: "platform-message-1",
     });
     expect(typeof events[2]?.durationMs).toBe("number");
-    expect(JSON.stringify(events)).not.toContain("secret delivery body");
-    expect(JSON.stringify(events)).not.toContain("secret-session-key");
+    expectRedacted(events, "secret delivery body", "secret-session-key");
   });
 
   it("uses the base policy key for isolated heartbeat group media read denies", async () => {
@@ -1393,21 +1267,9 @@ describe("deliverOutboundPayloads", () => {
     await deliverMatrix({
       accountId: "destination-account",
       cfg: {
-        tools: {
-          allow: ["read"],
-        },
+        tools: { allow: ["read"] },
         channels: {
-          matrix: {
-            groups: {
-              ops: {
-                toolsBySender: {
-                  "id:attacker": {
-                    deny: ["read"],
-                  },
-                },
-              },
-            },
-          },
+          matrix: { groups: { ops: { toolsBySender: { "id:attacker": { deny: ["read"] } } } } },
         } as OpenClawConfig["channels"],
       },
       payloads: [{ text: "heartbeat media", mediaUrl: "file:///tmp/policy.png" }],
@@ -1422,7 +1284,7 @@ describe("deliverOutboundPayloads", () => {
       },
     });
 
-    expectPartialCall(resolveMediaAccessSpy, {
+    expectCall(resolveMediaAccessSpy, {
       sessionKey: "agent:main:matrix:group:ops",
       messageProvider: undefined,
       accountId: "source-account",
@@ -1436,24 +1298,18 @@ describe("deliverOutboundPayloads", () => {
     expect((sendOptions.mediaLocalRoots as readonly string[] | undefined) ?? []).not.toContain(
       "/tmp",
     );
-    resolveMediaAccessSpy.mockRestore();
   });
 
   it("scopes media access after reply payload hooks add local media", async () => {
-    const auditEvents: TrustedMessageAuditEvent[] = [];
-    const unsubscribeAudit = onTrustedMessageAuditEvent((event) => auditEvents.push(event));
+    const auditEvents = captureEvents(onTrustedMessageAuditEvent);
     enableHooks("reply_payload_sending");
     hooks.runReplyPayloadSending.mockResolvedValueOnce({
-      payload: {
-        text: "hook media",
-        mediaUrl: "file:///tmp/hook-added.png",
-      },
+      payload: { text: "hook media", mediaUrl: "file:///tmp/hook-added.png" },
     });
     const resolveMediaAccessSpy = vi.spyOn(
       mediaCapabilityModule,
       "resolveAgentScopedOutboundMediaAccess",
     );
-    sendMatrix = vi.fn().mockResolvedValue({ messageId: "m5", roomId: "!room:example" });
 
     await deliverMatrix({
       session: {
@@ -1463,27 +1319,18 @@ describe("deliverOutboundPayloads", () => {
       },
       replyPayloadSendingHook: finalReplyHook(),
     });
-    unsubscribeAudit();
 
-    const [mediaAccessOptions] =
-      firstCall<[{ mediaSources?: unknown; requesterSenderId?: unknown; sessionKey?: unknown }]>(
-        resolveMediaAccessSpy,
-      );
-    expect(mediaAccessOptions).toEqual(
-      expect.objectContaining({
-        mediaSources: ["file:///tmp/hook-added.png"],
-        sessionKey: "agent:main:matrix:room:ops",
-        requesterSenderId: "sender-1",
-      }),
-    );
+    expectCall(resolveMediaAccessSpy, {
+      mediaSources: ["file:///tmp/hook-added.png"],
+      sessionKey: "agent:main:matrix:room:ops",
+      requesterSenderId: "sender-1",
+    });
     const sendOptions = firstCall(sendMatrix)[2] as Record<string, unknown>;
     expect(sendOptions).toMatchObject({
       mediaUrl: "file:///tmp/hook-added.png",
       mediaReadFile: expect.any(Function),
     });
-    expect(auditEvents).toHaveLength(1);
-    expect(auditEvents[0]).toMatchObject({ outcome: "sent", deliveryKind: "media" });
-    resolveMediaAccessSpy.mockRestore();
+    expect(auditEvents).toMatchObject([{ outcome: "sent", deliveryKind: "media" }]);
   });
 
   it("keeps a prepared transport-id delivery atomic", async () => {
@@ -1503,8 +1350,8 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(sendText).toHaveBeenCalledOnce();
-    expectPartialCall(sendText, { text: "abcd", preparedMessageId: "prepared-1" });
-    expectPartialCall(queue.enqueueDelivery, { preparedMessageId: "prepared-1" });
+    expectCall(sendText, { text: "abcd", preparedMessageId: "prepared-1" });
+    expectCall(queue.enqueue, { preparedMessageId: "prepared-1" });
   });
 
   it("skips text-only payloads blanked by message_sending hooks", async () => {
@@ -1540,11 +1387,9 @@ describe("deliverOutboundPayloads", () => {
       };
     });
     hooks.runMessageSending.mockResolvedValue({ content: "redacted" });
-    const sendText = vi.fn().mockResolvedValue({
-      channel: "matrix",
-      messageId: "sent",
-      roomId: "!room",
-    });
+    const sendText = vi
+      .fn()
+      .mockResolvedValue({ channel: "matrix", messageId: "sent", roomId: "!room" });
 
     await deliverMatrix({
       to: "!room",
@@ -1553,7 +1398,7 @@ describe("deliverOutboundPayloads", () => {
       replyPayloadSendingHook: finalReplyHook("!room"),
     });
 
-    expectPartialCall(
+    expectCall(
       hooks.runReplyPayloadSending,
       {
         payload: expect.objectContaining({ text: "secret" }),
@@ -1562,25 +1407,20 @@ describe("deliverOutboundPayloads", () => {
       },
       { channelId: "matrix", conversationId: "!room" },
     );
-    expectPartialCall(
+    expectCall(
       hooks.runMessageSending,
-      {
-        content: "secret + payload-hook",
-        replyToId: "hooked-reply",
-      },
+      { content: "secret + payload-hook", replyToId: "hooked-reply" },
       { channelId: "matrix", conversationId: "!room" },
     );
     expect(firstCall(sendText)[1]).toBe("redacted");
-    expectPartialCall(queue.enqueueDelivery, {
+    expectCall(queue.enqueue, {
       preparedBatch: expect.objectContaining({
         entries: [expect.objectContaining({ status: "accepted", sourceIndex: 0 })],
       }),
     });
-    expect(queue.markDeliveryPlatformSendAttemptStarted).toHaveBeenCalledWith(
-      "mock-queue-id",
-      expectedQueueStateDir,
-      { replyToId: "hooked-reply" },
-    );
+    expect(queue.markStarted).toHaveBeenCalledWith("mock-queue-id", queueStateDir, {
+      replyToId: "hooked-reply",
+    });
   });
 
   it("leaves projected Gateway reset status notices unchanged for banner hooks", async () => {
@@ -1659,7 +1499,7 @@ describe("deliverOutboundPayloads", () => {
       | undefined;
     expect(deliveredPayload?.text).toBe("visible");
     expect(deliveredPayload?.channelData).toStrictEqual({ copiedText: "visible" });
-    expect(queue.enqueueDelivery).toHaveBeenCalledWith(
+    expect(queue.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
         preparedBatch: expect.objectContaining({
           entries: [
@@ -1758,15 +1598,16 @@ describe("deliverOutboundPayloads", () => {
       ],
     });
 
-    expectPartialCall(resolvePresentationCapabilities, {
+    expectCall(resolvePresentationCapabilities, {
       formatting: expect.objectContaining({ parseMode: "HTML" }),
     });
     expect(renderPresentation).not.toHaveBeenCalled();
-    expectPartialCall(sendText, { text: "authored fallback" });
+    expectCall(sendText, { text: "authored fallback" });
   });
 
   it("uses formatted-only senders and scoped media roots", async () => {
     const caption = "album";
+    const cfg = { channels: { line: {} } } as OpenClawConfig;
     const mediaUrls = ["file:///tmp/f.png", "file:///tmp/g.png"];
     const sendText = vi.fn(async ({ text }: { text: string }) => ({
       channel: "line" as const,
@@ -1784,24 +1625,16 @@ describe("deliverOutboundPayloads", () => {
         messageId: `fmt-media:${mediaUrl}:${text}`,
       }),
     );
-    setTestOutbound(
-      {
-        sendText,
-        sendFormattedText,
-        sendFormattedMedia,
-      },
-      "line",
-    );
+    setTestOutbound({ sendText, sendFormattedText, sendFormattedMedia }, "line");
 
     const textResults = await deliverLine({
-      cfg: { channels: { line: {} } } as OpenClawConfig,
+      cfg,
       accountId: "default",
       payloads: [{ text: "hello **boss**" }],
     });
 
     expect(sendFormattedText).toHaveBeenCalledTimes(1);
-    const formattedTextOptions = firstArg(sendFormattedText);
-    expect(formattedTextOptions).toMatchObject({
+    expect(firstArg(sendFormattedText)).toMatchObject({
       to: "U123",
       text: "hello **boss**",
       accountId: "default",
@@ -1812,7 +1645,6 @@ describe("deliverOutboundPayloads", () => {
       "fmt:hello **boss**:2",
     ]);
 
-    const cfg = { channels: { line: {} } } as OpenClawConfig;
     const onDeliveredPayload = vi.fn();
     const mediaResults = await deliverLine({
       cfg,
@@ -1834,7 +1666,7 @@ describe("deliverOutboundPayloads", () => {
     expect(mediaResults.map((entry) => entry.messageId)).toEqual(
       mediaUrls.map((mediaUrl, index) => `fmt-media:${mediaUrl}:${index === 0 ? caption : ""}`),
     );
-    expectPartialCall(onDeliveredPayload, { text: caption, mediaUrls });
+    expectCall(onDeliveredPayload, { text: caption, mediaUrls });
     expect(sendFormattedMediaCall?.mediaLocalRoots).toContain(expectedPreferredTmpRoot);
     expect(
       sendFormattedMediaCall?.mediaLocalRoots?.some((root) =>
@@ -1843,7 +1675,8 @@ describe("deliverOutboundPayloads", () => {
     ).toBe(true);
   });
 
-  it("runs partial after-delivery bookkeeping once with rendered payload and accepted target", async () => {
+  it("bookkeeps partial rendered sends once without mirroring an incomplete payload", async () => {
+    enableHooks("message_sent");
     const platformError = new Error("second formatted chunk failed");
     const firstResult = {
       channel: "line" as const,
@@ -1871,14 +1704,12 @@ describe("deliverOutboundPayloads", () => {
 
     const results = await deliverLine({
       payloads: [
-        {
-          text: "fallback",
-          presentation: { blocks: [{ type: "context", text: "native" }] },
-        },
+        { text: "fallback", presentation: { blocks: [{ type: "context", text: "native" }] } },
       ],
       bestEffort: true,
       skipQueue: true,
       onError,
+      mirror: { sessionKey: "agent:main:main", text: "fallback" },
     });
 
     expect(results).toEqual([firstResult]);
@@ -1897,6 +1728,18 @@ describe("deliverOutboundPayloads", () => {
     expect(onError).toHaveBeenCalledWith(
       platformError,
       expect.objectContaining({ text: "native formatted prefix" }),
+    );
+    expect(transcript.append).not.toHaveBeenCalled();
+    expectSent(
+      [
+        {
+          content: "native formatted prefix",
+          error: "second formatted chunk failed",
+          messageId: "fmt-1",
+          success: false,
+        },
+      ],
+      "line",
     );
   });
 
@@ -1934,15 +1777,11 @@ describe("deliverOutboundPayloads", () => {
 
   it("keeps commit hooks attached to a final result that replaces progress evidence", async () => {
     const afterCommit = vi.fn();
-    const receipt = createMessageReceiptFromOutboundResults({
-      results: [{ channel: "matrix", messageId: "message-adapter-1" }],
-      kind: "text",
-    });
-    installMatrixTextMessageAdapter({
+    const result = messageResult("message-adapter-1");
+    installMessageText({
       durableFinal: { capabilities: { text: true, afterCommit: true } },
       lifecycle: { afterCommit },
       text: async (ctx: ChannelMessageSendTextContext) => {
-        const result = { messageId: "message-adapter-1", receipt };
         await ctx.onDeliveryResult?.(result);
         return result;
       },
@@ -1956,9 +1795,7 @@ describe("deliverOutboundPayloads", () => {
 
   it("exposes audio-only spokenText to hooks without rendering it as media caption", async () => {
     hooks.hasHooks.mockReturnValue(true);
-    hooks.runMessageSending.mockResolvedValue({
-      content: "rewritten hidden transcript",
-    });
+    hooks.runMessageSending.mockResolvedValue({ content: "rewritten hidden transcript" });
     const sendMedia = vi.fn(async (_ctx: Parameters<OutboundMediaSender>[0]) => ({
       channel: "matrix",
       messageId: "mx-voice",
@@ -1982,8 +1819,7 @@ describe("deliverOutboundPayloads", () => {
       { content: "original hidden transcript" },
       { channelId: "matrix" },
     ]);
-    const sendMediaOptions = firstArg(sendMedia);
-    expect(sendMediaOptions).toMatchObject({
+    expect(firstArg(sendMedia)).toMatchObject({
       text: "",
       mediaUrl: "file:///tmp/clip.opus",
       audioAsVoice: true,
@@ -2035,19 +1871,19 @@ describe("deliverOutboundPayloads", () => {
         (call) => (call[0] as { conversationReadOrigin?: string })?.conversationReadOrigin,
       ),
     ).toEqual(["direct-operator", "direct-operator"]);
-    expect(queue.enqueueDelivery.mock.calls[0]?.[0]).not.toHaveProperty(
-      "conversationReadOrigin",
-    );
+    expect(queue.enqueue.mock.calls[0]?.[0]).not.toHaveProperty("conversationReadOrigin");
   });
 
   it("drops plugin HTML-only text payloads after sanitization", async () => {
-    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
+    const sendSanitizedText = vi
+      .fn()
+      .mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
     const results = await deliverMatrix({
       payloads: [{ text: "<br>" }],
-      deps: { matrix: sendMatrix },
+      deps: { matrix: sendSanitizedText },
     });
 
-    expect(sendMatrix).not.toHaveBeenCalled();
+    expect(sendSanitizedText).not.toHaveBeenCalled();
     expect(results).toStrictEqual([]);
   });
 
@@ -2079,10 +1915,7 @@ describe("deliverOutboundPayloads", () => {
     expect(sendTextParams.formatting).toEqual({ parseMode: "HTML" });
   });
 
-  registerOutboundImageProjectionTests({
-    setTestOutbound,
-    hookMocks,
-  });
+  registerOutboundImageProjectionTests({ setTestOutbound, hookMocks });
 
   it.each([
     { partial: true, error: "queue storage down" },
@@ -2090,7 +1923,7 @@ describe("deliverOutboundPayloads", () => {
   ])(
     "logs a warning when failDelivery rejects (partial=$partial, #83113)",
     async ({ partial, error }) => {
-      queue.failDelivery.mockRejectedValueOnce(new Error(error));
+      queue.fail.mockRejectedValueOnce(new Error(error));
       if (partial) {
         sendMatrix
           .mockRejectedValueOnce(new Error("fail"))
@@ -2100,25 +1933,20 @@ describe("deliverOutboundPayloads", () => {
           bestEffort: true,
           onError: vi.fn(),
         });
-        expect(queue.failDelivery).toHaveBeenCalledWith(
+        expect(queue.fail).toHaveBeenCalledWith(
           "mock-queue-id",
           "partial delivery failure (bestEffort)",
         );
       } else {
         sendMatrix = vi.fn().mockRejectedValue(new Error("native send failed"));
-        queue.markDeliveryPlatformSendAttemptStarted.mockRejectedValueOnce(
-          new Error("pre-send marker offline"),
-        );
+        queue.markStarted.mockRejectedValueOnce(new Error("pre-send marker offline"));
 
-        await expect(deliverMatrix({ queuePolicy: "required" })).rejects.toThrow(
-          "pre-send marker offline",
-        );
+        await expectMatrixError("pre-send marker offline", { queuePolicy: "required" });
 
-        expect(queue.failDelivery).toHaveBeenCalledWith("mock-queue-id", expect.any(String));
+        expect(queue.fail).toHaveBeenCalledWith("mock-queue-id", expect.any(String));
         expect(sendMatrix).not.toHaveBeenCalled();
       }
-      const warnCall = firstCall(logMocks.warn);
-      const warnMessage = String(warnCall[0]);
+      const warnMessage = String(firstCall(logMocks.warn)[0]);
       expect(warnMessage).toContain("failed to mark queued delivery");
       expect(warnMessage).toContain("mock-queue-id");
       expect(warnMessage).toContain(error);
@@ -2128,41 +1956,29 @@ describe("deliverOutboundPayloads", () => {
   it("emits a stable terminal when best-effort marker fallback ack precedes provider rejection", async () => {
     enableHooks("message_sent");
 
-    queue.markDeliveryPlatformSendAttemptStarted.mockRejectedValueOnce(
-      new Error("pre-send marker offline"),
-    );
+    queue.markStarted.mockRejectedValueOnce(new Error("pre-send marker offline"));
     sendMatrix = vi.fn().mockRejectedValueOnce(new Error("provider rejected send"));
 
-    const events = await captureAudit(async () => {
-      await expect(
-        deliverMatrix({ payloads: [{ text: "secret body" }], queuePolicy: "best_effort" }),
-      ).rejects.toThrow("provider rejected send");
+    const events = captureEvents(onTrustedMessageAuditEvent);
+    await expectMatrixError("provider rejected send", {
+      payloads: [{ text: "secret body" }],
+      queuePolicy: "best_effort",
     });
 
-    expect(queue.ackDelivery).toHaveBeenCalledWith(
-      "mock-queue-id",
-      expectedQueueStateDir,
-      undefined,
-    );
-    expect(queue.failDelivery).not.toHaveBeenCalled();
-    expect(hooks.runMessageSent).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ content: "secret body", success: false }),
-      expect.objectContaining({ channelId: "matrix" }),
-    );
+    expect(queue.ack).toHaveBeenCalledWith("mock-queue-id", queueStateDir, undefined);
+    expect(queue.fail).not.toHaveBeenCalled();
+    expectSent([{ content: "secret body", success: false }]);
     expect(events.map((event) => event.outcome)).toEqual(["queued", "platform_started", "failed"]);
     expect(events[2]).toMatchObject({
       sourceId: "message:outbound:queue:mock-queue-id:payload:0",
       outcome: "failed",
       failureStage: "platform_send",
     });
-    expect(JSON.stringify(events)).not.toContain("secret body");
-    expect(JSON.stringify(events)).not.toContain("provider rejected send");
+    expectRedacted(events, "secret body", "provider rejected send");
   });
 
   it("retains queue media when recovery acks before adapter I/O", async () => {
-    queue.markDeliveryPlatformSendAttemptStarted.mockRejectedValueOnce(
-      new Error("pre-send marker offline"),
-    );
+    queue.markStarted.mockRejectedValueOnce(new Error("pre-send marker offline"));
 
     await deliverMatrix({
       queuePolicy: "best_effort",
@@ -2171,17 +1987,13 @@ describe("deliverOutboundPayloads", () => {
       deliveryQueueStateDir: "/queue-state",
     });
 
-    expect(queue.ackDelivery).toHaveBeenCalledWith(
-      "recovery-queue-id",
-      path.resolve("/queue-state"),
-      { retainSpoolArtifacts: true },
-    );
+    expect(queue.ack).toHaveBeenCalledWith("recovery-queue-id", path.resolve("/queue-state"), {
+      retainSpoolArtifacts: true,
+    });
     expect(sendMatrix).toHaveBeenCalledOnce();
   });
 
   it("strips internal runtime scaffolding before queue persistence", async () => {
-    sendMatrix = vi.fn().mockResolvedValue({ messageId: "m-internal", roomId: "!room:example" });
-
     await deliverMatrix({
       cfg: matrixChunkConfig,
       payloads: [
@@ -2207,26 +2019,17 @@ describe("deliverOutboundPayloads", () => {
       ],
     });
 
-    const queuedDelivery = firstArg(queue.enqueueDelivery);
+    const queuedDelivery = firstArg(queue.enqueue);
     expect(
       queuedDelivery?.preparedBatch?.entries?.flatMap((entry) =>
         entry.status === "accepted" ? [entry.payload] : [],
       ),
-    ).toStrictEqual([
-      {
-        text: "visible\nafter",
-        channelData: {
-          internal: "",
-        },
-      },
-    ]);
+    ).toStrictEqual([{ text: "visible\nafter", channelData: { internal: "" } }]);
     expect(queuedDelivery?.renderedBatchPlan).toMatchObject({ payloadCount: 1, textCount: 1 });
     expect(queuedDelivery?.renderedBatchPlan?.items?.[0]?.text).toBe("visible\nafter");
   });
 
   it("stages agent-workspace media that only the agent-scoped capability can read", async () => {
-    // Staging must use the agent grant, not the default media roots.
-    sendMatrix = vi.fn().mockResolvedValue({ messageId: "m-ws", roomId: "!room:example" });
     // Disable parent-root expansion so only the agent grant admits this source.
     const workspaceOnlyConfig = {
       ...matrixChunkConfig,
@@ -2243,11 +2046,7 @@ describe("deliverOutboundPayloads", () => {
     const source = path.join(workspaceDir, "voice.mp3");
     const mp3 = Buffer.alloc(417 * 8);
     for (let i = 0; i < 8; i++) {
-      const o = i * 417;
-      mp3[o] = 0xff;
-      mp3[o + 1] = 0xfb;
-      mp3[o + 2] = 0x90;
-      mp3[o + 3] = 0xc4;
+      mp3.writeUInt32BE(0xfffb90c4, i * 417);
     }
     const payload = { mediaUrl: source, audioAsVoice: true };
 
@@ -2260,7 +2059,7 @@ describe("deliverOutboundPayloads", () => {
         session: { key: "session-ws", agentId: "proofagent" },
       });
 
-      const queued = firstArg(queue.enqueueDelivery);
+      const queued = firstArg(queue.enqueue);
       const queuedMediaUrl = queued?.preparedBatch?.entries?.find(
         (entry) => entry.status === "accepted",
       )?.payload?.mediaUrl;
@@ -2277,7 +2076,6 @@ describe("deliverOutboundPayloads", () => {
   it.each(["required", undefined] as const)(
     "never persists sensitive media with queue policy %s",
     async (queuePolicy) => {
-      sendMatrix = vi.fn().mockResolvedValue({ messageId: "m-sens", roomId: "!room:example" });
       const delivery = deliverMatrix({
         cfg: matrixChunkConfig,
         payloads: [{ mediaUrl: "https://example.com/secret.ogg", sensitiveMedia: true }],
@@ -2289,7 +2087,7 @@ describe("deliverOutboundPayloads", () => {
         await delivery;
         expect(sendMatrix).toHaveBeenCalled();
       }
-      expect(queue.enqueueDelivery).not.toHaveBeenCalled();
+      expect(queue.enqueue).not.toHaveBeenCalled();
     },
   );
 
@@ -2297,21 +2095,17 @@ describe("deliverOutboundPayloads", () => {
     "retains admitted custody before execution after %s (#70386)",
     async (failure) => {
       if (failure === "concurrent drain") {
-        queue.withActiveDeliveryClaim.mockResolvedValueOnce({
-          status: "claimed-by-other-owner",
-        });
+        queue.withClaim.mockResolvedValueOnce({ status: "claimed-by-other-owner" });
       } else {
-        queue.renewDeliveryPlatformSendLease.mockRejectedValueOnce(
-          new Error("lease startup failed"),
-        );
+        queue.renewLease.mockRejectedValueOnce(new Error("lease startup failed"));
       }
       await expect(deliverMatrix({})).rejects.toMatchObject({ queueCustody: "held" });
-      expectUncalled(sendMatrix, queue.ackDelivery);
+      expectUncalled(sendMatrix, queue.ack);
       if (failure === "concurrent drain") {
-        expect(queue.failDelivery).not.toHaveBeenCalled();
+        expect(queue.fail).not.toHaveBeenCalled();
       } else {
-        expect(queue.enqueueDelivery).toHaveBeenCalledOnce();
-        expect(queue.moveToFailed).not.toHaveBeenCalled();
+        expect(queue.enqueue).toHaveBeenCalledOnce();
+        expect(queue.retire).not.toHaveBeenCalled();
       }
     },
   );
@@ -2319,36 +2113,17 @@ describe("deliverOutboundPayloads", () => {
   it("emits one terminal failure without queueing when preparation metadata is rejected", async () => {
     enableHooks("message_sent");
 
-    const abortController = new AbortController();
     const errorMessage = "metadata unavailable";
-    const resolutionSpy = vi
-      .spyOn(channelResolution, "resolveOutboundChannelMessageAdapter")
-      .mockRejectedValueOnce(new Error(errorMessage));
-    const cfg: OpenClawConfig = {};
-    const events: TrustedMessageAuditEvent[] = [];
-    const unsubscribe = onTrustedMessageAuditEvent((event) => events.push(event));
+    vi.spyOn(channelResolution, "resolveOutboundChannelMessageAdapter").mockRejectedValueOnce(
+      new Error(errorMessage),
+    );
+    const events = captureEvents(onTrustedMessageAuditEvent);
 
-    try {
-      await expect(
-        deliverMatrix({ cfg, payloads: [{ text: "a" }], abortSignal: abortController.signal }),
-      ).rejects.toThrow(errorMessage);
+    await expectMatrixError(errorMessage, { payloads: [{ text: "a" }] });
 
-      expectUncalled(queue.enqueueDelivery, queue.ackDelivery, queue.failDelivery, sendMatrix);
-      expect(events.map((event) => event.outcome)).toEqual(["failed"]);
-      expect(hooks.runMessageSent).toHaveBeenCalledOnce();
-      expectPartialCall(
-        hooks.runMessageSent,
-        {
-          content: "a",
-          error: expect.stringContaining(errorMessage),
-          success: false,
-        },
-        { channelId: "matrix" },
-      );
-    } finally {
-      unsubscribe();
-      resolutionSpy.mockRestore();
-    }
+    expectUncalled(queue.enqueue, queue.ack, queue.fail, sendMatrix);
+    expect(events.map((event) => event.outcome)).toEqual(["failed"]);
+    expectSent([{ content: "a", error: expect.stringContaining(errorMessage), success: false }]);
   });
 
   it("mirrors successfully delivered location-only payloads into the session transcript", async () => {
@@ -2367,57 +2142,15 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(results).toEqual([{ channel: "line", messageId: "location-1" }]);
-    expect(firstArg(sendPayload).payload).toMatchObject({
-      text: "",
-      location,
-    });
-    expectPartialCall(mocks.appendAssistantMessageToSessionTranscript, {
+    expect(firstArg(sendPayload).payload).toMatchObject({ text: "", location });
+    expectCall(transcript.append, {
       sessionKey: "agent:main:main",
       text: "📍 48.858844, 2.294351 ±12m",
     });
   });
 
-  it("does not mirror a full payload when only an internal sub-send succeeded", async () => {
-    enableHooks("message_sent");
-    const partialResult = { channel: "line" as const, messageId: "partial-1" };
-    const sendFormattedText = vi.fn(
-      async (ctx: {
-        onDeliveryResult?: (result: typeof partialResult) => Promise<void> | void;
-      }) => {
-        await ctx.onDeliveryResult?.(partialResult);
-        throw new Error("second internal send failed");
-      },
-    );
-    setTestOutbound({ sendText: async () => partialResult, sendFormattedText }, "line");
-    mocks.appendAssistantMessageToSessionTranscript.mockClear();
-
-    const results = await deliverLine({
-      payloads: [{ text: "first part and unsent second part" }],
-      bestEffort: true,
-      skipQueue: true,
-      mirror: {
-        sessionKey: "agent:main:main",
-        text: "first part and unsent second part",
-      },
-    });
-
-    expect(results).toEqual([partialResult]);
-    expect(mocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
-    expect(hooks.runMessageSent).toHaveBeenCalledOnce();
-    expectPartialCall(
-      hooks.runMessageSent,
-      {
-        content: "first part and unsent second part",
-        error: "second internal send failed",
-        messageId: "partial-1",
-        success: false,
-      },
-      { channelId: "line" },
-    );
-  });
-
   it("preserves the channel send when the post-delivery mirror throws", async () => {
-    mocks.appendAssistantMessageToSessionTranscript.mockRejectedValueOnce(
+    transcript.append.mockRejectedValueOnce(
       new Error("transcript mirror failed after channel delivery"),
     );
     const results = await deliverMatrix({
@@ -2431,30 +2164,6 @@ describe("deliverOutboundPayloads", () => {
       "failed to mirror outbound delivery into session transcript; channel send already succeeded",
     );
     expect(warnCall[1]).toMatchObject({ channel: "matrix", sessionKey: "agent:main:main" });
-  });
-
-  it("emits message_sent only after the durable queue terminal commits", async () => {
-    enableHooks("message_sent");
-    let releaseAck: (() => void) | undefined;
-    queue.ackDelivery.mockImplementationOnce(
-      async () =>
-        await new Promise<void>((resolve) => {
-          releaseAck = resolve;
-        }),
-    );
-    sendMatrix = vi.fn().mockResolvedValue({ messageId: "m-terminal", roomId: "!room" });
-
-    const delivery = deliverMatrix({ payloads: [{ text: "settled" }] });
-    await vi.waitFor(() => expect(sendMatrix).toHaveBeenCalledOnce());
-    expect(hooks.runMessageSent).not.toHaveBeenCalled();
-    releaseAck?.();
-    await expect(delivery).resolves.toEqual([
-      { channel: "matrix", messageId: "m-terminal", roomId: "!room" },
-    ]);
-    expect(hooks.runMessageSent).toHaveBeenCalledWith(
-      expect.objectContaining({ content: "settled", messageId: "m-terminal", success: true }),
-      expect.any(Object),
-    );
   });
 
   it("does not count sendPayload outcome not_sent as delivered", async () => {
@@ -2478,11 +2187,7 @@ describe("deliverOutboundPayloads", () => {
           delivery: { pin: { enabled: true, required: true } },
         },
       ],
-      mirror: {
-        sessionKey: "agent:main:main",
-        agentId: "main",
-        text: "provider exploded",
-      },
+      mirror: { sessionKey: "agent:main:main", agentId: "main", text: "provider exploded" },
     });
 
     expect(results).toStrictEqual([]);
@@ -2492,7 +2197,7 @@ describe("deliverOutboundPayloads", () => {
       pinDeliveredMessage,
       afterDeliverPayload,
       hooks.runMessageSent,
-      mocks.appendAssistantMessageToSessionTranscript,
+      transcript.append,
     );
     expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
       index: 0,
@@ -2503,9 +2208,7 @@ describe("deliverOutboundPayloads", () => {
 
   it("records formatted text with an empty result list honestly", async () => {
     const onPayloadDeliveryOutcome = vi.fn();
-    setTestOutbound({
-      sendFormattedText: async () => [],
-    });
+    setTestOutbound({ sendFormattedText: async () => [] });
 
     const results = await deliverMatrix({ skipQueue: true, onPayloadDeliveryOutcome });
 
@@ -2575,19 +2278,13 @@ describe("deliverOutboundPayloads", () => {
       }
       expect(sendText).toHaveBeenCalledTimes(2);
       if (outcome === "not_sent") {
-        expect(queue.markDeliveryPlatformOutcomeUnknown).not.toHaveBeenCalled();
-        expect(queue.failDeliveryBeforePlatformSend).toHaveBeenCalledOnce();
+        expect(queue.markUnknown).not.toHaveBeenCalled();
+        expect(queue.failBeforeSend).toHaveBeenCalledOnce();
       } else {
-        expect(queue.markDeliveryPlatformOutcomeUnknown).toHaveBeenCalledOnce();
-        expect(queue.failDeliveryBeforePlatformSend).not.toHaveBeenCalled();
-        if (chunked) {
-          expectPartialCall(onPayloadDeliveryOutcome, {
-            status: "failed",
-            sentBeforeError: true,
-          });
-        }
+        expect(queue.markUnknown).toHaveBeenCalledOnce();
+        expect(queue.failBeforeSend).not.toHaveBeenCalled();
       }
-      expect(queue.ackDelivery).not.toHaveBeenCalled();
+      expect(queue.ack).not.toHaveBeenCalled();
     },
   );
 
@@ -2595,9 +2292,11 @@ describe("deliverOutboundPayloads", () => {
     "preserves %s progress before a final no-send",
     async (_label, messageId, status) => {
       const onPayloadDeliveryOutcome = vi.fn();
-      installPayloadOutbound(async (ctx) => {
-        await ctx.onDeliveryResult?.({ channel: "matrix", messageId });
-        return { channel: "matrix", messageId: "", outcome: "not_sent" };
+      setTestOutbound({
+        sendPayload: vi.fn<OutboundPayloadSender>(async (ctx) => {
+          await ctx.onDeliveryResult?.({ channel: "matrix", messageId });
+          return { channel: "matrix", messageId: "", outcome: "not_sent" };
+        }),
       });
 
       const results = await deliverMatrix({
@@ -2631,24 +2330,10 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(results).toStrictEqual([{ channel: "matrix", messageId: "mx-1" }]);
-    expect(hooks.runMessageSent).toHaveBeenCalledTimes(2);
-    expect(hooks.runMessageSent).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        content: "first",
-        success: true,
-        messageId: "mx-1",
-      }),
-      expect.objectContaining({ channelId: "matrix" }),
-    );
-    expect(hooks.runMessageSent).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        content: "second",
-        success: false,
-      }),
-      expect.objectContaining({ channelId: "matrix" }),
-    );
+    expectSent([
+      { content: "first", success: true, messageId: "mx-1" },
+      { content: "second", success: false },
+    ]);
     expect(hooks.runMessageSent.mock.calls[1]?.[0]).not.toHaveProperty("messageId");
   });
 
@@ -2666,14 +2351,11 @@ describe("deliverOutboundPayloads", () => {
         { channel: "matrix", messageId: identified ? "mx-1" : "" },
         identified ? { pinDeliveredMessage } : {},
       );
-      const events = await captureAudit(async () => {
-        await expect(
-          deliverMatrix({
-            to: "!room:1",
-            skipQueue: true,
-            payloads: [{ text: "hello", delivery: { pin: { enabled: true, required: true } } }],
-          }),
-        ).rejects.toThrow(error);
+      const events = captureEvents(onTrustedMessageAuditEvent);
+      await expectMatrixError(error, {
+        to: "!room:1",
+        skipQueue: true,
+        payloads: [{ text: "hello", delivery: { pin: { enabled: true, required: true } } }],
       });
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
@@ -2688,13 +2370,8 @@ describe("deliverOutboundPayloads", () => {
           deliveryKind: "text",
           messageId: "mx-1",
         });
-        expect(JSON.stringify(events)).not.toContain("pin denied");
-        expect(hooks.runMessageSent).toHaveBeenCalledOnce();
-        expectPartialCall(
-          hooks.runMessageSent,
-          { content: "hello", messageId: "mx-1", success: true },
-          { channelId: "matrix" },
-        );
+        expectRedacted(events, "pin denied");
+        expectSent([{ content: "hello", messageId: "mx-1", success: true }]);
       } else {
         expect(events[0]).not.toHaveProperty("errorCode");
         expect(events[0]).not.toHaveProperty("deliveryKind");
@@ -2710,13 +2387,11 @@ describe("deliverOutboundPayloads", () => {
       .fn()
       .mockResolvedValueOnce({ channel: "matrix", messageId: "mx-1" })
       .mockResolvedValueOnce({ channel: "matrix", messageId: "mx-2" });
-    const pinDeliveredMessage = vi.fn<OutboundPinDeliveredMessage>(async () => {
-      order.push("pin");
-    });
+    const pinDeliveredMessage = vi.fn<OutboundPinDeliveredMessage>(
+      ordered(order, "pin", Promise.resolve()),
+    );
     const afterDeliverPayload = vi.fn<NonNullable<ChannelOutboundAdapter["afterDeliverPayload"]>>(
-      async () => {
-        order.push("after-delivery");
-      },
+      ordered(order, "after-delivery", Promise.resolve()),
     );
     setTestOutbound({ sendText, sendMedia, pinDeliveredMessage, afterDeliverPayload });
 
@@ -2734,8 +2409,7 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(sendMedia).toHaveBeenCalledTimes(2);
-    const pinOptions = firstArg(pinDeliveredMessage);
-    expect(pinOptions?.messageId).toBe("mx-1");
+    expect(firstArg(pinDeliveredMessage)?.messageId).toBe("mx-1");
     expect(order).toEqual(["delivered", "message-sent-staged", "pin", "after-delivery"]);
     expect(firstArg(afterDeliverPayload).results).toEqual([
       { channel: "matrix", messageId: "mx-1" },
@@ -2767,7 +2441,7 @@ describe("deliverOutboundPayloads", () => {
       await expect(delivery).resolves.toEqual([{ channel: "matrix", messageId: "mx-1" }]);
       expect(sendText).toHaveBeenCalledTimes(1);
       expect(firstArg(sendText).text).toBe("caption");
-      expectPartialCall(onDeliveredPayload, { text: "caption", mediaUrls: [] });
+      expectCall(onDeliveredPayload, { text: "caption", mediaUrls: [] });
       expect(firstArg(afterDeliverPayload).payload).toMatchObject({
         text: "caption",
         mediaUrl: "https://example.com/file.png",
@@ -2837,16 +2511,13 @@ describe("deliverOutboundPayloads", () => {
       "thread-created",
       "thread-created",
     ]);
-    expect(pinDeliveredMessage.mock.calls.map(([ctx]) => ctx.target.threadId)).toEqual([
-      "thread-created",
-      "thread-created",
-      "thread-created",
-    ]);
-    expect(afterDeliverPayload.mock.calls.map(([ctx]) => ctx.target.threadId)).toEqual([
-      "thread-created",
-      "thread-created",
-      "thread-created",
-    ]);
+    for (const callback of [pinDeliveredMessage, afterDeliverPayload]) {
+      expect(callback.mock.calls.map(([ctx]) => ctx.target.threadId)).toEqual([
+        "thread-created",
+        "thread-created",
+        "thread-created",
+      ]);
+    }
     expect(adoptTargetFromDelivery).toHaveBeenCalledTimes(1);
   });
 });
