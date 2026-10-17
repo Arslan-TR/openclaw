@@ -17,6 +17,18 @@ type CapturedOutcome = {
   connected: boolean;
 };
 
+const responseId = "response_1";
+const done = (response: Record<string, unknown>) => ({
+  type: "response.done",
+  response: { id: responseId, ...response },
+});
+const failed = (message: string, details: Record<string, unknown> = {}) => ({
+  responseId,
+  status: "failed",
+  ...details,
+  message: `OpenAI realtime voice response failed: ${message}`,
+});
+
 async function capture(
   terminalEvent: Record<string, unknown>,
   options: { completeFollowup?: boolean; queueFollowup?: boolean; throwCallback?: boolean } = {},
@@ -33,6 +45,8 @@ async function capture(
   const terminalProcessed = createDeferred<void>();
   const followupCreated = createDeferred<void>();
   const followupCompleted = createDeferred<void>();
+  const waitFor = (promise: Promise<void>, message: string) =>
+    withTimeout(promise, 2_000, { message: `timed out waiting for ${message}` });
   const server = createServer();
   const sockets = new Set<WebSocket>();
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
@@ -105,25 +119,17 @@ async function capture(
       throw new Error("expected a connected fixture socket");
     }
     socket.send(JSON.stringify({ type: "response.created", response: { id: "response_1" } }));
-    await withTimeout(responseCreated.promise, 2_000, {
-      message: "timed out waiting for response.created",
-    });
+    await waitFor(responseCreated.promise, "response.created");
     if (options.queueFollowup) {
       bridge.sendUserMessage?.("Continue after the terminal response.");
     }
     socket.send(JSON.stringify(terminalEvent));
-    await withTimeout(terminalProcessed.promise, 2_000, {
-      message: "timed out waiting for terminal response",
-    });
+    await waitFor(terminalProcessed.promise, "terminal response");
     if (options.queueFollowup) {
-      await withTimeout(followupCreated.promise, 2_000, {
-        message: "timed out waiting for queued response.create",
-      });
+      await waitFor(followupCreated.promise, "queued response.create");
     }
     if (options.completeFollowup) {
-      await withTimeout(followupCompleted.promise, 2_000, {
-        message: "timed out waiting for completed follow-up",
-      });
+      await waitFor(followupCompleted.promise, "completed follow-up");
     }
     captured.connected = bridge.isConnected();
     return captured;
@@ -150,73 +156,62 @@ const completedTool = {
   arguments: JSON.stringify({ city: "Paris" }),
 };
 
+const invalidStatus = (message: string) =>
+  failed(message, {
+    reason: "invalid_response_status",
+    error: { type: "invalid_response_status", message },
+  });
+const toolOutput = { output: [completedTool] };
+
 describe("OpenAI realtime terminal response ownership", () => {
   it.each([
     {
       response: { status: "completed", output: [] },
-      expected: { responseId: "response_1", status: "completed" },
+      expected: { responseId, status: "completed" },
     },
     {
       response: {
         status: "cancelled",
         status_details: { reason: "client_cancelled" },
-        output: [completedTool],
+        ...toolOutput,
       },
-      expected: { responseId: "response_1", status: "cancelled", reason: "client_cancelled" },
+      expected: { responseId, status: "cancelled", reason: "client_cancelled" },
     },
     {
       response: {
         status: "failed",
         status_details: { error: { type: "server_error", code: "rate_limit_exceeded" } },
-        output: [completedTool],
+        ...toolOutput,
       },
-      expected: {
-        responseId: "response_1",
-        status: "failed",
+      expected: failed("rate_limit_exceeded", {
         error: { type: "server_error", code: "rate_limit_exceeded" },
-        message: "OpenAI realtime voice response failed: rate_limit_exceeded",
-      },
+      }),
     },
     {
       response: {
         status: "incomplete",
         status_details: { reason: "max_output_tokens" },
-        output: [completedTool],
+        ...toolOutput,
       },
       expected: {
-        responseId: "response_1",
+        responseId,
         status: "incomplete",
         reason: "max_output_tokens",
         message: "OpenAI realtime voice response incomplete: max_output_tokens",
       },
     },
     {
-      response: { output: [completedTool] },
-      expected: {
-        responseId: "response_1",
-        status: "failed",
-        reason: "invalid_response_status",
-        error: { type: "invalid_response_status", message: "missing terminal status" },
-        message: "OpenAI realtime voice response failed: missing terminal status",
-      },
+      response: toolOutput,
+      expected: invalidStatus("missing terminal status"),
     },
     {
-      response: { status: "in_progress", output: [completedTool] },
-      expected: {
-        responseId: "response_1",
-        status: "failed",
-        reason: "invalid_response_status",
-        error: { type: "invalid_response_status", message: "invalid status in_progress" },
-        message: "OpenAI realtime voice response failed: invalid status in_progress",
-      },
+      response: { status: "in_progress", ...toolOutput },
+      expected: invalidStatus("invalid status in_progress"),
     },
   ])(
     "normalizes $response.status without closing the reusable socket",
     async ({ response, expected }) => {
-      const captured = await capture(
-        { type: "response.done", response: { id: "response_1", ...response } },
-        { queueFollowup: true },
-      );
+      const captured = await capture(done(response), { queueFollowup: true });
 
       expect(captured.errors).toEqual([]);
       expect(captured.outcomes).toEqual([expected]);
@@ -230,10 +225,7 @@ describe("OpenAI realtime terminal response ownership", () => {
   );
 
   it("delivers completed tools before their response owner is retired", async () => {
-    const captured = await capture({
-      type: "response.done",
-      response: { id: "response_1", status: "completed", output: [completedTool] },
-    });
+    const captured = await capture(done({ status: "completed", ...toolOutput }));
 
     expect(captured.tools).toEqual([
       {
@@ -249,10 +241,11 @@ describe("OpenAI realtime terminal response ownership", () => {
   });
 
   it("drains a queued follow-up when the terminal consumer throws", async () => {
-    const captured = await capture(
-      { type: "response.done", response: { id: "response_1", status: "failed", output: [] } },
-      { completeFollowup: true, queueFollowup: true, throwCallback: true },
-    );
+    const captured = await capture(done({ status: "failed", output: [] }), {
+      completeFollowup: true,
+      queueFollowup: true,
+      throwCallback: true,
+    });
 
     expect(captured.errors).toEqual([]);
     expect(captured.outcomes).toEqual([
