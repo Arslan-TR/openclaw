@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import "../test-utils/prepare-compiled-subprocesses.js";
 import type { GatewayServiceState } from "../daemon/service-types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { captureEnv } from "../test-utils/env.js";

@@ -42,7 +42,7 @@ function session() {
 
 it
   .skipIf(process.platform === "win32")
-  .each(["loader", "removed", "symbol", "musl", "version", "permission"])(
+  .each(["loader", "removed", "symbol", "dyld-symbol", "musl", "version", "permission"])(
   "reports a %s failure through the real read-only spawn and live readiness, without poisoning ordinary crashes",
   async (kind) => {
     const readiness = createReadinessChecker({
@@ -59,11 +59,13 @@ it
       'if [ "$1" = "--version" ]; then echo v26.12.0; exit 0; fi\n' +
         (kind === "symbol"
           ? 'echo "node: symbol lookup error: /fixture/plugin.node: undefined symbol: plugin_value" >&2\n'
-          : kind === "musl"
-            ? 'echo "Error loading shared library libaddon.so: No such file or directory (needed by /fixture/plugin.node)" >&2\n'
-            : kind === "version"
-              ? "echo \"node: /fixture/libstdc++.so.6: version 'GLIBCXX_3.4.29' not found (required by /fixture/plugin.node)\" >&2\n"
-              : "") +
+          : kind === "dyld-symbol"
+            ? 'echo "dyld: lazy symbol binding failed: Symbol not found: _plugin_value" >&2\n'
+            : kind === "musl"
+              ? 'echo "Error loading shared library libaddon.so: No such file or directory (needed by /fixture/plugin.node)" >&2\n'
+              : kind === "version"
+                ? "echo \"node: /fixture/libstdc++.so.6: version 'GLIBCXX_3.4.29' not found (required by /fixture/plugin.node)\" >&2\n"
+                : "") +
         `exit ${ordinaryExit}`,
     );
     const crashed = session();
@@ -77,11 +79,13 @@ it
     const executable = await runtime(
       kind === "symbol"
         ? 'echo "node: symbol lookup error: /fixture/libnode.so: undefined symbol: runtime_value" >&2\nexit 127'
-        : kind === "musl"
-          ? 'echo "Error loading shared library libnode.so: No such file or directory (needed by /fixture/node)" >&2\nexit 127'
-          : kind === "version"
-            ? "echo \"node: /fixture/libc.so.6: version 'GLIBC_2.28' not found (required by /fixture/node)\" >&2\nexit 1"
-            : 'echo "dyld[123]: Library not loaded: /fixture/libsimdutf.36.dylib" >&2\nexit 134',
+        : kind === "dyld-symbol"
+          ? 'echo "dyld: lazy symbol binding failed: Symbol not found: _runtime_value" >&2\nexit 134'
+          : kind === "musl"
+            ? 'echo "Error loading shared library libnode.so: No such file or directory (needed by /fixture/node)" >&2\nexit 127'
+            : kind === "version"
+              ? "echo \"node: /fixture/libc.so.6: version 'GLIBC_2.28' not found (required by /fixture/node)\" >&2\nexit 1"
+              : 'echo "dyld[123]: Library not loaded: /fixture/libsimdutf.36.dylib" >&2\nexit 134',
     );
     if (kind === "removed") {
       await fs.unlink(executable);

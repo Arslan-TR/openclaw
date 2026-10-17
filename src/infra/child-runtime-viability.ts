@@ -31,10 +31,10 @@ const runtime = resolveGlobalSingleton(
   }),
 );
 const loaderFailure =
-  /(?:dyld[^\n]*:\s*Library not loaded:|error while loading shared libraries:|dyld[^\n]*:\s*Symbol not found:)/i;
+  /(?:dyld[^\n]*:\s*Library not loaded:|error while loading shared libraries:)/i;
 
 const ambiguousLoaderFailure =
-  /(?:symbol lookup error:|Error loading shared library|version [`'"][^`'"\r\n]+[`'"] not found)/i;
+  /(?:dyld[^\n]*:\s*Symbol not found:|symbol lookup error:|Error loading shared library|version [`'"][^`'"\r\n]+[`'"] not found)/i;
 
 function executableIdentity(execPath: string): string | undefined {
   try {
