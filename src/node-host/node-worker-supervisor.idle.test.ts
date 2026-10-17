@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import type { NodeWorkerCapacitySnapshot } from "../infra/node-runner-inventory.js";
@@ -29,6 +30,18 @@ function input(turnId: string, environmentId = "environment-1") {
   return value;
 }
 
+function barrier() {
+  const deferred = createDeferred();
+  return { ...deferred, [Symbol.dispose]: () => deferred.resolve() };
+}
+
+function settle<T>(pending: Promise<T>) {
+  return pending.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+}
+
 function fixture(capacity = 1, container = false) {
   const launches = new Map<string, NodeWorkerLaunchReceipt>();
   const turns = new Map<string, NodeWorkerTurnReceipt>();
@@ -38,9 +51,7 @@ function fixture(capacity = 1, container = false) {
     [...launches.values()].filter((row) => row.state === "pending" || row.state === "running");
   const requireLaunch = (id: string) => {
     const row = launches.get(id);
-    if (!row) {
-      throw new Error(`Missing synthetic launch ${id}`);
-    }
+    assert(row, `Missing synthetic launch ${id}`);
     return row;
   };
   const readTurn = (id: string) => {
@@ -125,9 +136,7 @@ function fixture(capacity = 1, container = false) {
   });
   mocks.turnFinish.mockImplementation(async (params) => {
     const row = readTurn(params.expected.launchId);
-    if (!row) {
-      throw new Error("Missing synthetic turn");
-    }
+    assert(row, "Missing synthetic turn");
     const receipt = { ...row, state: params.state, resultJson: params.resultJson ?? null };
     turns.set(row.launchId, receipt);
     return receipt;
@@ -179,9 +188,7 @@ function fixture(capacity = 1, container = false) {
         });
       },
       async emit(frame: WorkerProcessMessage) {
-        if (!onMessage) {
-          throw new Error("Child observation has not started");
-        }
+        assert(onMessage, "Child observation has not started");
         await onMessage(frame);
       },
       complete(turnId: string, retention?: "idle" | "background") {
@@ -215,9 +222,7 @@ function fixture(capacity = 1, container = false) {
   });
   mocks.observe.mockImplementation((active, receive) => {
     const owner = [...children.values()].find((value) => value.adapter === active.adapter);
-    if (!owner) {
-      throw new Error("Missing synthetic child");
-    }
+    assert(owner, "Missing synthetic child");
     return owner.observe(active, receive);
   });
   const supervisor = createNodeWorkerSupervisor({
@@ -247,9 +252,7 @@ function fixture(capacity = 1, container = false) {
     async launch(value: ReturnType<typeof input>) {
       const receipt = await supervisor.launch(value, TEST_WORKER_ENDPOINT);
       const owner = children.get(value.launchId);
-      if (!owner) {
-        throw new Error("Missing newly admitted child");
-      }
+      assert(owner, "Missing newly admitted child");
       return { ...owner, receipt };
     },
   };
@@ -321,10 +324,7 @@ describe("node worker idle retention", () => {
         TEST_WORKER_ENDPOINT,
         controller.signal,
       );
-      const settled = pending.then(
-        (value) => ({ value }),
-        (error: unknown) => ({ error }),
-      );
+      const settled = settle(pending);
       try {
         expect(mocks.prepare).not.toHaveBeenCalled();
         if (outcome === "closed") {
@@ -398,93 +398,82 @@ describe("node worker idle retention", () => {
 
   it("publishes idle only after settlement and starts TTL at background idle-ready", async () => {
     await using f = fixture();
-    const release = createDeferred();
-    try {
-      const value = input("background");
-      const owner = await f.launch(value);
-      const finish = mocks.turnFinish.getMockImplementation()!;
-      const entered = createDeferred();
-      mocks.turnFinish.mockImplementationOnce(async (params) => {
-        entered.resolve();
-        await release.promise;
-        return finish(params);
-      });
-      const completing = owner.complete(value.launchId, "background");
-      await entered.promise;
-      expect(await f.supervisor.hasActiveWork()).toBe(true);
-      expect(f.snapshots.at(-1)?.reclaimableIdle ?? 0).toBe(0);
-      release.resolve();
-      await completing;
-      await vi.advanceTimersByTimeAsync(240_000);
-      expect(owner.adapter.kill).not.toHaveBeenCalled();
-      expect(await f.supervisor.hasActiveWork()).toBe(true);
-      await owner.emit({ type: "idle-ready", turnId: "stale-turn" });
-      expect(f.snapshots.at(-1)?.reclaimableIdle ?? 0).toBe(0);
-      await owner.emit({ type: "idle-ready", turnId: value.launchId });
-      expect(await f.supervisor.hasActiveWork()).toBe(false);
-      await vi.advanceTimersByTimeAsync(119_999);
-      expect(owner.adapter.kill).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(owner.adapter.dispose).toHaveBeenCalledOnce();
-    } finally {
-      release.resolve();
-    }
+    using release = barrier();
+    const value = input("background");
+    const owner = await f.launch(value);
+    const finish = mocks.turnFinish.getMockImplementation()!;
+    const entered = createDeferred();
+    mocks.turnFinish.mockImplementationOnce(async (params) => {
+      entered.resolve();
+      await release.promise;
+      return finish(params);
+    });
+    const completing = owner.complete(value.launchId, "background");
+    await entered.promise;
+    expect(await f.supervisor.hasActiveWork()).toBe(true);
+    expect(f.snapshots.at(-1)?.reclaimableIdle ?? 0).toBe(0);
+    release.resolve();
+    await completing;
+    await vi.advanceTimersByTimeAsync(240_000);
+    expect(owner.adapter.kill).not.toHaveBeenCalled();
+    expect(await f.supervisor.hasActiveWork()).toBe(true);
+    await owner.emit({ type: "idle-ready", turnId: "stale-turn" });
+    expect(f.snapshots.at(-1)?.reclaimableIdle ?? 0).toBe(0);
+    await owner.emit({ type: "idle-ready", turnId: value.launchId });
+    expect(await f.supervisor.hasActiveWork()).toBe(false);
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(owner.adapter.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(owner.adapter.dispose).toHaveBeenCalledOnce();
   });
 
   it.each(["before", "at"] as const)(
     "settles idle cleanup %s the admission deadline",
     async (timing) => {
       await using f = fixture();
-      const cleanup = createDeferred();
-      try {
-        const old = input("old", "old-environment");
-        const owner = await f.launch(old);
-        await owner.complete(old.launchId, "idle");
-        if (timing === "before") {
-          await vi.advanceTimersByTimeAsync(119_999);
-        }
-        owner.holdCleanup(cleanup.promise);
-        const replacement = f.supervisor
-          .launch(input("replacement", "new-environment"), TEST_WORKER_ENDPOINT)
-          .then(
-            (value) => ({ value }),
-            (error: unknown) => ({ error }),
-          );
-        await owner.killed.promise;
-        expect(mocks.prepare).toHaveBeenCalledTimes(1);
-        f.expectCapacity(0);
-        if (timing === "before") {
-          await vi.advanceTimersByTimeAsync(9_999);
-          expect(owner.adapter.kill).toHaveBeenCalledTimes(2);
-          expect(mocks.prepare).toHaveBeenCalledTimes(1);
-        } else {
-          // Move wall time to the boundary without firing the deadline callback.
-          vi.setSystemTime(10_000);
-        }
-        cleanup.resolve();
-        if (timing === "before") {
-          expect(await replacement).toMatchObject({
-            value: { launchId: "replacement", state: "running" },
-          });
-          expect(mocks.prepare).toHaveBeenCalledTimes(2);
-        } else {
-          expect(await replacement).toEqual({
-            error: expect.objectContaining({
-              name: "NodeWorkerCapacityExhaustedError",
-              message: "node worker capacity remained full for 10000 ms",
-            }),
-          });
-          expect(owner.adapter.kill).toHaveBeenCalledOnce();
-          expect(f.launches.get("old")?.state).toBe("interrupted");
-          expect(f.launches.has("replacement")).toBe(false);
-          expect(mocks.prepare).toHaveBeenCalledTimes(1);
-          f.expectCapacity(1);
-          expect(vi.getTimerCount()).toBe(0);
-        }
-        expect(owner.adapter.dispose).toHaveBeenCalledOnce();
-      } finally {
-        cleanup.resolve();
+      using cleanup = barrier();
+      const old = input("old", "old-environment");
+      const owner = await f.launch(old);
+      await owner.complete(old.launchId, "idle");
+      if (timing === "before") {
+        await vi.advanceTimersByTimeAsync(119_999);
       }
+      owner.holdCleanup(cleanup.promise);
+      const replacement = settle(
+        f.supervisor.launch(input("replacement", "new-environment"), TEST_WORKER_ENDPOINT),
+      );
+      await owner.killed.promise;
+      expect(mocks.prepare).toHaveBeenCalledTimes(1);
+      f.expectCapacity(0);
+      if (timing === "before") {
+        await vi.advanceTimersByTimeAsync(9_999);
+        expect(owner.adapter.kill).toHaveBeenCalledTimes(2);
+        expect(mocks.prepare).toHaveBeenCalledTimes(1);
+      } else {
+        // Move wall time to the boundary without firing the deadline callback.
+        vi.setSystemTime(10_000);
+      }
+      cleanup.resolve();
+      if (timing === "before") {
+        expect(await replacement).toMatchObject({
+          value: { launchId: "replacement", state: "running" },
+        });
+        expect(mocks.prepare).toHaveBeenCalledTimes(2);
+      } else {
+        expect(await replacement).toEqual({
+          error: expect.objectContaining({
+            name: "NodeWorkerCapacityExhaustedError",
+            message: "node worker capacity remained full for 10000 ms",
+          }),
+        });
+        expect(owner.adapter.kill).toHaveBeenCalledOnce();
+        expect(f.launches.get("old")?.state).toBe("interrupted");
+        expect(f.launches.has("replacement")).toBe(false);
+        expect(mocks.prepare).toHaveBeenCalledTimes(1);
+        f.expectCapacity(1);
+        expect(vi.getTimerCount()).toBe(0);
+      }
+      expect(owner.adapter.dispose).toHaveBeenCalledOnce();
     },
   );
 
@@ -502,16 +491,15 @@ describe("node worker idle retention", () => {
         const owner = await f.launch(input("old", "old-environment"));
         await owner.complete("old", "idle");
         owner.holdCleanup(cleanup.promise);
-        admitted = f.supervisor
-          .launch(input("replacement", "new-environment"), TEST_WORKER_ENDPOINT, controller.signal)
-          .then(
-            (value) => {
-              outcomes.push({ value });
-            },
-            (error: unknown) => {
-              outcomes.push({ error });
-            },
-          );
+        admitted = settle(
+          f.supervisor.launch(
+            input("replacement", "new-environment"),
+            TEST_WORKER_ENDPOINT,
+            controller.signal,
+          ),
+        ).then((outcome) => {
+          outcomes.push(outcome);
+        });
         await owner.killed.promise;
         if (boundary === "deadline") {
           await vi.advanceTimersByTimeAsync(9_999);
@@ -561,33 +549,29 @@ describe("node worker idle retention", () => {
 
   it("rejects reuse when idle expiry revokes the owner during turn admission", async () => {
     await using f = fixture();
-    const release = createDeferred();
-    try {
-      const owner = await f.launch(input("first"));
-      await owner.complete("first", "idle");
-      mocks.send.mockClear();
-      await vi.advanceTimersByTimeAsync(119_999);
-      const claim = mocks.turnClaim.getMockImplementation()!;
-      const entered = createDeferred();
-      mocks.turnClaim.mockImplementationOnce(async (params, authority) => {
-        entered.resolve();
-        await release.promise;
-        return claim(params, authority);
-      });
-      const rejection = expect(
-        f.supervisor.launch(input("expired-reuse"), TEST_WORKER_ENDPOINT),
-      ).rejects.toThrow("lost its physical owner before admission");
-      await entered.promise;
-      await vi.advanceTimersByTimeAsync(1);
-      expect(owner.adapter.dispose).toHaveBeenCalledOnce();
-      release.resolve();
-      await rejection;
-      expect(mocks.send).not.toHaveBeenCalled();
-      expect(await f.supervisor.status("expired-reuse")).toBeUndefined();
-      f.expectCapacity(1);
-    } finally {
-      release.resolve();
-    }
+    using release = barrier();
+    const owner = await f.launch(input("first"));
+    await owner.complete("first", "idle");
+    mocks.send.mockClear();
+    await vi.advanceTimersByTimeAsync(119_999);
+    const claim = mocks.turnClaim.getMockImplementation()!;
+    const entered = createDeferred();
+    mocks.turnClaim.mockImplementationOnce(async (params, authority) => {
+      entered.resolve();
+      await release.promise;
+      return claim(params, authority);
+    });
+    const rejection = expect(
+      f.supervisor.launch(input("expired-reuse"), TEST_WORKER_ENDPOINT),
+    ).rejects.toThrow("lost its physical owner before admission");
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(1);
+    expect(owner.adapter.dispose).toHaveBeenCalledOnce();
+    release.resolve();
+    await rejection;
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(await f.supervisor.status("expired-reuse")).toBeUndefined();
+    f.expectCapacity(1);
   });
 
   it("retains at most two idle children and reclaims the least recently used, never background", async () => {

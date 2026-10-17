@@ -86,6 +86,8 @@ const { withFileLockSync } = require(fileLockModule);
 const path = require("node:path");
 const args = process.argv.slice(2);
 const command = args[0];
+const enginePath = (file) => path.join(engineRoot, file);
+const print = (value) => process.stdout.write(value + "\n");
 const statePath = (id) => path.join(engineRoot, id + ".container.json");
 const load = (id) => JSON.parse(fs.readFileSync(statePath(id), "utf8"));
 // Separate CLI processes share one fake daemon. Serialize state transitions so
@@ -109,14 +111,13 @@ const launchIdFor = (container) =>
 const journalState = (launchId) => {
   try {
     const database = new DatabaseSync(path.join(stateRoot, "state", "openclaw.sqlite"), { readOnly: true });
-    const row = database.prepare("SELECT state FROM node_worker_launches WHERE launch_id = ?").get(launchId);
+    const query = (sql) => database.prepare(sql).get(launchId);
+    const row = query("SELECT state FROM node_worker_launches WHERE launch_id = ?");
     const hasContainerTable = database.prepare(
       "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'node_worker_launch_containers'",
     ).get();
     const container = hasContainerTable
-      ? database.prepare(
-        "SELECT container_json FROM node_worker_launch_containers WHERE launch_id = ?",
-      ).get(launchId)
+      ? query("SELECT container_json FROM node_worker_launch_containers WHERE launch_id = ?")
       : undefined;
     database.close();
     return row && { state: row.state, container_json: container?.container_json ?? null };
@@ -125,24 +126,22 @@ const journalState = (launchId) => {
   }
 };
 const record = (entry) => fs.appendFileSync(commandLog, JSON.stringify(entry) + "\n");
+const matchesJournal = (journal, container) => {
+  const persisted = journal?.container_json && JSON.parse(journal.container_json);
+  return journal?.state === "running" && persisted?.containerId === container.id &&
+    persisted?.engineTarget === expectedEngineTarget;
+};
 const waitForRunningJournal = async (container) => {
   let journal;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     journal = journalState(launchIdFor(container));
-    const persisted = journal?.container_json && JSON.parse(journal.container_json);
-    if (
-      journal?.state === "running" &&
-      persisted?.containerId === container.id &&
-      persisted?.engineTarget === expectedEngineTarget
-    ) {
-      return journal;
-    }
+    if (matchesJournal(journal, container)) return journal;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   return journal;
 };
 const releaseAfterMarker = (marker, operation) => {
-  const markerPath = path.join(engineRoot, marker);
+  const markerPath = enginePath(marker);
   if (!fs.existsSync(markerPath)) {
     operation();
     return;
@@ -167,11 +166,11 @@ if (command === "version") {
   record({ argv: args });
   process.stdout.write("27.0.0\n");
 } else if (command === "info") {
-  const daemonId = fs.readFileSync(path.join(engineRoot, "daemon-id"), "utf8");
+  const daemonId = fs.readFileSync(enginePath("daemon-id"), "utf8");
   record({ argv: args, daemonId });
-  const delayFile = path.join(engineRoot, "info-delay-ms");
+  const delayFile = enginePath("info-delay-ms");
   const delayMs = fs.existsSync(delayFile) ? Number(fs.readFileSync(delayFile, "utf8")) : 0;
-  setTimeout(() => process.stdout.write(daemonId + "\n"), delayMs);
+  setTimeout(() => print(daemonId), delayMs);
 } else if (command === "create") {
   const id = createHash("sha256").update(JSON.stringify(args)).digest("hex");
   const labels = {};
@@ -193,19 +192,14 @@ if (command === "version") {
   const container = { id, labels, env, mounts, image, entry, workerArgs, status: "created", pid: null };
   withContainerLock(id, () => save(container));
   record({ argv: args, container, journal: journalState(launchIdFor(container)) });
-  releaseAfterMarker("hold-create", () => process.stdout.write(id + "\n"));
+  releaseAfterMarker("hold-create", () => print(id));
 } else if (command === "start") {
   void (async () => {
     const id = args.at(-1);
     let container = withContainerLock(id, () => readContainer(id));
     const journal = await waitForRunningJournal(container);
     record({ argv: args, journal });
-    const persisted = journal?.container_json && JSON.parse(journal.container_json);
-    if (
-      journal?.state !== "running" ||
-      persisted?.containerId !== container.id ||
-      persisted?.engineTarget !== expectedEngineTarget
-    ) {
+    if (!matchesJournal(journal, container)) {
       process.stderr.write("container worker executed before its exact identity was journaled\n");
       process.exit(67);
     }
@@ -255,7 +249,7 @@ if (command === "version") {
   const columns = [container.status];
   // Releasing the startup hold here proves the supervisor observed the container
   // while it was still created: the launch only proceeds after that observation.
-  const startHold = path.join(engineRoot, "hold-start");
+  const startHold = enginePath("hold-start");
   if (fs.existsSync(startHold)) fs.unlinkSync(startHold);
   if (format.includes("openclaw.node-worker.host")) {
     columns.push(
@@ -264,7 +258,7 @@ if (command === "version") {
       container.labels["openclaw.node-worker.launch"] ?? "",
     );
   }
-  process.stdout.write(columns.join("\t") + "\n");
+  print(columns.join("\t"));
 } else if (command === "kill") {
   const id = args.at(-1);
   withContainerLock(id, () => {
@@ -277,13 +271,13 @@ if (command === "version") {
     container.status = "exited";
     save(container);
     killWorker(container);
-    process.stdout.write(container.id + "\n");
+    print(container.id);
   });
 } else if (command === "rm") {
   const id = args.at(-1);
   const container = withContainerLock(id, () => readContainer(id));
   record({ argv: args, journal: journalState(launchIdFor(container)) });
-  if (fs.existsSync(path.join(engineRoot, "fail-removal"))) {
+  if (fs.existsSync(enginePath("fail-removal"))) {
     process.stderr.write("injected container removal failure\n");
     process.exit(1);
   }
@@ -291,7 +285,7 @@ if (command === "version") {
     const current = readContainer(id);
     killWorker(current);
     fs.unlinkSync(statePath(id));
-    process.stdout.write(id + "\n");
+    print(id);
   }));
 } else if (command === "ps") {
   record({ argv: args });
@@ -302,11 +296,11 @@ if (command === "version") {
     const id = file.slice(0, -".container.json".length);
     const container = withContainerLock(id, () => fs.existsSync(statePath(id)) ? load(id) : undefined);
     if (!container || container.labels["openclaw.node-worker.host"] !== owner) continue;
-    process.stdout.write([
+    print([
       container.id,
       container.labels["openclaw.node-worker.gateway"],
       container.labels["openclaw.node-worker.launch"],
-    ].join("\t") + "\n");
+    ].join("\t"));
   }
 } else {
   record({ argv: args });

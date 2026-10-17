@@ -50,11 +50,23 @@ afterEach(() => {
 });
 
 function fixture(options: Parameters<typeof createNodeWorkerSupervisor>[0] = {}) {
-  const value = createNodeWorkerSupervisorFixture(
-    tempDirs.make("node-worker-supervisor-"),
-    options,
-  );
-  return { ...value, [Symbol.asyncDispose]: () => value.supervisor.close() };
+  const capacities: Array<{ total: number; available: number }> = [];
+  const value = createNodeWorkerSupervisorFixture(tempDirs.make("node-worker-supervisor-"), {
+    onCapacityChanged: (capacity) => capacities.push(capacity),
+    ...options,
+  });
+  const { env, supervisor, workspaceDir } = value;
+  return {
+    ...value,
+    capacities,
+    launch: (input: ReturnType<typeof launchInput>) =>
+      supervisor.launch(input, TEST_WORKER_ENDPOINT),
+    terminal: (id: string) => waitForTerminal(supervisor, id),
+    receipt: (id: string) =>
+      new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(id),
+    file: (name: string) => path.join(workspaceDir, name),
+    [Symbol.asyncDispose]: () => supervisor.close(),
+  };
 }
 
 function launchInput(workspaceDir: string, launchId: string, prompt = "success") {
@@ -62,6 +74,10 @@ function launchInput(workspaceDir: string, launchId: string, prompt = "success")
   input.descriptor.admission.environmentId = `environment-${launchId}`;
   input.descriptor.admission.sessionId = `session-${launchId}`;
   return input;
+}
+
+function capacityHistory(...available: number[]) {
+  return available.map((slots) => ({ total: 2, available: slots }));
 }
 
 function evictWorkerCredentialsOnRegistration() {
@@ -79,13 +95,8 @@ function evictWorkerCredentialsOnRegistration() {
 
 describe("node worker supervisor", () => {
   it("releases the physical capacity claim when the first turn cannot be journaled", async () => {
-    const capacities: Array<{ total: number; available: number }> = [];
-    await using f = fixture({
-      capacity: 1,
-      capacityWaitMs: 25,
-      onCapacityChanged: (capacity) => capacities.push(capacity),
-    });
-    const { env, supervisor, workspaceDir } = f;
+    await using f = fixture({ capacity: 1, capacityWaitMs: 25 });
+    const { capacities, workspaceDir } = f;
     const input = launchInput(workspaceDir, "turn-claim-failure");
     const claim = vi
       .spyOn(NodeWorkerTurnStore.prototype, "claim")
@@ -93,21 +104,14 @@ describe("node worker supervisor", () => {
         throw new Error("injected turn claim failure");
       });
     try {
-      await expect(supervisor.launch(input, TEST_WORKER_ENDPOINT)).rejects.toThrow(
-        "injected turn claim failure",
-      );
-      expect(
-        await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(input.launchId),
-      ).toMatchObject({
-        state: "failed",
-        worker: null,
-      });
+      await expect(f.launch(input)).rejects.toThrow("injected turn claim failure");
+      expect(await f.receipt(input.launchId)).toMatchObject({ state: "failed", worker: null });
       expect(capacities.at(-1)).toEqual({ total: 1, available: 1 });
-      expect(fs.existsSync(path.join(workspaceDir, `${input.launchId}.started.json`))).toBe(false);
+      expect(fs.existsSync(f.file(`${input.launchId}.started.json`))).toBe(false);
 
       const next = launchInput(workspaceDir, "turn-claim-recovered");
-      await supervisor.launch(next, TEST_WORKER_ENDPOINT);
-      expect((await waitForTerminal(supervisor, next.launchId)).state).toBe("completed");
+      await f.launch(next);
+      expect((await f.terminal(next.launchId)).state).toBe("completed");
     } finally {
       claim.mockRestore();
     }
@@ -115,14 +119,14 @@ describe("node worker supervisor", () => {
 
   it("launches idempotently and persists only bounded non-secret facts", async () => {
     await using f = fixture();
-    const { env, supervisor, workspaceDir } = f;
+    const { env, workspaceDir } = f;
     const input = launchInput(workspaceDir, "success-launch");
     let adapter: workerLaunchTransport.NodeWorkerChildAdapter | undefined;
     const captureAdapter = observeNodeWorkerAdapters((child) => {
       adapter = child;
     });
     try {
-      expect(await supervisor.launch(input, TEST_WORKER_ENDPOINT)).toMatchObject({
+      expect(await f.launch(input)).toMatchObject({
         launchId: "success-launch",
         state: "running",
         environmentId: input.descriptor.admission.environmentId,
@@ -137,25 +141,23 @@ describe("node worker supervisor", () => {
       }
       // Turn completion precedes the anchor's durable lineage-settled fact.
       await (adapter.waitForExtinction?.() ?? adapter.wait());
-      const completed = await waitForTerminal(supervisor, input.launchId);
+      const completed = await f.terminal(input.launchId);
       expect(completed).toMatchObject({ state: "completed", errorText: null });
       expect(JSON.parse(completed.resultJson ?? "null")).toEqual({
         status: "completed",
         transcriptLeafId: "leaf-1",
         transcriptNextSeq: 2,
       });
-      expect(
-        JSON.parse(fs.readFileSync(path.join(workspaceDir, `${input.launchId}.argv.json`), "utf8")),
-      ).toEqual(["--internal-worker-ipc", "--internal-worker-session"]);
-      expect(await supervisor.launch(input, TEST_WORKER_ENDPOINT)).toEqual(completed);
+      expect(JSON.parse(fs.readFileSync(f.file(`${input.launchId}.argv.json`), "utf8"))).toEqual([
+        "--internal-worker-ipc",
+        "--internal-worker-session",
+      ]);
+      expect(await f.launch(input)).toEqual(completed);
       await expect(
-        supervisor.launch(
-          {
-            ...input,
-            descriptor: testWorkerDescriptor(workspaceDir, "different-plan", input.launchId),
-          },
-          TEST_WORKER_ENDPOINT,
-        ),
+        f.launch({
+          ...input,
+          descriptor: testWorkerDescriptor(workspaceDir, "different-plan", input.launchId),
+        }),
       ).rejects.toThrow("replayed with a different plan");
 
       const row = openOpenClawStateDatabase({ env })
@@ -168,13 +170,8 @@ describe("node worker supervisor", () => {
   });
 
   it("admits two durable launches and releases one physical slot at a time", async () => {
-    const capacitySnapshots: Array<{ total: number; available: number }> = [];
-    await using f = fixture({
-      capacity: 2,
-      capacityWaitMs: 5_000,
-      onCapacityChanged: (capacity) => capacitySnapshots.push(capacity),
-    });
-    const { env, supervisor, workspaceDir } = f;
+    await using f = fixture({ capacity: 2, capacityWaitMs: 5_000 });
+    const { capacities: capacitySnapshots, env, supervisor, workspaceDir } = f;
     const first = launchInput(workspaceDir, "capacity-a", "wait");
     const second = launchInput(workspaceDir, "capacity-b", "wait");
     const third = launchInput(workspaceDir, "capacity-c", "wait");
@@ -184,21 +181,16 @@ describe("node worker supervisor", () => {
     let admissionsSettled: Promise<unknown> | undefined;
 
     try {
-      await supervisor.launch(first, TEST_WORKER_ENDPOINT);
-      await supervisor.launch(second, TEST_WORKER_ENDPOINT);
-      await expect(supervisor.launch(first, TEST_WORKER_ENDPOINT)).resolves.toMatchObject({
+      await f.launch(first);
+      await f.launch(second);
+      await expect(f.launch(first)).resolves.toMatchObject({
         launchId: first.launchId,
         state: "running",
       });
-      expect(capacitySnapshots).toEqual([
-        { total: 2, available: 0 },
-        { total: 2, available: 2 },
-        { total: 2, available: 1 },
-        { total: 2, available: 0 },
-      ]);
+      expect(capacitySnapshots).toEqual(capacityHistory(0, 2, 1, 0));
 
-      const thirdAdmission = supervisor.launch(third, TEST_WORKER_ENDPOINT);
-      const fourthAdmission = supervisor.launch(fourth, TEST_WORKER_ENDPOINT);
+      const thirdAdmission = f.launch(third);
+      const fourthAdmission = f.launch(fourth);
       admissionsSettled = Promise.allSettled([thirdAdmission, fourthAdmission]);
       await vi.waitFor(async () => {
         expect(await store.get(third.launchId)).toBeUndefined();
@@ -226,16 +218,7 @@ describe("node worker supervisor", () => {
       await expect(thirdAdmittedFirst ? fourthAdmission : thirdAdmission).resolves.toMatchObject({
         state: "running",
       });
-      expect(capacitySnapshots).toEqual([
-        { total: 2, available: 0 },
-        { total: 2, available: 2 },
-        { total: 2, available: 1 },
-        { total: 2, available: 0 },
-        { total: 2, available: 1 },
-        { total: 2, available: 0 },
-        { total: 2, available: 1 },
-        { total: 2, available: 0 },
-      ]);
+      expect(capacitySnapshots).toEqual(capacityHistory(0, 2, 1, 0, 1, 0, 1, 0));
     } finally {
       try {
         await supervisor.close();
@@ -248,23 +231,19 @@ describe("node worker supervisor", () => {
 
   it("aborts saturated admission when the supervisor closes", async () => {
     await using f = fixture({ capacity: 1, capacityWaitMs: 5_000 });
-    const { env, supervisor, workspaceDir } = f;
+    const { supervisor, workspaceDir } = f;
     const running = launchInput(workspaceDir, "capacity-close-running", "wait");
     const waiting = launchInput(workspaceDir, "capacity-close-waiting", "wait");
-    await supervisor.launch(running, TEST_WORKER_ENDPOINT);
-    const admission = supervisor.launch(waiting, TEST_WORKER_ENDPOINT);
+    await f.launch(running);
+    const admission = f.launch(waiting);
     const rejected = expect(admission).rejects.toThrow("node worker supervisor is closed");
     await vi.waitFor(async () => {
-      expect(
-        await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(waiting.launchId),
-      ).toBeUndefined();
+      expect(await f.receipt(waiting.launchId)).toBeUndefined();
     });
 
     await supervisor.close();
     await rejected;
-    expect(
-      await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(waiting.launchId),
-    ).toBeUndefined();
+    expect(await f.receipt(waiting.launchId)).toBeUndefined();
   });
 
   it("spawns workers with only supplied runtime essentials", async () => {
@@ -346,7 +325,7 @@ describe("node worker supervisor", () => {
 
   it("preserves worker result text while bounding and scrubbing failure diagnostics", async () => {
     await using f = fixture();
-    const { supervisor, workspaceDir } = f;
+    const { workspaceDir } = f;
     const successInput = launchInput(workspaceDir, "secret-success-launch", "secret-success");
     successInput.descriptor.assignment.github = {
       token: "worker-github-token",
@@ -357,15 +336,15 @@ describe("node worker supervisor", () => {
     const overflowInput = launchInput(workspaceDir, "overflow-launch", "overflow");
 
     const registrations = evictWorkerCredentialsOnRegistration();
-    await supervisor.launch(successInput, TEST_WORKER_ENDPOINT);
-    await supervisor.launch(failureInput, TEST_WORKER_ENDPOINT);
-    await supervisor.launch(overflowInput, TEST_WORKER_ENDPOINT);
+    await f.launch(successInput);
+    await f.launch(failureInput);
+    await f.launch(overflowInput);
     expect(registrations).toHaveBeenCalledTimes(4);
     expect(registrations).toHaveBeenCalledWith(TEST_WORKER_CREDENTIAL);
     expect(registrations).toHaveBeenCalledWith(successInput.descriptor.assignment.github.token);
-    const success = await waitForTerminal(supervisor, successInput.launchId);
-    const failure = await waitForTerminal(supervisor, failureInput.launchId);
-    const overflow = await waitForTerminal(supervisor, overflowInput.launchId);
+    const success = await f.terminal(successInput.launchId);
+    const failure = await f.terminal(failureInput.launchId);
+    const overflow = await f.terminal(overflowInput.launchId);
     const representations = [
       TEST_WORKER_CREDENTIAL,
       encodeURIComponent(TEST_WORKER_CREDENTIAL),
@@ -395,7 +374,7 @@ describe("node worker supervisor", () => {
     const input = launchInput(workspaceDir, "cutoff-secret", "secret-cutoff-url");
     const representation = encodeURIComponent(TEST_WORKER_CREDENTIAL);
     await supervisor.launch(input, TEST_WORKER_ENDPOINT);
-    const failure = await waitForTerminal(supervisor, input.launchId);
+    const failure = await f.terminal(input.launchId);
     expect(failure.state).toBe("failed");
     expect(Buffer.byteLength(failure.errorText ?? "", "utf8")).toBeLessThanOrEqual(4 * 1024);
     expect(failure.errorText).not.toContain(representation);
@@ -404,7 +383,7 @@ describe("node worker supervisor", () => {
 
   it("rotates credential scrubbing and drops prior-turn diagnostics when a worker is reused", async () => {
     await using f = fixture({ capacity: 1 });
-    const { supervisor, workspaceDir } = f;
+    const { workspaceDir } = f;
     const first = testWorkerLaunchInput(workspaceDir, "previous-diagnostic", "diagnostic-retain");
     const second = testWorkerLaunchInput(workspaceDir, "rotated-credential", "secret-success");
     second.descriptor.admission.credential = 'fresh worker/"credential\\secret?';
@@ -415,15 +394,15 @@ describe("node worker supervisor", () => {
     };
     const last = testWorkerLaunchInput(workspaceDir, "fresh-failure", "quiet-fail");
     last.descriptor.admission.credential = "final-worker-credential";
-    const original = await supervisor.launch(first, TEST_WORKER_ENDPOINT);
-    await waitForTerminal(supervisor, first.launchId);
+    const original = await f.launch(first);
+    await f.terminal(first.launchId);
     const registrations = evictWorkerCredentialsOnRegistration();
-    expect(await supervisor.launch(second, TEST_WORKER_ENDPOINT)).toMatchObject({
+    expect(await f.launch(second)).toMatchObject({
       worker: original.worker,
     });
     expect(registrations).toHaveBeenCalledWith(second.descriptor.admission.credential);
     expect(registrations).toHaveBeenCalledWith(second.descriptor.assignment.github.token);
-    const completed = await waitForTerminal(supervisor, second.launchId);
+    const completed = await f.terminal(second.launchId);
     expect(JSON.parse(completed.resultJson ?? "null")).toEqual({
       status: "completed",
       transcriptLeafId: `raw ${second.descriptor.admission.credential} encoded ${encodeURIComponent(second.descriptor.admission.credential)} github ${second.descriptor.assignment.github.token}`,
@@ -431,8 +410,8 @@ describe("node worker supervisor", () => {
     });
 
     registrations.mockRestore();
-    await supervisor.launch(last, TEST_WORKER_ENDPOINT);
-    const failed = await waitForTerminal(supervisor, last.launchId);
+    await f.launch(last);
+    const failed = await f.terminal(last.launchId);
     expect(failed).toMatchObject({
       state: "failed",
       errorText: "node worker failed with exit code 7",
@@ -443,13 +422,8 @@ describe("node worker supervisor", () => {
   });
 
   it("bounds a blocked cancellation write and stops only its physical owner", async () => {
-    const capacities: Array<{ total: number; available: number }> = [];
-    await using f = fixture({
-      capacity: 2,
-      capacityWaitMs: 25,
-      onCapacityChanged: (capacity) => capacities.push(capacity),
-    });
-    const { env, supervisor, workspaceDir } = f;
+    await using f = fixture({ capacity: 2, capacityWaitMs: 25 });
+    const { capacities, supervisor, workspaceDir } = f;
     const input = launchInput(workspaceDir, "blocked-cancel", "wait");
     const sibling = launchInput(workspaceDir, "unrelated-worker", "wait");
     const adapters = new Map<number, workerLaunchTransport.NodeWorkerChildAdapter>();
@@ -463,8 +437,8 @@ describe("node worker supervisor", () => {
     let cancellation: ReturnType<NodeWorkerSupervisor["cancel"]> | undefined;
     let cancelled: Awaited<ReturnType<NodeWorkerSupervisor["cancel"]>>;
     try {
-      const running = await supervisor.launch(input, TEST_WORKER_ENDPOINT);
-      const unrelated = await supervisor.launch(sibling, TEST_WORKER_ENDPOINT);
+      const running = await f.launch(input);
+      const unrelated = await f.launch(sibling);
       captureAdapter.mockRestore();
       const adapter = adapters.get(running.worker!.pid);
       const siblingAdapter = adapters.get(unrelated.worker!.pid);
@@ -496,10 +470,7 @@ describe("node worker supervisor", () => {
       expect(signalOwner).not.toHaveBeenCalled();
       expect(signalSibling).not.toHaveBeenCalled();
       expect(cancelled).toBeUndefined();
-      expect(
-        (await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(input.launchId))
-          ?.state,
-      ).toBe("running");
+      expect((await f.receipt(input.launchId))?.state).toBe("running");
       expect(inspectNodeWorkerProcessIdentity(running.worker!)).toBe("live");
       expect(inspectNodeWorkerProcessIdentity(unrelated.worker!)).toBe("live");
       expect(capacities.at(-1)).toEqual({ total: 2, available: 0 });
@@ -516,19 +487,13 @@ describe("node worker supervisor", () => {
         },
         { timeout: 7_000, interval: 25 },
       );
-      expect(
-        (await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(input.launchId))
-          ?.state,
-      ).toBe("cancelled");
+      expect((await f.receipt(input.launchId))?.state).toBe("cancelled");
       expect(signalOwner).toHaveBeenCalledWith("SIGTERM");
       expect(signalSibling).not.toHaveBeenCalled();
       expect(await supervisor.status(sibling.launchId)).toMatchObject({ state: "running" });
       expect(inspectNodeWorkerProcessIdentity(unrelated.worker!)).toBe("live");
       await expect(
-        supervisor.launch(
-          launchInput(workspaceDir, "after-blocked-cancel", "wait"),
-          TEST_WORKER_ENDPOINT,
-        ),
+        f.launch(launchInput(workspaceDir, "after-blocked-cancel", "wait")),
       ).resolves.toMatchObject({ state: "running" });
     } finally {
       vi.useRealTimers();
@@ -567,19 +532,15 @@ describe("node worker supervisor", () => {
   });
 
   it("preserves accepted cancellation when a rejected terminal event needs a journal retry", async () => {
-    const capacities: Array<{ total: number; available: number }> = [];
-    await using f = fixture({
-      capacity: 1,
-      onCapacityChanged: (capacity) => capacities.push(capacity),
-    });
-    const { supervisor, workspaceDir, env } = f;
+    await using f = fixture({ capacity: 1 });
+    const { capacities, supervisor, workspaceDir, env } = f;
     const input = launchInput(workspaceDir, "cancel-rejected-terminal", "tree-cancel-reject");
     const retryStarted = createDeferred();
     const releaseRetry = createDeferred();
     const journalCalls = vi.spyOn(NodeWorkerJournalWorker.prototype, "execute");
     let cancellation: ReturnType<NodeWorkerSupervisor["cancel"]> | undefined;
     try {
-      const running = await supervisor.launch(input, TEST_WORKER_ENDPOINT);
+      const running = await f.launch(input);
       const grandchildPath = path.join(workspaceDir, "grandchild.pid");
       await vi.waitFor(() =>
         expect(fs.readFileSync(grandchildPath, "utf8")).toMatch(/^[1-9]\d*$/u),
@@ -623,24 +584,21 @@ describe("node worker supervisor", () => {
       }
       expect(capacities.at(-1)).toEqual({ total: 1, available: 0 });
       releaseRetry.resolve();
-      expect(await cancellation).toMatchObject({ state: "cancelled", worker: running.worker });
-      expect(await supervisor.status(input.launchId)).toMatchObject({
-        state: "cancelled",
-        worker: running.worker,
-      });
-      expect(
-        await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(input.launchId),
-      ).toMatchObject({
+      for (const receipt of [await cancellation, await supervisor.status(input.launchId)]) {
+        expect(receipt).toMatchObject({ state: "cancelled", worker: running.worker });
+      }
+      expect(await f.receipt(input.launchId)).toMatchObject({
         state: "failed",
         errorText: "node worker failed with exit code 1: worker live event rejected: invalid-event",
       });
-      expect(inspectNodeWorkerProcessIdentity(running.worker!)).not.toBe("live");
-      expect(inspectNodeWorkerProcessIdentity(grandchild)).not.toBe("live");
+      for (const identity of [running.worker!, grandchild]) {
+        expect(inspectNodeWorkerProcessIdentity(identity)).not.toBe("live");
+      }
       expect(capacities.at(-1)).toEqual({ total: 1, available: 1 });
 
       const next = launchInput(workspaceDir, "after-cancel-rejected-terminal");
-      await supervisor.launch(next, TEST_WORKER_ENDPOINT);
-      expect(await waitForTerminal(supervisor, next.launchId)).toMatchObject({
+      await f.launch(next);
+      expect(await f.terminal(next.launchId)).toMatchObject({
         state: "completed",
       });
     } finally {

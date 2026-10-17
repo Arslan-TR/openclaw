@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { deserialize } from "node:v8";
 import { Worker } from "node:worker_threads";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
   WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
   WORKER_LINEAGE_START_PROTOCOL_FEATURE,
@@ -46,7 +46,18 @@ afterEach(() => {
 });
 
 function fixture(options: Parameters<typeof createNodeWorkerSupervisor>[0] = {}) {
-  return createNodeWorkerSupervisorFixture(tempDirs.make("node-worker-startup-"), options);
+  const capacities: Array<{ total: number; available: number }> = [];
+  const value = createNodeWorkerSupervisorFixture(tempDirs.make("node-worker-startup-"), {
+    onCapacityChanged: (capacity) => capacities.push(capacity),
+    ...options,
+  });
+  return {
+    ...value,
+    capacities,
+    receipt: (id: string) =>
+      new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env: value.env })).get(id),
+    [Symbol.asyncDispose]: () => value.supervisor.close(),
+  };
 }
 
 function launchInput(workspaceDir: string, launchId: string, prompt = "success") {
@@ -56,6 +67,19 @@ function launchInput(workspaceDir: string, launchId: string, prompt = "success")
   return input;
 }
 
+function writeWorker(bundleRoot: string, input: ReturnType<typeof launchInput>, source: string) {
+  fs.writeFileSync(
+    path.join(
+      bundleRoot,
+      input.gatewayNamespace,
+      "bundles",
+      input.expectedBundleHash,
+      "worker.mjs",
+    ),
+    source,
+  );
+}
+
 describe("node worker startup", () => {
   it.runIf(process.platform === "linux" || process.platform === "darwin").each([
     { build: "lineage-only", lineage: true },
@@ -63,31 +87,23 @@ describe("node worker startup", () => {
   ])(
     "preserves the $build worker's start envelope and process group",
     async ({ build, lineage }) => {
-      const { bundleRoot, supervisor, workspaceDir } = fixture();
+      await using f = fixture();
+      const { bundleRoot, supervisor, workspaceDir } = f;
       const input = launchInput(workspaceDir, `start-contract-${build}`);
       input.descriptor.admission.handshake.openclawVersion = "2026.9.4";
       input.descriptor.admission.handshake.protocolFeatures =
         input.descriptor.admission.handshake.protocolFeatures.filter(
-          (feature) => feature !== WORKER_NATIVE_PROCESS_OWNER_PROTOCOL_FEATURE,
+          (feature) =>
+            feature !== WORKER_NATIVE_PROCESS_OWNER_PROTOCOL_FEATURE &&
+            (lineage ||
+              (feature !== WORKER_LINEAGE_START_PROTOCOL_FEATURE &&
+                feature !== WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE)),
         );
-      if (!lineage) {
-        input.descriptor.admission.handshake.protocolFeatures =
-          input.descriptor.admission.handshake.protocolFeatures.filter(
-            (feature) =>
-              feature !== WORKER_LINEAGE_START_PROTOCOL_FEATURE &&
-              feature !== WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
-          );
-      }
       const expectedKeys = lineage ? ["lineageFds", "type"] : ["type"];
       const reportPath = path.join(workspaceDir, "start-contract.json");
-      fs.writeFileSync(
-        path.join(
-          bundleRoot,
-          input.gatewayNamespace,
-          "bundles",
-          input.expectedBundleHash,
-          "worker.mjs",
-        ),
+      writeWorker(
+        bundleRoot,
+        input,
         `import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -136,20 +152,16 @@ lines.once("line", line => {
         }
       } finally {
         captureAdapter.mockRestore();
-        await supervisor.close();
       }
     },
   );
 
   it("does not open or signal a child after markRunning observes its terminal receipt", async () => {
-    const capacities: Array<{ total: number; available: number }> = [];
-    const { supervisor, workspaceDir, env } = fixture({
-      capacity: 1,
-      onCapacityChanged: (capacity) => capacities.push(capacity),
-    });
+    await using f = fixture({ capacity: 1 });
+    const { supervisor, workspaceDir, capacities } = f;
     const input = launchInput(workspaceDir, "fast-terminal-launch", "fast-terminal");
-    const opened = vi.fn();
-    const signalled = vi.fn();
+    let opened: MockInstance | undefined;
+    let signalled: MockInstance | undefined;
     let childExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let cleanupSettled = false;
     let adapter: NodeWorkerChildAdapter | undefined;
@@ -165,16 +177,8 @@ lines.once("line", line => {
         },
         () => undefined,
       );
-      const openStartGate = child.openStartGate!;
-      vi.spyOn(child, "openStartGate").mockImplementation(() => {
-        opened();
-        return openStartGate();
-      });
-      const kill = child.kill;
-      vi.spyOn(child, "kill").mockImplementation((signal) => {
-        signalled(signal);
-        kill(signal);
-      });
+      opened = vi.spyOn(child, "openStartGate");
+      signalled = vi.spyOn(child, "kill");
     });
     vi.spyOn(NodeWorkerLaunchStore.prototype, "markRunning").mockImplementation(async function (
       this: NodeWorkerLaunchStore,
@@ -204,15 +208,11 @@ lines.once("line", line => {
       expect(adapter?.stdin?.destroyed).toBe(true);
       expect(opened).not.toHaveBeenCalled();
       expect(fs.existsSync(path.join(workspaceDir, "fast-terminal-marker"))).toBe(false);
-      expect(
-        (await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(input.launchId))
-          ?.state,
-      ).toBe("completed");
+      expect((await f.receipt(input.launchId))?.state).toBe("completed");
       await supervisor.close();
       expect(signalled).not.toHaveBeenCalled();
     } finally {
       captureAdapter.mockRestore();
-      await supervisor.close();
     }
   });
 
@@ -227,17 +227,13 @@ lines.once("line", line => {
   ] as const)(
     "records $state when a child exits before descriptor delivery ($operation)",
     async ({ operation, state, errorText }) => {
-      const { bundleRoot, supervisor, workspaceDir, env } = fixture();
+      await using f = fixture();
+      const { bundleRoot, supervisor, workspaceDir } = f;
       const input = launchInput(workspaceDir, "prestart-exit-launch");
       const exitedPath = path.join(workspaceDir, "prestart-exited");
-      fs.writeFileSync(
-        path.join(
-          bundleRoot,
-          input.gatewayNamespace,
-          "bundles",
-          input.expectedBundleHash,
-          "worker.mjs",
-        ),
+      writeWorker(
+        bundleRoot,
+        input,
         `import fs from "node:fs"; process.once("message", () => { fs.writeFileSync(${JSON.stringify(exitedPath)}, "exited"); process.exit(23); });`,
       );
       const observationReleased = createDeferred();
@@ -276,18 +272,13 @@ lines.once("line", line => {
 
         expect(fs.existsSync(exitedPath)).toBe(true);
         expect(childExit).toEqual({ code: 23, signal: null });
-        expect(terminal).toMatchObject({ state, errorText });
-        expect(
-          await new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env })).get(input.launchId),
-        ).toMatchObject({
-          state,
-          errorText,
-        });
+        for (const receipt of [terminal, await f.receipt(input.launchId)]) {
+          expect(receipt).toMatchObject({ state, errorText });
+        }
       } finally {
         captureAdapter.mockRestore();
         observationReleased.resolve();
         await closing;
-        await supervisor.close();
       }
     },
   );
@@ -298,7 +289,8 @@ lines.once("line", line => {
   ] as const)(
     "%s during startup closes the gate before worker code runs",
     async (operation, state) => {
-      const { supervisor, workspaceDir } = fixture();
+      await using f = fixture();
+      const { supervisor, workspaceDir } = f;
       const input = launchInput(workspaceDir, `${operation}-startup-launch`, "tree");
       const originalMarkRunning = Object.getOwnPropertyDescriptor(
         NodeWorkerLaunchStore.prototype,
@@ -322,14 +314,14 @@ lines.once("line", line => {
 
       expect((await supervisor.status(input.launchId))?.state).toBe(state);
       expect(fs.existsSync(path.join(workspaceDir, "grandchild.pid"))).toBe(false);
-      await supervisor.close();
     },
   );
 });
 
 describe("node worker supervisor initialization", () => {
   it("keeps the additive table absent until the first stateful operation", async () => {
-    const { bundleRoot, env, supervisor } = fixture();
+    await using f = fixture();
+    const { bundleRoot, env, supervisor } = f;
     const database = openOpenClawStateDatabase({ env });
     const findTable = () =>
       database.db
@@ -351,7 +343,8 @@ describe("node worker supervisor initialization", () => {
   });
 
   it("retains Windows restart capacity when the recorded worker root is reused", async () => {
-    const { bundleRoot, env, supervisor, workspaceDir } = fixture();
+    await using f = fixture();
+    const { bundleRoot, env, workspaceDir } = f;
     const store = new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env }));
     const input = launchInput(workspaceDir, "windows-reused", "wait");
     const claim = {
@@ -403,7 +396,6 @@ describe("node worker supervisor initialization", () => {
       expect(signal).not.toHaveBeenCalled();
     } finally {
       await recovered.close();
-      await supervisor.close();
     }
   });
 });
@@ -412,11 +404,8 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
   "settles durable capacity from the native cleanup certificate (%s)",
   { timeout: 20_000 },
   async (cleanupStatus, { signal }) => {
-    const capacities: Array<{ total: number; available: number }> = [];
-    const { env, supervisor, workspaceDir } = createNodeWorkerSupervisorFixture(
-      tempDirs.make("node-worker-uncertain-cleanup-"),
-      { capacity: 1, capacityWaitMs: 0, onCapacityChanged: (value) => capacities.push(value) },
-    );
+    await using f = fixture({ capacity: 1, capacityWaitMs: 0 });
+    const { env, supervisor, workspaceDir, capacities } = f;
     const input = testWorkerLaunchInput(workspaceDir, "uncertain-owner");
     const store = new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env }));
     const reported = createDeferred();
@@ -443,19 +432,19 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
     try {
       await supervisor.launch(input, TEST_WORKER_ENDPOINT);
       await withinTest(reported.promise, signal);
-      if (cleanupStatus === "confirmed") {
-        await supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(input));
-        expect((await store.get(input.launchId))?.state).toBe("completed");
-        expect(capacities.at(-1)).toEqual({ total: 1, available: 1 });
-        expect(await supervisor.hasActiveWork()).toBe(false);
+      const confirmed = cleanupStatus === "confirmed";
+      const stopping = supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(input));
+      if (confirmed) {
+        await stopping;
+      } else {
+        await expect(stopping).rejects.toThrow("cleanup remains unconfirmed");
+      }
+      expect((await store.get(input.launchId))?.state).toBe(confirmed ? "completed" : "running");
+      expect(capacities.at(-1)).toEqual({ total: 1, available: Number(confirmed) });
+      expect(await supervisor.hasActiveWork()).toBe(!confirmed);
+      if (confirmed) {
         return;
       }
-      await expect(
-        supervisor.stopEnvironment(testNodeWorkerEnvironmentIdentity(input)),
-      ).rejects.toThrow("cleanup remains unconfirmed");
-      expect((await store.get(input.launchId))?.state).toBe("running");
-      expect(capacities.at(-1)).toEqual({ total: 1, available: 0 });
-      expect(await supervisor.hasActiveWork()).toBe(true);
 
       const replacement = testWorkerLaunchInput(workspaceDir, "replacement-owner");
       replacement.descriptor.admission.environmentId = "replacement-environment";
@@ -466,7 +455,6 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
     } finally {
       capture.mockRestore();
       restoreConfirmation?.();
-      await supervisor.close();
     }
   },
 );
@@ -474,11 +462,10 @@ it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)
 it.skipIf(process.platform === "win32")(
   "keeps physical capacity reserved after a committed turn reply becomes unknown",
   async ({ signal }) => {
-    const capacities: Array<{ total: number; available: number }> = [];
-    const { env, supervisor, workspaceDir } = createNodeWorkerSupervisorFixture(
-      tempDirs.make("node-worker-unknown-turn-"),
-      { capacity: 1, capacityWaitMs: 0, onCapacityChanged: (value) => capacities.push(value) },
-    );
+    const { env, supervisor, workspaceDir, capacities } = fixture({
+      capacity: 1,
+      capacityWaitMs: 0,
+    });
     const input = testWorkerLaunchInput(workspaceDir, "unknown-turn");
     const committed = createDeferred<unknown>();
     let target: { worker: Worker; id: number } | undefined;
