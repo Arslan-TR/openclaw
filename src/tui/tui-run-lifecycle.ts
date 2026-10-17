@@ -245,7 +245,8 @@ export function createTuiRunLifecycle(context: TuiRunLifecycleContext) {
       reconnectPendingRunId = null;
     }
     state.activeChatRunId = null;
-    if (!hasPendingSubmit(state)) {
+    // Idle confirms cancellation settled; the terminal notice owns its brief expiry.
+    if (!hasPendingSubmit(state) && state.activityStatus !== LOCAL_MODEL_CANCELLATION_NOTICE) {
       state.activityStatus = "idle";
     }
     setActivityStatus(state.activityStatus);

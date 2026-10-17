@@ -90,6 +90,35 @@ it("bounds the terminal cancellation caveat without rearming it on replay", () =
   expect(setActivityStatus).toHaveBeenLastCalledWith("aborted");
 });
 
+it("preserves the terminal caveat when the cancelled session reports idle", () => {
+  const { state, setActivityStatus, handlers, aborted } = createCancellationHarness();
+  handlers.handleChatEvent(aborted);
+  handlers.handleAgentEvent({
+    runId: aborted.runId,
+    stream: "run_status",
+    data: { phase: "starting_model" },
+  });
+  handlers.handleAgentEvent({
+    runId: aborted.runId,
+    stream: "lifecycle",
+    data: { phase: "end", status: "cancelled", aborted: true },
+  });
+  handlers.handleSessionsChangedEvent({
+    sessionKey: state.currentSessionKey,
+    sessionId: state.currentSessionId,
+    reason: "agent.input.settled",
+    activeRunIds: [],
+  });
+  expect(setActivityStatus).toHaveBeenLastCalledWith(
+    "Cancellation requested; the local model may still be finishing.",
+  );
+  expect(state.activityStatus).toBe(
+    "Cancellation requested; the local model may still be finishing.",
+  );
+  vi.advanceTimersByTime(5_000);
+  expect(setActivityStatus).toHaveBeenLastCalledWith("aborted");
+});
+
 it.each(["new run", "pending run", "session change", "dispose"] as const)(
   "clears the cancellation notice on %s without overwriting later activity",
   (change) => {
