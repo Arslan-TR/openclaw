@@ -179,7 +179,9 @@ export function captureHttpRequestAuthority(
     return (
       !params.req.socket?.destroyed &&
       isGatewayAuthPolicyCurrent(policy, current) &&
-      (roleRevision === undefined || roleRevision === readOperatorRolePolicyRevision()) &&
+      (roleRevision === undefined
+        ? !current.gateway?.roles
+        : roleRevision === readOperatorRolePolicyRevision()) &&
       aliasRevision === readUserProfileAliasRevision() &&
       authGeneration ===
         resolveSharedGatewaySessionGeneration(
