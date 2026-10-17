@@ -88,7 +88,7 @@ import { SessionDataOwner } from "./session-data.ts";
 import type { SessionOrganizerController } from "./session-organizer-controller.ts";
 import { SessionOwnerFilter } from "./session-owner-filter.ts";
 import { SidebarEmptyGroupsPreference } from "./sidebar-empty-groups.ts";
-import type { SidebarMenusController } from "./sidebar-menus-controller.tsx";
+import type { SidebarMenus } from "./sidebar-menus.tsx";
 import type { SidebarNavigationCatalog } from "./sidebar-navigation-catalog.ts";
 import {
   memoizedSidebarCatalogs,
@@ -289,7 +289,7 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
   declare readonly sidebarTools: ReadonlyMap<string, SidebarToolActivity>;
   declare readonly sidebarObserverDigests: ReadonlyMap<string, SessionObserverDigest>;
   declare readonly sessionOrganizer: SessionOrganizerController;
-  declare readonly sidebarMenus: SidebarMenusController;
+  declare readonly sidebarMenus: SidebarMenus;
 
   get sessionDataContext() {
     return this.context;

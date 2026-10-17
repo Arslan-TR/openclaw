@@ -2,8 +2,9 @@ import { expect, it, onTestFinished, vi } from "vitest";
 import { mountSolid as render } from "../test-helpers/mount-solid.ts";
 import { flush, waitForSolid } from "../test-helpers/solid-settle.ts";
 import { SidebarDropdown, renderSidebarNavLink } from "./app-sidebar-nav-menus.tsx";
-import type { SidebarMenusController } from "./sidebar-menus-controller.tsx";
-import { renderSidebarRailPinMenuForController } from "./sidebar-menus-render.tsx";
+import { renderSidebarRailPinMenuForMenus } from "./sidebar-menus-render.tsx";
+import type { SidebarMenusOwner } from "./sidebar-menus-types.ts";
+import type { SidebarMenus } from "./sidebar-menus.tsx";
 
 it("keeps modified sidebar links native and handles ordinary navigation", () => {
   const navigate = vi.fn();
@@ -124,32 +125,35 @@ it.each([
     const calls: string[] = [];
     const move = vi.fn();
     const remove = vi.fn();
-    const controller = {
-      railPinMenuPosition: { x: 12, y: 30, entry: entries[index], label: "Pinned item" },
-      railPinMenuTrigger: null,
-      host: {
-        sidebarEntries: entries,
-        querySelectorAll: pins.querySelectorAll.bind(pins),
-        updateComplete: Promise.resolve(true),
-        sessionOrganizer: {
-          writeSidebarEntryAt(entry: string, neighbor: string, position: string) {
-            calls.push("move");
-            move(entry, neighbor, position);
-          },
-          removeSidebarEntry(entry: string) {
-            calls.push("remove");
-            remove(entry);
-          },
+    const host = {
+      sidebarEntries: entries,
+      sessionOrganizer: {
+        writeSidebarEntryAt(entry: string, neighbor: string, position: string) {
+          calls.push("move");
+          move(entry, neighbor, position);
+        },
+        removeSidebarEntry(entry: string) {
+          calls.push("remove");
+          remove(entry);
         },
       },
+    } as SidebarMenusOwner;
+    const menus = {
+      railPinMenuPosition: { x: 12, y: 30, entry: entries[index], label: "Pinned item" },
+      triggers: new Map([["railPin", null]]),
+      element: pins,
+      commit: () => Promise.resolve(true),
       closePositionedMenu(_menu: "railPin") {
         calls.push("close");
       },
       positionedMenuHandlers: (_menu: "railPin") => ({ onClose() {} }),
-    } as SidebarMenusController;
-    const view = render(() => renderSidebarRailPinMenuForController(controller), {
-      container: pins,
-    });
+    } as SidebarMenus;
+    const view = render(
+      () => renderSidebarRailPinMenuForMenus(menus, host, menus.railPinMenuPosition!),
+      {
+        container: pins,
+      },
+    );
     flush();
     const menu = view.getByRole("menu", { hidden: true });
     expect(menu.querySelector('[data-value="before"]')?.hasAttribute("disabled")).toBe(index === 0);
