@@ -42,6 +42,7 @@ const runnerMocks = vi.hoisted(() => ({
 
 export const messageActionRunnerMocks = runnerMocks;
 
+// mock-isolation: Resolve only the synthetic channel instead of loading bundled plugins.
 vi.mock("./channel-resolution.js", () => ({
   normalizeDeliverableOutboundChannel: (value?: string | null) =>
     typeof value === "string" ? value.trim().toLowerCase() || undefined : undefined,
@@ -49,6 +50,7 @@ vi.mock("./channel-resolution.js", () => ({
   resetOutboundChannelResolutionStateForTest: vi.fn(),
 }));
 
+// mock-isolation: Observe runner dispatch without invoking delivery and recovery services.
 vi.mock("./outbound-send-service.js", () => ({
   executeSendAction: runnerMocks.executeSendAction,
   executePollAction: runnerMocks.executePollAction,
@@ -56,6 +58,7 @@ vi.mock("./outbound-send-service.js", () => ({
   materializeMessagePresentationFallback: runnerMocks.materializeMessagePresentationFallback,
 }));
 
+// mock-isolation: Control Gateway outcomes without opening a live connection.
 vi.mock("./message.gateway.runtime.js", () => ({
   callGateway: runnerMocks.callGateway,
   callGatewayLeastPrivilege: runnerMocks.callGatewayLeastPrivilege,
@@ -63,6 +66,7 @@ vi.mock("./message.gateway.runtime.js", () => ({
   randomIdempotencyKey: runnerMocks.randomIdempotencyKey,
 }));
 
+// mock-isolation: Observe source-reply settlement without changing real session transcripts.
 vi.mock("./source-reply-mirror.js", () => ({
   beginTerminalSourceReplyDelivery: runnerMocks.beginTerminalSourceReplyDelivery,
   cancelTerminalSourceReplyDelivery: runnerMocks.cancelTerminalSourceReplyDelivery,
@@ -70,6 +74,7 @@ vi.mock("./source-reply-mirror.js", () => ({
   reconcileTerminalSourceReplyDelivery: runnerMocks.reconcileTerminalSourceReplyDelivery,
 }));
 
+// mock-isolation: Keep speech synthesis at the payload boundary without loading providers.
 vi.mock("../../tts/tts.runtime.js", () => ({
   maybeApplyTtsToPayload: runnerMocks.maybeApplyTtsToPayload,
 }));

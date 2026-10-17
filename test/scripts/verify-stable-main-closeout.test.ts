@@ -981,7 +981,8 @@ function historical(scenario: (typeof scenarios)[number], historicalSha: string)
     logs,
     historicalJob,
     bytes,
-    read: (metadata = historicalJob) => readRecoveryStepInputs(logs, metadata, scenario.name),
+    read: (metadata: Parameters<typeof readRecoveryStepInputs>[1] = historicalJob) =>
+      readRecoveryStepInputs(logs, metadata, scenario.name),
   };
 }
 it.each(

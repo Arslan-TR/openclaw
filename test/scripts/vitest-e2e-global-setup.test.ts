@@ -117,8 +117,8 @@ await runE2eGlobalSetup(undefined, process.env);`;
       runner.once("close", (code, exitSignal) => resolve({ code, signal: exitSignal }));
     });
     const groupState = () => inspectManagedProcessGroup(runner, { errorPolicy: "indeterminate" });
-    cleanup = () =>
-      runQaGatewayFixture(
+    cleanup = async () => {
+      await runQaGatewayFixture(
         async () => forceKillVitestProcessGroup(runner),
         () => killPidIfAlive(runner.pid),
         ...pidPaths.map((file) => async () => {
@@ -145,6 +145,7 @@ await runE2eGlobalSetup(undefined, process.env);`;
           fs.rmSync(fixtureDir, { force: true, recursive: true });
         },
       );
+    };
     const output = { stdout: "", stderr: "" };
     const outputReady = (["stdout", "stderr"] as const).map((name) => {
       const ready = createDeferred();

@@ -15,11 +15,12 @@ import {
 } from "./run-entry.test-support.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
 
-const retryModel = "gpt-daybreak-blue-latest";
+const retryModel = "gpt-5.6-sol";
 const cyberRefusal = { provider: "openai", category: "cyber" } as const;
 const cyberCode = "OPENAI_CYBER_POLICY_REFUSAL";
 const runWithModelFallback = vi.hoisted(() => vi.fn<typeof runFallback>());
 
+// mock-isolation: Drive fallback outcomes without invoking provider runtimes.
 vi.mock("../model-fallback-runner.js", () => ({ runWithModelFallback }));
 vi.mock("../harness/runtime-plugin.js", () => ({
   ensureSelectedAgentHarnessPlugin: vi.fn(async () => undefined),

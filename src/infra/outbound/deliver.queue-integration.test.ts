@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
 import { onTrustedMessageAuditEventForTest as onTrustedMessageAuditEvent } from "../../audit/message-audit-events.test-support.js";
@@ -34,12 +34,13 @@ let deliverOutboundPayloads: typeof import("./deliver.js").deliverOutboundPayloa
 
 type DeliveryParams = Parameters<typeof deliverOutboundPayloads>[0];
 type MatrixParams = Partial<Omit<DeliveryParams, "cfg" | "channel" | "to">>;
+type MatrixSender = NonNullable<NonNullable<DeliveryParams["deps"]>["matrix"]>;
 
 describe("durable outbound queue delivery", () => {
   const fixtures = installDeliveryQueueTmpDirHooks();
   const deliveryIntentId = "cron-direct-delivery:v1:test";
   let tmpDir: string;
-  let sendMatrix: ReturnType<typeof vi.fn>;
+  let sendMatrix: Mock<MatrixSender>;
 
   const queueStatus = (id = deliveryIntentId) =>
     getDeliveryQueueEntryStatus(OUTBOUND_DELIVERY_QUEUE_NAME, id, tmpDir);
@@ -94,7 +95,7 @@ describe("durable outbound queue delivery", () => {
   beforeEach(() => {
     tmpDir = fixtures.tmpDir();
     process.env.OPENCLAW_STATE_DIR = tmpDir;
-    sendMatrix = vi.fn();
+    sendMatrix = vi.fn<MatrixSender>();
     setActivePluginRegistry(
       createTestRegistry([
         {

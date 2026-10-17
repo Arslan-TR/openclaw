@@ -194,7 +194,7 @@ async function createRun(sessionId: string, model: string, staged = false) {
         (result) => ({ result }),
         (error: unknown) => ({ error }),
       ),
-    async seed(history: NonNullable<EmbeddedRunAttemptResult["messagesSnapshot"]>) {
+    seed: async (history: NonNullable<EmbeddedRunAttemptResult["messagesSnapshot"]>) => {
       await replaceSessionEntry(target, { sessionId, updatedAt: 1 });
       await persistSessionTranscriptTurn(target, {
         messages: history.map((message, index) => ({ eventId: `seed-${index}`, message })),
@@ -206,7 +206,7 @@ async function createRun(sessionId: string, model: string, staged = false) {
 }
 
 function observeProjectionWait(onWait: () => void) {
-  const wait = reconciliation.waitForSessionTranscriptProjection;
+  const wait = reconciliation.waitForSessionTranscriptProjection.bind(reconciliation);
   return vi
     .spyOn(reconciliation, "waitForSessionTranscriptProjection")
     .mockImplementation((...args) => {

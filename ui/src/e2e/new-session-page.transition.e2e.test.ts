@@ -94,11 +94,7 @@ async function expectListedKeys(page: Page, keys: string[]) {
   }
 }
 
-async function captureJson(
-  name: string,
-  value: () => unknown | Promise<unknown>,
-  dir = transitionProofDir(),
-) {
+async function captureJson(name: string, value: () => unknown, dir = transitionProofDir()) {
   if (captureProofEnabled) {
     await writeFile(path.join(dir, name), JSON.stringify(await value(), null, 2));
   }

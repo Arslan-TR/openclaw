@@ -47,7 +47,7 @@ describe("continuePostCoreUpdateInFreshProcess", () => {
   it.each([false, true])(
     "releases artifact ownership only for a target without the prepared-fact consumer (modern=%s)",
     async (modern) => {
-      const root = await withTempDir();
+      const root = withTempDir();
       const control = path.join(root, "control");
       await fs.mkdir(control, { mode: 0o700 });
       installPrivateUpdateHandoffStore(control);
@@ -114,7 +114,7 @@ await fs.writeFile(process.env.OPENCLAW_UPDATE_POST_CORE_RESULT_PATH, ${JSON.str
   it.runIf(process.platform !== "win32").each([true, false])(
     "waits for a committed child's shutdown before returning its result (cooperative=%s)",
     async (cooperative) => {
-      const root = await withTempDir();
+      const root = withTempDir();
       const settledPath = path.join(root, "settled");
       const pidPath = path.join(root, "writer.pid");
       const argvPath = path.join(root, "argv.json");
@@ -219,7 +219,7 @@ describe("post-core result publication", () => {
   it.runIf(process.platform !== "win32").each(["success", "failure"] as const)(
     "keeps the handoff private after publishing %s",
     async (outcome) => {
-      const dir = await withTempDir();
+      const dir = withTempDir();
       await fs.chmod(dir, 0o700);
       const siblingPath = path.join(dir, "source-config.json");
       const sibling = '{"sourceConfig":{"gateway":{"port":18789}}}\n';
@@ -256,7 +256,7 @@ describe("readPostCorePluginInstallRecordsFile", () => {
       reason: "Malformed JSON in plugin install records file",
     },
   ])("distinguishes $kind handoffs from valid install records", async ({ kind, raw, reason }) => {
-    const dir = await withTempDir();
+    const dir = withTempDir();
     if (!raw) {
       await expect(
         readPostCorePluginInstallRecordsFile(
@@ -277,7 +277,7 @@ describe("readPostCorePluginInstallRecordsFile", () => {
   });
 
   it("writes UTF-8 byte order and preserves special ids and passthrough fields", async () => {
-    const dir = await withTempDir();
+    const dir = withTempDir();
     const filePath = path.join(dir, "plugin-install-records.json");
     const records = createPluginInstallRecordMap<PluginInstallRecord>();
     setPluginInstallRecordMapEntry(records, "\u{10000}", { source: "git" });
@@ -432,7 +432,7 @@ describe("post-core operator deadline provenance", () => {
     { name: "malformed handoff", timeout: "3", malformed: true },
   ];
   it.each(cases)("preserves intent for $name", async (entry) => {
-    const root = await withTempDir();
+    const root = withTempDir();
     const resultPath = path.join(root, "plugins.json");
     if (!entry.missing) {
       await fs.writeFile(

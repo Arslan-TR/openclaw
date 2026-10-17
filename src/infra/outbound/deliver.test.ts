@@ -163,6 +163,7 @@ vi.mock("../../hooks/internal-hooks.js", () => ({
   createInternalHookEvent: internalHookMocks.createInternalHookEvent,
   triggerInternalHook: internalHookMocks.triggerInternalHook,
 }));
+// mock-isolation: Record queue custody transitions without writing a real delivery database.
 vi.mock("./delivery-queue-storage.js", () => ({
   enqueueDelivery: async (params: EnqueueDeliveryTestParams) =>
     queue.enqueue(withoutInitialProducerClaim(params)),
@@ -195,14 +196,17 @@ vi.mock("./delivery-queue-storage.js", () => ({
   loadPendingDelivery: queue.pending,
   findDeliveryIntentOwner: queue.intentOwner,
 }));
+// mock-isolation: Control preparation ownership independently of the delivery storage worker.
 vi.mock("./delivery-queue-preparation.js", () => ({
   StableDeliveryPreparationLostError: class StableDeliveryPreparationLostError extends Error {},
   withStableDeliveryPreparation: queue.prepare,
 }));
+// mock-isolation: Keep lease renewal deterministic while testing outbound delivery ordering.
 vi.mock("./delivery-queue-platform-lease.js", () => ({
   claimReusableDeliveryPlatformSendAttempt: queue.claim,
   renewDeliveryPlatformSendLease: queue.renewLease,
 }));
+// mock-isolation: Supply the claimed-delivery boundary without starting recovery workers.
 vi.mock("./delivery-queue-recovery.js", () => ({ withActiveDeliveryClaim: queue.withClaim }));
 vi.mock("./delivery-completion.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./delivery-completion.js")>()),
@@ -303,8 +307,8 @@ type OutboundPinDeliveredMessage = NonNullable<ChannelOutboundAdapter["pinDelive
 type OutboundTextResult = Awaited<ReturnType<OutboundTextSender>>;
 type OutboundPayloadResult = Awaited<ReturnType<OutboundPayloadSender>>;
 
-function installTextOutbound<TResult extends OutboundTextResult>(
-  send: TResult,
+function installTextOutbound(
+  send: OutboundTextResult,
   overrides: Omit<Partial<ChannelOutboundAdapter>, "sendText"> = {},
   id: Parameters<typeof createOutboundTestPlugin>[0]["id"] = "matrix",
 ) {
@@ -313,8 +317,8 @@ function installTextOutbound<TResult extends OutboundTextResult>(
   return sendText;
 }
 
-function installPayloadOutbound<TResult extends OutboundPayloadResult>(
-  send: TResult,
+function installPayloadOutbound(
+  send: OutboundPayloadResult,
   overrides: Omit<Partial<ChannelOutboundAdapter>, "sendPayload"> = {},
   id: Parameters<typeof createOutboundTestPlugin>[0]["id"] = "matrix",
 ) {
@@ -803,10 +807,10 @@ describe("deliverOutboundPayloads", () => {
       ordered(order, "suppress", undefined),
     );
     queue.ack.mockImplementationOnce(ordered(order, "ack", Promise.resolve()));
-    sendMatrix = vi
-      .fn()
+    const sendText = vi
+      .fn<OutboundTextSender>()
       .mockResolvedValue({ channel: "matrix", messageId: "", outcome: "not_sent" });
-    setTestOutbound({ sendText: sendMatrix });
+    setTestOutbound({ sendText });
 
     const results = await deliverMatrix({
       payloads: [{ text: "---" }],
@@ -815,7 +819,7 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(results).toEqual([]);
-    expect(sendMatrix).toHaveBeenCalledOnce();
+    expect(sendText).toHaveBeenCalledOnce();
     expect(order).toEqual(["queue", "suppress", "ack"]);
     expectUncalled(queue.failAfterSend, completionMocks.failDurableDelivery);
   });

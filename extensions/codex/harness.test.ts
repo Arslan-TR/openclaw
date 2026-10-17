@@ -680,12 +680,14 @@ describe("Codex session runtime ownership", () => {
       let disposal: Promise<void> | undefined;
       const invalidate = () => {
         if (reason === "disposed") {
-          return (disposal = fixture.harness.dispose?.());
+          disposal = Promise.resolve(fixture.harness.dispose?.());
+        } else {
+          current = false;
         }
-        current = false;
       };
       if (timing === "before") {
-        await invalidate();
+        invalidate();
+        await disposal;
       } else {
         read.mockImplementationOnce(async (requestedIdentity) => {
           const binding = await readBinding(requestedIdentity);

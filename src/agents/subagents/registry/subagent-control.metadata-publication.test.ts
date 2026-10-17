@@ -248,7 +248,8 @@ it.for([
     );
     const { state, release, dispose } = held;
     if (publication === "discovery") {
-      const prepareGeneration = sessionGeneration.prepareSessionGenerationFacts;
+      const prepareGeneration =
+        sessionGeneration.prepareSessionGenerationFacts.bind(sessionGeneration);
       vi.spyOn(sessionGeneration, "prepareSessionGenerationFacts").mockImplementation(
         async (input) => {
           const facts = await prepareGeneration(input);
@@ -275,7 +276,11 @@ it.for([
       );
     }
     const producer = metadataProducer(held, child, signal, replacement);
-    const acquire = SubagentLifecycleController.prototype.acquireTerminalCompletionLock;
+    const acquire = vi.spyOn(
+      SubagentLifecycleController.prototype,
+      "acquireTerminalCompletionLock",
+    );
+    acquire.mockRestore();
     vi.spyOn(
       SubagentLifecycleController.prototype,
       "acquireTerminalCompletionLock",
@@ -393,7 +398,7 @@ it("joins a pending session publication before a collector terminal commit", asy
   });
   const { state, release, dispose } = held;
   const producer = metadataProducer(held, child, signal);
-  const prepareSession = controlSession.prepareSubagentKillSession;
+  const prepareSession = controlSession.prepareSubagentKillSession.bind(controlSession);
   vi.spyOn(controlSession, "prepareSubagentKillSession").mockImplementation(async (...args) => {
     const session = await prepareSession(...args);
     if (!completionScope.getStore() || args[1] !== childKey || producer.outcome) {

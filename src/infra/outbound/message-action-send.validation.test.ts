@@ -35,6 +35,7 @@ function captureWorkspaceSend(messageId = "workspace-test-message") {
     ...workspaceTestPlugin,
     outbound: {
       ...workspaceTestPlugin.outbound,
+      deliveryMode: "direct",
       sendText: async (ctx: ChannelOutboundContext) => {
         sentText.push(ctx.text);
         return { channel: "workspace", messageId };

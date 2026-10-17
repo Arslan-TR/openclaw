@@ -40,7 +40,7 @@ export function button(scope: Page | Locator, name: string | RegExp, exact = fal
 export async function bounds(locator: Locator) {
   const box = await locator.boundingBox();
   if (!box) {
-    throw new Error("Expected visible bounds for " + locator);
+    throw new Error("Expected visible bounds for " + locator.toString());
   }
   return box;
 }

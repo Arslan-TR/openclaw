@@ -30,13 +30,15 @@ function cacheFixture() {
       gate.resolve(result);
       return done;
     };
-    onTestFinished(finish);
+    onTestFinished(async () => {
+      await finish();
+    });
     return { path: assignedPath, finish };
   }
   return {
     lease,
     hold,
-    async visit(entry = spec, groupJoined = true) {
+    visit: async (entry = spec, groupJoined = true) => {
       const held = hold({ groupJoined }, entry);
       await held.finish();
       return held.path;

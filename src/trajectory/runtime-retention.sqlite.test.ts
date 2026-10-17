@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import {
@@ -213,7 +214,10 @@ it.each(["sibling", "managed"])(
 it("reselects a trimmed older run before evicting newer budget-only history", async () => {
   const current = startCurrent();
   const history = await addHistory(["older", "older", "newer"]);
-  const { trigger, maxGlobalRuntimeBytes } = nextWindow(current, history[2]);
+  const { trigger, maxGlobalRuntimeBytes } = nextWindow(
+    current,
+    expectDefined(history[2], "newer history event"),
+  );
   withCompetingSelectionWrite(
     (competing) =>
       competing.exec(
@@ -232,7 +236,10 @@ it.each(["expired", "recent"] as const)(
     const history = await addHistory(["older", "newer"], (index) =>
       age === "expired" && index === 0 ? expiredAt : now - 1000 + index,
     );
-    const { trigger, maxGlobalRuntimeBytes } = nextWindow(current, history[1]);
+    const { trigger, maxGlobalRuntimeBytes } = nextWindow(
+      current,
+      expectDefined(history[1], "newer history event"),
+    );
     const arrival = createTrajectoryEvent({
       sessionId: "history",
       runId: "arrival",
