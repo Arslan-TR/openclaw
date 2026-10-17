@@ -311,7 +311,12 @@ export abstract class AppSidebarSessionNavigationElement extends AppSidebarBase 
 
   protected override willUpdate() {
     if (this.emptyGroups.reconcile() && this.sidebarMenus.sessionSortMenuPosition) {
-      this.sidebarMenus.closePositionedMenu("sessionSort");
+      // Menu state writes belong after the preparation memo commits.
+      void this.updateComplete.then((committed) => {
+        if (committed) {
+          this.sidebarMenus.closePositionedMenu("sessionSort");
+        }
+      });
     }
     super.willUpdate();
   }

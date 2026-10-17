@@ -104,6 +104,29 @@ describe("mounted sidebar menus", () => {
   setupSidebarTest();
   afterEach(clearNativeGatewayTestState);
 
+  it("closes the filter popup when the gateway viewer changes", async () => {
+    const gateway = createGatewayHarness(createTestGatewayClient(async () => ({})));
+    gateway.publish({ selfUser: { id: "profile-ada", name: "Ada" } });
+    const { sidebar } = await mountSidebar(
+      gateway.gateway,
+      createSessions("main", ["agent:main:main"]),
+    );
+    sidebar.connected = true;
+    await sidebar.updateComplete;
+    const trigger = () => sidebar.querySelector<HTMLButtonElement>(".sidebar-session-sort")!;
+    const popup = () => sidebar.querySelector(".sidebar-session-sort-menu");
+    trigger().click();
+    await waitForSolid(() => expect(popup()).not.toBeNull());
+
+    gateway.publish({ selfUser: { id: "profile-bob", name: "Bob" } });
+    await waitForSolid(() => {
+      expect(trigger()).not.toBeNull();
+      expect(popup()).toBeNull();
+    });
+    trigger().click();
+    await waitForSolid(() => expect(popup()).not.toBeNull());
+  });
+
   it("keeps the catalog popup and row state live after provider replacement", async () => {
     vi.useFakeTimers();
     const request = createGatewayRequestMock().mockResolvedValue(
