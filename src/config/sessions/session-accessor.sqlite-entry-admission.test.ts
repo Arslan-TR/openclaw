@@ -103,6 +103,10 @@ function own<T>(promise: Promise<T>): Promise<T> {
   return promise;
 }
 
+function cachedDatabase(databasePath: string) {
+  return getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: databasePath });
+}
+
 function stateRoot(label = "session-patch-admission-") {
   const root = roots.make(label);
   const env = { OPENCLAW_STATE_DIR: root };
@@ -137,7 +141,7 @@ async function memoryFixture() {
 }
 
 function evictHandle(databasePath: string) {
-  const database = getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: databasePath });
+  const database = cachedDatabase(databasePath);
   if (!database) {
     throw new Error("Fixture lost its cached handle before eviction");
   }
@@ -180,22 +184,17 @@ function holdWorkerValidation(databasePath: string) {
   worker.gate = gate;
   gate.arm();
   releases.push(gate.release);
-  return { entered: { promise: gate.entered }, release: { resolve: gate.release } };
+  return gate;
 }
 
-async function expectAdmission(
+function expectAdmission(
   gate: ReturnType<typeof holdWorkerValidation>,
   operation: Promise<unknown>,
 ) {
-  const entered = await Promise.race([
-    gate.entered.promise.then(() => true),
-    operation.then(
-      () => false,
-      () => false,
-    ),
-  ]);
-  expect(entered, "cold patch settled before a pending native admission could be observed").toBe(
-    true,
+  return awaitGateBeforeSettlement(
+    gate.entered,
+    operation,
+    "cold patch settled before a pending native admission could be observed",
   );
 }
 
@@ -206,10 +205,7 @@ it.each(["sessions.json", "custom.json"])(
     const storePath = path.join(root, "custom-store", filename);
     const entries = ["first", "second", "third"].map((name) => ({
       sessionKey: `agent:main:${name}`,
-      entry: {
-        sessionId: `session-${name}`,
-        updatedAt: Date.now(),
-      },
+      entry: { sessionId: `session-${name}`, updatedAt: Date.now() },
     }));
     await Promise.all(
       entries.map(({ sessionKey, entry }) =>
@@ -253,8 +249,9 @@ it.each([
           { skipMaintenance: true },
         ),
   );
-  await expect(operation).resolves.toMatchObject({ sessionId: "original", label: "updated" });
-  expect(loadSessionEntry(f.scope)).toMatchObject({ sessionId: "original", label: "updated" });
+  const expected = { sessionId: "original", label: "updated" };
+  await expect(operation).resolves.toMatchObject(expected);
+  expect(loadSessionEntry(f.scope)).toMatchObject(expected);
   expect(parentChecks()).toBe(0);
 });
 
@@ -263,19 +260,12 @@ it.each(["worker", "legacy callback", "incognito"] as const)(
   async (mode) => {
     const f = mode === "incognito" ? await memoryFixture() : fixture();
     const native = vi.spyOn(integrity, "assertSqliteIntegrityInWorker");
-    let called = false;
-    const operation = patch(
-      f.scope,
-      () => {
-        called = true;
-        return { label: mode };
-      },
-      {
-        assertCommitAllowed: mode === "legacy callback" ? () => {} : undefined,
-      },
-    );
+    const update = vi.fn(() => ({ label: mode }));
+    const operation = patch(f.scope, update, {
+      assertCommitAllowed: mode === "legacy callback" ? () => {} : undefined,
+    });
     await expect(operation).resolves.toMatchObject({ label: mode });
-    expect(called).toBe(true);
+    expect(update).toHaveBeenCalled();
     expect(native).not.toHaveBeenCalled();
     if (mode === "incognito") {
       expect(fs.readdirSync(f.root)).toEqual([]);
@@ -309,17 +299,13 @@ it("captures the queued ambient state owner before admission", async () => {
   const blocker = own(
     runExclusiveSqliteSessionWrite(
       resolveSqliteScope(original),
-      async () => {
-        await release.promise;
-      },
+      () => release.promise,
       "session.transcript.batch",
     ),
   );
   const scope = { agentId: "main", sessionKey: original.sessionKey };
   const operation = patch(scope, () => {
-    expect(
-      getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: f.databasePath }),
-    ).toBeUndefined();
+    expect(cachedDatabase(f.databasePath)).toBeUndefined();
     return { label: "original owner" };
   });
   vi.stubEnv("OPENCLAW_STATE_DIR", successor);
@@ -345,7 +331,7 @@ it("keeps the physical database owner for logical rows in a shared store", async
   evictHandle(storePath);
   await expect(
     patch(secondary, () => {
-      expect(getOpenClawAgentDatabaseIfOpen({ agentId: "main", path: storePath })).toBeUndefined();
+      expect(cachedDatabase(storePath)).toBeUndefined();
       return { label: "shared owner" };
     }),
   ).resolves.toMatchObject({ sessionId: "secondary", label: "shared owner" });
@@ -377,53 +363,48 @@ it("retains FIFO, caller context and publication across cold admission", async (
       order.push(`published:${mutation.current.sessionId}`);
     }
   });
-  try {
-    const first = contexts.run("first", () =>
-      patch(
-        f.scope,
-        async () => {
-          order.push(`update:${contexts.getStore()}`);
-          enteredUpdater.resolve();
-          if (holdUpdater) {
-            await updateRelease.promise;
-          }
-          return { sessionId: "first" };
-        },
-        { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
-      ),
-    );
-    await expectAdmission(gate, first);
-    holdUpdater = true;
-    const second = contexts.run("second", () =>
-      patch(
-        f.scope,
-        (entry) => {
-          order.push(`update:${contexts.getStore()}:${entry.sessionId}`);
-          return { sessionId: "second" };
-        },
-        { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
-      ),
-    );
-    expect(order).toEqual([]);
-    gate.release.resolve();
-    await enteredUpdater.promise;
-    expect(order).toEqual(["update:first"]);
-    updateRelease.resolve();
-    await Promise.all([first, second]);
-    expect(order).toEqual([
-      "update:first",
-      "commit:first",
-      "published:first",
-      "update:second:first",
-      "commit:second",
-      "published:second",
-    ]);
-    expect(loadSessionEntry(f.scope)?.sessionId).toBe("second");
-  } finally {
-    unsubscribe();
-    gate.release.resolve();
-    updateRelease.resolve();
-  }
+  releases.push(unsubscribe);
+  const first = contexts.run("first", () =>
+    patch(
+      f.scope,
+      async () => {
+        order.push(`update:${contexts.getStore()}`);
+        enteredUpdater.resolve();
+        if (holdUpdater) {
+          await updateRelease.promise;
+        }
+        return { sessionId: "first" };
+      },
+      { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
+    ),
+  );
+  await expectAdmission(gate, first);
+  holdUpdater = true;
+  const second = contexts.run("second", () =>
+    patch(
+      f.scope,
+      (entry) => {
+        order.push(`update:${contexts.getStore()}:${entry.sessionId}`);
+        return { sessionId: "second" };
+      },
+      { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
+    ),
+  );
+  expect(order).toEqual([]);
+  gate.release();
+  await enteredUpdater.promise;
+  expect(order).toEqual(["update:first"]);
+  updateRelease.resolve();
+  await Promise.all([first, second]);
+  expect(order).toEqual([
+    "update:first",
+    "commit:first",
+    "published:first",
+    "update:second:first",
+    "commit:second",
+    "published:second",
+  ]);
+  expect(loadSessionEntry(f.scope)?.sessionId).toBe("second");
 });
 
 it.each(["dispose", "physical replacement"] as const)(
@@ -435,27 +416,23 @@ it.each(["dispose", "physical replacement"] as const)(
     const update = vi.fn(() => ({ label: "must not commit" }));
     const committed = vi.fn();
     const operation = patch(f.scope, update, { onCommitted: committed });
-    try {
-      await expectAdmission(gate, operation);
-      expect(update).not.toHaveBeenCalled();
-      if (mode === "dispose") {
-        closeOpenClawAgentDatabaseByPath(f.databasePath);
-      } else {
-        const replacementPath = `${f.databasePath}.replacement`;
-        fs.copyFileSync(f.databasePath, replacementPath);
-        fs.renameSync(replacementPath, f.databasePath);
-      }
-      gate.release.resolve();
-      await expect(operation).rejects.toThrow(/closed|revoked|replaced|changed/);
-      expect(update).not.toHaveBeenCalled();
-      expect(committed).not.toHaveBeenCalled();
-      expect(loadSessionEntry(f.scope)).not.toHaveProperty("label");
-      await expect(patch(f.scope, () => ({ label: "successor" }))).resolves.toMatchObject({
-        label: "successor",
-      });
-    } finally {
-      gate.release.resolve();
+    await expectAdmission(gate, operation);
+    expect(update).not.toHaveBeenCalled();
+    if (mode === "dispose") {
+      closeOpenClawAgentDatabaseByPath(f.databasePath);
+    } else {
+      const replacementPath = `${f.databasePath}.replacement`;
+      fs.copyFileSync(f.databasePath, replacementPath);
+      fs.renameSync(replacementPath, f.databasePath);
     }
+    gate.release();
+    await expect(operation).rejects.toThrow(/closed|revoked|replaced|changed/);
+    expect(update).not.toHaveBeenCalled();
+    expect(committed).not.toHaveBeenCalled();
+    expect(loadSessionEntry(f.scope)).not.toHaveProperty("label");
+    await expect(patch(f.scope, () => ({ label: "successor" }))).resolves.toMatchObject({
+      label: "successor",
+    });
   },
 );
 
@@ -483,23 +460,17 @@ it.each(["cancel", "revoke"] as const)(
         onCommitted: committed,
       },
     );
-    try {
-      await expectAdmission(gate, operation);
-      allowed = false;
-      gate.release.resolve();
-      if (mode === "cancel") {
-        await expect(operation).resolves.toBeNull();
-      } else {
-        await expect(operation).rejects.toBe(revoked);
-      }
-      expect(committed).not.toHaveBeenCalled();
-      expect(loadSessionEntry(f.scope)?.sessionId).toBe("original");
-      expect(
-        getOpenClawAgentDatabaseIfOpen({ agentId: "main", env: f.env })?.db.isTransaction,
-      ).toBe(false);
-    } finally {
-      gate.release.resolve();
+    await expectAdmission(gate, operation);
+    allowed = false;
+    gate.release();
+    if (mode === "cancel") {
+      await expect(operation).resolves.toBeNull();
+    } else {
+      await expect(operation).rejects.toBe(revoked);
     }
+    expect(committed).not.toHaveBeenCalled();
+    expect(loadSessionEntry(f.scope)?.sessionId).toBe("original");
+    expect(cachedDatabase(f.databasePath)?.db.isTransaction).toBe(false);
   },
 );
 
@@ -541,17 +512,11 @@ it("pins the selected root for relative native reopen patch work", async () => {
     operation,
     "Patch settled before its root-selection updater",
   );
-  // Control: unchanged caller inputs now resolve elsewhere; the operation must use
-  // its private resolved root, not repeat ambient selection after its await.
+  // Unchanged caller inputs now resolve elsewhere; admission must retain its selected root.
   expect(resolveStateDir(env)).toBe(path.join(successor, "state"));
-  await expect(operation).resolves.toMatchObject({
-    sessionId: "original",
-    label: "retained selected root",
-  });
-  expect(loadSessionEntry(original)).toMatchObject({
-    sessionId: "original",
-    label: "retained selected root",
-  });
+  const expected = { sessionId: "original", label: "retained selected root" };
+  await expect(operation).resolves.toMatchObject(expected);
+  expect(loadSessionEntry(original)).toMatchObject(expected);
   expect(env.OPENCLAW_STATE_DIR).toBe("state");
   expect(fs.readdirSync(successor, { recursive: true })).toEqual([]);
 });

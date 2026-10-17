@@ -1,8 +1,8 @@
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
-import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import * as sqlite from "../../infra/node-sqlite.js";
@@ -12,7 +12,6 @@ import {
   closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
-  openOpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { loadSessionEntry, replaceSessionEntrySync } from "./session-accessor.js";
@@ -27,25 +26,30 @@ import { runSqliteSessionReclamation } from "./session-accessor.sqlite-reclamati
 import {
   createSessionMaintenanceStatisticsOperation,
   createSessionMaintenanceFinalizationOperation,
-  resolveSessionReclamationDatabaseOptions,
 } from "./session-accessor.sqlite-reclamation.js";
 import { applySessionEntryExactReplacements } from "./session-accessor.sqlite-replacement-projection.js";
-import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
+
+function waitForGate(gate: Promise<void>, operation: Promise<unknown>, signal: AbortSignal) {
+  return racePromiseWithAbortSignal(
+    awaitGateBeforeSettlement(gate, operation, "Maintenance settled before its expected boundary"),
+    signal,
+  );
+}
 
 export function registerSessionMaintenancePreparationTests() {
   it.each(["no-op", "preservation", "statistics", "empty-finalization"] as const)(
     "keeps resident rows warm after %s Worker maintenance",
     async (operation) => {
       await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-        const storePath = path.join(state.sessionsDir(), "sessions.json");
-        const active = { sessionKey: "agent:main:publication-active", storePath };
-        const stale = { sessionKey: "agent:main:publication-stale", storePath };
-        replaceSessionEntrySync(active, { sessionId: "active", updatedAt: Date.now() });
-        if (operation === "preservation") {
-          replaceSessionEntrySync(stale, { sessionId: "stale", updatedAt: 1 });
+        const { stale, database, plan: seededPlan } = maintenancePreparationFixture(state);
+        const maintenancePlan: Extract<SqliteSessionReclamationPlan, { kind: "maintenance-plan" }> =
+          seededPlan;
+        if (operation !== "preservation") {
+          replaceSessionEntrySync(stale, { sessionId: "stale", updatedAt: Date.now() });
         }
-        const databaseOptions = { agentId: "main", env: state.env };
-        const database = openOpenClawAgentDatabase(databaseOptions);
+        const { databaseOptions } = maintenancePlan;
+        maintenancePlan.input.preservation.providerKeys = [stale.sessionKey];
+        maintenancePlan.input.maintenance.pruneAfterMs = 60 * 60 * 1000;
         const originalFile = statSync(database.path, { bigint: true });
         const plan: SqliteSessionReclamationPlan =
           operation === "statistics"
@@ -57,26 +61,7 @@ export function registerSessionMaintenancePreparationTests() {
                   entries: [],
                   materializedPlans: [],
                 })
-              : {
-                  kind: "maintenance-plan",
-                  databaseOptions: resolveSessionReclamationDatabaseOptions(databaseOptions),
-                  materializedPlans: [],
-                  input: {
-                    activeSessionKey: active.sessionKey,
-                    archiveDirectory: state.sessionsDir(),
-                    maintenance: resolveMaintenanceConfigFromInput({
-                      mode: "enforce",
-                      maxEntries: 100,
-                      pruneAfter: "1h",
-                    }),
-                    preservation: {
-                      providerKeys: [stale.sessionKey],
-                      workIdentities: [],
-                      lifecycleIdentities: [],
-                    },
-                    storePath,
-                  },
-                };
+              : maintenancePlan;
         const published: unknown[] = [];
         const unsubscribe = sessionChanges.subscribe((change) => {
           const scope = "all" in change ? change.scope : change;
@@ -126,19 +111,12 @@ export function registerSessionMaintenancePreparationTests() {
         const diagnostics: SqliteSessionReclamationDiagnostics = {};
         const archiveEntered = createDeferredCore();
         const releaseArchive = createDeferredCore();
-        let archiveSettled = false;
+        const archiveSettled = vi.fn();
         const heldArchive = runExclusiveSqliteTranscriptArchiveWorker(async () => {
           archiveEntered.resolve();
           await releaseArchive.promise;
         });
-        void heldArchive.then(
-          () => {
-            archiveSettled = true;
-          },
-          () => {
-            archiveSettled = true;
-          },
-        );
+        void heldArchive.then(archiveSettled, archiveSettled);
         let pending: ReturnType<typeof runSqliteSessionReclamation> | undefined;
         let archive: PromiseSettledResult<Awaited<typeof heldArchive>>;
         try {
@@ -148,7 +126,7 @@ export function registerSessionMaintenancePreparationTests() {
             diagnostics,
           });
           const result = await racePromiseWithAbortSignal(pending, signal);
-          expect(archiveSettled).toBe(false);
+          expect(archiveSettled).not.toHaveBeenCalled();
           expect(result.kind).toBe(kind);
           expect(diagnostics.workerThreadId).toBeGreaterThan(0);
           expect(opened.mock.calls).toEqual([]);
@@ -221,15 +199,7 @@ export function registerSessionMaintenancePreparationTests() {
       let foreground: Promise<void> | undefined;
       let retry: ReturnType<typeof runSqliteSessionReclamation> | undefined;
       try {
-        await racePromiseWithAbortSignal(
-          Promise.race([
-            prepared.promise,
-            pending.then(() => {
-              throw new Error("Maintenance completed without its preparation boundary");
-            }),
-          ]),
-          signal,
-        );
+        await waitForGate(prepared.promise, pending, signal);
         foreground = applySessionEntryExactReplacements({
           storePath: database.path,
           sessionKeys: [stale.sessionKey],
@@ -315,7 +285,7 @@ export function registerSessionMaintenancePreparationTests() {
           },
         });
         let current = true;
-        let settled = false;
+        const settled = vi.fn();
         const published = vi.fn();
         const sql = observeHostDataSql();
         const first = runSqliteSessionReclamation({
@@ -327,44 +297,21 @@ export function registerSessionMaintenancePreparationTests() {
             }
           },
         });
+        void first.then(settled, settled);
         const firstOutcome = first.then(
-          (value) => {
-            settled = true;
-            return { kind: "returned" as const, value };
-          },
-          (error: unknown) => {
-            settled = true;
-            return { kind: "failed" as const, error };
-          },
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
         );
         let second: ReturnType<typeof runSqliteSessionReclamation> | undefined;
         let excess: ReturnType<typeof runSqliteSessionReclamation> | undefined;
-        const premature = firstOutcome.then(() => {
-          throw new Error("Cancelled maintenance settled before its retained cleanup");
-        });
-        void premature.catch(() => {});
         try {
-          await racePromiseWithAbortSignal(
-            Promise.race([firstPrepared.promise, premature]),
-            signal,
-          );
+          await waitForGate(firstPrepared.promise, firstOutcome, signal);
           current = failure !== "caller revocation";
           continueFirst.resolve();
-          await racePromiseWithAbortSignal(
-            Promise.race([releaseEntered.promise, premature]),
-            signal,
-          );
-          expect(settled).toBe(false);
+          await waitForGate(releaseEntered.promise, firstOutcome, signal);
+          expect(settled).not.toHaveBeenCalled();
           second = runSqliteSessionReclamation({ plan });
-          await racePromiseWithAbortSignal(
-            Promise.race([
-              secondPrepared.promise,
-              second.then(() => {
-                throw new Error("Sibling maintenance completed without preparation");
-              }),
-            ]),
-            signal,
-          );
+          await waitForGate(secondPrepared.promise, second, signal);
           expect(preparations).toHaveLength(2);
           expect(preparations[0]).not.toBe(preparations[1]);
           expect(released).toEqual([]);
@@ -378,7 +325,7 @@ export function registerSessionMaintenancePreparationTests() {
           const refusedId = expectDefined(released[0], "refused preparation discard");
           expect(preparations).not.toContain(refusedId);
           continueRelease.resolve();
-          expect(await firstOutcome).toEqual({ kind: "failed", error: cancelled });
+          expect(await firstOutcome).toEqual({ error: cancelled });
           expect(released).toEqual([refusedId, preparations[0]]);
           continueSecond.resolve();
           await expect(second).resolves.toMatchObject({
@@ -442,15 +389,7 @@ export function registerSessionMaintenancePreparationTests() {
         let originalMoved = false;
         let replacementInstalled = false;
         try {
-          await racePromiseWithAbortSignal(
-            Promise.race([
-              prepared.promise,
-              outcome.then(() => {
-                throw new Error("Maintenance completed before native preparation");
-              }),
-            ]),
-            signal,
-          );
+          await waitForGate(prepared.promise, outcome, signal);
           expect(nativeClosed).toBe(false);
           await fs.rename(database.path, heldPath);
           originalMoved = true;
@@ -513,7 +452,7 @@ export function registerSessionMaintenancePreparationTests() {
       const continueClose = createDeferredCore();
       const published = vi.fn();
       let committed = false;
-      let settled = false;
+      const settled = vi.fn();
       let closeNative: (() => Promise<void>) | undefined;
       const cleanupFailure = new Error("Preparation discard failed after committed maintenance");
       observeSessionMaintenancePlanningWorker({
@@ -540,23 +479,11 @@ export function registerSessionMaintenancePreparationTests() {
         plan,
         onWorkerResult: published,
       });
-      void pending
-        .finally(() => {
-          settled = true;
-        })
-        .catch(() => {});
+      void pending.then(settled, settled);
       try {
-        await racePromiseWithAbortSignal(
-          Promise.race([
-            nativeClosed.promise,
-            pending.then(() => {
-              throw new Error("Maintenance acknowledged before joining its native retirement");
-            }),
-          ]),
-          signal,
-        );
+        await waitForGate(nativeClosed.promise, pending, signal);
         expect(published).toHaveBeenCalledOnce();
-        expect(settled).toBe(false);
+        expect(settled).not.toHaveBeenCalled();
         continueClose.resolve();
         await expect(pending).resolves.toMatchObject({
           kind: "maintenance-plan",

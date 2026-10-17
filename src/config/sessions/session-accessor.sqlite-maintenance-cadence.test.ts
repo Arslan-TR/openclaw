@@ -66,27 +66,48 @@ function createStore(entryCount: number, updatedAt = Date.now()) {
   const database = openOpenClawAgentDatabase(options);
   runOpenClawAgentWriteTransaction((owner) => {
     for (let index = 0; index < entryCount; index += 1) {
-      writeSessionEntry(owner, key(index), { sessionId: `cadence-${index}`, updatedAt });
+      writeFixtureEntry(owner, index, { updatedAt });
     }
   }, options);
   return { database, options, storePath };
+}
+
+function writeFixtureEntry(
+  database: ReturnType<typeof openOpenClawAgentDatabase>,
+  index: number,
+  fields: Partial<SessionEntry> = {},
+) {
+  writeSessionEntry(database, key(index), {
+    sessionId: `cadence-${index}`,
+    updatedAt: Date.now(),
+    ...fields,
+  });
+}
+
+async function maintenanceInput(storePath: string) {
+  const preservation = await prepareSessionMaintenancePreservation(storePath);
+  onTestFinished(preservation.dispose);
+  return {
+    storePath,
+    archiveDirectory: path.join(path.dirname(storePath), "archives"),
+    maintenanceConfig: resolveMaintenanceConfigFromInput(),
+    preservation: preservation.capture,
+  };
 }
 
 async function createPlanningOperation(
   options: ReturnType<typeof createStore>["options"],
   input: Partial<SessionEntryMaintenanceInput> = {},
 ): Promise<Extract<SqliteSessionReclamationPlan, { kind: "maintenance-plan" }>> {
-  const preservation = await prepareSessionMaintenancePreservation(options.path);
-  onTestFinished(preservation.dispose);
+  const { maintenanceConfig: maintenance, ...defaults } = await maintenanceInput(options.path);
   return {
     kind: "maintenance-plan",
     databaseOptions: resolveSessionReclamationDatabaseOptions(options),
     materializedPlans: [],
     input: {
-      maintenance: resolveMaintenanceConfigFromInput(),
-      storePath: options.path,
-      archiveDirectory: path.join(path.dirname(options.path), "archives"),
-      preservation: preservation.capture(),
+      ...defaults,
+      maintenance,
+      preservation: defaults.preservation(),
       ...input,
     },
   };
@@ -96,7 +117,6 @@ function renameEntry(storePath: string, index: number, label: string) {
   return replaceEntryInDatabase(storePath, index, (entry) => ({ ...entry, label }));
 }
 
-// Observe the same SQL owner used by the worker, with its clock and connection in this isolate.
 async function replaceEntryInDatabase(
   storePath: string,
   index: number,
@@ -156,7 +176,6 @@ it.each(["participant", "owner"] as const)(
     const { database, storePath } = createStore(24);
     writeMetadata(storePath, kind, 0);
     const factReads = vi.spyOn(ageFacts, "recordSessionEntryMaintenanceAgeFact");
-    // One fact uses separate indexed probes; metadata writes must not repeat any of them.
     const queries = trackSqliteStatementExecutions(
       requireNativeSqliteDatabase(database.db),
       ["after", "dashboards", "pending", "unexpected"],
@@ -175,52 +194,42 @@ it.each(["participant", "owner"] as const)(
     );
     const expectedProbes = { after: 1, dashboards: 1, pending: 1, unexpected: 0 };
     const expectedRows = { after: 1, dashboards: 0, pending: 0, unexpected: 0 };
-    try {
-      await renameEntry(storePath, 0, "warm age facts");
-      expect(factReads).toHaveBeenCalledTimes(1);
-      expect(queries.counts).toEqual(expectedProbes);
-      expect(queries.rowCounts).toEqual(expectedRows);
-      for (let sequence = 1; sequence <= 3; sequence += 1) {
-        writeMetadata(storePath, kind, sequence);
-        await renameEntry(storePath, 0, `renamed-${sequence}`);
-      }
-      expect(readEntry(storePath)).toMatchObject({
-        label: "renamed-3",
-      });
-      if (kind === "participant") {
-        expect(listSessionParticipantsReadOnly({ agentId: "main", storePath }).get(key(0))).toEqual(
-          [
-            {
-              identity: { type: "agent", id: "worker" },
-              contributionCount: 4,
-              firstPromptedAt: 0,
-              lastPromptedAt: 3,
-            },
-          ],
-        );
-      } else {
-        expect(readEntry(storePath)?.owner).toEqual({
-          actor: { type: "agent", id: "worker-3" },
-          assignedBy: { type: "agent", id: "main" },
-          assignedAt: 3,
-        });
-      }
-      expect(factReads).toHaveBeenCalledTimes(1);
-      expect(queries.counts).toEqual(expectedProbes);
-      expect(queries.rowCounts).toEqual(expectedRows);
-    } finally {
-      queries.restore();
+    onTestFinished(queries.restore);
+    await renameEntry(storePath, 0, "warm age facts");
+    expect(factReads).toHaveBeenCalledTimes(1);
+    expect(queries.counts).toEqual(expectedProbes);
+    expect(queries.rowCounts).toEqual(expectedRows);
+    for (let sequence = 1; sequence <= 3; sequence += 1) {
+      writeMetadata(storePath, kind, sequence);
+      await renameEntry(storePath, 0, `renamed-${sequence}`);
     }
+    expect(readEntry(storePath)).toMatchObject({ label: "renamed-3" });
+    if (kind === "participant") {
+      expect(listSessionParticipantsReadOnly({ agentId: "main", storePath }).get(key(0))).toEqual([
+        {
+          identity: { type: "agent", id: "worker" },
+          contributionCount: 4,
+          firstPromptedAt: 0,
+          lastPromptedAt: 3,
+        },
+      ]);
+    } else {
+      expect(readEntry(storePath)?.owner).toEqual({
+        actor: { type: "agent", id: "worker-3" },
+        assignedBy: { type: "agent", id: "main" },
+        assignedAt: 3,
+      });
+    }
+    expect(factReads).toHaveBeenCalledTimes(1);
+    expect(queries.counts).toEqual(expectedProbes);
+    expect(queries.rowCounts).toEqual(expectedRows);
   },
 );
 
 it("reports a maintenance deadline without an unused revision snapshot", () => {
   const now = Date.now();
   const { database, options } = createStore(1, now);
-  const maintenance = agePolicy({
-    mode: "enforce",
-    pruneAfterMs: DAY_MS,
-  });
+  const maintenance = agePolicy({ mode: "enforce", pruneAfterMs: DAY_MS });
   runOpenClawAgentWriteTransaction(
     (current) => ageFacts.recordSessionEntryMaintenanceAgeFact(current, maintenance, now),
     options,
@@ -231,55 +240,42 @@ it("reports a maintenance deadline without an unused revision snapshot", () => {
     (sql) => (/^PRAGMA data_version\b/i.test(sql) ? "revision" : null),
   );
   let admittedReads = 0;
-  try {
-    const result = reclaimSessionMaintenanceInTransaction(
-      {
-        kind: "maintenance-age",
-        databaseOptions: resolveSessionReclamationDatabaseOptions(options),
-        materializedPlans: [],
-        maintenance,
-      },
-      {
-        beforeMutation() {
-          // The transaction's freshness probe remains; the deadline needs no second snapshot.
-          admittedReads = reads.counts.revision;
-        },
-      },
-    );
-    expect(result).toMatchObject({
+  onTestFinished(reads.restore);
+  const result = reclaimSessionMaintenanceInTransaction(
+    {
       kind: "maintenance-age",
-      nextAt: now + ageFacts.SESSION_ENTRY_MAINTENANCE_INTERVAL_MS,
-    });
-    expect(reads.counts.revision - admittedReads).toBe(0);
-  } finally {
-    reads.restore();
-  }
+      databaseOptions: resolveSessionReclamationDatabaseOptions(options),
+      materializedPlans: [],
+      maintenance,
+    },
+    {
+      beforeMutation() {
+        admittedReads = reads.counts.revision;
+      },
+    },
+  );
+  expect(result).toMatchObject({
+    kind: "maintenance-age",
+    nextAt: now + ageFacts.SESSION_ENTRY_MAINTENANCE_INTERVAL_MS,
+  });
+  expect(reads.counts.revision - admittedReads).toBe(0);
 });
 
 it.each([
-  { scenario: "a write crosses the cap", count: 2, maxEntries: 2, force: false },
-  {
-    scenario: "forced maintenance bypasses ordinary-write slack",
-    count: 51,
-    maxEntries: 50,
-    force: true,
-  },
-])("enforces the cap when $scenario", async ({ count, maxEntries, force }) => {
+  ["a write crosses the cap", 2, 2, false],
+  ["forced maintenance bypasses ordinary-write slack", 51, 50, true],
+] as const)("enforces the cap when %s", async (_scenario, count, maxEntries, force) => {
   const { options, storePath } = createStore(count);
-  const maintenanceConfig = { ...resolveMaintenanceConfigFromInput(), maxEntries };
-  const preservation = await prepareSessionMaintenancePreservation(storePath);
-  onTestFinished(preservation.dispose);
+  const input = await maintenanceInput(storePath);
+  input.maintenanceConfig.maxEntries = maxEntries;
   const maintain = (trigger = false) =>
     runOpenClawAgentWriteTransaction((database) => {
       if (trigger && !force) {
-        writeSessionEntry(database, key(2), { sessionId: "cadence-2", updatedAt: Date.now() });
+        writeFixtureEntry(database, 2);
       }
       return applySessionEntryMaintenance(database, {
-        preservation: preservation.capture,
-        archiveDirectory: path.join(path.dirname(storePath), "archives"),
-        maintenanceConfig,
+        ...input,
         forceMaintenance: trigger && force,
-        storePath,
       });
     }, options);
   expect(maintain().archived).toBe(0);
@@ -345,9 +341,7 @@ it.each(["foreign backdate", "managed backdate", "shorter age policy"] as const)
       }
       await renameEntry(storePath, 0, "reconsider after invalidation");
     }
-    expect(readEntry(storePath, 1)).toMatchObject({
-      archiveReason: "age-retention",
-    });
+    expect(readEntry(storePath, 1)).toMatchObject({ archiveReason: "age-retention" });
   },
 );
 
@@ -367,22 +361,14 @@ it("keeps an age boundary due when it passes between planning and recording the 
   await renameEntry(storePath, 0, "boundary passed during planning");
   expect(readEntry(storePath)?.archivedAt).toBeUndefined();
   await renameEntry(storePath, 0, "reconsider the elapsed boundary");
-  expect(readEntry(storePath)).toMatchObject({
-    archiveReason: "age-retention",
-  });
+  expect(readEntry(storePath)).toMatchObject({ archiveReason: "age-retention" });
 });
 
 it("does not retain an age fact from a rolled-back archive", async () => {
   const { options, storePath } = createStore(1, Date.now() - 31 * DAY_MS);
-  const preservation = await prepareSessionMaintenancePreservation(storePath);
-  onTestFinished(preservation.dispose);
+  const input = await maintenanceInput(storePath);
   const maintain = (database: ReturnType<typeof openOpenClawAgentDatabase>) =>
-    applySessionEntryMaintenance(database, {
-      preservation: preservation.capture,
-      archiveDirectory: path.join(path.dirname(storePath), "archives"),
-      maintenanceConfig: resolveMaintenanceConfigFromInput(),
-      storePath,
-    });
+    applySessionEntryMaintenance(database, input);
   expect(() =>
     runOpenClawAgentWriteTransaction((database) => {
       expect(maintain(database).archived).toBe(1);
@@ -392,9 +378,7 @@ it("does not retain an age fact from a rolled-back archive", async () => {
   ).toThrow("roll back archive");
   expect(readEntry(storePath)?.archivedAt).toBeUndefined();
   expect(runOpenClawAgentWriteTransaction(maintain, options).archived).toBe(1);
-  expect(readEntry(storePath)).toMatchObject({
-    archiveReason: "age-retention",
-  });
+  expect(readEntry(storePath)).toMatchObject({ archiveReason: "age-retention" });
 });
 
 it("reconsiders a session unarchived without changing its timestamp", async () => {
@@ -418,20 +402,19 @@ it("reconsiders a session unarchived without changing its timestamp", async () =
 });
 
 it.each([
-  "shared dashboards",
-  "pending dashboard alias",
-  "pending namespace prefixes",
-  "recent activity",
-  "expired recent activity",
-  "disabled ages",
-] as const)("keeps exact next maintenance deadlines for %s", (scenario) => {
+  ["shared dashboards", 6],
+  ["pending dashboard alias", 7],
+  ["pending namespace prefixes", 7],
+  ["recent activity", 4],
+  ["expired recent activity", 22],
+  ["disabled ages", Infinity],
+] as const)("keeps exact next maintenance deadlines for %s", (scenario, daysUntilDue) => {
   const { options } = createStore(0);
   const now = Date.now();
   const maintenance = agePolicy({ pruneAfterMs: 30 * DAY_MS });
   const result = runOpenClawAgentWriteTransaction((database) => {
     const write = (
       sessionKey: string,
-      sessionId: string,
       days: number,
       fields: Partial<SessionEntry> = {},
       alias = false,
@@ -439,24 +422,22 @@ it.each([
       writeSessionEntry(
         database,
         sessionKey,
-        { sessionId, updatedAt: now - days * DAY_MS, ...fields },
+        { sessionId: sessionKey.replaceAll(":", "-"), updatedAt: now - days * DAY_MS, ...fields },
         alias ? { allowStoredAliases: true, canonicalPreviousEntry: null } : undefined,
       );
-    write("agent:main:main", "protected-primary", 100);
+    write("agent:main:main", 100);
+    if (scenario.startsWith("pending") || scenario === "shared dashboards") {
+      maintenance.archiveDashboardAfterMs = 7 * DAY_MS;
+    }
     if (scenario === "shared dashboards") {
-      maintenance.archiveDashboardAfterMs = 7 * DAY_MS;
-      write("agent:main:dashboard:first", "first-dashboard", 8, { lastActivityAt: now });
-      write("agent:zeta:dashboard:second", "second-dashboard", 8, {
-        lastInteractionAt: now - DAY_MS,
-      });
+      write("agent:main:dashboard:first", 8, { lastActivityAt: now });
+      write("agent:zeta:dashboard:second", 8, { lastInteractionAt: now - DAY_MS });
     } else if (scenario === "pending dashboard alias") {
-      maintenance.archiveDashboardAfterMs = 7 * DAY_MS;
-      write("AGENT:MAIN:DASHBOARD:ALIAS", "pending-dashboard", 8, { lastActivityAt: now }, true);
+      write("AGENT:MAIN:DASHBOARD:ALIAS", 8, { lastActivityAt: now }, true);
     } else if (scenario === "pending namespace prefixes") {
-      maintenance.archiveDashboardAfterMs = 7 * DAY_MS;
-      write("agent:main:dashboard:certified", "certified-dashboard", 8, { lastActivityAt: now });
-      for (const [index, storedKey] of ["agent:", "agent:foo"].entries()) {
-        write(storedKey, `pending-prefix-${index}`, 0, {}, true);
+      write("agent:main:dashboard:certified", 8, { lastActivityAt: now });
+      for (const storedKey of ["agent:", "agent:foo"]) {
+        write(storedKey, 0, {}, true);
       }
     } else if (scenario === "recent activity") {
       maintenance.pruneAfterMs = 60 * DAY_MS;
@@ -468,12 +449,12 @@ it.each([
         "sessionStartedAt",
       ] as const;
       for (const [index, field] of fields.entries()) {
-        write(key(index), `activity-${index}`, 31, { [field]: now - index * DAY_MS });
+        write(key(index), 31, { [field]: now - index * DAY_MS });
       }
     } else {
       maintenance.preserveRecentMs = scenario === "expired recent activity" ? 7 * DAY_MS : null;
       maintenance.pruneAfterMs = scenario === "disabled ages" ? 0 : 30 * DAY_MS;
-      write(key(0), "ordinary", 8);
+      write(key(0), 8);
     }
     ageFacts.recordSessionEntryMaintenanceAgeFact(database, maintenance, now);
     return {
@@ -481,18 +462,11 @@ it.each([
       nextMaintenanceAt: ageFacts.readSessionEntryMaintenanceNextAgeAt(database, maintenance),
     };
   }, options);
-  const expected = {
-    "shared dashboards": now + 6 * DAY_MS + 1,
-    "pending dashboard alias": now + 7 * DAY_MS + 1,
-    "pending namespace prefixes": now + 7 * DAY_MS + 1,
-    "recent activity": now + 4 * DAY_MS + 1,
-    "expired recent activity": now + 22 * DAY_MS + 1,
-    "disabled ages": Infinity,
-  };
-  expect(result.nextAgeAt).toBe(expected[scenario]);
-  expect(result.nextMaintenanceAt).toBe(
-    Math.min(expected[scenario], now + ageFacts.SESSION_ENTRY_MAINTENANCE_INTERVAL_MS),
-  );
+  const expected = now + daysUntilDue * DAY_MS + 1;
+  expect(result).toEqual({
+    nextAgeAt: expected,
+    nextMaintenanceAt: Math.min(expected, now + ageFacts.SESSION_ENTRY_MAINTENANCE_INTERVAL_MS),
+  });
 });
 
 it.each([
@@ -515,11 +489,7 @@ it.each([
     );
     const childKey = key(1);
     if (!entryChanged) {
-      writeSessionEntry(database, childKey, {
-        sessionId: "cadence-1",
-        updatedAt: Date.now(),
-        ...(candidateChanged ? {} : { parentSessionKey: key(0) }),
-      });
+      writeFixtureEntry(database, 1, candidateChanged ? {} : { parentSessionKey: key(0) });
     }
     const operation = await createPlanningOperation(
       options,
@@ -535,20 +505,18 @@ it.each([
       if (entryChanged) {
         expect(database.db.isTransaction).toBe(false);
       }
-      // A write can finish after preparation and before maintenance enters its writer.
       if (writer) {
         writer
           .prepare(
             "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.label', 'newer') WHERE session_key = ?",
           )
           .run(key(0));
-        // The foreign writer certifies its valid postimage, like the ordinary entry owner.
+        // Certify the foreign postimage, as the ordinary entry owner does.
         writer
           .prepare("UPDATE session_nodes SET entry_valid = 1 WHERE session_key = ?")
           .run(key(0));
       } else if (mutation === "local entry") {
-        writeSessionEntry(database, key(0), {
-          sessionId: "cadence-0",
+        writeFixtureEntry(database, 0, {
           updatedAt: Date.now() - 31 * DAY_MS,
           label: "newer",
         });
@@ -560,11 +528,7 @@ it.each([
           ).ok,
         ).toBe(true);
       } else if (mutation === "protected parent") {
-        writeSessionEntry(database, childKey, {
-          sessionId: "cadence-1",
-          updatedAt: Date.now(),
-          parentSessionKey: key(0),
-        });
+        writeFixtureEntry(database, 1, { parentSessionKey: key(0) });
       } else {
         operation.input.activeSessionKeys = mutation === "active ancestor" ? [childKey] : [];
         operation.input.preservation = {

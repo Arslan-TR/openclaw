@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { redactIdentifier } from "@openclaw/normalization-core/node-crypto";
 import { withTempHome } from "openclaw/plugin-sdk/test-env";
-import { describe, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { AgentSelectionRequiredError } from "../../agents/agent-scope-config.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { resolveZstdCodec } from "../../infra/zstd-codec.js";
@@ -48,10 +48,15 @@ function fleetConfig(storePath: string, owner?: string): OpenClawConfig {
 function turnOptions(config: OpenClawConfig, content: string) {
   return {
     config,
-    messages: [{ message: { role: "user", content } }],
+    messages: [userMessage(content)],
     updateMode: "none" as const,
   };
 }
+
+const userMessage = (content: string, eventId?: string) => ({
+  eventId,
+  message: { role: "user", content },
+});
 
 function sessionScope(
   home: string,
@@ -70,349 +75,292 @@ function seedSession(
   return replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 1, ...fields });
 }
 
-describe("transcript turn logical ownership", () => {
-  it.each([
-    { phase: "selection", replay: false },
-    { phase: "selection", replay: true },
-    { phase: "transaction", replay: false },
-    { phase: "transaction", replay: true },
-  ])(
-    "rejects revoked write authority before commit ($phase, replay: $replay)",
-    async ({ phase, replay }) => {
-      await withTempHome(async (home) => {
-        const scope = sessionScope(home, "source-authority-session", "main", "agent:main:main");
-        await seedSession(scope, { lifecycleRevision: "source-generation" });
-        const append = {
-          eventId: "source-authority-message",
-          message: { role: "assistant", content: "Original completion" },
-        };
-        const options = {
-          config: { session: { store: scope.storePath } },
-          expectedSessionId: scope.sessionId,
-          expectedLifecycleRevision: "source-generation",
-          messages: [append],
-          updateMode: "none" as const,
-        };
-        if (replay) {
-          await persistSessionTranscriptTurn(scope, options);
-        }
-        const before = await loadTranscriptEvents(scope);
-        const entryBefore = loadSessionEntry(scope);
-        let current = true;
-        let committed = false;
-        const turn = withOwnedSessionTranscriptWrites(
-          {
-            sessionTarget: scope,
-            assertCommitAllowed: () => {
-              if (!current) {
-                throw new Error("original source authority revoked");
-              }
-            },
-            withTranscriptWrite: async (write) => await write(),
-          },
-          () =>
-            persistSessionTranscriptTurn(scope, {
-              ...options,
-              messages: [
-                {
-                  ...append,
-                  shouldAppend: async () => {
-                    // Row identity stays valid; the original live authority expires
-                    // across selection's await or inside the real transaction.
-                    if (phase === "selection") {
-                      current = false;
-                    }
-                    return true;
-                  },
-                  shouldAppendInTransaction: () => {
-                    if (phase === "transaction") {
-                      current = false;
-                    }
-                    return true;
-                  },
-                },
-              ],
-              onMessageCommitted: () => {
-                committed = true;
-              },
-            }),
-        );
-        await expect(turn).rejects.toThrow("original source authority revoked");
-        expect(committed).toBe(false);
-        expect(await loadTranscriptEvents(scope)).toEqual(before);
-        expect(loadSessionEntry(scope)).toEqual(entryBefore);
-      });
-    },
-  );
-
-  it("completes committed custody before a queued cancellation can interrupt the receipt", async () => {
+it.each([
+  { phase: "selection", replay: false },
+  { phase: "selection", replay: true },
+  { phase: "transaction", replay: false },
+  { phase: "transaction", replay: true },
+])(
+  "rejects revoked write authority before commit ($phase, replay: $replay)",
+  async ({ phase, replay }) => {
     await withTempHome(async (home) => {
-      const scope = sessionScope(home, "commit-callback-session", "main", "agent:main:main");
-      await seedSession(scope);
-      const controller = new AbortController();
-      const completed: string[] = [];
-      const turn = persistSessionTranscriptTurn(scope, {
+      const scope = sessionScope(home, "source-authority-session", "main", "agent:main:main");
+      await seedSession(scope, { lifecycleRevision: "source-generation" });
+      const append = {
+        eventId: "source-authority-message",
+        message: { role: "assistant", content: "Original completion" },
+      };
+      const options = {
         config: { session: { store: scope.storePath } },
         expectedSessionId: scope.sessionId,
-        messages: [
-          {
-            eventId: "committed-before-cancellation",
-            message: { role: "assistant", content: "Committed notification" },
-            shouldAppendInTransaction: () => {
-              // Cancellation runs at the first async boundary after SQLite commit.
-              queueMicrotask(() => controller.abort(new Error("cancelled after commit")));
-              return true;
-            },
-          },
-        ],
-        onMessageCommitted: ({ messageId }) => {
-          controller.signal.throwIfAborted();
-          completed.push(messageId);
-        },
-        updateMode: "none",
-      });
-      await expect(turn).resolves.toMatchObject({ appendedCount: 1 });
-      expect(controller.signal.aborted).toBe(true);
-      expect(completed).toEqual(["committed-before-cancellation"]);
-      expect(await loadTranscriptEvents(scope)).toContainEqual(
-        expect.objectContaining({ id: "committed-before-cancellation" }),
-      );
-    });
-  });
-
-  it("rejects a bare-key write without a designation despite retained provenance", async () => {
-    await withTempHome(async (home) => {
-      const storePath = path.join(home, "sessions.json");
-      const cfg = retainLegacyDefaultAgentId(fleetConfig(storePath), "ops");
-
-      await expect(
-        persistSessionTranscriptTurn(
-          sessionScope(home, "ownerless-transcript-session", undefined, "main"),
-          turnOptions(cfg, "must not be attributed"),
-        ),
-      ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
-    });
-  });
-
-  it("attributes a bare-key write to the recorded default owner", async () => {
-    await withTempHome(async (home) => {
-      const storePath = path.join(home, "sessions.json");
-      const cfg = retainLegacyDefaultAgentId(
+        expectedLifecycleRevision: "source-generation",
+        messages: [append],
+        updateMode: "none" as const,
+      };
+      if (replay) {
+        await persistSessionTranscriptTurn(scope, options);
+      }
+      const before = await loadTranscriptEvents(scope);
+      const entryBefore = loadSessionEntry(scope);
+      let current = true;
+      const committed = vi.fn();
+      const revokeAt = (boundary: string) => {
+        if (phase === boundary) {
+          current = false;
+        }
+        return true;
+      };
+      const turn = withOwnedSessionTranscriptWrites(
         {
-          ...fleetConfig(storePath),
-          agents: {
-            ...fleetConfig(storePath).agents,
-            defaults: { systemAgent: { agentId: "ops" } },
+          sessionTarget: scope,
+          assertCommitAllowed: () => {
+            if (!current) {
+              throw new Error("original source authority revoked");
+            }
+          },
+          withTranscriptWrite: async (write) => await write(),
+        },
+        () =>
+          persistSessionTranscriptTurn(scope, {
+            ...options,
+            messages: [
+              {
+                ...append,
+                // Keep the async selection boundary distinct from the transaction guard.
+                shouldAppend: async () => revokeAt("selection"),
+                shouldAppendInTransaction: () => revokeAt("transaction"),
+              },
+            ],
+            onMessageCommitted: committed,
+          }),
+      );
+      await expect(turn).rejects.toThrow("original source authority revoked");
+      expect(committed).not.toHaveBeenCalled();
+      expect(await loadTranscriptEvents(scope)).toEqual(before);
+      expect(loadSessionEntry(scope)).toEqual(entryBefore);
+    });
+  },
+);
+
+it("completes committed custody before a queued cancellation can interrupt the receipt", async () => {
+  await withTempHome(async (home) => {
+    const scope = sessionScope(home, "commit-callback-session", "main", "agent:main:main");
+    await seedSession(scope);
+    const controller = new AbortController();
+    const completed: string[] = [];
+    const turn = persistSessionTranscriptTurn(scope, {
+      config: { session: { store: scope.storePath } },
+      expectedSessionId: scope.sessionId,
+      messages: [
+        {
+          eventId: "committed-before-cancellation",
+          message: { role: "assistant", content: "Committed notification" },
+          shouldAppendInTransaction: () => {
+            // Cancellation runs at the first async boundary after SQLite commit.
+            queueMicrotask(() => controller.abort(new Error("cancelled after commit")));
+            return true;
           },
         },
-        "ops",
-      );
-      const scope = sessionScope(home, "retained-owner-transcript-session", undefined, "main");
-      await seedSession({ ...scope, agentId: "ops" });
-
-      await expect(
-        persistSessionTranscriptTurn(scope, turnOptions(cfg, "retained owner")),
-      ).resolves.toMatchObject({ appendedCount: 1 });
-      await expect(loadTranscriptEvents({ ...scope, agentId: "ops" })).resolves.toContainEqual(
-        expect.objectContaining({
-          message: expect.objectContaining({ content: "retained owner", role: "user" }),
-          type: "message",
-        }),
-      );
+      ],
+      onMessageCommitted: ({ messageId }) => {
+        controller.signal.throwIfAborted();
+        completed.push(messageId);
+      },
+      updateMode: "none",
     });
+    await expect(turn).resolves.toMatchObject({ appendedCount: 1 });
+    expect(controller.signal.aborted).toBe(true);
+    expect(completed).toEqual(["committed-before-cancellation"]);
+    expect(await loadTranscriptEvents(scope)).toContainEqual(
+      expect.objectContaining({ id: "committed-before-cancellation" }),
+    );
   });
+});
 
-  it("rejects a conflicting scope agent for a persisted fixed-store owner", async () => {
+it.each(["undesignated", "retired", "pathless injected"] as const)(
+  "rejects an ownerless %s transcript write",
+  async (kind) => {
     await withTempHome(async (home) => {
       const storePath = path.join(home, "sessions.json");
-      const cfg = fleetConfig(storePath, "ops");
-      const scope = sessionScope(home, "persisted-owner-transcript-session", "research");
-
-      await expect(
-        persistSessionTranscriptTurn(scope, turnOptions(cfg, "wrong owner")),
-      ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
-
-      await seedSession({ ...scope, agentId: "ops" });
-      await expect(
-        persistSessionTranscriptTurn({ ...scope, agentId: "ops" }, turnOptions(cfg, "right owner")),
-      ).resolves.toMatchObject({ appendedCount: 1 });
-    });
-  });
-
-  it("rejects a bare-key write for a retired persisted owner", async () => {
-    await withTempHome(async (home) => {
-      const storePath = path.join(home, "sessions.json");
-      const cfg = fleetConfig(storePath, "retired");
-
-      await expect(
-        persistSessionTranscriptTurn(
-          sessionScope(home, "retired-owner-transcript-session"),
-          turnOptions(cfg, "retired owner"),
-        ),
-      ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
-    });
-  });
-
-  it("allows an explicit agent write to a different per-agent store", async () => {
-    await withTempHome(async (home) => {
-      const fixedStorePath = path.join(home, "shared-sessions.json");
-      const cfg = fleetConfig(fixedStorePath, "ops");
+      const configured = fleetConfig(
+        storePath,
+        kind === "undesignated" ? undefined : kind === "retired" ? "retired" : "ops",
+      );
+      const cfg =
+        kind === "undesignated" ? retainLegacyDefaultAgentId(configured, "ops") : configured;
       const scope = sessionScope(
         home,
-        "research-global-session",
-        "research",
-        "global",
-        "research-sessions.json",
+        "ownerless",
+        undefined,
+        kind === "undesignated" ? "main" : "global",
       );
-      await seedSession(scope);
+      const target =
+        kind === "pathless injected"
+          ? {
+              sessionId: scope.sessionId,
+              sessionKey: "global",
+              sessionStore: { global: { sessionId: scope.sessionId, updatedAt: 1 } },
+            }
+          : scope;
+
+      await expect(
+        persistSessionTranscriptTurn(target, turnOptions(cfg, "must select")),
+      ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
+    });
+  },
+);
+
+it.each(["recorded default", "explicit per-agent store"] as const)(
+  "attributes a write to its %s",
+  async (kind) => {
+    await withTempHome(async (home) => {
+      const explicit = kind === "explicit per-agent store";
+      const agentId = explicit ? "research" : "ops";
+      const scope = sessionScope(
+        home,
+        "attributed",
+        explicit ? agentId : undefined,
+        explicit ? "global" : "main",
+        explicit ? "research-sessions.json" : "sessions.json",
+      );
+      const cfg = explicit
+        ? fleetConfig(path.join(home, "shared-sessions.json"), "ops")
+        : retainLegacyDefaultAgentId(
+            {
+              ...fleetConfig(scope.storePath),
+              agents: {
+                ...fleetConfig(scope.storePath).agents,
+                defaults: { systemAgent: { agentId: "ops" } },
+              },
+            },
+            "ops",
+          );
+      await seedSession({ ...scope, agentId });
 
       await expect(
         persistSessionTranscriptTurn(scope, {
-          ...turnOptions(cfg, "research store"),
-          expectedSessionId: scope.sessionId,
+          ...turnOptions(cfg, kind),
+          ...(explicit ? { expectedSessionId: scope.sessionId } : {}),
         }),
       ).resolves.toMatchObject({ appendedCount: 1 });
-      await expect(loadTranscriptEvents({ ...scope, agentId: "research" })).resolves.toContainEqual(
+      await expect(loadTranscriptEvents({ ...scope, agentId })).resolves.toContainEqual(
         expect.objectContaining({
-          message: expect.objectContaining({ content: "research store", role: "user" }),
+          message: expect.objectContaining({ content: kind, role: "user" }),
           type: "message",
         }),
       );
     });
+  },
+);
+
+it("rejects a conflicting scope agent for a persisted fixed-store owner", async () => {
+  await withTempHome(async (home) => {
+    const storePath = path.join(home, "sessions.json");
+    const cfg = fleetConfig(storePath, "ops");
+    const scope = sessionScope(home, "persisted-owner-transcript-session", "research");
+
+    await expect(
+      persistSessionTranscriptTurn(scope, turnOptions(cfg, "wrong owner")),
+    ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
+
+    await seedSession({ ...scope, agentId: "ops" });
+    await expect(
+      persistSessionTranscriptTurn({ ...scope, agentId: "ops" }, turnOptions(cfg, "right owner")),
+    ).resolves.toMatchObject({ appendedCount: 1 });
   });
+});
 
-  it("completes a pathless injected write before a later failure", async () => {
-    await withTempHome(async (home) => {
-      const configuredStorePath = path.join(home, "shared-sessions.json");
-      const sessionEntry = { sessionId: "injected-research", updatedAt: 1 };
-      const sessionStore = { global: sessionEntry };
-      const cfg = fleetConfig(configuredStorePath, "ops");
+it("completes a pathless injected write before a later failure", async () => {
+  await withTempHome(async (home) => {
+    const configuredStorePath = path.join(home, "shared-sessions.json");
+    const sessionEntry = { sessionId: "injected-research", updatedAt: 1 };
+    const sessionStore = { global: sessionEntry };
+    const scope = { agentId: "research", sessionId: sessionEntry.sessionId, sessionKey: "global" };
+    const cfg = fleetConfig(configuredStorePath, "ops");
 
-      const completed: string[] = [];
-      const accepted = createDeferredCore();
-      const release = createDeferredCore();
-      const settled: string[] = [];
-      const turn = persistSessionTranscriptTurn(
-        {
-          agentId: "research",
-          sessionId: sessionEntry.sessionId,
-          sessionKey: "global",
-          sessionStore,
-        },
-        {
-          config: cfg,
-          messages: [
-            {
-              eventId: "injected-first",
-              message: { role: "user", content: "injected research" },
+    const completed: string[] = [];
+    const accepted = createDeferredCore();
+    const release = createDeferredCore();
+    const settled: string[] = [];
+    const turn = persistSessionTranscriptTurn(
+      { ...scope, sessionStore },
+      {
+        config: cfg,
+        messages: [
+          userMessage("injected research", "injected-first"),
+          {
+            ...userMessage("cannot commit"),
+            prepareMessageAfterIdempotencyCheck: () => {
+              throw new Error("second append failed");
             },
-            {
-              message: { role: "user", content: "cannot commit" },
-              prepareMessageAfterIdempotencyCheck: () => {
-                throw new Error("second append failed");
-              },
-            },
-          ],
-          onMessageCommitted: ({ messageId }, acceptCompletion) => {
-            completed.push(messageId);
-            acceptCompletion(async () => {
-              accepted.resolve();
-              await release.promise;
-              settled.push(messageId);
-            });
           },
-          updateMode: "none",
+        ],
+        onMessageCommitted: ({ messageId }, acceptCompletion) => {
+          completed.push(messageId);
+          acceptCompletion(async () => {
+            accepted.resolve();
+            await release.promise;
+            settled.push(messageId);
+          });
         },
+        updateMode: "none",
+      },
+    );
+    const outcome = turn.catch((error: unknown) => error);
+    try {
+      expect(await Promise.race([accepted.promise.then(() => "accepted"), outcome])).toBe(
+        "accepted",
       );
-      const outcome = turn.then(
-        (value) => ({ value }),
-        (error: unknown) => ({ error }),
-      );
-      try {
-        expect(await Promise.race([accepted.promise.then(() => "accepted"), outcome])).toBe(
-          "accepted",
-        );
-        expect(completed).toEqual(["injected-first"]);
-        expect(settled).toEqual([]);
-        release.resolve();
-        await expect(turn).rejects.toThrow("second append failed");
-      } finally {
-        release.resolve();
-        await outcome;
-      }
       expect(completed).toEqual(["injected-first"]);
-      expect(settled).toEqual(["injected-first"]);
-      expect(
-        await loadTranscriptEvents({
-          agentId: "research",
-          sessionId: sessionEntry.sessionId,
-          sessionKey: "global",
-          storePath: configuredStorePath,
-        }),
-      ).toContainEqual(expect.objectContaining({ id: "injected-first" }));
-    });
+      expect(settled).toEqual([]);
+      release.resolve();
+      await expect(turn).rejects.toThrow("second append failed");
+    } finally {
+      release.resolve();
+      await outcome;
+    }
+    expect(completed).toEqual(["injected-first"]);
+    expect(settled).toEqual(["injected-first"]);
+    expect(await loadTranscriptEvents({ ...scope, storePath: configuredStorePath })).toContainEqual(
+      expect.objectContaining({ id: "injected-first" }),
+    );
   });
+});
 
-  it("keeps a pathless injected session store ownerless without an explicit agent", async () => {
+it.runIf(process.platform !== "win32")(
+  "treats a symlink alias as the configured owned fixed store",
+  async () => {
     await withTempHome(async (home) => {
-      const cfg = fleetConfig(path.join(home, "shared-sessions.json"), "ops");
+      const fixedStorePath = path.join(home, "shared-store.sqlite");
+      const aliasStorePath = path.join(home, "shared-store-alias.sqlite");
+      await fs.writeFile(fixedStorePath, "");
+      await fs.symlink(fixedStorePath, aliasStorePath);
+      const cfg = fleetConfig(fixedStorePath, "ops");
 
       await expect(
         persistSessionTranscriptTurn(
-          {
-            sessionId: "injected-ownerless",
-            sessionKey: "global",
-            sessionStore: { global: { sessionId: "injected-ownerless", updatedAt: 1 } },
-          },
-          turnOptions(cfg, "must select"),
+          sessionScope(
+            home,
+            "aliased-store-session",
+            "research",
+            "global",
+            "shared-store-alias.sqlite",
+          ),
+          turnOptions(cfg, "wrong owner"),
         ),
       ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
     });
-  });
+  },
+);
 
-  it.runIf(process.platform !== "win32")(
-    "treats a symlink alias as the configured owned fixed store",
-    async () => {
-      await withTempHome(async (home) => {
-        const fixedStorePath = path.join(home, "shared-store.sqlite");
-        const aliasStorePath = path.join(home, "shared-store-alias.sqlite");
-        await fs.writeFile(fixedStorePath, "");
-        await fs.symlink(fixedStorePath, aliasStorePath);
-        const cfg = fleetConfig(fixedStorePath, "ops");
-
-        await expect(
-          persistSessionTranscriptTurn(
-            sessionScope(
-              home,
-              "aliased-store-session",
-              "research",
-              "global",
-              "shared-store-alias.sqlite",
-            ),
-            turnOptions(cfg, "wrong owner"),
-          ),
-        ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
-      });
-    },
-  );
-
-  it.each([
-    {
-      name: "writer",
-      fence: {
-        expectedLifecycleRevision: "current-revision",
-        expectedWriterRunId: "superseded-run",
-      },
-    },
-    {
-      name: "lifecycle",
-      fence: {
-        expectedLifecycleRevision: "superseded-revision",
-        expectedWriterRunId: "current-run",
-      },
-    },
-  ])("fences matching transcript mutations with the admitted $name claim", async ({ fence }) => {
+it.each(["writer", "lifecycle"] as const)(
+  "fences transcript mutations with the admitted %s claim",
+  async (claim) => {
     await withTempHome(async (home) => {
+      const fence = {
+        expectedLifecycleRevision: claim === "writer" ? "current-revision" : "superseded-revision",
+        expectedWriterRunId: claim === "writer" ? "superseded-run" : "current-run",
+      };
       const sensitivePeer = "+15551234567";
       const scope = sessionScope(
         home,
@@ -449,16 +397,11 @@ describe("transcript turn logical ownership", () => {
             }
             throw new Error("expected the writer claim to reject transcript persistence");
           };
-          const replacementError = captureClaimError(() => replaceTranscriptEventsSync(scope, []));
-          const eventError = captureClaimError(() =>
-            appendTranscriptEventSync(scope, { type: "custom", id: "stale-event" }),
-          );
-          const messageError = captureClaimError(() =>
-            appendTranscriptMessageSync(scope, {
-              eventId: "stale-message",
-              message: { role: "user", content: "late" },
-            }),
-          );
+          const [replacementError, eventError, messageError] = [
+            () => replaceTranscriptEventsSync(scope, []),
+            () => appendTranscriptEventSync(scope, { type: "custom", id: "stale-event" }),
+            () => appendTranscriptMessageSync(scope, userMessage("late", "stale-message")),
+          ].map(captureClaimError);
           const expectedCause = {
             actualSessionIdHash: redactIdentifier(scope.sessionId),
             agentIdHash: redactIdentifier(scope.agentId),
@@ -472,10 +415,7 @@ describe("transcript turn logical ownership", () => {
           await expect(
             appendTranscriptMessage(
               { ...scope, ...fence },
-              {
-                eventId: "stale-async-message",
-                message: { role: "user", content: "late async append" },
-              },
+              userMessage("late async append", "stale-async-message"),
             ),
           ).rejects.toMatchObject({
             name: "SessionTranscriptWriterClaimReboundError",
@@ -494,9 +434,8 @@ describe("transcript turn logical ownership", () => {
       expect(loadSessionEntry(scope)?.updatedAt).toBe(1);
       await expect(loadTranscriptEvents(scope)).resolves.toEqual([]);
     });
-  });
-});
-
+  },
+);
 it.each(["authority", "idempotency"] as const)(
   "commits a %s-guarded turn without decoding unrelated tool results",
   async (guardKind) => {
