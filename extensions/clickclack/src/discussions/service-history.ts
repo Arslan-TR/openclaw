@@ -49,32 +49,39 @@ export async function readDiscussionHistory(params: {
     | undefined;
   let session: Awaited<ReturnType<typeof prepareDiscussionSessionEntry>> | undefined;
   try {
-    revocation = await prepareClickClackDiscussionChannelRevocation({ runtime, ...binding });
-    session = await prepareDiscussionSessionEntry(runtime, sessionKey);
-    // SAFETY: account resolution only reads the SDK's schema-validated configuration.
-    const config = runtime.config.current() as CoreConfig;
-    if (resolveDiscussionBindingAccount(config, binding).state !== "active") {
+    const channelRevocation = await prepareClickClackDiscussionChannelRevocation({
+      runtime,
+      ...binding,
+    });
+    revocation = channelRevocation;
+    const sessionEntry = await prepareDiscussionSessionEntry(runtime, sessionKey);
+    session = sessionEntry;
+    const canReadHistory = () => {
+      try {
+        sessionEntry.source();
+        const current = bindingFacts.read();
+        // SAFETY: account resolution only reads the SDK's schema-validated configuration.
+        const config = runtime.config.current() as CoreConfig;
+        return (
+          current !== undefined &&
+          current.externalRef === binding.externalRef &&
+          current.serverBaseUrl === binding.serverBaseUrl &&
+          current.channelId === binding.channelId &&
+          sessionEntry.entry?.sessionId === binding.sessionId &&
+          sessionEntry.entry.archivedAt === undefined &&
+          resolveDiscussionBindingAccount(config, binding).state === "active" &&
+          !channelRevocation.isRevoked(current)
+        );
+      } catch {
+        return false;
+      }
+    };
+    // The credentialed fetch and the later disclosure each require current authority.
+    if (!canReadHistory()) {
       return { text: "No discussion is bound to this session." };
     }
     const history = await client.latestChannelMessages(binding.channelId, limit);
-    try {
-      session.source();
-      const current = bindingFacts.read();
-      // SAFETY: account resolution only reads the SDK's schema-validated configuration.
-      const currentConfig = runtime.config.current() as CoreConfig;
-      if (
-        !current ||
-        current.externalRef !== binding.externalRef ||
-        current.serverBaseUrl !== binding.serverBaseUrl ||
-        current.channelId !== binding.channelId ||
-        session.entry?.sessionId !== binding.sessionId ||
-        session.entry.archivedAt !== undefined ||
-        resolveDiscussionBindingAccount(currentConfig, binding).state !== "active" ||
-        revocation.isRevoked(current)
-      ) {
-        return { text: "No discussion is bound to this session." };
-      }
-    } catch {
+    if (!canReadHistory()) {
       return { text: "No discussion is bound to this session." };
     }
     return {

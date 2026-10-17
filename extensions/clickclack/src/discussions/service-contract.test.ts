@@ -764,6 +764,22 @@ describe("ClickClack discussion service contracts", () => {
     );
   });
 
+  it("does not fetch history for a revoked discussion", async () => {
+    const harness = createHarness({ label: "Revoked history" });
+    const sessionKey = "agent:main:revoked-history";
+    await harness.service.open(sessionKey);
+    const binding = await getClickClackDiscussionBindingStore(harness.runtime).getAsync(sessionKey);
+    if (!binding) {
+      throw new Error("Expected the opened discussion binding");
+    }
+    await markClickClackDiscussionChannelRevoked(harness.runtime, sessionKey, binding);
+
+    expect(await harness.service.readLatestMessages(sessionKey, 30)).toEqual({
+      text: "No discussion is bound to this session.",
+    });
+    expect(harness.latestChannelMessages).not.toHaveBeenCalled();
+  });
+
   it.each(["session reset", "channel revocation"])(
     "withholds fetched history after %s while HTTP is in flight",
     async (change) => {
