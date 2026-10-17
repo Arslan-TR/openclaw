@@ -130,6 +130,7 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
         const result = await pending;
         expect(result.text).toBe("Completed as synthetic-allowed-account");
       } else {
+        await expect(pending).rejects.toBeInstanceOf(Error);
         await expect(pending).rejects.toThrow(
           scenario === "forbidden" ? /not configured/ : /authority revoked/,
         );
