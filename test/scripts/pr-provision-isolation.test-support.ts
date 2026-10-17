@@ -26,8 +26,7 @@ export function createProvisionIsolationFixture(directory: string, canonical: st
   const stateDatabase = join(repository, ".local", "pr-state", "state", "openclaw.sqlite");
   writeFileSync(launches, "");
   writeFileSync(observations, "");
-  // Explicit argv survives env replacement and other tests replacing NODE_OPTIONS.
-  // Never patch the wrapper, its trust anchor, or the sealed-runtime registry.
+  // Explicit argv survives env/NODE_OPTIONS replacement without patching the trust anchor.
   const nodeArgs = [binding.nodeOption, `--import=${pathToFileURL(preload).href}`];
   writeFileSync(
     join(bin, "node"),
@@ -67,6 +66,7 @@ const observerParams = new URL(import.meta.url).searchParams;
 const provisioner = workerThreads.isMainThread && entry?.endsWith('/scripts/pr-lib/worktree-provision.mts');
 const sourceRoot = provisioner
   ? path.resolve(path.dirname(fs.realpathSync(entry)), '../..') : observerParams.get('sourceRoot');
+const importSource = (relative) => import(pathToFileURL(path.join(sourceRoot, relative)).href);
 let phase = observerParams.get('phase') ?? 'preflight';
 function observe(kind, databasePath) {
   fs.appendFileSync(observations, JSON.stringify({kind, phase, pid: process.pid,
@@ -105,12 +105,7 @@ sqlite.DatabaseSync = new Proxy(sqlite.DatabaseSync, {
       ? fileURLToPath(new URL(supplied)) : supplied;
     if (location !== ':memory:') {
       if (location === binding.databasePath) binding.assertPath(location);
-      else {
-        try { assertPrivateState(location); } catch (error) {
-          console.error('[private-provision-store]', error.message);
-          throw error;
-        }
-      }
+      else assertPrivateState(location);
     }
     const database = Reflect.construct(target, args, newTarget);
     if (location !== ':memory:' && !seen.has(phase + location)) {
@@ -136,9 +131,9 @@ if (provisioner) workerThreads.Worker = new Proxy(workerThreads.Worker, {
 syncBuiltinESMExports();
 if (provisioner) {
   assert.equal(fs.realpathSync(process.argv[2]), repository);
-  await import(pathToFileURL(path.join(sourceRoot, 'scripts/tsx.mjs')).href);
-  const { resolveManagedUpdateLeaseDatabasePath, createManagedHandoffLeaseStore } = await import(
-    pathToFileURL(path.join(sourceRoot, 'src/infra/update-managed-service-handoff-lease.ts')).href);
+  await importSource('scripts/tsx.mjs');
+  const { resolveManagedUpdateLeaseDatabasePath, createManagedHandoffLeaseStore } =
+    await importSource('src/infra/update-managed-service-handoff-lease.ts');
   assert.equal(resolveManagedUpdateLeaseDatabasePath(), binding.databasePath, 'Missing private provisioner handoff binding');
   const store = createManagedHandoffLeaseStore();
   const installation = path.join(binding.directory, 'installation');
@@ -150,21 +145,18 @@ if (provisioner) {
     assert.equal(store.release(acquired.lease), true);
   }
   assert.equal(store.read(installation).kind, 'absent');
-  const { withConfigWriteLock } = await import(pathToFileURL(path.join(sourceRoot, 'src/config/write-lock.ts')).href);
+  const { withConfigWriteLock } = await importSource('src/config/write-lock.ts');
   const config = path.join(binding.directory, 'custody.json');
   await withConfigWriteLock(config, async () => fs.writeFileSync(config, '{}\\n'));
   assert.equal(fs.readFileSync(config, 'utf8'), '{}\\n');
   assert.equal(fs.existsSync(config + '.lock'), false);
   fs.unlinkSync(config);
   observe('store-and-config-custody-verified', binding.databasePath);
-}
-if (provisioner) {
   phase = 'workload';
   try {
     await import(pathToFileURL(entry).href);
   } finally {
-    const {closeOpenClawStateDatabaseAsync} = await import(
-      pathToFileURL(path.join(sourceRoot, 'src/state/openclaw-state-db.ts')).href);
+    const {closeOpenClawStateDatabaseAsync} = await importSource('src/state/openclaw-state-db.ts');
     await closeOpenClawStateDatabaseAsync();
   }
 }

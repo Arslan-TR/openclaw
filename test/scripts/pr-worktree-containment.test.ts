@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   chmodSync,
@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { createIndependentPrFixtureEnv } from "./pr-wrapper.test-support.js";
@@ -27,10 +28,8 @@ const reviewScript = join(repoRoot, "scripts/pr-lib/review.sh");
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 // Directly sourced helpers need the same Darwin heredoc protection as scripts/pr.
 const bash = process.platform === "darwin" ? "/bin/bash" : "bash";
-// These directly sourced containment/transition fixtures inject shell Git
-// failures, without the wrapper's operation-lock or dependency environment.
-// Keep real worktree/index behavior at the provisioning boundary; the complete
-// locked adapter path is covered by pr-worktree-provision.test.ts.
+const execFileAsync = promisify(execFile);
+// Inject Git failures below the locked adapter covered by pr-worktree-provision.test.ts.
 const provisionWorktreeFixture =
   'provision_pr_worktree() { pr_git -C "$1" worktree add -- "$1/.worktrees/pr-$2" "temp/pr-$2"; }';
 
@@ -52,90 +51,76 @@ function git(root: string, ...args: string[]) {
   return result.stdout.trim();
 }
 
-function createFixtureTemplate() {
-  const root = templateDirs.make("openclaw-pr-worktree-containment-template-");
+function initTemplate() {
+  const root = templateDirs.make("openclaw-pr-worktree-template-");
   git(root, "init", "--initial-branch=main");
   git(root, "config", "user.name", "OpenClaw Test");
   git(root, "config", "user.email", "test@openclaw.invalid");
-  writeFileSync(join(root, "fixture.txt"), "main\n");
-  git(root, "add", "fixture.txt");
-  git(root, "commit", "-m", "main fixture");
-  const mainSha = git(root, "rev-parse", "HEAD");
+  return root;
+}
+
+function commitFiles(root: string, message: string, files: Record<string, string>) {
+  for (const [path, contents] of Object.entries(files)) {
+    writeFileSync(join(root, path), contents);
+  }
+  git(root, "add", ".");
+  git(root, "commit", "-m", message);
+  return git(root, "rev-parse", "HEAD");
+}
+
+function createFixtureTemplate() {
+  const root = initTemplate();
+  const mainSha = commitFiles(root, "main fixture", { "fixture.txt": "main\n" });
   return { root, mainSha };
 }
 
-function createFixture(): Fixture {
-  const template = (fixtureTemplate ??= createFixtureTemplate());
+function cloneFixture<T extends { root: string; mainSha: string }>(template: T, review = false) {
   const root = tempDirs.make("openclaw-pr-worktree-containment-");
   // Copy complete history before worktrees exist; each case owns its fetch and refs.
   cpSync(template.root, root, { recursive: true, mode: fsConstants.COPYFILE_FICLONE });
-  const { mainSha } = template;
   git(root, "remote", "add", "origin", root);
   git(root, "fetch", "origin");
   git(root, "checkout", "-b", "sibling/work");
-  writeFileSync(join(root, "fixture.txt"), "sibling\n");
+  const path = review ? "sibling.txt" : "fixture.txt";
+  writeFileSync(join(root, path), "sibling\n");
+  git(root, "add", path);
   git(root, "commit", "-am", "sibling fixture");
   return {
+    ...template,
     root,
-    mainSha,
     siblingBranch: git(root, "branch", "--show-current"),
     siblingSha: git(root, "rev-parse", "HEAD"),
   };
 }
 
-function createReviewFixtureTemplate() {
-  const root = templateDirs.make("openclaw-pr-review-transition-template-");
-  git(root, "init", "--initial-branch=main");
-  git(root, "config", "user.name", "OpenClaw Test");
-  git(root, "config", "user.email", "test@openclaw.invalid");
-  writeFileSync(join(root, "transition-a.txt"), "base-a\n");
-  writeFileSync(join(root, "transition-b.txt"), "base-b\n");
-  writeFileSync(join(root, "overlap.txt"), "base-overlap\n");
-  git(root, "add", ".");
-  git(root, "commit", "-m", "base fixture");
-  const baseSha = git(root, "rev-parse", "HEAD");
+function createFixture(): Fixture {
+  return cloneFixture((fixtureTemplate ??= createFixtureTemplate()));
+}
 
+function createReviewFixtureTemplate() {
+  const root = initTemplate();
+  const baseSha = commitFiles(root, "base fixture", {
+    "transition-a.txt": "base-a\n",
+    "transition-b.txt": "base-b\n",
+    "overlap.txt": "base-overlap\n",
+  });
   git(root, "checkout", "-b", "review/pr", baseSha);
-  writeFileSync(join(root, "transition-a.txt"), "pr-a\n");
-  writeFileSync(join(root, "transition-b.txt"), "pr-b\n");
-  writeFileSync(join(root, "overlap.txt"), "pr-a-overlap\n");
-  writeFileSync(join(root, "pr-only.txt"), "removed on main\n");
-  git(root, "add", ".");
-  git(root, "commit", "-m", "PR head A");
-  const prASha = git(root, "rev-parse", "HEAD");
-  writeFileSync(join(root, "overlap.txt"), "pr-b-overlap\n");
-  git(root, "commit", "-am", "PR head B");
-  const prBSha = git(root, "rev-parse", "HEAD");
+  const prASha = commitFiles(root, "PR head A", {
+    "transition-a.txt": "pr-a\n",
+    "transition-b.txt": "pr-b\n",
+    "overlap.txt": "pr-a-overlap\n",
+    "pr-only.txt": "removed on main\n",
+  });
+  const prBSha = commitFiles(root, "PR head B", { "overlap.txt": "pr-b-overlap\n" });
   git(root, "update-ref", "refs/pull/42/head", prASha);
 
   git(root, "checkout", "main");
-  writeFileSync(join(root, "main-only.txt"), "main-only\n");
-  git(root, "add", "main-only.txt");
-  git(root, "commit", "-m", "advance main fixture");
-  const mainSha = git(root, "rev-parse", "HEAD");
+  const mainSha = commitFiles(root, "advance main fixture", { "main-only.txt": "main-only\n" });
   return { root, mainSha, prASha, prBSha };
 }
 
 function createReviewFixture(): ReviewFixture {
-  const template = (reviewFixtureTemplate ??= createReviewFixtureTemplate());
-  const root = tempDirs.make("openclaw-pr-review-transition-");
-  cpSync(template.root, root, { recursive: true, mode: fsConstants.COPYFILE_FICLONE });
-  const { mainSha, prASha, prBSha } = template;
-  git(root, "remote", "add", "origin", root);
-  git(root, "fetch", "origin");
-
-  git(root, "checkout", "-b", "sibling/work");
-  writeFileSync(join(root, "sibling.txt"), "sibling\n");
-  git(root, "add", "sibling.txt");
-  git(root, "commit", "-m", "sibling fixture");
-  return {
-    root,
-    mainSha,
-    prASha,
-    prBSha,
-    siblingBranch: git(root, "branch", "--show-current"),
-    siblingSha: git(root, "rev-parse", "HEAD"),
-  };
+  return cloneFixture((reviewFixtureTemplate ??= createReviewFixtureTemplate()), true);
 }
 
 function reviewCase() {
@@ -143,8 +128,49 @@ function reviewCase() {
   return { fixture, worktree: join(fixture.root, ".worktrees", "pr-42") };
 }
 
-function makeStaleWorktreeDir(fixture: Fixture) {
-  mkdirSync(join(fixture.root, ".worktrees", "pr-42"), { recursive: true });
+function expectSuccess(result: ReturnType<typeof runShell>) {
+  expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+}
+
+function transitionSetup(mode = "detached", branch = "''") {
+  return [
+    "review_init 42",
+    "review_checkout_pr 42",
+    "source_sha=$(git rev-parse HEAD)",
+    "target_sha=$(git rev-parse origin/main)",
+    `write_review_transition_journal 42 "$source_sha" "$target_sha" ${mode} ${branch}`,
+  ];
+}
+
+function expectRefused(fixture: Fixture, result: ReturnType<typeof runShell>, message: string) {
+  expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+  expect(result.stderr).toContain(message);
+  expectCanonicalCheckoutUnchanged(fixture);
+}
+
+function expectFile(root: string, path: string, content: string) {
+  expect(readFileSync(join(root, path), "utf8")).toBe(content);
+}
+
+function expectPreserved(
+  fixture: Fixture,
+  worktree: string,
+  command = "review_init 42",
+  message = "Refusing scripts/pr transition for PR #42",
+) {
+  const before = reviewState(worktree);
+  const result = runShell(fixture, [command]);
+  expectRefused(fixture, result, message);
+  expect(reviewState(worktree)).toEqual(before);
+  return result;
+}
+
+function addSiblingWorktrees(fixture: Fixture) {
+  const path = (pr: number) => join(fixture.root, `.worktrees/pr-${pr}`);
+  for (const pr of [42, 99]) {
+    git(fixture.root, "worktree", "add", "-b", `temp/pr-${pr}`, path(pr), fixture.mainSha);
+  }
+  return { worktree: path(42), sibling: path(99) };
 }
 
 function runShell(fixture: Fixture, commands: string[], env?: NodeJS.ProcessEnv) {
@@ -267,45 +293,24 @@ describePosix("scripts/pr worktree containment", () => {
           );
         }),
       ]);
-      const results = await Promise.all(
-        [42, 43].map(
-          (pr) =>
-            new Promise<{ code: number | null; output: string }>((resolve, reject) => {
-              const child = spawn(
-                bash,
-                [
-                  "-c",
-                  `set -euo pipefail\nsource "$1"\nsource "$2"\nsource "$3"\nscript_parent_dir="$4"\npr_gh_plain() { [ "$*" = writer-login ] || return 99; printf 'fixture-user\\n'; }\nmark_pr_operation_side_effects_started() { :; }\n${provisionWorktreeFixture}\nreview_checkout_main "$5"`,
-                  "pr-concurrency",
-                  commonScript,
-                  worktreeScript,
-                  reviewScript,
-                  fixture.root,
-                  String(pr),
-                ],
-                {
-                  cwd: fixture.root,
-                  env: createIndependentPrFixtureEnv(),
-                  stdio: ["ignore", "pipe", "pipe"],
-                },
-              );
-              let output = "";
-              child.stdout.on("data", (chunk) => {
-                output += chunk;
-              });
-              child.stderr.on("data", (chunk) => {
-                output += chunk;
-              });
-              child.once("error", reject);
-              child.once("close", (code) => {
-                resolve({ code, output });
-              });
-            }),
+      await Promise.all(
+        [42, 43].map((pr) =>
+          execFileAsync(
+            bash,
+            [
+              "-c",
+              `set -euo pipefail\nsource "$1"\nsource "$2"\nsource "$3"\nscript_parent_dir="$4"\npr_gh_plain() { [ "$*" = writer-login ] || return 99; printf 'fixture-user\\n'; }\nmark_pr_operation_side_effects_started() { :; }\n${provisionWorktreeFixture}\nreview_checkout_main "$5"`,
+              "pr-concurrency",
+              commonScript,
+              worktreeScript,
+              reviewScript,
+              fixture.root,
+              String(pr),
+            ],
+            { cwd: fixture.root, env: createIndependentPrFixtureEnv() },
+          ),
         ),
       );
-      for (const result of results) {
-        expect.soft(result.code, result.output).toBe(0);
-      }
       expect(writer.exitCode).toBeNull();
       expect(readFileSync(fetchHead, "utf8")).toBe(previousFetch);
       expect(git(fixture.root, "rev-parse", "refs/remotes/origin/main")).toBe(fixture.mainSha);
@@ -392,7 +397,7 @@ describePosix("scripts/pr worktree containment", () => {
 
   it("preserves an unregistered orphan instead of trashing it during provisioning", () => {
     const fixture = createFixture();
-    makeStaleWorktreeDir(fixture);
+    mkdirSync(join(fixture.root, ".worktrees/pr-42"), { recursive: true });
     const marker = join(fixture.root, ".worktrees", "pr-42", "foreign-note");
     writeFileSync(marker, "preserve me\n");
     const result = runShell(fixture, [
@@ -404,7 +409,7 @@ describePosix("scripts/pr worktree containment", () => {
     expect(commands).not.toMatch(/(?:worktree (?:prune|remove|add)|trash| fetch )/);
     expect(result.stderr).toContain("unregistered or ambiguous PR worktree");
     expectCanonicalCheckoutUnchanged(fixture);
-    expect(readFileSync(marker, "utf8")).toBe("preserve me\n");
+    expectFile(fixture.root, ".worktrees/pr-42/foreign-note", "preserve me\n");
   });
 
   it("refuses a symlink alias pointing at another PR's worktree", () => {
@@ -441,10 +446,8 @@ describePosix("scripts/pr worktree containment", () => {
     it.each(operation.success ? ["unreadable"] : ["missing", "unreadable"])(
       `${operation.name} preserves an unrelated worktree with a %s backlink`,
       (damage) => {
-        const { fixture, worktree } = reviewCase();
-        const sibling = join(fixture.root, ".worktrees", "pr-99");
-        git(fixture.root, "worktree", "add", "-b", "temp/pr-42", worktree, fixture.mainSha);
-        git(fixture.root, "worktree", "add", "-b", "temp/pr-99", sibling, fixture.mainSha);
+        const fixture = createReviewFixture();
+        const { worktree, sibling } = addSiblingWorktrees(fixture);
         const admin = git(sibling, "rev-parse", "--absolute-git-dir");
         const backlink = join(admin, "gitdir");
         writeFileSync(join(sibling, "marker"), "preserve sibling\n");
@@ -496,7 +499,7 @@ describePosix("scripts/pr worktree containment", () => {
         expect(existsSync(backlink) ? readFileSync(backlink) : null).toEqual(retainedBacklink);
         expect(git(sibling, "rev-parse", "HEAD")).toBe(fixture.mainSha);
         expect(git(sibling, "branch", "--show-current")).toBe("temp/pr-99");
-        expect(readFileSync(join(sibling, "marker"), "utf8")).toBe("preserve sibling\n");
+        expectFile(sibling, "marker", "preserve sibling\n");
         expectCanonicalCheckoutUnchanged(fixture);
       },
     );
@@ -506,10 +509,7 @@ describePosix("scripts/pr worktree containment", () => {
     "refuses warm entry with invalid target-local identity (%s)",
     (fault) => {
       const fixture = createFixture();
-      const worktree = join(fixture.root, ".worktrees", "pr-42");
-      const sibling = join(fixture.root, ".worktrees", "pr-99");
-      git(fixture.root, "worktree", "add", "-b", "temp/pr-42", worktree, fixture.mainSha);
-      git(fixture.root, "worktree", "add", "-b", "temp/pr-99", sibling, fixture.mainSha);
+      const { worktree, sibling } = addSiblingWorktrees(fixture);
       const admin = git(worktree, "rev-parse", "--absolute-git-dir");
       const siblingGitfile = readFileSync(join(sibling, ".git"));
       if (fault === "gitfile-symlink") {
@@ -539,8 +539,7 @@ describePosix("scripts/pr worktree containment", () => {
   );
 
   it("recovers an interrupted transition before repeated init, main, and PR checkout", () => {
-    const fixture = createReviewFixture();
-    const artifact = join(fixture.root, ".worktrees", "pr-42", ".local", "review-note");
+    const { fixture, worktree } = reviewCase();
 
     const result = runShell(fixture, [
       "review_init 42",
@@ -558,17 +557,11 @@ describePosix("scripts/pr worktree containment", () => {
       "review_checkout_pr 42",
     ]);
 
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(git(join(fixture.root, ".worktrees", "pr-42"), "rev-parse", "HEAD")).toBe(
-      fixture.prBSha,
-    );
-    expect(
-      git(join(fixture.root, ".worktrees", "pr-42"), "status", "--short", "--untracked-files=no"),
-    ).toBe("");
-    expect(readFileSync(artifact, "utf8")).toBe("preserve me\n");
-    expect(
-      existsSync(join(fixture.root, ".worktrees", "pr-42", ".local", "review-transition.json")),
-    ).toBe(false);
+    expectSuccess(result);
+    expect(git(worktree, "rev-parse", "HEAD")).toBe(fixture.prBSha);
+    expect(git(worktree, "status", "--short", "--untracked-files=no")).toBe("");
+    expectFile(worktree, ".local/review-note", "preserve me\n");
+    expect(existsSync(join(worktree, ".local/review-transition.json"))).toBe(false);
     expectCanonicalCheckoutUnchanged(fixture);
   });
 
@@ -594,232 +587,145 @@ describePosix("scripts/pr worktree containment", () => {
         'git diff --cached --quiet "$target_sha"',
       ],
     },
-  ])(`recovers completed deletions after $name (branch)`, ({ setup }) => {
+    {
+      name: "target index with source worktree entries",
+      setup: [
+        'git restore --source="$target_sha" --staged -- .',
+        'git diff --cached --quiet "$target_sha"',
+        "test -f pr-only.txt",
+        "test ! -e main-only.txt",
+      ],
+      sourceWorktree: true,
+    },
+  ])(`recovers $name (branch)`, ({ setup, sourceWorktree }) => {
     const { fixture, worktree } = reviewCase();
     const result = runShell(fixture, [
-      "review_init 42",
-      "review_checkout_pr 42",
+      ...transitionSetup("branch", "temp/pr-42"),
       'printf "preserve me\\n" > .local/review-note',
-      "source_sha=$(git rev-parse HEAD)",
-      "target_sha=$(git rev-parse origin/main)",
-      `write_review_transition_journal 42 "$source_sha" "$target_sha" branch temp/pr-42`,
       ...setup,
-      "test ! -e pr-only.txt",
+      ...(sourceWorktree ? [] : ["test ! -e pr-only.txt"]),
       'test "$(git rev-parse HEAD)" = "$source_sha"',
       "test -f .local/review-transition.json",
       "recover_review_transition 42",
     ]);
 
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expectSuccess(result);
     expect(git(worktree, "rev-parse", "HEAD")).toBe(fixture.mainSha);
     expect(git(worktree, "branch", "--show-current")).toBe("temp/pr-42");
     expect(git(worktree, "status", "--porcelain=v1", "--untracked-files=no")).toBe("");
     expect(existsSync(join(worktree, "pr-only.txt"))).toBe(false);
-    expect(readFileSync(join(worktree, ".local", "review-note"), "utf8")).toBe("preserve me\n");
-    expect(existsSync(join(worktree, ".local", "review-transition.json"))).toBe(false);
+    expect(existsSync(join(worktree, ".local/review-transition.json"))).toBe(false);
     expectCanonicalCheckoutUnchanged(fixture);
+    expectFile(worktree, ".local/review-note", "preserve me\n");
+    if (sourceWorktree) {
+      expectFile(worktree, "main-only.txt", "main-only\n");
+    }
   });
-
-  it(`recovers target index entries with source worktree entries (branch)`, () => {
-    const { fixture, worktree } = reviewCase();
-    const result = runShell(fixture, [
-      "review_init 42",
-      "review_checkout_pr 42",
-      "source_sha=$(git rev-parse HEAD)",
-      "target_sha=$(git rev-parse origin/main)",
-      `write_review_transition_journal 42 "$source_sha" "$target_sha" branch temp/pr-42`,
-      'git restore --source="$target_sha" --staged -- .',
-      'git diff --cached --quiet "$target_sha"',
-      "test -f pr-only.txt",
-      "test ! -e main-only.txt",
-      "recover_review_transition 42",
-    ]);
-
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(git(worktree, "rev-parse", "HEAD")).toBe(fixture.mainSha);
-    expect(git(worktree, "branch", "--show-current")).toBe("temp/pr-42");
-    expect(git(worktree, "status", "--porcelain=v1", "--untracked-files=no")).toBe("");
-    expect(existsSync(join(worktree, "pr-only.txt"))).toBe(false);
-    expect(readFileSync(join(worktree, "main-only.txt"), "utf8")).toBe("main-only\n");
-    expect(existsSync(join(worktree, ".local", "review-transition.json"))).toBe(false);
-    expectCanonicalCheckoutUnchanged(fixture);
-  });
-
-  for (const testCase of [
-    {
-      name: "staged",
-      setup: ['printf "foreign staged\\n" > overlap.txt', "git add overlap.txt"],
-      expectedStatus: "M  overlap.txt",
-      dirtyFile: "overlap.txt",
-      dirtyContent: "foreign staged\n",
-    },
-    {
-      name: "unstaged",
-      setup: ['printf "foreign unstaged\\n" > overlap.txt'],
-      expectedStatus: "M overlap.txt",
-      dirtyFile: "overlap.txt",
-      dirtyContent: "foreign unstaged\n",
-    },
-    {
-      name: "untracked",
-      setup: ['printf "foreign untracked\\n" > foreign.txt'],
-      expectedStatus: "?? foreign.txt",
-      dirtyFile: "foreign.txt",
-      dirtyContent: "foreign untracked\n",
-    },
-    {
-      name: "untracked target path with foreign bytes",
-      setup: ['printf "foreign addition\\n" > main-only.txt'],
-      expectedStatus: "?? main-only.txt",
-      dirtyFile: "main-only.txt",
-      dirtyContent: "foreign addition\n",
-    },
-    {
-      name: "BOM-prefixed untracked target lookalike",
-      setup: [
-        'printf "/.local/\\n" >> "$(git rev-parse --git-path info/exclude)"',
-        "printf 'foreign BOM\\n' > '\ufeffmain-only.txt'",
-      ],
-      expectedStatus: "main-only.txt",
-      dirtyFile: "\ufeffmain-only.txt",
-      dirtyContent: "foreign BOM\n",
-    },
-  ]) {
-    it(`refuses and preserves ${testCase.name} foreign state`, () => {
-      const { fixture, worktree } = reviewCase();
-      const result = runShell(fixture, [
-        "review_init 42",
-        "review_checkout_pr 42",
-        "source_sha=$(git rev-parse HEAD)",
-        "target_sha=$(git rev-parse origin/main)",
-        'jq -cn --arg source "$source_sha" --arg target "$target_sha" \'{version:1,pr:42,source:$source,target:$target,mode:"detached",branch:null}\' > .local/review-transition.json',
-        'git restore --source="$target_sha" --staged --worktree -- transition-a.txt',
-        ...testCase.setup,
-        "git status --porcelain=v1 > .local/expected-status",
-        "review_init 42",
-      ]);
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("Refusing scripts/pr transition for PR #42");
-      expect(git(worktree, "rev-parse", "HEAD")).toBe(fixture.prASha);
-      expect(git(worktree, "status", "--porcelain=v1")).toBe(
-        readFileSync(join(worktree, ".local", "expected-status"), "utf8").trim(),
-      );
-      expect(git(worktree, "status", "--short")).toContain(testCase.expectedStatus);
-      expect(readFileSync(join(worktree, testCase.dirtyFile), "utf8")).toBe(testCase.dirtyContent);
-      expect(existsSync(join(worktree, ".local", "review-transition.json"))).toBe(true);
-      expectCanonicalCheckoutUnchanged(fixture);
-    });
-  }
 
   it.each([
-    { name: "executable bit", setup: ["chmod +x overlap.txt"], symlink: false },
-    {
-      name: "symlink with a known blob but foreign mode",
-      setup: ["rm overlap.txt", "ln -s $'pr-a-overlap\\n' overlap.txt"],
-      symlink: true,
-    },
-    {
-      name: "assume-unchanged flag hiding foreign bytes",
-      setup: [
+    ["staged", "overlap.txt", "foreign staged", "M  overlap.txt"],
+    ["unstaged", "overlap.txt", "foreign unstaged", "M overlap.txt"],
+    ["untracked", "foreign.txt", "foreign untracked", "?? foreign.txt"],
+    [
+      "untracked target path with foreign bytes",
+      "main-only.txt",
+      "foreign addition",
+      "?? main-only.txt",
+    ],
+    [
+      "BOM-prefixed untracked target lookalike",
+      "\ufeffmain-only.txt",
+      "foreign BOM",
+      "main-only.txt",
+    ],
+  ])("refuses and preserves %s foreign state", (name, path, content, expectedStatus) => {
+    const { fixture, worktree } = reviewCase();
+    const result = runShell(fixture, [
+      ...transitionSetup(),
+      'git restore --source="$target_sha" --staged --worktree -- transition-a.txt',
+      ...(name.startsWith("BOM")
+        ? ['printf "/.local/\\n" >> "$(git rev-parse --git-path info/exclude)"']
+        : []),
+      `printf '${content}\\n' > '${path}'`,
+      ...(name === "staged" ? ["git add overlap.txt"] : []),
+      "git status --porcelain=v1 > .local/expected-status",
+      "review_init 42",
+    ]);
+
+    expectRefused(fixture, result, "Refusing scripts/pr transition for PR #42");
+    expect(git(worktree, "rev-parse", "HEAD")).toBe(fixture.prASha);
+    expect(git(worktree, "status", "--porcelain=v1")).toBe(
+      readFileSync(join(worktree, ".local", "expected-status"), "utf8").trim(),
+    );
+    expect(git(worktree, "status", "--short")).toContain(expectedStatus);
+    expect(readFileSync(join(worktree, path), "utf8")).toBe(`${content}\n`);
+    expect(existsSync(join(worktree, ".local", "review-transition.json"))).toBe(true);
+  });
+
+  it.each([
+    "executable bit",
+    "symlink",
+    "assume-unchanged",
+    "intent-to-add",
+    "resolve-undo",
+  ] as const)("refuses and preserves foreign %s metadata", (metadata) => {
+    const { fixture, worktree } = reviewCase();
+    if (metadata === "intent-to-add") {
+      git(fixture.root, "checkout", "main");
+      writeFileSync(join(fixture.root, "main-only.txt"), "");
+      git(fixture.root, "commit", "-am", "empty target fixture");
+      fixture.mainSha = git(fixture.root, "rev-parse", "HEAD");
+      git(fixture.root, "checkout", fixture.siblingBranch);
+    }
+    const setups: Record<typeof metadata, string[]> = {
+      "executable bit": ["chmod +x overlap.txt"],
+      symlink: ["rm overlap.txt", "ln -s $'pr-a-overlap\\n' overlap.txt"],
+      "assume-unchanged": [
         "git update-index --assume-unchanged overlap.txt",
         'printf "foreign hidden\\n" > overlap.txt',
       ],
-      symlink: false,
-    },
-  ])("refuses and preserves a foreign $name", ({ setup, symlink }) => {
-    const { fixture, worktree } = reviewCase();
-    const prepared = runShell(fixture, [
-      "review_init 42",
-      "review_checkout_pr 42",
-      `write_review_transition_journal 42 ${fixture.prASha} ${fixture.mainSha} detached ''`,
-      ...setup,
-    ]);
-    expect(prepared.status, prepared.stdout + prepared.stderr).toBe(0);
-    const before = reviewState(worktree);
+      "intent-to-add": [": > main-only.txt", "git add --intent-to-add main-only.txt"],
+      "resolve-undo": [
+        `base_blob=$(git rev-parse ${fixture.mainSha}:overlap.txt)`,
+        `ours_blob=$(git rev-parse ${fixture.prASha}:overlap.txt)`,
+        'printf "0 %040d\\toverlap.txt\\n100644 %s 1\\toverlap.txt\\n100644 %s 2\\toverlap.txt\\n100644 %s 3\\toverlap.txt\\n" 0 "$base_blob" "$ours_blob" "$base_blob" | git update-index --index-info',
+        "git add overlap.txt",
+        'test -n "$(git ls-files --resolve-undo)"',
+      ],
+    };
+    expectSuccess(runShell(fixture, [...transitionSetup(), ...setups[metadata]]));
     const pathname = join(worktree, "overlap.txt");
-    const bytes = symlink ? readlinkSync(pathname) : readFileSync(pathname, "utf8");
-    const result = runShell(fixture, ["review_init 42"]);
-
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("Refusing scripts/pr transition for PR #42");
-    expect(reviewState(worktree)).toEqual(before);
-    expect(symlink ? readlinkSync(pathname) : readFileSync(pathname, "utf8")).toBe(bytes);
-    expectCanonicalCheckoutUnchanged(fixture);
+    const readOverlap = () =>
+      metadata === "symlink" ? readlinkSync(pathname) : readFileSync(pathname, "utf8");
+    const bytes = readOverlap();
+    expectPreserved(fixture, worktree);
+    expect(readOverlap()).toBe(bytes);
   });
 
-  it.each(["intent-to-add", "resolve-undo"])(
-    "refuses and preserves hidden %s index metadata on endpoint entries",
-    (metadata) => {
-      const fixture = createReviewFixture();
-      if (metadata === "intent-to-add") {
-        git(fixture.root, "checkout", "main");
-        writeFileSync(join(fixture.root, "main-only.txt"), "");
-        git(fixture.root, "commit", "-am", "empty target fixture");
-        fixture.mainSha = git(fixture.root, "rev-parse", "HEAD");
-        git(fixture.root, "checkout", fixture.siblingBranch);
-      }
-      const worktree = join(fixture.root, ".worktrees", "pr-42");
-      const prepared = runShell(fixture, [
-        "review_init 42",
-        "review_checkout_pr 42",
-        `write_review_transition_journal 42 ${fixture.prASha} ${fixture.mainSha} detached ''`,
-        ...(metadata === "intent-to-add"
-          ? [": > main-only.txt", "git add --intent-to-add main-only.txt"]
-          : [
-              `base_blob=$(git rev-parse ${fixture.mainSha}:overlap.txt)`,
-              `ours_blob=$(git rev-parse ${fixture.prASha}:overlap.txt)`,
-              'printf "0 %040d\\toverlap.txt\\n100644 %s 1\\toverlap.txt\\n100644 %s 2\\toverlap.txt\\n100644 %s 3\\toverlap.txt\\n" 0 "$base_blob" "$ours_blob" "$base_blob" | git update-index --index-info',
-              "git add overlap.txt",
-              'test -n "$(git ls-files --resolve-undo)"',
-            ]),
-      ]);
-      expect(prepared.status, prepared.stdout + prepared.stderr).toBe(0);
-      const before = reviewState(worktree);
-      const result = runShell(fixture, ["review_init 42"]);
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("Refusing scripts/pr transition for PR #42");
-      expect(reviewState(worktree)).toEqual(before);
-      expectCanonicalCheckoutUnchanged(fixture);
+  it.each([
+    { name: "file" },
+    { name: "file during recovery", recovery: true },
+    { name: "dangling symlink", symlink: true },
+    { name: "file ancestor", ancestor: true },
+    { name: "dangling symlink ancestor", symlink: true, ancestor: true },
+    { name: "directory symlink ancestor", symlink: true, ancestor: true, directoryTarget: true },
+    {
+      name: "directory containing ignored data",
+      path: "main-only.txt/private.ignored",
+      directory: true,
     },
-  );
-
-  for (const recovery of [false, true]) {
-    it.each(
-      [
-        { name: "file" },
-        { name: "dangling symlink", symlink: true },
-        { name: "file ancestor", ancestor: true },
-        { name: "dangling symlink ancestor", symlink: true, ancestor: true },
-        {
-          name: "directory symlink ancestor",
-          symlink: true,
-          ancestor: true,
-          directoryTarget: true,
-        },
-        {
-          name: "directory containing ignored data",
-          path: "main-only.txt/private.ignored",
-          directory: true,
-        },
-      ]
-        .map((collision) =>
-          Object.assign(
-            {
-              path: "main-only.txt",
-              directory: false,
-              symlink: false,
-              ancestor: false,
-              directoryTarget: false,
-            },
-            collision,
-          ),
-        )
-        .filter((collision) => !recovery || collision.name === "file"),
-    )(`preserves an ignored $name before mutation (recovery=${recovery})`, (collision) => {
+  ])(
+    "preserves an ignored $name before mutation",
+    ({
+      recovery = false,
+      path = "main-only.txt",
+      directory = false,
+      symlink = false,
+      ancestor = false,
+      directoryTarget = false,
+    }) => {
       const fixture = createReviewFixture();
-      if (collision.ancestor) {
+      if (ancestor) {
         git(fixture.root, "checkout", "main");
         rmSync(join(fixture.root, "main-only.txt"));
         mkdirSync(join(fixture.root, "main-only.txt", "nested"), { recursive: true });
@@ -829,7 +735,7 @@ describePosix("scripts/pr worktree containment", () => {
         fixture.mainSha = git(fixture.root, "rev-parse", "HEAD");
         git(fixture.root, "checkout", fixture.siblingBranch);
       }
-      const linkTarget = collision.directoryTarget ? ".local/link-target" : "missing";
+      const linkTarget = directoryTarget ? ".local/link-target" : "missing";
       const worktree = join(fixture.root, ".worktrees", "pr-42");
       const setup = runShell(fixture, [
         "review_init 42",
@@ -840,31 +746,26 @@ describePosix("scripts/pr worktree containment", () => {
               `git restore --source=${fixture.mainSha} --staged --worktree -- transition-a.txt`,
             ]
           : []),
-        `printf '%s\\n' '${collision.path}' >> "$(git rev-parse --git-path info/exclude)"`,
-        ...(collision.directory ? ["mkdir main-only.txt"] : []),
+        `printf '%s\\n' '${path}' >> "$(git rev-parse --git-path info/exclude)"`,
+        ...(directory ? ["mkdir main-only.txt"] : []),
         "mkdir -p .local/link-target",
         "printf 'unrelated target data\\n' > .local/link-target/private",
-        collision.symlink
-          ? `ln -s '${linkTarget}' '${collision.path}'`
-          : `printf 'foreign ignored\\n' > '${collision.path}'`,
+        symlink ? `ln -s '${linkTarget}' '${path}'` : `printf 'foreign ignored\\n' > '${path}'`,
       ]);
-      expect(setup.status, `${setup.stdout}\n${setup.stderr}`).toBe(0);
-      const before = reviewState(worktree);
-      const result = runShell(fixture, [recovery ? "review_init 42" : "review_checkout_main 42"]);
-
-      expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
-      expect(result.stderr).toContain(`ignored file '${collision.path}' would be overwritten`);
-      expect(reviewState(worktree)).toEqual(before);
-      const preserved = join(worktree, collision.path);
-      expect(collision.symlink ? readlinkSync(preserved) : readFileSync(preserved, "utf8")).toBe(
-        collision.symlink ? linkTarget : "foreign ignored\n",
+      expectSuccess(setup);
+      expectPreserved(
+        fixture,
+        worktree,
+        recovery ? "review_init 42" : "review_checkout_main 42",
+        `ignored file '${path}' would be overwritten`,
       );
-      expect(readFileSync(join(worktree, ".local/link-target/private"), "utf8")).toBe(
-        "unrelated target data\n",
+      const preserved = join(worktree, path);
+      expect(symlink ? readlinkSync(preserved) : readFileSync(preserved, "utf8")).toBe(
+        symlink ? linkTarget : "foreign ignored\n",
       );
-      expectCanonicalCheckoutUnchanged(fixture);
-    });
-  }
+      expectFile(worktree, ".local/link-target/private", "unrelated target data\n");
+    },
+  );
 
   it("refuses the reserved transition path .local/review-mode.env", () => {
     const path = ".local/review-mode.env";
@@ -885,7 +786,7 @@ describePosix("scripts/pr worktree containment", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("reserved .local artifact namespace");
     expect(reviewState(worktree)).toEqual(before);
-    expect(readFileSync(join(worktree, ".local", "review-mode.env"), "utf8")).toBe(artifact);
+    expectFile(worktree, ".local/review-mode.env", artifact);
     expectCanonicalCheckoutUnchanged(fixture);
   });
 
@@ -950,9 +851,7 @@ describePosix("scripts/pr worktree containment", () => {
     const queries = commands.filter((command) => command === "ignored-query").length;
     expect(queries).toBeGreaterThan(1);
     expect(queries).toBeLessThan(16);
-    expect(readFileSync(join(worktree, literalPath), "utf8")).toBe(
-      collision ? "foreign ignored\n" : "literal path\n",
-    );
+    expectFile(worktree, literalPath, collision ? "foreign ignored\n" : "literal path\n");
     expect(readFileSync(lookalike, "utf8")).toBe("unrelated ignored data\n");
     if (collision) {
       expect(result.stderr).toContain(`ignored file '${literalPath}' would be overwritten`);

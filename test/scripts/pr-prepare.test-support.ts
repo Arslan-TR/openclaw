@@ -41,6 +41,22 @@ export function runGatesBash(
     gatesOnly?: boolean;
   } = {},
 ) {
+  const sources = ["common", "gates"];
+  if (!options.gatesOnly) {
+    sources.push("review");
+  }
+  if (options.sourcePush) {
+    sources.push("worktree", "push");
+  }
+  if (options.sourcePrepareCore) {
+    sources.push("prepare-core");
+  }
+  const setup = options.gatesOnly
+    ? []
+    : ["mark_pr_operation_side_effects_started() { :; }", "require_prepared_review() { :; }"];
+  if (!options.sourcePrepareCore && !options.gatesOnly) {
+    setup.push("refresh_prep_branch_for_reviewed_head() { :; }");
+  }
   return spawnSync(
     process.platform === "darwin" ? "/bin/bash" : "bash",
     [
@@ -48,34 +64,12 @@ export function runGatesBash(
       [
         "set -euo pipefail",
         `script_parent_dir='${repoRoot}/scripts'`,
-        `source '${repoRoot}/scripts/pr-lib/common.sh'`,
-        `source '${repoRoot}/scripts/pr-lib/gates.sh'`,
-        ...(options.gatesOnly
-          ? []
-          : [
-              `source '${repoRoot}/scripts/pr-lib/review.sh'`,
-              "mark_pr_operation_side_effects_started() { :; }",
-              "require_prepared_review() { :; }",
-            ]),
-        ...(options.sourcePush
-          ? [
-              `source '${repoRoot}/scripts/pr-lib/worktree.sh'`,
-              `source '${repoRoot}/scripts/pr-lib/push.sh'`,
-            ]
-          : []),
-        ...(options.sourcePrepareCore
-          ? [`source '${repoRoot}/scripts/pr-lib/prepare-core.sh'`]
-          : options.gatesOnly
-            ? []
-            : ["refresh_prep_branch_for_reviewed_head() { :; }"]),
+        ...sources.map((name) => `source '${repoRoot}/scripts/pr-lib/${name}.sh'`),
+        ...setup,
         script,
       ].join("\n"),
     ],
-    {
-      cwd: options.cwd ?? repoRoot,
-      encoding: "utf8",
-      env: sanitizedEnv(options.env),
-    },
+    { cwd: options.cwd ?? repoRoot, encoding: "utf8", env: sanitizedEnv(options.env) },
   );
 }
 
