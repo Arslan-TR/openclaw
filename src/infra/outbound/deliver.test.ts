@@ -440,6 +440,29 @@ function deliverMatrix(params: MatrixDeliveryArgs) {
   });
 }
 
+function enableHooks(...names: string[]) {
+  hookMocks.runner.hasHooks.mockImplementation(
+    (name) => name !== undefined && names.includes(name),
+  );
+}
+
+function finalReplyHook(
+  conversationId = "!room:example",
+): DeliverOutboundArgs["replyPayloadSendingHook"] {
+  return { kind: "final", channel: "matrix", context: { channelId: "matrix", conversationId } };
+}
+
+function conversationCompletion(
+  operationId: string,
+  routeFingerprint: string,
+): DeliverOutboundArgs["deliveryCompletion"] {
+  return { kind: "conversation", agentId: "main", operationId, routeFingerprint };
+}
+
+function expectPartialCall(mock: unknown, ...args: Record<string, unknown>[]) {
+  expect(mock).toHaveBeenCalledWith(...args.map((arg) => expect.objectContaining(arg)));
+}
+
 function flushDiagnosticEvents() {
   return new Promise<void>((resolve) => {
     setImmediate(resolve);
@@ -555,66 +578,45 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it.each([
-    {
-      name: "missing reconciler",
-      reconciler: false,
-      kinds: undefined,
-      media: false,
-      batch: false,
-      ok: false,
-    },
-    {
-      name: "heterogeneous batch missing text",
-      reconciler: true,
-      kinds: { media: true, batch: true },
-      media: true,
-      batch: true,
-      ok: false,
-    },
-  ])(
-    "validates required unknown-send recovery: $name",
-    async ({ reconciler, kinds, media, batch, ok }) => {
-      installMatrixTextMessageAdapter({
-        messageId: "message",
-        durableFinal: {
-          capabilities: {
-            text: true,
-            ...(reconciler ? { media: true } : {}),
-            ...(batch ? { batch: true } : {}),
-            reconcileUnknownSend: true,
-          },
-          ...(reconciler
-            ? { reconcileUnknownSend: async () => ({ status: "not_sent" as const }) }
-            : {}),
-          reconcileUnknownSendKinds: kinds,
+    { name: "missing reconciler", batch: false },
+    { name: "heterogeneous batch missing text", batch: true },
+  ])("validates required unknown-send recovery: $name", async ({ batch }) => {
+    installMatrixTextMessageAdapter({
+      messageId: "message",
+      durableFinal: {
+        capabilities: {
+          text: true,
+          ...(batch ? { media: true, batch: true } : {}),
+          reconcileUnknownSend: true,
         },
-        ...(!batch
-          ? {
-              outbound: {
-                deliveryMode: "direct" as const,
-                sendText: async () => ({ channel: "matrix", messageId: "outbound" }),
-              },
-            }
-          : {}),
-      });
-      await expect(
-        resolveOutboundDurableFinalDeliverySupport({
-          cfg: {},
-          channel: "matrix",
-          requirements: {
-            text: true,
-            ...(media ? { media: true } : {}),
-            ...(batch ? { batch: true } : {}),
-            reconcileUnknownSend: true,
-          },
-        }),
-      ).resolves.toEqual(
-        ok
-          ? { ok: true, automaticUnknownSendReconciliation: false }
-          : { ok: false, reason: "capability_mismatch", capability: "reconcileUnknownSend" },
-      );
-    },
-  );
+        ...(batch ? { reconcileUnknownSend: async () => ({ status: "not_sent" as const }) } : {}),
+        reconcileUnknownSendKinds: batch ? { media: true, batch: true } : undefined,
+      },
+      ...(!batch
+        ? {
+            outbound: {
+              deliveryMode: "direct" as const,
+              sendText: async () => ({ channel: "matrix", messageId: "outbound" }),
+            },
+          }
+        : {}),
+    });
+    await expect(
+      resolveOutboundDurableFinalDeliverySupport({
+        cfg: {},
+        channel: "matrix",
+        requirements: {
+          text: true,
+          ...(batch ? { media: true, batch: true } : {}),
+          reconcileUnknownSend: true,
+        },
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      reason: "capability_mismatch",
+      capability: "reconcileUnknownSend",
+    });
+  });
 
   it("runs message adapter send lifecycle after durable intent and before platform send", async () => {
     const order: string[] = [];
@@ -671,12 +673,7 @@ describe("deliverOutboundPayloads", () => {
     });
     const results = await deliverMatrix({
       queuePolicy: "required",
-      deliveryCompletion: {
-        kind: "conversation",
-        agentId: "main",
-        operationId: "operation-1",
-        routeFingerprint: "route-1",
-      },
+      deliveryCompletion: conversationCompletion("operation-1", "route-1"),
       onDeliveryAttempt: async () => {},
     });
 
@@ -691,34 +688,28 @@ describe("deliverOutboundPayloads", () => {
       "ack",
       "commit:pending-1:message-adapter-1",
     ]);
-    expect(beforeSendAttempt).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "text",
-        to: "!room:example",
-        text: "hello",
-        deliveryQueueId: "queue-1",
-      }),
-    );
+    expectPartialCall(beforeSendAttempt, {
+      kind: "text",
+      to: "!room:example",
+      text: "hello",
+      deliveryQueueId: "queue-1",
+    });
     expect(queueMocks.markDeliveryPlatformSendDispatched).toHaveBeenCalledWith(
       "queue-1",
       expectedQueueStateDir,
       expect.objectContaining({ replyToId: undefined, threadId: undefined }),
     );
     expect(queueMocks.markDeliveryPlatformSendDispatched).toHaveBeenCalledOnce();
-    expect(afterSendSuccess).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "text",
-        attemptToken: "pending-1",
-        result: expect.objectContaining({ messageId: "message-adapter-1" }),
-      }),
-    );
-    expect(afterCommit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "text",
-        attemptToken: "pending-1",
-        result: expect.objectContaining({ messageId: "message-adapter-1" }),
-      }),
-    );
+    expectPartialCall(afterSendSuccess, {
+      kind: "text",
+      attemptToken: "pending-1",
+      result: expect.objectContaining({ messageId: "message-adapter-1" }),
+    });
+    expectPartialCall(afterCommit, {
+      kind: "text",
+      attemptToken: "pending-1",
+      result: expect.objectContaining({ messageId: "message-adapter-1" }),
+    });
     expect(results[0]?.channel).toBe("matrix");
     expect(results[0]?.messageId).toBe("message-adapter-1");
   });
@@ -795,7 +786,7 @@ describe("deliverOutboundPayloads", () => {
     queueMocks.withStableDeliveryPreparation.mockResolvedValueOnce({ status: "existing" });
     queueMocks.loadPendingDelivery.mockResolvedValueOnce(null);
     queueMocks.findDeliveryIntentOwner.mockResolvedValueOnce(null);
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sending");
+    enableHooks("message_sending");
     const sendMatrix = vi.fn();
 
     await expect(
@@ -823,7 +814,7 @@ describe("deliverOutboundPayloads", () => {
         active = false;
       }
     });
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sending");
+    enableHooks("message_sending");
     let releaseModifier: (() => void) | undefined;
     hookMocks.runner.runMessageSending.mockImplementationOnce(
       async () =>
@@ -854,9 +845,7 @@ describe("deliverOutboundPayloads", () => {
     const checkpoint = createDeferredCore();
     const entered = createDeferredCore();
     const controller = new AbortController();
-    hookMocks.runner.hasHooks.mockImplementation(
-      (name?: string) => name === "reply_payload_sending" || name === "message_sending",
-    );
+    enableHooks("reply_payload_sending", "message_sending");
     const pending = prepareOutboundPayloadBatch(
       {
         cfg: {},
@@ -913,12 +902,7 @@ describe("deliverOutboundPayloads", () => {
         payloads: [{ text: "hello" }],
         deps: { matrix: sendMatrix },
         queuePolicy: "required",
-        deliveryCompletion: {
-          kind: "conversation",
-          agentId: "main",
-          operationId: "operation-revoked",
-          routeFingerprint: "route-revoked",
-        },
+        deliveryCompletion: conversationCompletion("operation-revoked", "route-revoked"),
         onDeliveryAttempt: async () => {
           order.push("authorize");
           throw new PlatformMessageNotDispatchedError("route was revoked", {
@@ -984,12 +968,7 @@ describe("deliverOutboundPayloads", () => {
     const results = await deliverMatrix({
       payloads: [{ text: "---" }],
       deps: { matrix: sendMatrix },
-      deliveryCompletion: {
-        kind: "conversation",
-        agentId: "main",
-        operationId: "operation-suppressed",
-        routeFingerprint: "route-suppressed",
-      },
+      deliveryCompletion: conversationCompletion("operation-suppressed", "route-suppressed"),
       onDeliveryAttempt: async () => {},
     });
 
@@ -1026,14 +1005,12 @@ describe("deliverOutboundPayloads", () => {
       "unsupported_enterprise_slack_delivery",
     );
 
-    expect(admitDeferredDelivery).toHaveBeenCalledWith(
-      expect.objectContaining({
-        accountId: "enterprise",
-        channel: "matrix",
-        phase: "live",
-        to: "!room:example",
-      }),
-    );
+    expectPartialCall(admitDeferredDelivery, {
+      accountId: "enterprise",
+      channel: "matrix",
+      phase: "live",
+      to: "!room:example",
+    });
     expect(queueMocks.enqueueDelivery).not.toHaveBeenCalled();
     expect(admitDeferredDelivery).toHaveBeenCalledTimes(2);
     expect(messageSendText).not.toHaveBeenCalled();
@@ -1106,20 +1083,16 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(sendPayload).toHaveBeenCalledOnce();
-    expect(sendPayload).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "payload",
-        payload: expect.objectContaining({ text: "caption", mediaUrls }),
-      }),
-    );
+    expectPartialCall(sendPayload, {
+      kind: "payload",
+      payload: expect.objectContaining({ text: "caption", mediaUrls }),
+    });
     expect(sendMedia).not.toHaveBeenCalled();
     expect(results[0]?.receipt?.platformMessageIds).toEqual(["media-1", "media-2"]);
-    expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith(
-      expect.objectContaining({
-        status: "sent",
-        deliveryKind: "media",
-      }),
-    );
+    expectPartialCall(onPayloadDeliveryOutcome, {
+      status: "sent",
+      deliveryKind: "media",
+    });
 
     await deliverMatrix({ payloads: [{ text: "single caption", mediaUrl: mediaUrls[0] }] });
     expect(sendPayload).toHaveBeenCalledOnce();
@@ -1230,9 +1203,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("rejects a required send before platform I/O when hooks change its reconciliable shape", async () => {
-    hookMocks.runner.hasHooks.mockImplementation(
-      (hookName?: string) => hookName === "reply_payload_sending",
-    );
+    enableHooks("reply_payload_sending");
     hookMocks.runner.runReplyPayloadSending.mockResolvedValueOnce({
       payload: { text: "hook media", mediaUrl: "https://example.com/hook.png" },
     });
@@ -1257,11 +1228,7 @@ describe("deliverOutboundPayloads", () => {
       deliverMatrix({
         queuePolicy: "required",
         requireUnknownSendReconciliation: true,
-        replyPayloadSendingHook: {
-          kind: "final",
-          channel: "matrix",
-          context: { channelId: "matrix", conversationId: "!room:example" },
-        },
+        replyPayloadSendingHook: finalReplyHook(),
       }),
     ).rejects.toThrow(/prepared payload capability mismatch \(reconcileUnknownSend\)/);
     expect(sendText).not.toHaveBeenCalled();
@@ -1327,13 +1294,11 @@ describe("deliverOutboundPayloads", () => {
       }),
     ).rejects.toThrow("native send failed");
 
-    expect(afterSendFailure).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "text",
-        attemptToken: "pending-2",
-        error: expect.any(Error),
-      }),
-    );
+    expectPartialCall(afterSendFailure, {
+      kind: "text",
+      attemptToken: "pending-2",
+      error: expect.any(Error),
+    });
     const failDeliveryCall = requireMockCall(queueMocks.failDelivery, "failDelivery");
     expect(failDeliveryCall[0]).toBe("mock-queue-id");
     expect(String(failDeliveryCall[1])).toContain("native send failed");
@@ -1362,12 +1327,10 @@ describe("deliverOutboundPayloads", () => {
     expect(results[0]?.channel).toBe("matrix");
     expect(results[0]?.messageId).toBe("message-adapter-1");
     expect(afterSendFailure).not.toHaveBeenCalled();
-    expect(afterCommit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "text",
-        result: expect.objectContaining({ messageId: "message-adapter-1" }),
-      }),
-    );
+    expectPartialCall(afterCommit, {
+      kind: "text",
+      result: expect.objectContaining({ messageId: "message-adapter-1" }),
+    });
     expect(queueMocks.ackDelivery).toHaveBeenCalledWith(
       "mock-queue-id",
       expectedQueueStateDir,
@@ -1377,9 +1340,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("emits one message_sent failure per payload when batch preparation fails", async () => {
-    hookMocks.runner.hasHooks.mockImplementation(
-      (hookName?: string) => hookName === "message_sent" || hookName === "reply_payload_sending",
-    );
+    enableHooks("message_sent", "reply_payload_sending");
     hookMocks.runner.runReplyPayloadSending.mockRejectedValueOnce(new Error("modifier exploded"));
     const sendMatrix = vi.fn();
 
@@ -1387,11 +1348,7 @@ describe("deliverOutboundPayloads", () => {
       deliverMatrix({
         payloads: [{ text: "first payload" }, { text: "second payload" }],
         deps: { matrix: sendMatrix },
-        replyPayloadSendingHook: {
-          kind: "final",
-          channel: "matrix",
-          context: { channelId: "matrix", conversationId: "!room:example" },
-        },
+        replyPayloadSendingHook: finalReplyHook(),
       }),
     ).rejects.toThrow("modifier exploded");
 
@@ -1430,12 +1387,10 @@ describe("deliverOutboundPayloads", () => {
         deps: { matrix: sendMatrix },
         queuePolicy: "required",
         deliveryRetryOwner: "caller",
-        deliveryCompletion: {
-          kind: "conversation",
-          agentId: "main",
-          operationId: "operation-proven-not-sent",
-          routeFingerprint: "route-proven-not-sent",
-        },
+        deliveryCompletion: conversationCompletion(
+          "operation-proven-not-sent",
+          "route-proven-not-sent",
+        ),
         onDeliveryAttempt: async () => {},
       }),
     ).rejects.toThrow("ECONNREFUSED");
@@ -1620,17 +1575,15 @@ describe("deliverOutboundPayloads", () => {
       },
     });
 
-    expect(resolveMediaAccessSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionKey: "agent:main:matrix:group:ops",
-        messageProvider: undefined,
-        accountId: "source-account",
-        requesterSenderId: "attacker",
-        requesterSenderName: "Alice",
-        requesterSenderUsername: "alice_u",
-        requesterSenderE164: "+15551234567",
-      }),
-    );
+    expectPartialCall(resolveMediaAccessSpy, {
+      sessionKey: "agent:main:matrix:group:ops",
+      messageProvider: undefined,
+      accountId: "source-account",
+      requesterSenderId: "attacker",
+      requesterSenderName: "Alice",
+      requesterSenderUsername: "alice_u",
+      requesterSenderE164: "+15551234567",
+    });
     const sendOptions = requireMatrixSendCall(sendMatrix)[2] as Record<string, unknown>;
     expect(sendOptions.mediaReadFile).toBeUndefined();
     expect((sendOptions.mediaLocalRoots as readonly string[] | undefined) ?? []).not.toContain(
@@ -1642,9 +1595,7 @@ describe("deliverOutboundPayloads", () => {
   it("scopes media access after reply payload hooks add local media", async () => {
     const auditEvents: TrustedMessageAuditEvent[] = [];
     const unsubscribeAudit = onTrustedMessageAuditEvent((event) => auditEvents.push(event));
-    hookMocks.runner.hasHooks.mockImplementation(
-      (hookName?: string) => hookName === "reply_payload_sending",
-    );
+    enableHooks("reply_payload_sending");
     hookMocks.runner.runReplyPayloadSending.mockResolvedValueOnce({
       payload: {
         text: "hook media",
@@ -1664,11 +1615,7 @@ describe("deliverOutboundPayloads", () => {
         agentId: "main",
         requesterSenderId: "sender-1",
       },
-      replyPayloadSendingHook: {
-        kind: "final",
-        channel: "matrix",
-        context: { channelId: "matrix", conversationId: "!room:example" },
-      },
+      replyPayloadSendingHook: finalReplyHook(),
     });
     unsubscribeAudit();
 
@@ -1704,12 +1651,8 @@ describe("deliverOutboundPayloads", () => {
     });
 
     expect(sendText).toHaveBeenCalledOnce();
-    expect(sendText).toHaveBeenCalledWith(
-      expect.objectContaining({ text: "abcd", preparedMessageId: "prepared-1" }),
-    );
-    expect(queueMocks.enqueueDelivery).toHaveBeenCalledWith(
-      expect.objectContaining({ preparedMessageId: "prepared-1" }),
-    );
+    expectPartialCall(sendText, { text: "abcd", preparedMessageId: "prepared-1" });
+    expectPartialCall(queueMocks.enqueueDelivery, { preparedMessageId: "prepared-1" });
   });
 
   it("skips text-only payloads blanked by message_sending hooks", async () => {
@@ -1733,9 +1676,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("runs reply payload hooks before the final message_sending policy pass", async () => {
-    hookMocks.runner.hasHooks.mockImplementation(
-      (hookName?: string) => hookName === "reply_payload_sending" || hookName === "message_sending",
-    );
+    enableHooks("reply_payload_sending", "message_sending");
     hookMocks.runner.runReplyPayloadSending.mockImplementationOnce(async (event) => {
       const payload = (event as { payload: { text?: string } }).payload;
       return {
@@ -1757,36 +1698,32 @@ describe("deliverOutboundPayloads", () => {
       to: "!room",
       payloads: [{ text: "secret", replyToId: "original-reply" }],
       deps: { matrix: sendText },
-      replyPayloadSendingHook: {
-        kind: "final",
-        channel: "matrix",
-        context: { channelId: "matrix", conversationId: "!room" },
-      },
+      replyPayloadSendingHook: finalReplyHook("!room"),
     });
 
-    expect(hookMocks.runner.runReplyPayloadSending).toHaveBeenCalledWith(
-      expect.objectContaining({
+    expectPartialCall(
+      hookMocks.runner.runReplyPayloadSending,
+      {
         payload: expect.objectContaining({ text: "secret" }),
         kind: "final",
         channel: "matrix",
-      }),
-      expect.objectContaining({ channelId: "matrix", conversationId: "!room" }),
+      },
+      { channelId: "matrix", conversationId: "!room" },
     );
-    expect(hookMocks.runner.runMessageSending).toHaveBeenCalledWith(
-      expect.objectContaining({
+    expectPartialCall(
+      hookMocks.runner.runMessageSending,
+      {
         content: "secret + payload-hook",
         replyToId: "hooked-reply",
-      }),
-      expect.objectContaining({ channelId: "matrix", conversationId: "!room" }),
+      },
+      { channelId: "matrix", conversationId: "!room" },
     );
     expect(requireMatrixSendCall(sendText)[1]).toBe("redacted");
-    expect(queueMocks.enqueueDelivery).toHaveBeenCalledWith(
-      expect.objectContaining({
-        preparedBatch: expect.objectContaining({
-          entries: [expect.objectContaining({ status: "accepted", sourceIndex: 0 })],
-        }),
+    expectPartialCall(queueMocks.enqueueDelivery, {
+      preparedBatch: expect.objectContaining({
+        entries: [expect.objectContaining({ status: "accepted", sourceIndex: 0 })],
       }),
-    );
+    });
     expect(queueMocks.markDeliveryPlatformSendAttemptStarted).toHaveBeenCalledWith(
       "mock-queue-id",
       expectedQueueStateDir,
@@ -1969,13 +1906,13 @@ describe("deliverOutboundPayloads", () => {
       ],
     });
 
-    expect(resolvePresentationCapabilities).toHaveBeenCalledWith(
-      expect.objectContaining({ formatting: expect.objectContaining({ parseMode: "HTML" }) }),
-    );
+    expectPartialCall(resolvePresentationCapabilities, {
+      formatting: expect.objectContaining({ parseMode: "HTML" }),
+    });
     // The formatting-aware resolver disables tables for HTML-mode sends, so the
     // authored fallback body ships verbatim instead of a degraded flatten.
     expect(renderPresentation).not.toHaveBeenCalled();
-    expect(sendText).toHaveBeenCalledWith(expect.objectContaining({ text: "authored fallback" }));
+    expectPartialCall(sendText, { text: "authored fallback" });
   });
 
   it("uses formatted-only senders and scoped media roots", async () => {
@@ -2047,9 +1984,7 @@ describe("deliverOutboundPayloads", () => {
     expect(mediaResults.map((entry) => entry.messageId)).toEqual(
       mediaUrls.map((mediaUrl, index) => `fmt-media:${mediaUrl}:${index === 0 ? caption : ""}`),
     );
-    expect(onDeliveredPayload).toHaveBeenCalledWith(
-      expect.objectContaining({ text: caption, mediaUrls }),
-    );
+    expectPartialCall(onDeliveredPayload, { text: caption, mediaUrls });
     expect(sendFormattedMediaCall?.mediaLocalRoots).toContain(expectedPreferredTmpRoot);
     expect(
       sendFormattedMediaCall?.mediaLocalRoots?.some((root) =>
@@ -2351,9 +2286,7 @@ describe("deliverOutboundPayloads", () => {
   );
 
   it("emits a stable terminal when best-effort marker fallback ack precedes provider rejection", async () => {
-    hookMocks.runner.hasHooks.mockImplementation(
-      (hookName?: string) => hookName === "message_sent",
-    );
+    enableHooks("message_sent");
     const events: TrustedMessageAuditEvent[] = [];
     const unsubscribe = onTrustedMessageAuditEvent((event) => events.push(event));
     queueMocks.markDeliveryPlatformSendAttemptStarted.mockRejectedValueOnce(
@@ -2585,7 +2518,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("emits one terminal failure without queueing when preparation metadata is rejected", async () => {
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sent");
+    enableHooks("message_sent");
     const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
     const abortController = new AbortController();
     const errorMessage = "metadata unavailable";
@@ -2612,13 +2545,14 @@ describe("deliverOutboundPayloads", () => {
       expect(sendMatrix).not.toHaveBeenCalled();
       expect(events.map((event) => event.outcome)).toEqual(["failed"]);
       expect(hookMocks.runner.runMessageSent).toHaveBeenCalledOnce();
-      expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
-        expect.objectContaining({
+      expectPartialCall(
+        hookMocks.runner.runMessageSent,
+        {
           content: "a",
           error: expect.stringContaining(errorMessage),
           success: false,
-        }),
-        expect.objectContaining({ channelId: "matrix" }),
+        },
+        { channelId: "matrix" },
       );
     } finally {
       unsubscribe();
@@ -2649,16 +2583,14 @@ describe("deliverOutboundPayloads", () => {
       text: "",
       location,
     });
-    expect(mocks.appendAssistantMessageToSessionTranscript).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionKey: "agent:main:main",
-        text: "📍 48.858844, 2.294351 ±12m",
-      }),
-    );
+    expectPartialCall(mocks.appendAssistantMessageToSessionTranscript, {
+      sessionKey: "agent:main:main",
+      text: "📍 48.858844, 2.294351 ±12m",
+    });
   });
 
   it("does not mirror a full payload when only an internal sub-send succeeded", async () => {
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sent");
+    enableHooks("message_sent");
     const partialResult = { channel: "line" as const, messageId: "partial-1" };
     const sendFormattedText = vi.fn(
       async (ctx: {
@@ -2687,14 +2619,15 @@ describe("deliverOutboundPayloads", () => {
     expect(results).toEqual([partialResult]);
     expect(mocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
     expect(hookMocks.runner.runMessageSent).toHaveBeenCalledOnce();
-    expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
-      expect.objectContaining({
+    expectPartialCall(
+      hookMocks.runner.runMessageSent,
+      {
         content: "first part and unsent second part",
         error: "second internal send failed",
         messageId: "partial-1",
         success: false,
-      }),
-      expect.objectContaining({ channelId: "line" }),
+      },
+      { channelId: "line" },
     );
   });
 
@@ -2718,7 +2651,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("emits message_sent only after the durable queue terminal commits", async () => {
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sent");
+    enableHooks("message_sent");
     let releaseAck: (() => void) | undefined;
     queueMocks.ackDelivery.mockImplementationOnce(
       async () =>
@@ -2866,12 +2799,10 @@ describe("deliverOutboundPayloads", () => {
         expect(queueMocks.markDeliveryPlatformOutcomeUnknown).toHaveBeenCalledOnce();
         expect(queueMocks.failDeliveryBeforePlatformSend).not.toHaveBeenCalled();
         if (chunked) {
-          expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith(
-            expect.objectContaining({
-              status: "failed",
-              sentBeforeError: true,
-            }),
-          );
+          expectPartialCall(onPayloadDeliveryOutcome, {
+            status: "failed",
+            sentBeforeError: true,
+          });
         }
       }
       expect(queueMocks.ackDelivery).not.toHaveBeenCalled();
@@ -2940,7 +2871,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("fails sends when required delivery pinning fails", async () => {
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sent");
+    enableHooks("message_sent");
     const events: TrustedMessageAuditEvent[] = [];
     const unsubscribe = onTrustedMessageAuditEvent((event) => events.push(event));
     const pinDeliveredMessage = vi
@@ -2972,9 +2903,10 @@ describe("deliverOutboundPayloads", () => {
     });
     expect(JSON.stringify(events)).not.toContain("pin denied");
     expect(hookMocks.runner.runMessageSent).toHaveBeenCalledOnce();
-    expect(hookMocks.runner.runMessageSent).toHaveBeenCalledWith(
-      expect.objectContaining({ content: "hello", messageId: "mx-1", success: true }),
-      expect.objectContaining({ channelId: "matrix" }),
+    expectPartialCall(
+      hookMocks.runner.runMessageSent,
+      { content: "hello", messageId: "mx-1", success: true },
+      { channelId: "matrix" },
     );
   });
 
@@ -3007,7 +2939,7 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("pins the first delivered media message for multi-media payloads", async () => {
-    hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sent");
+    enableHooks("message_sent");
     const order: string[] = [];
     const sendText = vi.fn().mockResolvedValue({ channel: "matrix", messageId: "mx-text" });
     const sendMedia = vi
@@ -3071,9 +3003,7 @@ describe("deliverOutboundPayloads", () => {
       await expect(delivery).resolves.toEqual([{ channel: "matrix", messageId: "mx-1" }]);
       expect(sendText).toHaveBeenCalledTimes(1);
       expect(requireMockCallArg(sendText, "sendText").text).toBe("caption");
-      expect(onDeliveredPayload).toHaveBeenCalledWith(
-        expect.objectContaining({ text: "caption", mediaUrls: [] }),
-      );
+      expectPartialCall(onDeliveredPayload, { text: "caption", mediaUrls: [] });
       expect(
         requireMockCallArg(afterDeliverPayload, "after delivered payload").payload,
       ).toMatchObject({ text: "caption", mediaUrl: "https://example.com/file.png" });
