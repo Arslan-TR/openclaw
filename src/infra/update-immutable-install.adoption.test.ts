@@ -11,7 +11,11 @@ import {
   resolvePackageActivationAnchor,
   resolvePackageActivationJournalPath,
 } from "./package-update-activation-paths.js";
-import { syntheticImmutableServiceObservation } from "./update-immutable-activation.test-support.js";
+import {
+  syntheticImmutableServiceObservation,
+  syntheticActivationCustody,
+  syntheticImmutableProtection,
+} from "./update-immutable-activation.test-support.js";
 import type {
   ImmutableActivationOperation,
   ImmutableInstallRecord,
@@ -78,6 +82,17 @@ function writeReaderVersion(version?: number) {
   );
 }
 
+function preparedGeneration(sha: string, buildDigest: string) {
+  const generationPath = path.join(root, "releases", sha);
+  return {
+    sha,
+    path: generationPath,
+    identity: identity(generationPath),
+    buildDigest,
+    preparedAtMs: 12,
+  };
+}
+
 async function prepareRetentionUpgrade() {
   await adoptImmutableInstall(params);
   original = read();
@@ -99,59 +114,22 @@ function retainPendingActivation() {
     version: 2 as const,
     activationEnabled: true as const,
   };
-  const file = { dev: "1", ino: "2", mode: 0o600, nlink: 1 as const, uid: 0, gid: 0 };
-  const statePath = path.join(descriptor.service.stateDir, "openclaw.db");
+  const { authority, recovery } = syntheticActivationCustody(descriptor, ["1:3", "1:4"]);
   const operation: ImmutableActivationOperation = {
     version: 1,
     operationId: "b2a30aad-b116-4b9a-8984-679671ecfc66",
-    authority: {
-      databasePath: journal(),
-      databaseIdentity: identity(journal()),
-      parentIdentity: identity(path.dirname(journal())),
-      installKey: root,
-      owner: "synthetic-executor",
-    },
+    authority,
     phase: "prepared",
     previous: descriptor.current,
-    candidate: {
-      sha: bridgeSha,
-      path: bridgePath,
-      identity: identity(bridgePath),
-      buildDigest: bridgeDigest,
-      preparedAtMs: 12,
-    },
+    candidate: preparedGeneration(bridgeSha, bridgeDigest),
     serviceDigest: "3".repeat(64),
     startedAtMs: 12,
-    protection: {
-      capturedAtMs: 1,
-      auditBoundary: null,
-      state: {
-        path: statePath,
-        identity: file,
-        pathProof: { targetPath: statePath, entries: [] },
-        key: "synthetic",
-      },
-      config: [
-        {
-          path: descriptor.service.configPath,
-          identity: file,
-          pathProof: { targetPath: descriptor.service.configPath, entries: [] },
-          hash: "4".repeat(64),
-          fingerprint: {},
-          policyFingerprint: "5".repeat(64),
-        },
-      ],
-    },
-    recovery: {
-      root,
-      path: path.join(path.dirname(journal()), `recovery-${previousSha}`),
-      sha: previousSha,
-      identity: "1:3",
-      buildDigest: previousDigest,
-      helperPath: path.join(path.dirname(journal()), "recovery.mjs"),
-      helperIdentity: "1:4",
-      helperDigest: "6".repeat(64),
-    },
+    protection: syntheticImmutableProtection(descriptor, {
+      key: "synthetic",
+      hash: "4".repeat(64),
+      policyFingerprint: "5".repeat(64),
+    }),
+    recovery,
   };
   updateRecord({ descriptor, activation: { operation } });
 }
@@ -222,13 +200,10 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
           fsSync.mkdirSync(candidatePath, { mode: 0o755 });
         }
         updateRecord({
-          prepared: {
+          prepared: preparedGeneration(
             sha,
-            path: candidatePath,
-            identity: identity(candidatePath),
-            buildDigest: preparedKind === "selected" ? bridgeDigest : "3".repeat(64),
-            preparedAtMs: 12,
-          },
+            preparedKind === "selected" ? bridgeDigest : "3".repeat(64),
+          ),
         });
       }
       const pointerIdentity = identity(path.join(root, "current"));
@@ -352,19 +327,19 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
     );
   });
 
-  it.each([undefined, 2, 4])(
-    "refuses a serving reader marker of %s before adopting retention",
+  it.each([undefined, 2, 4, 3])(
+    "refuses retention with reader %s or pending recovery",
     async (version) => {
       await prepareRetentionUpgrade();
+      if (version === 3) {
+        retainPendingActivation();
+      }
       writeReaderVersion(version);
-      await expectRetentionRejected("cannot read this control format");
+      await expectRetentionRejected(
+        version === 3
+          ? "Complete version-2 bridge activation and recovery"
+          : "cannot read this control format",
+      );
     },
   );
-
-  it("preserves pending recovery before any retention-format upgrade", async () => {
-    await prepareRetentionUpgrade();
-    retainPendingActivation();
-    writeReaderVersion(3);
-    await expectRetentionRejected("Complete version-2 bridge activation and recovery");
-  });
 });

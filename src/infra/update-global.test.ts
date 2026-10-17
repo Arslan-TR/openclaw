@@ -507,9 +507,12 @@ describe("update global helpers", () => {
     }
   });
 
-  it("builds global install argv for each supported manager", () => {
+  it("builds npm global install argv", () => {
     expect(globalInstallArgs("npm", "openclaw@latest")).toEqual(expectedNpmInstall);
-    for (const spec of ["openclaw@latest", "github:openclaw/openclaw#release/2026.5.12"]) {
+  });
+  it.each(["openclaw@latest", "github:openclaw/openclaw#release/2026.5.12"])(
+    "allows only OpenClaw builds for pnpm target %s",
+    (spec) => {
       expect(globalInstallArgs("pnpm", spec)).toEqual([
         "pnpm",
         "add",
@@ -517,21 +520,16 @@ describe("update global helpers", () => {
         "--allow-build=openclaw",
         spec,
       ]);
-    }
-    for (const [spec, expected] of [
-      ["openclaw@latest", "openclaw@latest"],
-      ["/tmp/openclaw-current.tgz", "openclaw@file:/tmp/openclaw-current.tgz"],
-      ["https://example.test/openclaw.tgz", "openclaw@https://example.test/openclaw.tgz"],
-      ["github:openclaw/openclaw#main", "openclaw@github:openclaw/openclaw#main"],
-    ] as const) {
-      expect(globalInstallArgs("bun", spec)).toEqual([
-        process.versions.bun ? process.execPath : "bun",
-        "add",
-        "-g",
-        "--trust",
-        expected,
-      ]);
-    }
+    },
+  );
+  it.each([
+    ["openclaw@latest", "openclaw@latest"],
+    ["/tmp/openclaw-current.tgz", "openclaw@file:/tmp/openclaw-current.tgz"],
+    ["https://example.test/openclaw.tgz", "openclaw@https://example.test/openclaw.tgz"],
+    ["github:openclaw/openclaw#main", "openclaw@github:openclaw/openclaw#main"],
+  ] as const)("replaces Bun's global dependency for %s", (spec, expected) => {
+    const command = process.versions.bun ? process.execPath : "bun";
+    expect(globalInstallArgs("bun", spec)).toEqual([command, "add", "-g", "--trust", expected]);
   });
 
   it("resolves npm prefix layouts for normal global roots", () => {
@@ -665,26 +663,18 @@ describe("update global helpers", () => {
     );
   });
 
-  it("verifies legacy sidecars for installed bundled plugins without inventory", async () => {
-    const packageRoot = dirs.make("openclaw-update-global-legacy-plugin-");
-
-    await writeGlobalPackageJson(packageRoot);
-    await writeBundledPluginPackageJson(packageRoot, "telegram", "@openclaw/telegram");
-
-    await expect(collectInstalledGlobalPackageErrors({ packageRoot })).resolves.toContain(
-      `missing bundled runtime sidecar ${TELEGRAM_RUNTIME_API}`,
-    );
-  });
-
-  it("still enforces critical sidecars when the inventory omits them", async () => {
-    const packageRoot = dirs.make("openclaw-update-global-critical-sidecars-");
-
-    await writeGlobalPackageJson(packageRoot, "2026.4.15");
-    await writeBundledPluginPackageJson(packageRoot, "telegram", "@openclaw/telegram");
-    await writePackageDistInventory(packageRoot);
-
-    await expect(collectInstalledGlobalPackageErrors({ packageRoot })).resolves.toContain(
-      `missing bundled runtime sidecar ${TELEGRAM_RUNTIME_API}`,
-    );
-  });
+  it.each([false, true])(
+    "enforces critical bundled sidecars with inventory present: %s",
+    async (inventory) => {
+      const packageRoot = dirs.make("openclaw-update-global-sidecars-");
+      await writeGlobalPackageJson(packageRoot, inventory ? "2026.4.15" : "1.0.0");
+      await writeBundledPluginPackageJson(packageRoot, "telegram", "@openclaw/telegram");
+      if (inventory) {
+        await writePackageDistInventory(packageRoot);
+      }
+      await expect(collectInstalledGlobalPackageErrors({ packageRoot })).resolves.toContain(
+        `missing bundled runtime sidecar ${TELEGRAM_RUNTIME_API}`,
+      );
+    },
+  );
 });

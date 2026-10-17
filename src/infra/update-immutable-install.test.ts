@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { CommandProcessCleanupError } from "../process/exec-result.js";
+import type * as Activation from "./package-update-activation-immutable.js";
 import { packageActivationRuntimeIdentity } from "./package-update-activation-paths.js";
 import type { ImmutableInstallRecord } from "./update-immutable-install-schema.js";
 import { inspectImmutableInstall, prepareImmutableUpdate } from "./update-immutable-install.js";
@@ -14,10 +15,7 @@ import {
 
 const mocks = vi.hoisted(() => ({
   read: vi.fn<typeof import("./update-immutable-install-record.js").readImmutableInstallRecord>(),
-  record:
-    vi.fn<
-      typeof import("./package-update-activation-immutable.js").recordImmutablePreparedGeneration
-    >(),
+  record: vi.fn<typeof Activation.recordImmutablePreparedGeneration>(),
   command: vi.fn<import("./update-runner-types.js").CommandRunner>(),
   build: vi.fn<typeof import("./update-immutable-build.js").runImmutableBuild>(),
   verify: vi.fn<typeof import("./update-immutable-generation.js").verifyImmutableGeneration>(),
@@ -59,6 +57,8 @@ const buildDigest = "c".repeat(64);
 let root: string;
 let record: ImmutableInstallRecord;
 const pointer = () => fs.readlink(path.join(root, "current"));
+const readRelease = (sha: string, file: string) =>
+  fs.readFile(path.join(root, "releases", sha, file), "utf8");
 async function expectUnchanged(...unused: Parameters<typeof expectUncalled>) {
   expect(await pointer()).toBe(`releases/${currentSha}`);
   expectUncalled(...unused);
@@ -91,13 +91,11 @@ beforeEach(async () => {
     expect((await fs.stat(path.dirname(destination))).mode & 0o077).toBe(0);
     await fs.cp(source, destination, { recursive: true, verbatimSymlinks: true });
   });
-  mocks.command.mockImplementation(async (argv) => {
-    return {
-      code: 0,
-      stdout: argv.includes("ls-remote") ? `${nextSha}\trefs/heads/main\n` : "",
-      stderr: "",
-    };
-  });
+  mocks.command.mockImplementation(async (argv) => ({
+    code: 0,
+    stdout: argv.includes("ls-remote") ? `${nextSha}\trefs/heads/main\n` : "",
+    stderr: "",
+  }));
   mocks.build.mockImplementation(async ({ stage, sha }) => {
     const built = path.join(stage, "generation");
     await fs.mkdir(path.join(built, "dist"), { recursive: true, mode: 0o755 });
@@ -126,7 +124,6 @@ it("leaves an ordinary checkout with an unrelated current file to its existing u
   await fs.writeFile(path.join(checkout, "current"), "operator notes");
 
   await expect(inspectImmutableInstall(checkout)).resolves.toBeNull();
-
   expect(mocks.read).not.toHaveBeenCalled();
   expect(await fs.readFile(path.join(checkout, "current"), "utf8")).toBe("operator notes");
 });
@@ -207,12 +204,8 @@ describe.skipIf(process.platform !== "linux")("immutable preparation", () => {
       installation: { currentSha, prepared: { sha: nextSha, path: destination, buildDigest } },
     });
     expect(await pointer()).toBe(`releases/${currentSha}`);
-    expect(await fs.readFile(path.join(destination, "dist/index.js"), "utf8")).toBe(
-      `candidate ${nextSha}`,
-    );
-    expect(await fs.readFile(path.join(record.descriptor.current.path, "serving"), "utf8")).toBe(
-      "previous Gateway bytes",
-    );
+    expect(await readRelease(nextSha, "dist/index.js")).toBe(`candidate ${nextSha}`);
+    expect(await readRelease(currentSha, "serving")).toBe("previous Gateway bytes");
     expect(mocks.command.mock.calls.filter(([argv]) => argv.includes("ls-remote"))).toHaveLength(1);
     expect(mocks.seal).toHaveBeenCalledOnce();
     expect(mocks.record).toHaveBeenCalledOnce();
@@ -241,9 +234,7 @@ describe.skipIf(process.platform !== "linux")("immutable preparation", () => {
       status: "error",
       reason: expect.stringContaining("without a matching preparation receipt"),
     });
-    expect(await fs.readFile(path.join(destination, "incomplete"), "utf8")).toBe(
-      "retain for inspection",
-    );
+    expect(await readRelease(nextSha, "incomplete")).toBe("retain for inspection");
     await expectUnchanged(mocks.build, mocks.record);
   });
 });

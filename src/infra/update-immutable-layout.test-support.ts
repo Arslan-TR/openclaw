@@ -14,6 +14,7 @@ export function immutableLayout(
     unit: string;
     account: string;
     externalRuntime?: boolean;
+    ownParent?: boolean;
   },
 ): ImmutableInstallDescriptor {
   const root = path.join(parent, "installation");
@@ -39,7 +40,12 @@ export function immutableLayout(
   vi.spyOn(fs, "lstatSync").mockImplementation((...args) => {
     const stat = lstat(...args);
     const file = String(args[0]);
-    if (stat && (parents.has(file) || file.startsWith(`${parent}${path.sep}`))) {
+    if (
+      stat &&
+      (parents.has(file) ||
+        (options.ownParent && file === parent) ||
+        file.startsWith(`${parent}${path.sep}`))
+    ) {
       Object.defineProperty(stat, "uid", { value: typeof stat.uid === "bigint" ? 0n : 0 });
       if (parents.has(file)) {
         Object.defineProperty(stat, "mode", {

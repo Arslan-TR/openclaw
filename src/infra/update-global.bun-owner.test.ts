@@ -468,11 +468,10 @@ describe("custom Bun global installation ownership", () => {
           expect(runStep).not.toHaveBeenCalled();
           expect(beforeActivate).not.toHaveBeenCalled();
         } else if (installFails) {
-          expect(result.failedStep).toMatchObject({
-            name: "package-install",
-            stderrTail: "staged Bun install failed",
+          expect(result).toMatchObject({
+            failedStep: { name: "package-install", stderrTail: "staged Bun install failed" },
+            recovery: { serviceRestartSafe: true, version: "1.0.0" },
           });
-          expect(result.recovery).toMatchObject({ serviceRestartSafe: true, version: "1.0.0" });
           expect(beforeActivate).not.toHaveBeenCalled();
           expect(runStep).toHaveBeenCalledOnce();
           await expect(fs.readdir(path.dirname(globalProject))).resolves.toEqual(["global"]);
@@ -480,8 +479,7 @@ describe("custom Bun global installation ownership", () => {
             "original launcher\n",
           );
         } else {
-          expect(result.failedStep).toBeNull();
-          expect(result.afterVersion).toBe("2.0.0");
+          expect(result).toMatchObject({ failedStep: null, afterVersion: "2.0.0" });
           expect(runStep).toHaveBeenCalledOnce();
           expect(beforeActivate).toHaveBeenCalledOnce();
           await expect(fs.realpath(path.join(owningBin, "openclaw"))).resolves.toBe(

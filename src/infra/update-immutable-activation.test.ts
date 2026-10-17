@@ -19,6 +19,7 @@ import {
   identity,
   previousSha,
   syntheticImmutableGatewayObservation,
+  syntheticActivationCustody,
   syntheticImmutableServiceObservation,
 } from "./update-immutable-activation.test-support.js";
 import type {
@@ -131,6 +132,12 @@ function expectRestarts(stops: number, starts: number) {
   expect(mocks.stop).toHaveBeenCalledTimes(stops);
   expect(mocks.start).toHaveBeenCalledTimes(starts);
 }
+function requireFixture<T>(implementation: T | undefined): T {
+  if (implementation === undefined) {
+    throw new Error("Missing lifecycle fixture");
+  }
+  return implementation;
+}
 
 describe.skipIf(process.platform !== "linux")("immutable activation orchestration", () => {
   beforeEach(() => {
@@ -145,13 +152,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
     ({ root, descriptor, candidate, protection } = createImmutableActivationLayout(parent));
     serving = { pid: nextPid++, generationPath: descriptor.current.path };
     const assertCurrent = () => {};
-    const authority: ImmutableActivationOperation["authority"] = {
-      databasePath: journalPath(),
-      databaseIdentity: identity(journalPath()),
-      parentIdentity: identity(path.dirname(journalPath())),
-      installKey: root,
-      owner: "synthetic-executor",
-    };
+    const { authority, recovery } = syntheticActivationCustody(descriptor, ["1:9", "1:10"]);
     mocks.read.mockImplementation(async () => read());
     mocks.install.mockImplementation(async () => ({
       root,
@@ -176,16 +177,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
       }
     });
     mocks.authority.mockReturnValue(authority);
-    mocks.prepareRecovery.mockResolvedValue({
-      root,
-      path: path.join(path.dirname(journalPath()), `recovery-${previousSha}`),
-      sha: previousSha,
-      identity: "1:9",
-      buildDigest: descriptor.current.buildDigest,
-      helperPath: path.join(path.dirname(journalPath()), "recovery.mjs"),
-      helperIdentity: "1:10",
-      helperDigest: "6".repeat(64),
-    });
+    mocks.prepareRecovery.mockResolvedValue(recovery);
     mocks.verifyRecovery.mockImplementation(async ({ assertCurrent: check }) => check());
     mocks.generation.mockImplementation(async (generationPath: string) => ({
       identity: identity(generationPath),
@@ -444,10 +436,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
       buildDigest: "8".repeat(64),
       preparedAtMs: candidate.preparedAtMs + 1,
     };
-    const enter = mocks.owner.getMockImplementation();
-    if (!enter) {
-      throw new Error("Missing executor fixture");
-    }
+    const enter = requireFixture(mocks.owner.getMockImplementation());
     mocks.owner.mockImplementationOnce(async (...args) => {
       recordImmutablePreparedGeneration(read(), replacement, () => {});
       return enter(...args);
@@ -672,10 +661,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
         }
         return foreignWrite ? foreign : original;
       });
-      const canary = mocks.canary.getMockImplementation();
-      if (!canary) {
-        throw new Error("Missing canary fixture");
-      }
+      const canary = requireFixture(mocks.canary.getMockImplementation());
       mocks.canary.mockImplementation(async (params) => {
         const result = await canary(params);
         if (window === "rehearsal" && params.root === descriptor.current.path) {
@@ -709,10 +695,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
     "resumes %s toward the predecessor after a crash with the failed candidate stopped",
     async (phase) => {
       outcomes = ["failed"];
-      const stop = mocks.stop.getMockImplementation();
-      if (!stop) {
-        throw new Error("Missing service-stop fixture");
-      }
+      const stop = requireFixture(mocks.stop.getMockImplementation());
       mocks.stop.mockImplementation(async (params) => {
         await stop(params);
         if (phase === "rollback-stopping" && selectedSha() === candidateSha) {
@@ -823,10 +806,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
   it("retains accepted startup writes when the post-start canary fails and later recovers a healthy PID", async () => {
     const accepted = { ...protection, capturedAtMs: 2 };
     mocks.capture.mockResolvedValueOnce(protection).mockResolvedValue(accepted);
-    const canary = mocks.canary.getMockImplementation();
-    if (!canary) {
-      throw new Error("Missing canary fixture");
-    }
+    const canary = requireFixture(mocks.canary.getMockImplementation());
     let canaries = 0;
     mocks.canary.mockImplementation(async (params) => {
       if (++canaries === 2) {
@@ -848,10 +828,7 @@ describe.skipIf(process.platform !== "linux")("immutable activation orchestratio
   });
 
   it("keeps recovery pending when the serving process changes after the post-start canary", async () => {
-    const wait = mocks.wait.getMockImplementation();
-    if (!wait) {
-      throw new Error("Missing readiness fixture");
-    }
+    const wait = requireFixture(mocks.wait.getMockImplementation());
     let observations = 0;
     mocks.wait.mockImplementation(async (params) => {
       if (++observations === 2) {
