@@ -20,6 +20,7 @@ export type LocalRunState = {
   lifecycleStopReason?: string;
   lifecycleYielded?: boolean;
   toolErrorSummary?: string;
+  localModelMayStillBeFinishing?: true;
   terminalState?: "provisional" | "final";
   registered: boolean;
   pendingQueue?: {

@@ -96,6 +96,7 @@ import {
 import { projectSessionsPatchEntry } from "../gateway/sessions-patch.js";
 import { waitForAbortSignal } from "../infra/abort-signal.js";
 import { type AgentEventRuntimePayload, onAgentEvent } from "../infra/agent-events.js";
+import { getAgentRunContext } from "../infra/agent-run-registry.js";
 import { setEmbeddedMode } from "../infra/embedded-mode.js";
 import {
   clearEmbeddedPluginApprovalBroker,
@@ -401,6 +402,16 @@ export class EmbeddedTuiBackend implements TuiBackend {
       queuedRunReady: queuedRunReadiness.promise,
       markQueuedRunReady: queuedRunReadiness.resolve,
     };
+    controller.signal.addEventListener(
+      "abort",
+      () => {
+        // Capture before downstream abort listeners clear the provider wait.
+        if (getAgentRunContext(runId)?.localModelWait) {
+          run.localModelMayStillBeFinishing = true;
+        }
+      },
+      { once: true },
+    );
     this.runs.set(runId, run);
 
     const runPromise = (run.promise = this.runTurn(runId, run, opts));
@@ -1043,6 +1054,9 @@ export class EmbeddedTuiBackend implements TuiBackend {
     const text = state === "final" && !projected.suppress ? projected.text.trim() : "";
     this.emitRun("chat", runId, run, {
       state,
+      ...(state === "aborted" && run.localModelMayStillBeFinishing
+        ? { localModelMayStillBeFinishing: true }
+        : {}),
       ...(state === "final" && detail ? { stopReason: detail } : {}),
       ...(state === "final" && run.lifecycleYielded ? { yielded: true } : {}),
       ...(text ? { message: assistantChatMessage(text) } : {}),
