@@ -1,7 +1,7 @@
 // Control UI E2E tests protect transcript disclosure geometry across animation frames.
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { Locator } from "playwright";
+import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import { takeControlUiElementScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
@@ -19,6 +19,83 @@ const suite = createControlUiE2eSuite({
   name: "Control UI transcript disclosure anchoring",
   startServerBeforeBrowser: true,
 });
+
+const textBlock = (text: string) => ({ type: "text", text });
+const message = (role: string, content: unknown, timestamp: number) => ({
+  role,
+  content,
+  timestamp,
+});
+const assistant = (text: string, timestamp: number) =>
+  message("assistant", [textBlock(text)], timestamp);
+const toolCall = (id: string, name: string, args: Record<string, unknown>) => ({
+  type: "toolCall",
+  id,
+  name,
+  arguments: args,
+});
+const toolResult = (toolCallId: string, toolName: string, text: string, timestamp: number) => ({
+  ...message("toolResult", [textBlock(text)], timestamp),
+  toolCallId,
+  toolName,
+});
+
+function makeTranscript(
+  count: number,
+  prompt: (n: number) => string,
+  response: (n: number) => string,
+  start = 1,
+) {
+  return Array.from({ length: count }, (_, index) => [
+    message("user", prompt(index + 1), start + index * 2),
+    assistant(response(index + 1), start + index * 2 + 1),
+  ]).flat();
+}
+
+async function createDisclosurePage(height: number, width: number, record = true) {
+  const parent = process.env.OPENCLAW_CONTROL_UI_E2E_ARTIFACT_DIR?.trim();
+  const artifactDir =
+    record && parent
+      ? createControlUiE2eArtifactDir("chat-transcript-disclosure-anchor", parent)
+      : undefined;
+  const viewport = { height, width };
+  const context = await suite.browser.newContext({
+    reducedMotion: "reduce",
+    viewport,
+    ...(artifactDir ? { recordVideo: { dir: artifactDir, size: viewport } } : {}),
+  });
+  return { context, page: await context.newPage(), artifactDir };
+}
+
+async function centerDisclosure(control: Locator) {
+  await control.evaluate((button) => {
+    const row = button.closest<HTMLElement>(".chat-virtual-row");
+    const thread = button.closest<HTMLElement>(".chat-thread");
+    if (!row || !thread) {
+      throw new Error("Expected disclosure inside a virtual transcript row");
+    }
+    const rowTop = row.getBoundingClientRect().top - thread.getBoundingClientRect().top;
+    thread.scrollTop += Math.round(rowTop - thread.clientHeight / 2);
+  });
+  await waitForChatScrollIdle(control.page());
+}
+
+async function saveTraces(
+  directory: string | undefined,
+  name: string,
+  traces: Record<string, DisclosureFrame[]>,
+  summary: Locator,
+  focus = false,
+) {
+  if (!directory) {
+    return;
+  }
+  await fs.writeFile(path.join(directory, `${name}.json`), `${JSON.stringify(traces, null, 2)}\n`);
+  if (focus) {
+    await summary.focus();
+  }
+  await captureDisclosureThemes(directory, name, summary);
+}
 
 async function captureDisclosureThemes(directory: string, name: string, summary: Locator) {
   const page = summary.page();
@@ -46,8 +123,8 @@ type DisclosureFrame = {
 };
 
 async function toggleDisclosureWithFrameTrace(
-  page: import("playwright").Page,
-  summary: import("playwright").Locator,
+  page: Page,
+  summary: Locator,
   actionSelector?: string,
 ): Promise<DisclosureFrame[]> {
   return await summary.evaluate((button, selector) => {
@@ -115,7 +192,7 @@ function expectStableDisclosureFrames(frames: DisclosureFrame[], label = "disclo
   ).toBeLessThanOrEqual(2);
 }
 
-async function showSplitDashboard(page: import("playwright").Page, sessionKey: string) {
+async function showSplitDashboard(page: Page, sessionKey: string) {
   const storageKey = controlUiBundledSettingsStorageKey(suite.server.baseUrl);
   await page.addInitScript(
     ({ key, settingsKey }) => {
@@ -561,31 +638,8 @@ suite.define(() => {
   );
 
   it("keeps completed-work and tool disclosures anchored on every expand and collapse frame", async () => {
-    const artifactDirParent = process.env.OPENCLAW_CONTROL_UI_E2E_ARTIFACT_DIR?.trim();
-    const artifactDir = artifactDirParent
-      ? createControlUiE2eArtifactDir("chat-transcript-disclosure-anchor", artifactDirParent)
-      : undefined;
-    const context = await suite.browser.newContext({
-      reducedMotion: "reduce",
-      viewport: { height: 800, width: 1400 },
-      ...(artifactDir
-        ? { recordVideo: { dir: artifactDir, size: { height: 800, width: 1400 } } }
-        : {}),
-    });
-    const page = await context.newPage();
+    const { context, page, artifactDir } = await createDisclosurePage(800, 1400);
     const sessionKey = "agent:main:dashboard:disclosure-geometry";
-    const transcriptPrefix = Array.from({ length: 12 }, (_, index) => [
-      {
-        role: "user",
-        content: `Earlier prompt ${index + 1}: keep enough transcript above the active row to make the pane scroll.`,
-        timestamp: index * 2 + 1,
-      },
-      {
-        role: "assistant",
-        content: [{ type: "text", text: `Earlier response ${index + 1}.` }],
-        timestamp: index * 2 + 2,
-      },
-    ]).flat();
     await installMockGateway(page, {
       sessionKey,
       featureMethods: ["board.get", "chat.history", "chat.metadata", "chat.startup"],
@@ -598,105 +652,52 @@ suite.define(() => {
         },
       },
       historyMessages: [
-        ...transcriptPrefix,
-        {
-          role: "user",
-          content: "Inspect the transcript implementation and run its focused tests.",
-          timestamp: 99,
-        },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "call-anchor",
-              name: "bash",
-              arguments: { command: "pnpm test ui/src/pages/chat" },
-            },
-            {
-              type: "toolCall",
-              id: "call-anchor-read",
-              name: "read",
-              arguments: { path: "ui/src/pages/chat/components/chat-tool-cards.ts" },
-            },
+        ...makeTranscript(
+          12,
+          (n) =>
+            `Earlier prompt ${n}: keep enough transcript above the active row to make the pane scroll.`,
+          (n) => `Earlier response ${n}.`,
+        ),
+        message("user", "Inspect the transcript implementation and run its focused tests.", 99),
+        message(
+          "assistant",
+          [
+            toolCall("call-anchor", "bash", { command: "pnpm test ui/src/pages/chat" }),
+            toolCall("call-anchor-read", "read", {
+              path: "ui/src/pages/chat/components/chat-tool-cards.ts",
+            }),
           ],
-          timestamp: 100,
-        },
-        {
-          role: "toolResult",
-          toolCallId: "call-anchor",
-          toolName: "bash",
-          content: [
-            {
-              type: "text",
-              text: Array.from(
-                { length: 24 },
-                (_, index) => `Focused test ${index + 1}: passed with stable transcript geometry.`,
-              ).join("\n"),
-            },
+          100,
+        ),
+        toolResult(
+          "call-anchor",
+          "bash",
+          Array.from(
+            { length: 24 },
+            (_, index) => `Focused test ${index + 1}: passed with stable transcript geometry.`,
+          ).join("\n"),
+          101,
+        ),
+        toolResult("call-anchor-read", "read", "export function renderToolCard() {}", 102),
+        assistant("The transcript implementation is sound and all focused tests pass.", 103),
+        ...makeTranscript(
+          3,
+          (n) => `Follow-up ${n}: record the next transcript observation.`,
+          (n) => `Observation ${n} recorded.`,
+          104,
+        ),
+        message("user", "Run one short sibling tool check.", 110),
+        message(
+          "assistant",
+          [
+            toolCall("call-sibling", "bash", {
+              command: "pnpm test ui/src/pages/chat/components/chat-tool-cards.test.ts",
+            }),
           ],
-          timestamp: 101,
-        },
-        {
-          role: "toolResult",
-          toolCallId: "call-anchor-read",
-          toolName: "read",
-          content: [{ type: "text", text: "export function renderToolCard() {}" }],
-          timestamp: 102,
-        },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: "The transcript implementation is sound and all focused tests pass.",
-            },
-          ],
-          timestamp: 103,
-        },
-        ...Array.from({ length: 3 }, (_, index) => [
-          {
-            role: "user",
-            content: `Follow-up ${index + 1}: record the next transcript observation.`,
-            timestamp: 104 + index * 2,
-          },
-          {
-            role: "assistant",
-            content: [{ type: "text", text: `Observation ${index + 1} recorded.` }],
-            timestamp: 105 + index * 2,
-          },
-        ]).flat(),
-        {
-          role: "user",
-          content: "Run one short sibling tool check.",
-          timestamp: 110,
-        },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "call-sibling",
-              name: "bash",
-              arguments: {
-                command: "pnpm test ui/src/pages/chat/components/chat-tool-cards.test.ts",
-              },
-            },
-          ],
-          timestamp: 111,
-        },
-        {
-          role: "toolResult",
-          toolCallId: "call-sibling",
-          toolName: "bash",
-          content: [{ type: "text", text: "Focused sibling passed." }],
-          timestamp: 112,
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "The sibling tool check passed." }],
-          timestamp: 113,
-        },
+          111,
+        ),
+        toolResult("call-sibling", "bash", "Focused sibling passed.", 112),
+        assistant("The sibling tool check passed.", 113),
       ],
     });
 
@@ -724,16 +725,7 @@ suite.define(() => {
         (button) => button.closest<HTMLElement>(".chat-virtual-row")?.dataset.virtualRowKey,
       ),
     ).not.toBe(endRowKey);
-    await middleWorkSummary.evaluate((button) => {
-      const row = button.closest<HTMLElement>(".chat-virtual-row");
-      const thread = button.closest<HTMLElement>(".chat-thread");
-      if (!row || !thread) {
-        throw new Error("Expected disclosure inside a virtual transcript row");
-      }
-      const rowTop = row.getBoundingClientRect().top - thread.getBoundingClientRect().top;
-      thread.scrollTop += Math.round(rowTop - thread.clientHeight / 2);
-    });
-    await waitForChatScrollIdle(page);
+    await centerDisclosure(middleWorkSummary);
     traces.workMiddleExpand = await toggleDisclosureWithFrameTrace(page, middleWorkSummary);
     const activitySummary = page
       .locator(
@@ -753,14 +745,7 @@ suite.define(() => {
     traces.activityMiddleCollapse = await toggleDisclosureWithFrameTrace(page, activitySummary);
     traces.workMiddleCollapse = await toggleDisclosureWithFrameTrace(page, middleWorkSummary);
 
-    if (artifactDir) {
-      await fs.writeFile(
-        path.join(artifactDir, "disclosure-geometry.json"),
-        `${JSON.stringify(traces, null, 2)}\n`,
-      );
-      await middleWorkSummary.focus();
-      await captureDisclosureThemes(artifactDir, "disclosure-geometry", middleWorkSummary);
-    }
+    await saveTraces(artifactDir, "disclosure-geometry", traces, middleWorkSummary, true);
     await context.close();
     for (const frames of Object.values(traces)) {
       expectStableDisclosureFrames(frames);
@@ -768,42 +753,18 @@ suite.define(() => {
   });
 
   it("keeps raw tool details anchored at the end and middle of a long transcript", async () => {
-    const artifactDirParent = process.env.OPENCLAW_CONTROL_UI_E2E_ARTIFACT_DIR?.trim();
-    const artifactDir = artifactDirParent
-      ? createControlUiE2eArtifactDir("chat-transcript-disclosure-anchor", artifactDirParent)
-      : undefined;
-    const context = await suite.browser.newContext({
-      reducedMotion: "reduce",
-      viewport: { height: 600, width: 900 },
-      ...(artifactDir
-        ? { recordVideo: { dir: artifactDir, size: { height: 600, width: 900 } } }
-        : {}),
-    });
-    const page = await context.newPage();
-    const transcriptPrefix = Array.from({ length: 14 }, (_, index) => [
-      {
-        role: "user",
-        content: `Earlier raw-details prompt ${index + 1}.`,
-        timestamp: index * 2 + 1,
-      },
-      {
-        role: "assistant",
-        content: [{ type: "text", text: `Earlier raw-details response ${index + 1}.` }],
-        timestamp: index * 2 + 2,
-      },
-    ]).flat();
+    const { context, page, artifactDir } = await createDisclosurePage(600, 900);
     await installMockGateway(page, {
       historyMessages: [
-        ...transcriptPrefix,
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "raw-details-widget",
-              name: "canvas_render",
-              arguments: { title: "Disclosure geometry proof" },
-            },
+        ...makeTranscript(
+          14,
+          (n) => `Earlier raw-details prompt ${n}.`,
+          (n) => `Earlier raw-details response ${n}.`,
+        ),
+        message(
+          "assistant",
+          [
+            toolCall("raw-details-widget", "canvas_render", { title: "Disclosure geometry proof" }),
             {
               type: "tool_result",
               id: "raw-details-widget",
@@ -829,13 +790,9 @@ suite.define(() => {
               ),
             },
           ],
-          timestamp: 100,
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "Disclosure geometry proof rendered." }],
-          timestamp: 101,
-        },
+          100,
+        ),
+        assistant("Disclosure geometry proof rendered.", 101),
       ],
     });
 
@@ -858,25 +815,10 @@ suite.define(() => {
     traces.rawDetailsEndExpand = await toggleDisclosureWithFrameTrace(page, rawDetailsToggle);
     traces.rawDetailsEndCollapse = await toggleDisclosureWithFrameTrace(page, rawDetailsToggle);
 
-    await rawDetailsToggle.evaluate((button) => {
-      const row = button.closest<HTMLElement>(".chat-virtual-row");
-      const thread = button.closest<HTMLElement>(".chat-thread");
-      if (!row || !thread) {
-        throw new Error("Expected raw-details disclosure inside a virtual transcript row");
-      }
-      const rowTop = row.getBoundingClientRect().top - thread.getBoundingClientRect().top;
-      thread.scrollTop += Math.round(rowTop - thread.clientHeight / 2);
-    });
-    await waitForChatScrollIdle(page);
+    await centerDisclosure(rawDetailsToggle);
     traces.rawDetailsMiddleExpand = await toggleDisclosureWithFrameTrace(page, rawDetailsToggle);
 
-    if (artifactDir) {
-      await fs.writeFile(
-        path.join(artifactDir, "raw-details-geometry.json"),
-        `${JSON.stringify(traces, null, 2)}\n`,
-      );
-      await captureDisclosureThemes(artifactDir, "raw-details-geometry", toolSummary);
-    }
+    await saveTraces(artifactDir, "raw-details-geometry", traces, toolSummary);
     traces.rawDetailsMiddleCollapse = await toggleDisclosureWithFrameTrace(page, rawDetailsToggle);
     const video = page.video();
     await context.close();
@@ -889,57 +831,37 @@ suite.define(() => {
   });
 
   it("keeps message disclosures and shared JSON controls anchored in a long transcript", async () => {
-    const context = await suite.browser.newContext({
-      reducedMotion: "reduce",
-      viewport: { height: 600, width: 900 },
-    });
-    const page = await context.newPage();
-    const transcriptPrefix = Array.from({ length: 12 }, (_, index) => [
-      {
-        role: "user",
-        content: `Earlier sibling-disclosure prompt ${index + 1}.`,
-        timestamp: index * 2 + 1,
-      },
-      {
-        role: "assistant",
-        content: [{ type: "text", text: `Earlier sibling-disclosure response ${index + 1}.` }],
-        timestamp: index * 2 + 2,
-      },
-    ]).flat();
+    const { context, page } = await createDisclosurePage(600, 900, false);
     await installMockGateway(page, {
       historyMessages: [
-        ...transcriptPrefix,
-        {
-          role: "user",
-          content: `User disclosure anchor marker. ${"A wrapped prompt line that must remain visually anchored. ".repeat(24)}`,
-          timestamp: 100,
-        },
-        {
-          role: "assistant",
-          content: JSON.stringify({
+        ...makeTranscript(
+          12,
+          (n) => `Earlier sibling-disclosure prompt ${n}.`,
+          (n) => `Earlier sibling-disclosure response ${n}.`,
+        ),
+        message(
+          "user",
+          `User disclosure anchor marker. ${"A wrapped prompt line that must remain visually anchored. ".repeat(24)}`,
+          100,
+        ),
+        message(
+          "assistant",
+          JSON.stringify({
             marker: "json-disclosure-anchor-marker",
             rows: Array.from(
               { length: 30 },
               (_, index) => `JSON disclosure proof row ${index + 1}`,
             ),
           }),
-          timestamp: 101,
-        },
-        {
-          role: "assistant",
-          content: `\`\`\`text\n${"A wide transcript code line that must wrap without moving its virtual row. ".repeat(24)}\n\`\`\``,
-          timestamp: 102,
-        },
-        {
-          role: "user",
-          content: "Keep both sibling disclosures above this final exchange.",
-          timestamp: 103,
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "Both sibling disclosures are ready." }],
-          timestamp: 104,
-        },
+          101,
+        ),
+        message(
+          "assistant",
+          `\`\`\`text\n${"A wide transcript code line that must wrap without moving its virtual row. ".repeat(24)}\n\`\`\``,
+          102,
+        ),
+        message("user", "Keep both sibling disclosures above this final exchange.", 103),
+        assistant("Both sibling disclosures are ready.", 104),
       ],
     });
 

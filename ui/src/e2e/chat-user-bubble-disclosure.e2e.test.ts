@@ -11,9 +11,40 @@ import {
   captureUiProofEnabled,
   createChatFlowE2eSuite,
   installMockGateway,
+  newChatPage,
 } from "./chat-flow.test-support.ts";
 
 const suite = createChatFlowE2eSuite();
+const artifactPath = (name: string) => path.join(suite.artifactDir, "user-bubble-clamp", name);
+const preview = (root: Page | Locator) => root.locator(".chat-message-disclosure__content");
+const height = (content: Locator) => content.evaluate((element) => element.clientHeight);
+const mask = (content: Locator) =>
+  content.evaluate((element) => getComputedStyle(element).maskImage);
+const message = (content: unknown, timestamp = 1, role = "user") => ({ role, content, timestamp });
+const browserOptions = (width = 1440, colorScheme: "light" | "dark" = "light") => ({
+  locale: "en-US",
+  serviceWorkers: "block" as const,
+  viewport: { width, height: 844 },
+  colorScheme,
+});
+
+async function screenshot(target: Page | Locator, name: string) {
+  if (captureUiProofEnabled) {
+    await target.screenshot({ path: artifactPath(name) });
+  }
+}
+
+async function openChat(
+  historyMessages: unknown[],
+  options: Parameters<typeof suite.newBrowserContext>[0] = {
+    viewport: { width: 1440, height: 844 },
+  },
+) {
+  const page = await newChatPage(suite, options);
+  await installMockGateway(page, { historyMessages });
+  await page.goto(`${suite.server.baseUrl}chat`);
+  return page;
+}
 
 async function expectCenteredToggle(bubble: Locator) {
   const { above, below } = await bubble.evaluate((element) => {
@@ -201,257 +232,178 @@ suite.define(() => {
                 `- Review sample item ${index + 1}: keep the project notes clear and explain the next useful step.`,
             ).join("\n")
           : prose;
-      const context = await suite.newBrowserContext({
-        locale: "en-US",
-        serviceWorkers: "block",
-        viewport: { height: 844, width },
-        colorScheme: theme,
-      });
-      const page = await context.newPage();
-      await installMockGateway(page, {
-        historyMessages: [
-          {
-            role: "user",
-            content: [
-              ...(withImage
-                ? [
-                    {
-                      type: "image",
-                      url: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='32'%3E%3Crect width='64' height='32' fill='teal'/%3E%3C/svg%3E",
-                    },
-                  ]
-                : []),
-              { type: "text", text },
-            ],
-            timestamp: 1,
-          },
+      const page = await openChat(
+        [
+          message([
+            ...(withImage
+              ? [
+                  {
+                    type: "image",
+                    url: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='32'%3E%3Crect width='64' height='32' fill='teal'/%3E%3C/svg%3E",
+                  },
+                ]
+              : []),
+            { type: "text", text },
+          ]),
           // Source exceeds the threshold, but all five rendered lines fit the full preview.
-          {
-            role: "user",
-            content: Array.from(
+          message(
+            Array.from(
               { length: 5 },
               (_, index) => `[Short link ${index + 1}](https://example.com/${"a".repeat(300)})`,
             ).join("\n"),
-            timestamp: 2,
-          },
+            2,
+          ),
         ],
-      });
+        browserOptions(width, theme),
+      );
+      const bubbles = page.locator(".chat-group.user .chat-bubble");
+      const bubble = bubbles.first();
+      await bubble.waitFor({ state: "visible", timeout: 10_000 });
+      const content = preview(bubble);
+      const toggle = bubble.getByRole("button", { name: "Show more" });
 
-      try {
-        await page.goto(`${suite.server.baseUrl}chat`);
-        const bubbles = page.locator(".chat-group.user .chat-bubble");
-        const bubble = bubbles.first();
-        await bubble.waitFor({ state: "visible", timeout: 10_000 });
-        const content = bubble.locator(".chat-message-disclosure__content");
-        const toggle = bubble.getByRole("button", { name: "Show more" });
+      await page.evaluate(() => document.fonts.ready);
+      await expectCenteredToggle(bubble);
+      await expectReadableLastLine(page, content);
+      expect(await mask(content)).not.toBe("none");
+      const fitting = bubbles.nth(1);
+      await fitting.locator(".chat-message-disclosure__toggle").waitFor({ state: "hidden" });
+      expect(await mask(preview(fitting))).toBe("none");
+      expect(await toggle.getAttribute("aria-expanded")).toBe("false");
+      const rendered = await content
+        .locator(layout === "list" ? ".chat-text li" : ".chat-text p")
+        .allTextContents();
+      expect(rendered).toEqual(
+        layout === "list" ? text.split("\n").map((item) => item.slice(2)) : text.split("\n\n"),
+      );
+      const collapsedHeight = await height(content);
+      expect(await content.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(
+        true,
+      );
+      await screenshot(
+        bubble,
+        `${theme}-${width}-${withImage ? "image" : "text"}-${layout}-collapsed.png`,
+      );
 
-        await page.evaluate(() => document.fonts.ready);
-        await expectCenteredToggle(bubble);
-        await expectReadableLastLine(page, content);
-        expect(await content.evaluate((element) => getComputedStyle(element).maskImage)).not.toBe(
-          "none",
-        );
-        const fitting = bubbles.nth(1);
-        await fitting.locator(".chat-message-disclosure__toggle").waitFor({ state: "hidden" });
-        expect(
-          await fitting
-            .locator(".chat-message-disclosure__content")
-            .evaluate((element) => getComputedStyle(element).maskImage),
-        ).toBe("none");
-        expect(await toggle.getAttribute("aria-expanded")).toBe("false");
-        expect(
-          await content
-            .locator(layout === "list" ? ".chat-text li" : ".chat-text p")
-            .allTextContents(),
-        ).toEqual(
-          layout === "list" ? text.split("\n").map((item) => item.slice(2)) : text.split("\n\n"),
-        );
-        const collapsedHeight = await content.evaluate((element) => element.clientHeight);
-        expect(
-          await content.evaluate((element) => element.scrollHeight > element.clientHeight),
-        ).toBe(true);
-        if (captureUiProofEnabled) {
-          await bubble.screenshot({
-            path: path.join(
-              suite.artifactDir,
-              "user-bubble-clamp",
-              `${theme}-${width}-${withImage ? "image" : "text"}-${layout}-collapsed.png`,
-            ),
-          });
-        }
-
-        await toggle.click();
-        const collapse = bubble.getByRole("button", { name: "Show less" });
-        expect(await collapse.getAttribute("aria-expanded")).toBe("true");
-        await expectCenteredToggle(bubble);
-        expect(await content.evaluate((element) => getComputedStyle(element).maskImage)).toBe(
-          "none",
-        );
-        expect(await content.evaluate((element) => element.clientHeight)).toBeGreaterThan(
-          collapsedHeight,
-        );
-      } finally {
-        await suite.closeBrowserContext(context);
-      }
+      await toggle.click();
+      const collapse = bubble.getByRole("button", { name: "Show less" });
+      expect(await collapse.getAttribute("aria-expanded")).toBe("true");
+      await expectCenteredToggle(bubble);
+      expect(await mask(content)).toBe("none");
+      expect(await height(content)).toBeGreaterThan(collapsedHeight);
     },
   );
 
   it("remeasures the fifth line after viewport and text reflow", async () => {
-    const context = await suite.newBrowserContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { width: 1440, height: 844 },
-      colorScheme: "light",
-    });
-    const page = await context.newPage();
-    await installMockGateway(page, {
-      historyMessages: [
-        {
-          role: "user",
-          content:
-            "Keep the project notes clear enough for someone reading the conversation later. ".repeat(
-              3,
-            ) +
+    const page = await openChat(
+      [
+        message(
+          "Keep the project notes clear enough for someone reading the conversation later. ".repeat(
+            3,
+          ) +
             "\n\n" +
             "The remaining sample notes stay available after expansion. ".repeat(24),
-          timestamp: 1,
-        },
+        ),
       ],
+      browserOptions(),
+    );
+    const content = preview(page);
+    await content.waitFor();
+    await page.evaluate(() => document.fonts.ready);
+    await expectReadableLastLine(page, content);
+    const desktopHeight = await height(content);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect.poll(() => height(content)).not.toBe(desktopHeight);
+    await expectReadableLastLine(page, content);
+    await page.setViewportSize({ width: 1440, height: 844 });
+    await expect.poll(() => height(content)).toBe(desktopHeight);
+    await expectReadableLastLine(page, content);
+    await content.locator(".chat-text").evaluate((element) => {
+      (element as HTMLElement).style.fontSize = "18px";
     });
-    try {
-      await page.goto(`${suite.server.baseUrl}chat`);
-      const content = page.locator(".chat-message-disclosure__content");
-      await content.waitFor();
-      await page.evaluate(() => document.fonts.ready);
-      await expectReadableLastLine(page, content);
-      const desktopHeight = await content.evaluate((element) => element.clientHeight);
-      await page.setViewportSize({ width: 390, height: 844 });
-      await expect
-        .poll(() => content.evaluate((element) => element.clientHeight))
-        .not.toBe(desktopHeight);
-      await expectReadableLastLine(page, content);
-      await page.setViewportSize({ width: 1440, height: 844 });
-      await expect
-        .poll(() => content.evaluate((element) => element.clientHeight))
-        .toBe(desktopHeight);
-      await expectReadableLastLine(page, content);
-      await content.locator(".chat-text").evaluate((element) => {
-        (element as HTMLElement).style.fontSize = "18px";
-      });
-      await expect
-        .poll(() => content.evaluate((element) => element.clientHeight))
-        .not.toBe(desktopHeight);
-      await expectReadableLastLine(page, content);
-    } finally {
-      await suite.closeBrowserContext(context);
-    }
+    await expect.poll(() => height(content)).not.toBe(desktopHeight);
+    await expectReadableLastLine(page, content);
   });
 
   it.each(["paragraphs", "escaped HTML", "native summary"])(
     "measures visible lines when authored details with %s close and reopen",
     async (body) => {
-      const context = await suite.newBrowserContext({ viewport: { width: 1440, height: 844 } });
-      const page = await context.newPage();
-      try {
-        await installMockGateway(page, {
-          historyMessages: [
-            {
-              role: "user",
-              content:
-                (body === "native summary"
-                  ? "<details>\n\n"
-                  : "<details><summary>Hidden reference</summary>\n\n") +
-                (body === "escaped HTML"
-                  ? `<div>${"Hidden row with reference text. ".repeat(20)}</div>\n`
-                  : "Hidden row with reference text.\n".repeat(20)) +
-                "\n</details>\n\n" +
-                "Visible project notes continue here and explain the next useful step. ".repeat(28),
-              timestamp: 1,
-            },
-          ],
-        });
-        await page.goto(`${suite.server.baseUrl}chat`);
-        const content = page.locator(".chat-message-disclosure__content");
-        const details = content.locator("details");
-        const summary = details.locator("summary");
-        await details.waitFor();
-        await page.evaluate(() => document.fonts.ready);
-        const expectFourthProseLineCut = async (paragraph: Locator) => {
-          const fraction = () =>
-            paragraph.evaluate((element) => {
-              const range = document.createRange();
-              const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-              const lines: DOMRect[] = [];
-              for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-                if (!node.textContent?.trim() || node.parentElement?.closest("summary")) {
-                  continue;
-                }
-                range.selectNodeContents(node);
-                for (const rect of range.getClientRects()) {
-                  if (rect.width > 0 && !lines.some((line) => line.top === rect.top)) {
-                    lines.push(rect);
-                  }
+      const page = await openChat([
+        message(
+          (body === "native summary"
+            ? "<details>\n\n"
+            : "<details><summary>Hidden reference</summary>\n\n") +
+            (body === "escaped HTML"
+              ? `<div>${"Hidden row with reference text. ".repeat(20)}</div>\n`
+              : "Hidden row with reference text.\n".repeat(20)) +
+            "\n</details>\n\n" +
+            "Visible project notes continue here and explain the next useful step. ".repeat(28),
+        ),
+      ]);
+      const content = preview(page);
+      const details = content.locator("details");
+      const summary = details.locator("summary");
+      await details.waitFor();
+      await page.evaluate(() => document.fonts.ready);
+      const expectFourthProseLineCut = async (paragraph: Locator) => {
+        const fraction = () =>
+          paragraph.evaluate((element) => {
+            const range = document.createRange();
+            const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+            const lines: DOMRect[] = [];
+            for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+              if (!node.textContent?.trim() || node.parentElement?.closest("summary")) {
+                continue;
+              }
+              range.selectNodeContents(node);
+              for (const rect of range.getClientRects()) {
+                if (rect.width > 0 && !lines.some((line) => line.top === rect.top)) {
+                  lines.push(rect);
                 }
               }
-              const fourthLine = lines[3]!;
-              const lineHeight = Number.parseFloat(getComputedStyle(element).lineHeight);
-              const lineTop = fourthLine.top - Math.floor((lineHeight - fourthLine.height) / 2);
-              const bottom = element
-                .closest(".chat-message-disclosure__content")!
-                .getBoundingClientRect().bottom;
-              return (bottom - lineTop) / lineHeight;
-            });
-          // The visible summary owns the first preview line; prose supplies the next four.
-          await expect.poll(fraction).toSatisfy((value: number) => value >= 0.66 && value <= 0.75);
-        };
-        const outside = content.locator(".chat-text > p");
-        const toggleDetails = () =>
-          body === "native summary"
-            ? details.click({ position: { x: 30, y: 10 } })
-            : summary.click();
-        await expectFourthProseLineCut(outside);
-        await toggleDetails();
-        await expectFourthProseLineCut(details);
-        await toggleDetails();
-        await expectFourthProseLineCut(outside);
-      } finally {
-        await suite.closeBrowserContext(context);
-      }
+            }
+            const fourthLine = lines[3]!;
+            const lineHeight = Number.parseFloat(getComputedStyle(element).lineHeight);
+            const lineTop = fourthLine.top - Math.floor((lineHeight - fourthLine.height) / 2);
+            const bottom = element
+              .closest(".chat-message-disclosure__content")!
+              .getBoundingClientRect().bottom;
+            return (bottom - lineTop) / lineHeight;
+          });
+        // The visible summary owns the first preview line; prose supplies the next four.
+        await expect.poll(fraction).toSatisfy((value: number) => value >= 0.66 && value <= 0.75);
+      };
+      const outside = content.locator(".chat-text > p");
+      const toggleDetails = () =>
+        body === "native summary" ? details.click({ position: { x: 30, y: 10 } }) : summary.click();
+      await expectFourthProseLineCut(outside);
+      await toggleDetails();
+      await expectFourthProseLineCut(details);
+      await toggleDetails();
+      await expectFourthProseLineCut(outside);
     },
   );
 
   it("keeps densely spaced block art within five preview rows", async () => {
-    const context = await suite.newBrowserContext({ viewport: { width: 1440, height: 844 } });
-    const page = await context.newPage();
-    try {
-      await installMockGateway(page, {
-        historyMessages: [
-          {
-            role: "user",
-            content:
-              "```\n" +
-              Array.from({ length: 24 }, () => "█▀▄ ".repeat(20)).join("\n") +
-              "\n```\n\n" +
-              "Follow the sample notes. ".repeat(60),
-            timestamp: 1,
-          },
-        ],
-      });
-      await page.goto(`${suite.server.baseUrl}chat`);
-      const content = page.locator(".chat-message-disclosure__content");
-      await content.waitFor();
-      await page.evaluate(() => document.fonts.ready);
-      const visibleRows = await content.evaluate((element) => {
-        const range = document.createRange();
-        range.selectNodeContents(element.querySelector("code.markdown-block-art")!);
-        const bottom = element.getBoundingClientRect().bottom;
-        return [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.top < bottom)
-          .length;
-      });
-      expect(visibleRows).toBe(5);
-    } finally {
-      await suite.closeBrowserContext(context);
-    }
+    const page = await openChat([
+      message(
+        "```\n" +
+          Array.from({ length: 24 }, () => "█▀▄ ".repeat(20)).join("\n") +
+          "\n```\n\n" +
+          "Follow the sample notes. ".repeat(60),
+      ),
+    ]);
+    const content = preview(page);
+    await content.waitFor();
+    await page.evaluate(() => document.fonts.ready);
+    const visibleRows = await content.evaluate((element) => {
+      const range = document.createRange();
+      range.selectNodeContents(element.querySelector("code.markdown-block-art")!);
+      const bottom = element.getBoundingClientRect().bottom;
+      return [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.top < bottom)
+        .length;
+    });
+    expect(visibleRows).toBe(5);
   });
 
   it.each([{ name: "mobile", width: 390, height: 844 }])(
@@ -475,138 +427,113 @@ suite.define(() => {
         ),
         "Final prompt tail: the complete request remains available.",
       ];
-      const context = await suite.newBrowserContext({
-        locale: "en-US",
-        colorScheme: "light",
-        serviceWorkers: "block",
-        viewport: { width: viewport.width, height: viewport.height },
-      });
-      const page = await context.newPage();
-      await installMockGateway(page, {
-        historyMessages: [
-          { role: "user", content: paragraphs.join("\n\n"), timestamp: 1 },
-          { role: "user", content: "Short follow-up request.", timestamp: 2 },
-          { role: "assistant", content: "The sample review is complete.", timestamp: 3 },
+      const page = await openChat(
+        [
+          message(paragraphs.join("\n\n")),
+          message("Short follow-up request.", 2),
+          message("The sample review is complete.", 3, "assistant"),
         ],
+        browserOptions(viewport.width),
+      );
+      const bubble = page.locator(".chat-group.user .chat-bubble").first();
+      const toggle = bubble.getByRole("button", { name: "Show more", exact: true });
+      await toggle.waitFor({ state: "visible" });
+      await page.reload();
+      await toggle.waitFor({ state: "visible" });
+      const content = preview(bubble);
+      const markdown = content.locator(".chat-text");
+      const initialCollapsedHeight = await height(content);
+      expect(await content.evaluate((element) => element.scrollTop)).toBe(0);
+      expect(await markdown.locator("p").allTextContents()).toEqual(paragraphs);
+
+      // Browser descendant reveal can scroll an overflow-hidden preview without expanding it.
+      const revealedParagraph = markdown.locator("p").nth(9);
+      await revealedParagraph.scrollIntoViewIfNeeded();
+      const geometry = await revealedParagraph.evaluate((paragraph) => {
+        const clip = paragraph.closest(".chat-message-disclosure__content");
+        if (!clip) {
+          throw new Error("Missing user message preview");
+        }
+        const clipRect = clip.getBoundingClientRect();
+        const paragraphRect = paragraph.getBoundingClientRect();
+        // Read individual text nodes so BR boxes and duplicate element fragments are excluded.
+        const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
+        const lines: Array<{ top: number; bottom: number }> = [];
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          if (!node.textContent?.trim()) {
+            continue;
+          }
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          for (const rect of range.getClientRects()) {
+            if (rect.width > 0 && rect.height > 0) {
+              lines.push({ top: rect.top, bottom: rect.bottom });
+            }
+          }
+        }
+        return {
+          scrollTop: clip.scrollTop,
+          clip: { top: clipRect.top, bottom: clipRect.bottom },
+          paragraph: { top: paragraphRect.top, bottom: paragraphRect.bottom },
+          lines,
+        };
       });
-
-      try {
-        await page.goto(`${suite.server.baseUrl}chat`);
-        const bubble = page.locator(".chat-group.user .chat-bubble").first();
-        const toggle = bubble.getByRole("button", { name: "Show more", exact: true });
-        await toggle.waitFor({ state: "visible" });
-        await page.reload();
-        await toggle.waitFor({ state: "visible" });
-        const content = bubble.locator(".chat-message-disclosure__content");
-        const markdown = content.locator(".chat-text");
-        const initialCollapsedHeight = await content.evaluate((element) => element.clientHeight);
-        expect(await content.evaluate((element) => element.scrollTop)).toBe(0);
-        expect(await markdown.locator("p").allTextContents()).toEqual(paragraphs);
-
-        // Browser descendant reveal can scroll an overflow-hidden preview without expanding it.
-        const revealedParagraph = markdown.locator("p").nth(9);
-        await revealedParagraph.scrollIntoViewIfNeeded();
-        const geometry = await revealedParagraph.evaluate((paragraph) => {
-          const clip = paragraph.closest(".chat-message-disclosure__content");
-          if (!clip) {
-            throw new Error("Missing user message preview");
-          }
-          const clipRect = clip.getBoundingClientRect();
-          const paragraphRect = paragraph.getBoundingClientRect();
-          // Read individual text nodes so BR boxes and duplicate element fragments are excluded.
-          const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
-          const lines: Array<{ top: number; bottom: number }> = [];
-          for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-            if (!node.textContent?.trim()) {
-              continue;
-            }
-            const range = document.createRange();
-            range.selectNodeContents(node);
-            for (const rect of range.getClientRects()) {
-              if (rect.width > 0 && rect.height > 0) {
-                lines.push({ top: rect.top, bottom: rect.bottom });
-              }
-            }
-          }
-          return {
-            scrollTop: clip.scrollTop,
-            clip: { top: clipRect.top, bottom: clipRect.bottom },
-            paragraph: { top: paragraphRect.top, bottom: paragraphRect.bottom },
-            lines,
-          };
-        });
-        if (captureUiProofEnabled) {
-          const artifactDir = path.join(suite.artifactDir, "user-bubble-clamp");
-          await page.screenshot({ path: path.join(artifactDir, `${viewport.name}-revealed.png`) });
-          await writeFile(
-            path.join(artifactDir, `${viewport.name}-geometry.json`),
-            `${JSON.stringify(geometry, null, 2)}\n`,
-          );
-        }
-        expect(await toggle.getAttribute("aria-expanded")).toBe("false");
-        expect(geometry.scrollTop).toBeGreaterThan(0);
-        expect(
-          geometry.lines.filter(
-            (line) => line.top >= geometry.clip.top && line.bottom <= geometry.clip.bottom,
-          ).length,
-        ).toBeGreaterThan(0);
-        expect(geometry.lines.length).toBeGreaterThanOrEqual(6);
-        for (const line of geometry.lines) {
-          expect(line.top, "text starts within its own paragraph").toBeGreaterThanOrEqual(
-            geometry.paragraph.top - 1,
-          );
-          expect(
-            line.bottom,
-            "text ends within its own paragraph without overlapping the next",
-          ).toBeLessThanOrEqual(geometry.paragraph.bottom + 1);
-        }
-        const collapsedHeight = await content.evaluate((element) => element.clientHeight);
-        expect(collapsedHeight).toBe(initialCollapsedHeight);
-
-        await toggle.click();
-        const collapse = bubble.getByRole("button", { name: "Show less", exact: true });
-        expect(await collapse.getAttribute("aria-expanded")).toBe("true");
-        expect(await content.evaluate((element) => element.clientHeight)).toBeGreaterThan(
-          collapsedHeight,
+      await screenshot(page, `${viewport.name}-revealed.png`);
+      if (captureUiProofEnabled) {
+        await writeFile(
+          artifactPath(`${viewport.name}-geometry.json`),
+          `${JSON.stringify(geometry, null, 2)}\n`,
+        );
+      }
+      expect(await toggle.getAttribute("aria-expanded")).toBe("false");
+      expect(geometry.scrollTop).toBeGreaterThan(0);
+      expect(
+        geometry.lines.filter(
+          (line) => line.top >= geometry.clip.top && line.bottom <= geometry.clip.bottom,
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(geometry.lines.length).toBeGreaterThanOrEqual(6);
+      for (const line of geometry.lines) {
+        expect(line.top, "text starts within its own paragraph").toBeGreaterThanOrEqual(
+          geometry.paragraph.top - 1,
         );
         expect(
-          await content.evaluate((element) => element.scrollHeight - element.clientHeight),
-        ).toBeLessThanOrEqual(1);
-        const tail = markdown.locator("p").last();
-        await tail.scrollIntoViewIfNeeded();
-        expect(await tail.textContent()).toBe(paragraphs.at(-1));
-        if (captureUiProofEnabled) {
-          await page.screenshot({
-            path: path.join(
-              suite.artifactDir,
-              "user-bubble-clamp",
-              `${viewport.name}-expanded-tail.png`,
-            ),
-          });
+          line.bottom,
+          "text ends within its own paragraph without overlapping the next",
+        ).toBeLessThanOrEqual(geometry.paragraph.bottom + 1);
+      }
+      const collapsedHeight = await height(content);
+      expect(collapsedHeight).toBe(initialCollapsedHeight);
+
+      await toggle.click();
+      const collapse = bubble.getByRole("button", { name: "Show less", exact: true });
+      expect(await collapse.getAttribute("aria-expanded")).toBe("true");
+      expect(await height(content)).toBeGreaterThan(collapsedHeight);
+      expect(
+        await content.evaluate((element) => element.scrollHeight - element.clientHeight),
+      ).toBeLessThanOrEqual(1);
+      const tail = markdown.locator("p").last();
+      await tail.scrollIntoViewIfNeeded();
+      expect(await tail.textContent()).toBe(paragraphs.at(-1));
+      await screenshot(page, `${viewport.name}-expanded-tail.png`);
+      await collapse.click();
+      expect(await toggle.getAttribute("aria-expanded")).toBe("false");
+      expect(await height(content)).toBe(initialCollapsedHeight);
+      const siblings = page.locator(".chat-group .chat-bubble");
+      expect(await siblings.nth(1).textContent()).toContain("Short follow-up request.");
+      expect(await siblings.nth(2).textContent()).toContain("The sample review is complete.");
+      const boxes = await siblings.evaluateAll((elements) =>
+        elements.map((element) => {
+          const rect = element.getBoundingClientRect();
+          return { top: rect.top, bottom: rect.bottom };
+        }),
+      );
+      expect(boxes).toHaveLength(3);
+      for (const [index, box] of boxes.entries()) {
+        const previous = boxes[index - 1];
+        if (previous) {
+          expect(previous.bottom).toBeLessThanOrEqual(box.top + 1);
         }
-        await collapse.click();
-        expect(await toggle.getAttribute("aria-expanded")).toBe("false");
-        expect(await content.evaluate((element) => element.clientHeight)).toBe(
-          initialCollapsedHeight,
-        );
-        const siblings = page.locator(".chat-group .chat-bubble");
-        expect(await siblings.nth(1).textContent()).toContain("Short follow-up request.");
-        expect(await siblings.nth(2).textContent()).toContain("The sample review is complete.");
-        const boxes = await siblings.evaluateAll((elements) =>
-          elements.map((element) => {
-            const rect = element.getBoundingClientRect();
-            return { top: rect.top, bottom: rect.bottom };
-          }),
-        );
-        expect(boxes).toHaveLength(3);
-        for (const [index, box] of boxes.entries()) {
-          const previous = boxes[index - 1];
-          if (previous) {
-            expect(previous.bottom).toBeLessThanOrEqual(box.top + 1);
-          }
-        }
-      } finally {
-        await suite.closeBrowserContext(context);
       }
     },
   );

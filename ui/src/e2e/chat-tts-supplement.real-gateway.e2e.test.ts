@@ -404,29 +404,22 @@ suite.define(() => {
                         }
                         const snapshotKey = resolveChatSnapshotKey(snapshotHost, { sessionKey });
                         return page.evaluate(
-                          ({
-                            sessionKey: expectedSessionKey,
-                            snapshotKey: expectedSnapshotKey,
-                            gatewayUrl: expectedGatewayUrl,
-                            recoveryScope: expectedRecoveryScope,
-                            text: expectedText,
-                            cursors: hydrationCursors,
-                            consumedAfterResponse,
-                          }) => {
+                          (expected) => {
                             const state = document.querySelector<
                               HTMLElement & { state?: ChatPageHost }
                             >(".chat-pane-cache__pane--active")?.state;
-                            const snapshot =
-                              state?.chatMessagesBySession?.get(expectedSnapshotKey)?.snapshot;
+                            const snapshot = state?.chatMessagesBySession?.get(
+                              expected.snapshotKey,
+                            )?.snapshot;
                             return (
-                              state?.sessionKey === expectedSessionKey &&
-                              state.settings.gatewayUrl === expectedGatewayUrl &&
+                              state?.sessionKey === expected.sessionKey &&
+                              state.settings.gatewayUrl === expected.gatewayUrl &&
                               state.client?.recoveryScopeReady === true &&
-                              state.client.recoveryScope === expectedRecoveryScope &&
+                              state.client.recoveryScope === expected.recoveryScope &&
                               !state.chatLoading &&
-                              (hydrationCursors.includes(snapshot?.deltaCursor ?? "") ||
-                                consumedAfterResponse) &&
-                              JSON.stringify(snapshot?.messages ?? []).includes(expectedText)
+                              (expected.cursors.includes(snapshot?.deltaCursor ?? "") ||
+                                expected.consumedAfterResponse) &&
+                              JSON.stringify(snapshot?.messages ?? []).includes(expected.text)
                             );
                           },
                           {

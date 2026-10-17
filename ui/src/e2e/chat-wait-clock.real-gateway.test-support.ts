@@ -121,6 +121,14 @@ function writeTool(
   ]);
 }
 
+function writeReply(response: ServerResponse, text: string, id: string) {
+  writeOpenAiResponsesText(response, {
+    text,
+    messageId: `${id}_reply`,
+    responseId: `${id}_response`,
+  });
+}
+
 /** Model transport only: the Gateway executes all tools and owns the native child registry. */
 export async function startWaitClockProvider() {
   const childStarted = createDeferred();
@@ -190,20 +198,12 @@ export async function startWaitClockProvider() {
             // Never manufacture already_pending: this must come from the real registry/tool owner.
             expect(result.status).toBe("already_pending");
             expect(result.pendingChildren).toHaveLength(1);
-            writeOpenAiResponsesText(response, {
-              text: waitClockFixture.updateReply,
-              messageId: "update_reply",
-              responseId: "update_response",
-            });
+            writeReply(response, waitClockFixture.updateReply, "update");
           } else {
             expect(step, "exactly one completion turn must resume the parent").toBe(4);
             expect(childReleased).toBe(true);
             expect(JSON.stringify(body.input)).toContain(waitClockFixture.childReply);
-            writeOpenAiResponsesText(response, {
-              text: waitClockFixture.resumedReply,
-              messageId: "resumed_reply",
-              responseId: "resumed_response",
-            });
+            writeReply(response, waitClockFixture.resumedReply, "resumed");
           }
         })();
         handlers.add(handler);
@@ -231,11 +231,7 @@ export async function startWaitClockProvider() {
         throw new Error("The actual child provider request is not pending");
       }
       childReleased = true;
-      writeOpenAiResponsesText(childResponse, {
-        text: waitClockFixture.childReply,
-        messageId: "child_reply",
-        responseId: "child_response",
-      });
+      writeReply(childResponse, waitClockFixture.childReply, "child");
     },
     async stop() {
       if (stopped) {

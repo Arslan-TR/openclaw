@@ -8,6 +8,7 @@ import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts"
 const suite = createControlUiE2eSuite({ name: "Expanded video gallery" });
 // Existing synthetic VP9 fixture; no generated media is added to the source tree.
 const video = readFileSync(new URL("./fixtures/video-poster.mp4", import.meta.url));
+const clip = (name: string) => `MEDIA:https://example.com/gallery-proof/${name}.mp4`;
 
 type NativeControlNode = {
   backendNodeId: number;
@@ -84,25 +85,19 @@ suite.define(() => {
           });
           const gateway = await installMockGateway(page, {
             historyMessages: [
-              { role: "user", content: "Compare these clips.", timestamp: 1800000000000 },
+              { role: "user", content: "Compare these clips." },
               {
                 role: "assistant",
-                content:
-                  "**Before**\nMEDIA:https://example.com/gallery-proof/before.mp4\n\n**After**\nMEDIA:https://example.com/gallery-proof/after.mp4",
-                timestamp: 1800000001000,
+                content: `**Before**\n${clip("before")}\n\n**After**\n${clip("after")}`,
               },
-              {
-                role: "assistant",
-                content: "**Alternate**\nMEDIA:https://example.com/gallery-proof/alternate.mp4",
-                timestamp: 1800000002000,
-              },
-              { role: "user", content: "A separate turn.", timestamp: 1800000003000 },
-              {
-                role: "assistant",
-                content: "MEDIA:https://example.com/gallery-proof/separate.mp4",
-                timestamp: 1800000004000,
-              },
-            ],
+              { role: "assistant", content: `**Alternate**\n${clip("alternate")}` },
+              { role: "user", content: "A separate turn." },
+              { role: "assistant", content: clip("separate") },
+            ].map(({ role, content }, index) => ({
+              role,
+              content,
+              timestamp: 1800000000000 + index * 1000,
+            })),
           });
           await page.goto(`${suite.server.baseUrl}chat`);
           await gateway.waitForRequest("chat.startup");
@@ -119,9 +114,16 @@ suite.define(() => {
           const viewer = page.locator("openclaw-image-lightbox");
           const player = viewer.locator("video");
           const counter = viewer.locator(".gallery-counter");
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.readyState))
-            .toBeGreaterThanOrEqual(2);
+          const ready = () => player.evaluate((media: HTMLVideoElement) => media.readyState);
+          const paused = () => player.evaluate((media: HTMLVideoElement) => media.paused);
+          const time = () => player.evaluate((media: HTMLVideoElement) => media.currentTime);
+          const fullscreen = () => player.evaluate((media) => media.matches(":fullscreen"));
+          const position = async () => (await counter.textContent())?.trim();
+          const navigate = async (key: string, name: string) => {
+            await page.keyboard.press(key);
+            await expect.poll(() => player.getAttribute("src")).toContain(`${name}.mp4`);
+          };
+          await expect.poll(ready).toBeGreaterThanOrEqual(2);
           await expect.poll(async () => (await counter.textContent())?.trim()).toBe("1 / 3");
           await page.screenshot({ path: `${dir}/expanded-first.png`, animations: "disabled" });
           expect(
@@ -141,17 +143,12 @@ suite.define(() => {
               );
             }),
           ).toBe(true);
+          await navigate("ArrowRight", "after");
+          await navigate("ArrowRight", "alternate");
           await page.keyboard.press("ArrowRight");
-          await expect.poll(() => player.getAttribute("src")).toContain("after.mp4");
-          await page.keyboard.press("ArrowRight");
-          await expect.poll(() => player.getAttribute("src")).toContain("alternate.mp4");
-          await page.keyboard.press("ArrowRight");
-          expect((await counter.textContent())?.trim()).toBe("3 / 3");
-          await page.keyboard.press("ArrowLeft");
-          await expect.poll(() => player.getAttribute("src")).toContain("after.mp4");
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.readyState))
-            .toBeGreaterThanOrEqual(2);
+          expect(await position()).toBe("3 / 3");
+          await navigate("ArrowLeft", "after");
+          await expect.poll(ready).toBeGreaterThanOrEqual(2);
           await page.screenshot({ path: `${dir}/expanded-next.png`, animations: "disabled" });
           const controls = await context.newCDPSession(page);
           const clickNative = async (name: string, fraction = 0.5) => {
@@ -160,42 +157,28 @@ suite.define(() => {
             await page.mouse.click(box.x + box.width * fraction, box.y + box.height / 2);
           };
           // Pause using the real native button, then scrub the real timeline.
-          if (!(await player.evaluate((media: HTMLVideoElement) => media.paused))) {
+          if (!(await paused())) {
             await clickNative("play-button");
           }
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.paused))
-            .toBe(true);
+          await expect.poll(paused).toBe(true);
           await clickNative("timeline", 0.25);
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.currentTime))
-            .toBeGreaterThan(0.1);
-          expect((await counter.textContent())?.trim()).toBe("2 / 3");
+          await expect.poll(time).toBeGreaterThan(0.1);
+          expect(await position()).toBe("2 / 3");
           await player.focus();
-          const beforeSeek = await player.evaluate((media: HTMLVideoElement) => media.currentTime);
+          const beforeSeek = await time();
           await page.keyboard.press("ArrowRight");
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.currentTime))
-            .toBeGreaterThan(beforeSeek);
-          expect((await counter.textContent())?.trim()).toBe("2 / 3");
+          await expect.poll(time).toBeGreaterThan(beforeSeek);
+          expect(await position()).toBe("2 / 3");
           await clickNative("timeline", 0.1);
           await clickNative("play-button");
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.paused))
-            .toBe(false);
+          await expect.poll(paused).toBe(false);
           await clickNative("play-button");
-          await expect
-            .poll(() => player.evaluate((media: HTMLVideoElement) => media.paused))
-            .toBe(true);
+          await expect.poll(paused).toBe(true);
           if (!mobile) {
             await clickNative("fullscreen-button");
-            await expect
-              .poll(() => player.evaluate((media) => media.matches(":fullscreen")))
-              .toBe(true);
+            await expect.poll(fullscreen).toBe(true);
             await page.keyboard.press("Escape");
-            await expect
-              .poll(() => player.evaluate((media) => media.matches(":fullscreen")))
-              .toBe(false);
+            await expect.poll(fullscreen).toBe(false);
             expect(await viewer.count()).toBe(1);
           }
           await controls.detach();
@@ -217,10 +200,8 @@ suite.define(() => {
               touchPoints: [{ ...timelinePoint, x: timeline.x + timeline.width * 0.6 }],
             });
             await touch.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-            await expect
-              .poll(() => player.evaluate((media: HTMLVideoElement) => media.currentTime))
-              .toBeGreaterThan(0.3);
-            expect((await counter.textContent())?.trim()).toBe("2 / 3");
+            await expect.poll(time).toBeGreaterThan(0.3);
+            expect(await position()).toBe("2 / 3");
             const swipe = async (dx: number) => {
               const box = await player.boundingBox();
               if (!box) {
