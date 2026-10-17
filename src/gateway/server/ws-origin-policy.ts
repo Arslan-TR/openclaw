@@ -1,11 +1,13 @@
 import type { ConnectParams } from "../../../packages/gateway-protocol/src/schema/frames.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { roleScopesAllow } from "../../shared/operator-scope-compat.js";
 import {
   isBrowserCopilotClient,
   isBrowserOperatorUiClient,
   isWebchatClient,
 } from "../../utils/message-channel.js";
 import { isGatewayAuthGrantCurrent, isGatewayAuthPolicyCurrent } from "../auth-policy.js";
+import { resolveOperatorRolePolicyForProfile } from "../operator-role-policy.js";
 import { checkGatewayWsBrowserOrigin, normalizeChromeExtensionOrigin } from "../origin-check.js";
 import { invalidateGatewayPolicyClient } from "./ws-policy-close.js";
 import type { GatewayWsBrowserOrigin, GatewayWsClient } from "./ws-types.js";
@@ -39,7 +41,15 @@ export function resolveGatewayWsBrowserOrigin(
 /** Revocation follows committed publication; unrelated authenticated connections remain live. */
 export function disconnectDisallowedGatewayPolicyClients(
   clients: Iterable<
-    Pick<GatewayWsClient, "browserOrigin" | "invalidated" | "invalidatedReason" | "authPolicy"> & {
+    Pick<
+      GatewayWsClient,
+      | "browserOrigin"
+      | "invalidated"
+      | "invalidatedReason"
+      | "authPolicy"
+      | "authenticatedUserProfile"
+    > & {
+      connect?: Pick<ConnectParams, "role" | "scopes">;
       socket: Pick<GatewayWsClient["socket"], "close">;
     }
   >,
@@ -52,12 +62,33 @@ export function disconnectDisallowedGatewayPolicyClients(
         code: 1008,
         message: "origin not allowed",
       });
-    } else if (!isGatewayAuthPolicyCurrent(client.authPolicy, cfg)) {
+      continue;
+    }
+    let roleScopesRevoked = false;
+    if (client.connect?.role === "operator") {
+      try {
+        const role = resolveOperatorRolePolicyForProfile(
+          client.authenticatedUserProfile?.profileId,
+          cfg,
+        );
+        roleScopesRevoked =
+          role !== undefined &&
+          !roleScopesAllow({
+            role: "operator",
+            requestedScopes: client.connect.scopes ?? [],
+            allowedScopes: role.scopes,
+          });
+      } catch {
+        // A retired profile cannot retain its connection's grants.
+        roleScopesRevoked = true;
+      }
+    }
+    if (roleScopesRevoked || !isGatewayAuthPolicyCurrent(client.authPolicy, cfg)) {
       invalidateGatewayPolicyClient(client, {
         reason: "gateway-policy-changed",
         code: 4001,
         message: "gateway policy changed",
-        revokeSource: !isGatewayAuthGrantCurrent(client.authPolicy, cfg),
+        revokeSource: roleScopesRevoked || !isGatewayAuthGrantCurrent(client.authPolicy, cfg),
       });
     }
   }
