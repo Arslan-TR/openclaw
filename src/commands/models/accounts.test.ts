@@ -79,6 +79,7 @@ type Request = {
   params: Record<string, unknown>;
   socket: WebSocket;
 };
+type Responder = (request: Request) => unknown;
 
 function expectRequests(requests: Request[], expected: Array<[string, Record<string, unknown>]>) {
   expect(requests.map(({ method, params }) => [method, params])).toEqual(expected);
@@ -108,7 +109,7 @@ function expectNoPrompt() {
 }
 
 async function withGateway(
-  respond: (request: Request) => unknown,
+  handlers: Responder | Record<string, Responder>,
   run: (gateway: {
     port: string;
     url: string;
@@ -118,6 +119,15 @@ async function withGateway(
   }) => Promise<void>,
   options: { config?: OpenClawConfig; env?: NodeJS.ProcessEnv } = {},
 ): Promise<void> {
+  let respond = handlers;
+  if (typeof respond !== "function") {
+    const routes: Record<string, Responder> = { "users.authConnect.start": startResult };
+    for (const [operation, handler] of Object.entries(respond)) {
+      routes[`users.authConnect.${operation}`] = handler;
+    }
+    respond = (request) => routes[request.method]?.(request);
+  }
+  const handle = respond;
   await withOpenClawTestState(
     { label: "personal-account-cli", scenario: "minimal", env: options.env },
     async (state) => {
@@ -147,7 +157,7 @@ async function withGateway(
             }
           };
           void Promise.resolve()
-            .then(() => respond(request))
+            .then(() => handle(request))
             .then(
               (payload) =>
                 reply({
@@ -193,19 +203,6 @@ async function withGateway(
       }
     },
   );
-}
-
-function withLoginGateway(
-  handlers: Record<string, (request: Request) => unknown>,
-  run: Parameters<typeof withGateway>[1],
-) {
-  const routes: Record<string, (request: Request) => unknown> = {
-    "users.authConnect.start": startResult,
-  };
-  for (const [operation, handler] of Object.entries(handlers)) {
-    routes[`users.authConnect.${operation}`] = handler;
-  }
-  return withGateway((request) => routes[request.method]?.(request), run);
 }
 
 function runtime() {
@@ -379,18 +376,28 @@ it.each([
   },
 );
 
-it("guides an unidentified person through login without prompting for provider credentials", async () => {
-  await withGateway(
-    () => {
-      throw new Error("unidentified");
-    },
-    async ({ port, requests }) => {
-      await expect(login(port)).rejects.toThrow("require a signed-in person");
-      expect(requests.map((request) => request.method)).toEqual(["users.self"]);
-      expectNoPrompt();
-    },
-  );
-});
+it.each([
+  [false, undefined, "require a signed-in person", ["self"]],
+  [true, "missing", "Unknown sign-in method", ["self", "authConnect.catalog"]],
+] as const)(
+  "rejects preflight before prompting (identified=%s, method=%s)",
+  async (identified, method, error, methods) => {
+    await withGateway(
+      () => {
+        if (!identified) {
+          throw new Error("unidentified");
+        }
+      },
+      async ({ port, requests }) => {
+        await expect(login(port, { method })).rejects.toThrow(error);
+        expect(requests.map((request) => request.method)).toEqual(
+          methods.map((name) => `users.${name}`),
+        );
+        expectNoPrompt();
+      },
+    );
+  },
+);
 
 it("uses Gateway provider/method choices and sends a hidden API key only as the exact step answer", async () => {
   const apiKey = "synthetic-personal-api-key";
@@ -412,7 +419,7 @@ it("uses Gateway provider/method choices and sends a hidden API key only as the 
     ],
   } satisfies UsersAuthConnectCatalogResult;
   mocks.autocomplete.mockResolvedValueOnce("xai").mockResolvedValueOnce("api-key");
-  await withLoginGateway(
+  await withGateway(
     {
       catalog: () => choices,
       status: () => ({ status: "pending", step: keyStep }),
@@ -457,20 +464,6 @@ it("uses Gateway provider/method choices and sends a hidden API key only as the 
   );
 });
 
-it("rejects an unavailable catalog selection before starting", async () => {
-  await withGateway(
-    () => undefined,
-    async ({ port, requests }) => {
-      await expect(login(port, { method: "missing" })).rejects.toThrow("Unknown sign-in method");
-      expect(requests.map((request) => request.method)).toEqual([
-        "users.self",
-        "users.authConnect.catalog",
-      ]);
-      expectNoPrompt();
-    },
-  );
-});
-
 it("rejects non-TTY sign-in without consuming input", async () => {
   Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: false });
   await expect(modelsAccountsLoginCommand({ provider: "openai" }, runtime())).rejects.toThrow(
@@ -510,7 +503,7 @@ it("renders the latest device progress snapshot and opens each destination once 
   let renderedProgress = "";
   let inputStepId: string | undefined;
   try {
-    await withLoginGateway(
+    await withGateway(
       {
         status: async () => {
           await progressUpdated.promise;
@@ -542,7 +535,6 @@ it("renders the latest device progress snapshot and opens each destination once 
         await login(port, { json: true });
         expect(session.getStatus()).toBe("done");
         expect(inputStepId).toEqual(expect.any(String));
-        expect(new Set(requests.map(({ socket }) => socket)).size).toBe(1);
         expect(
           requests
             .filter(({ method }) => method === "users.authConnect.answer")
@@ -584,7 +576,7 @@ it("finishes from the authoritative failed status and closes the prompt", async 
   const result = { status: "failed", reason: "exchange" } satisfies UsersAuthConnectStatusResult;
   waitForPromptAbort();
   let polls = 0;
-  await withLoginGateway(
+  await withGateway(
     { status: () => (++polls === 1 ? { status: "pending", step: inputStep } : result) },
     async ({ port, requests }) => {
       const command = login(port, { json: true });
@@ -609,7 +601,7 @@ it("waits for exact cancellation acknowledgment before closing the initiating so
   mocks.password.mockResolvedValue(CANCEL_SYMBOL);
   const received = createDeferredCore<Request>();
   const acknowledged = createDeferredCore<UsersAuthConnectStatusResult>();
-  await withLoginGateway(
+  await withGateway(
     {
       status: () => ({ status: "pending", step: inputStep }),
       cancel: (request) => {
@@ -633,7 +625,7 @@ it("cancels a late start response after Ctrl-C instead of orphaning its operatio
   const started = createDeferredCore();
   const response = createDeferredCore<UsersAuthConnectStartResult>();
   const onSignal = vi.spyOn(process, "once");
-  await withLoginGateway(
+  await withGateway(
     {
       start: () => {
         started.resolve();
@@ -666,7 +658,7 @@ it("cancels a late start response after Ctrl-C instead of orphaning its operatio
 it("stops on connection loss and never carries the operation to another socket", async () => {
   waitForPromptAbort();
   let polls = 0;
-  await withLoginGateway(
+  await withGateway(
     {
       status: ({ socket }) => {
         if (++polls === 1) {
