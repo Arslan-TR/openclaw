@@ -1,8 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { SourceMap } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { asRecord } from "@openclaw/normalization-core/record-coerce";
 import { z } from "zod";
+
+const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 
 export type ColdLoadTraceEvent = {
   name?: string;
@@ -141,11 +144,19 @@ export async function mapColdLoadCpuProfile(
       mappedFrames += 1;
       // Node's SourceMapping declarations omit the optional decoded name.
       const name = asRecord(origin)?.name;
+      const source = origin.originalSource;
       return {
         ...node,
         callFrame: {
           functionName: typeof name === "string" && name ? name : frame.functionName,
-          url: path.posix.normalize(origin.originalSource),
+          // Resolve map-relative paths before comparing functions across build directories.
+          url:
+            URL.canParse(source) && !path.isAbsolute(source)
+              ? source
+              : path
+                  .relative(repositoryRoot, path.resolve(path.dirname(file), source))
+                  .split(path.sep)
+                  .join("/"),
           lineNumber: origin.originalLine,
           columnNumber: origin.originalColumn,
         },

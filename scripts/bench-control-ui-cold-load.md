@@ -152,6 +152,7 @@ reports missing mappings; keep maps alongside any `--bundle-dir` assets.
 prints candidate-minus-baseline self/inclusive function deltas, also saved in
 `cpu-profile-compare.json`. A per-run report is accepted too. Function identity is
 source path, name, line and column; moving a function appears as a removal/addition.
+Mapped filesystem paths are repository-relative, independent of the build output directory.
 Use the same fixture, phases, sampling and machine for both captures.
 Profiling inflates timing: use these tables to prove the hot path runs, then
 measure improvements in separate unprofiled, interleaved runs.

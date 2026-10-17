@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { transform } from "esbuild";
+import { build, transform } from "esbuild";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   compareCpuTables,
@@ -208,15 +208,46 @@ describe("cold-load CPU accounting", () => {
       { assetBaseUrl: "http://localhost/assets/", assetDirectory: directory },
     );
     expect(mapped.profile.nodes[0]?.callFrame).toMatchObject({
-      url: "../../src/timestamp.ts",
+      url: expect.stringMatching(/(?:^|\/)src\/timestamp\.ts$/u),
       lineNumber: 1,
       columnNumber: 9,
     });
     expect(mapped.profile.nodes[1]?.callFrame).toMatchObject({
-      url: "../../src/timestamp.ts",
+      url: expect.stringMatching(/(?:^|\/)src\/timestamp\.ts$/u),
       lineNumber: 0,
       columnNumber: 7,
     });
+  });
+
+  it("compares the same emitted function across output directories", async () => {
+    const directory = tempDirs.make("openclaw-cold-load-output-paths-");
+    const source = path.join(directory, "source.ts");
+    await writeFile(source, "export function sample(value: number) { return value + 1; }");
+    const profile: ColdLoadCpuProfile = {
+      nodes: [{ id: 1, callFrame: frame("sample", "http://localhost/assets/app.js") }],
+      samples: [1],
+      timeDeltas: [1_000],
+    };
+    async function capture(assetDirectory: string) {
+      await build({
+        entryPoints: [source],
+        outfile: path.join(assetDirectory, "app.js"),
+        format: "esm",
+        minify: true,
+        sourcemap: "external",
+      });
+      const mapped = await mapColdLoadCpuProfile(profile, {
+        assetBaseUrl: "http://localhost/assets/",
+        assetDirectory,
+      });
+      expect(mapped.mappedFrames).toBe(1);
+      return summarizeCpuProfile(mapped.profile, { includeTables: true }).tables!;
+    }
+    const baseline = await capture(path.join(directory, "one"));
+    const candidate = await capture(path.join(directory, "nested", "two"));
+    expect(compareCpuTables(baseline, candidate)).toEqual([
+      expect.objectContaining({ selfMs: 0, inclusiveMs: 0 }),
+    ]);
   });
 
   it("counts recursive functions and same-file ancestors once per inclusive sample", () => {
