@@ -195,7 +195,6 @@ export function createTuiRunLifecycle(context: TuiRunLifecycleContext) {
   };
 
   const acknowledgeChatRun = (runId: string, options?: { protectStream?: boolean }) => {
-    clearCancellationNotice();
     if (reconnectPendingRunId === runId) {
       reconnectPendingRunId = null;
     }
@@ -303,6 +302,7 @@ export function createTuiRunLifecycle(context: TuiRunLifecycleContext) {
     flushPendingHistoryRefreshIfIdle();
     if (!promotedRemainingRun) {
       if (params.wasActiveRun) {
+        clearCancellationNotice();
         setActivityStatus(params.status);
         clearStreamingWatchdog();
         if (params.localModelMayStillBeFinishing && !hasPendingSubmit(state)) {

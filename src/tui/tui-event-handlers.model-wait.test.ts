@@ -50,7 +50,7 @@ it("renders local model waits with verbosity off and clears each wait", () => {
   expect(setActivityStatus).toHaveBeenLastCalledWith("aborted");
 });
 
-function createCancellationHarness() {
+function createCancellationHarness(isLocalBtwRunId?: (runId: string) => boolean) {
   vi.useFakeTimers();
   const state = makeTuiState({ activeChatRunId: "run-1" });
   const setActivityStatus = vi.fn((status: string) => {
@@ -65,6 +65,7 @@ function createCancellationHarness() {
     tui: { requestRender: vi.fn() },
     updateFooter: vi.fn(),
     loadHistory: async () => ({ loaded: false }),
+    isLocalBtwRunId,
   });
   onTestFinished(handlers.dispose);
   const aborted = {
@@ -88,6 +89,22 @@ it("bounds the terminal cancellation caveat without rearming it on replay", () =
   handlers.handleChatEvent(aborted);
   vi.advanceTimersByTime(1_000);
   expect(setActivityStatus).toHaveBeenLastCalledWith("aborted");
+});
+
+it("preserves the cancellation caveat while a surviving side question completes", () => {
+  const { state, handlers, aborted } = createCancellationHarness((runId) => runId === "side-run");
+  handlers.handleChatEvent(aborted);
+  vi.advanceTimersByTime(4_000);
+  handlers.handleChatEvent({
+    runId: "side-run",
+    sessionKey: state.currentSessionKey,
+    state: "final",
+  });
+  expect(state.activityStatus).toBe(
+    "Cancellation requested; the local model may still be finishing.",
+  );
+  vi.advanceTimersByTime(1_000);
+  expect(state.activityStatus).toBe("aborted");
 });
 
 it("preserves the terminal caveat when the cancelled session reports idle", () => {
