@@ -13,6 +13,15 @@ beforeEach(() => {
   vi.mocked(resolveNpmSpecMetadata).mockReset();
 });
 
+function npmMetadata(version: string) {
+  return {
+    name: "@openclaw/codex",
+    version,
+    resolvedSpec: `@openclaw/codex@${version}`,
+    integrity: `sha512-${version}`,
+  };
+}
+
 describe("installWithSourceFallback", () => {
   it.each(["notarget", "etarget"])(
     "keeps an integrity refusal terminal for package %s",
@@ -49,39 +58,19 @@ describe("installWithSourceFallback", () => {
 
 describe("resolveNpmInstallSpecsForUpdateChannel", () => {
   it.each([
-    {
-      channel: "extended-stable" as const,
-      versionBoundToCore: false,
-      coreVersion: "2026.7.33",
-      expectedVersion: "2026.7.33",
-    },
-    {
-      channel: "stable" as const,
-      versionBoundToCore: true,
-      coreVersion: "2026.8.1",
-      expectedVersion: "2026.8.1",
-    },
-    {
-      channel: "stable" as const,
-      versionBoundToCore: true,
-      coreVersion: "2026.7.1-2",
-      expectedVersion: "2026.7.1",
-    },
-    {
-      channel: "extended-stable" as const,
-      versionBoundToCore: true,
-      coreVersion: "2026.7.1-2",
-      expectedVersion: "2026.7.1",
-    },
-  ])(
-    "preserves the $channel release-cohort contract for $coreVersion",
-    async ({ channel, versionBoundToCore, coreVersion, expectedVersion }) => {
+    ["extended-stable", false, "2026.7.33", "2026.7.33"],
+    ["stable", true, "2026.8.1", "2026.8.1"],
+    ["stable", true, "2026.7.1-2", "2026.7.1"],
+    ["extended-stable", true, "2026.7.1-2", "2026.7.1"],
+  ] as const)(
+    "preserves the %s release-cohort contract (bound=%s, core=%s, version=%s)",
+    async (channel, versionBoundToCore, coreVersion, expectedVersion) => {
       for (const spec of ["@openclaw/codex", "@openclaw/codex@latest"]) {
         expect(
           await resolveNpmInstallSpecsForUpdateChannel({
             spec,
-            updateChannel: channel,
             officialPackageName: "@openclaw/codex",
+            updateChannel: channel,
             coreVersion,
             versionBoundToCore,
           }),
@@ -98,8 +87,8 @@ describe("resolveNpmInstallSpecsForUpdateChannel", () => {
       expect(
         await resolveNpmInstallSpecsForUpdateChannel({
           spec,
-          updateChannel: "beta",
           officialPackageName: "@openclaw/codex",
+          updateChannel: "beta",
           coreVersion: "2026.8.1-beta.3",
         }),
       ).toEqual({ installSpec: spec, recordSpec: spec });
@@ -148,32 +137,22 @@ describe("resolveNpmInstallSpecsForUpdateChannel", () => {
         return version
           ? {
               ok: true,
-              metadata: {
-                name: "@openclaw/codex",
-                version,
-                resolvedSpec: `@openclaw/codex@${version}`,
-                integrity: `sha512-${version}`,
-              },
+              metadata: npmMetadata(version),
             }
           : { ok: false, error: "Package not found on npm" };
       });
       for (const spec of ["@openclaw/codex", "@openclaw/codex@latest", "@openclaw/codex@beta"]) {
         const result = await resolveNpmInstallSpecsForUpdateChannel({
           spec,
-          updateChannel: "beta",
           officialPackageName: "@openclaw/codex",
+          updateChannel: "beta",
           coreVersion: "2026.9.1-beta.1",
           versionBoundToCore: true,
         });
         expect(result).toEqual({
           installSpec: `@openclaw/codex@${expected}`,
           recordSpec: spec,
-          npmResolution: {
-            name: "@openclaw/codex",
-            version: expected,
-            resolvedSpec: `@openclaw/codex@${expected}`,
-            integrity: `sha512-${expected}`,
-          },
+          npmResolution: npmMetadata(expected),
           channelTag: tag,
           ...(reason ? { channelReason: reason } : {}),
         });
@@ -224,8 +203,8 @@ describe("resolveClawHubInstallSpecsForUpdateChannel", () => {
         expect(
           resolveClawHubInstallSpecsForUpdateChannel({
             spec,
-            updateChannel,
             officialPackageName: "@openclaw/discord",
+            updateChannel,
             coreVersion,
             versionBoundToCore,
             preferCoreVersion,
@@ -249,8 +228,8 @@ describe("resolveClawHubInstallSpecsForUpdateChannel", () => {
         expect(
           resolveClawHubInstallSpecsForUpdateChannel({
             spec,
-            updateChannel,
             officialPackageName: "@openclaw/discord",
+            updateChannel,
             coreVersion: updateChannel === "beta" ? "2026.8.1-beta.3" : "2026.7.33",
             versionBoundToCore: true,
           }),

@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-// Covers plugin install flows, manifests, and install records.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -77,17 +76,18 @@ function writeJson(file: string, value: unknown) {
   fs.writeFileSync(file, JSON.stringify(value), "utf8");
 }
 
-function captureSecurityEvents(): {
-  events: Extract<DiagnosticEventPayload, { type: "security.event" }>[];
-  stop: () => void;
-} {
+async function withSecurityEvents<T>(run: () => Promise<T>) {
   const events: Extract<DiagnosticEventPayload, { type: "security.event" }>[] = [];
   const stop = onInternalDiagnosticEvent((event, metadata) => {
     if (metadata.trusted && event.type === "security.event") {
       events.push(event);
     }
   });
-  return { events, stop };
+  try {
+    return { result: await run(), events };
+  } finally {
+    stop();
+  }
 }
 
 function setupPluginInstallDirs() {
@@ -99,11 +99,28 @@ function setupPluginInstallDirs() {
   return { tmpDir, pluginDir, extensionsDir };
 }
 
-function writeMinimalPackagePlugin(pluginDir: string, name: string): void {
+type PathInstallOptions = Omit<
+  Parameters<typeof installPluginFromPath>[0],
+  "path" | "extensionsDir"
+>;
+function installDirectory(
+  pluginDir: string,
+  extensionsDir: string,
+  options: PathInstallOptions = {},
+) {
+  return installPluginFromPath({ path: pluginDir, extensionsDir, ...options });
+}
+
+function writeMinimalPackagePlugin(
+  pluginDir: string,
+  name: string,
+  manifest: Record<string, unknown> = {},
+): void {
   writeJson(path.join(pluginDir, "package.json"), {
     name,
     version: "1.0.0",
     openclaw: { extensions: ["index.js"] },
+    ...manifest,
   });
   fs.writeFileSync(path.join(pluginDir, "index.js"), "export {};\n");
 }
@@ -121,26 +138,15 @@ function setupInstallPluginFromDirFixture() {
   return fixture;
 }
 
-async function installFromDirWithWarnings(params: {
-  pluginDir: string;
-  extensionsDir: string;
-  config?: OpenClawConfig;
-  onInstallPolicyWarning?: Parameters<typeof installPluginFromPath>[0]["onInstallPolicyWarning"];
-  trustedSourceLinkedOfficialInstall?: boolean;
-  mode?: "install" | "update";
-}) {
+async function installFromDirWithWarnings({
+  pluginDir,
+  extensionsDir,
+  ...options
+}: { pluginDir: string; extensionsDir: string } & PathInstallOptions) {
   const warnings: string[] = [];
-  const result = await installPluginFromPath({
-    trustedSourceLinkedOfficialInstall: params.trustedSourceLinkedOfficialInstall,
-    path: params.pluginDir,
-    extensionsDir: params.extensionsDir,
-    config: params.config,
-    mode: params.mode,
-    onInstallPolicyWarning: params.onInstallPolicyWarning,
-    logger: {
-      info: () => {},
-      warn: (msg: string) => warnings.push(msg),
-    },
+  const result = await installDirectory(pluginDir, extensionsDir, {
+    ...options,
+    logger: { info: () => {}, warn: (message) => warnings.push(message) },
   });
   return { result, warnings };
 }
@@ -218,21 +224,18 @@ function readCapturedInstallPolicyRequests(logPath: string): CapturedInstallPoli
 }
 
 function mockNpmViewMetadata(params: { name: string; version?: string }) {
-  vi.mocked(runCommandWithTimeout).mockResolvedValueOnce({
-    code: 0,
-    killed: false,
-    signal: null,
-    stderr: "",
-    termination: "exit",
-    stdout: JSON.stringify({
-      name: params.name,
-      version: params.version ?? "1.0.0",
-      dist: {
-        integrity: "sha512-test",
-        shasum: "abc123",
-      },
+  vi.mocked(runCommandWithTimeout).mockResolvedValueOnce(
+    createCommandResult({
+      stdout: JSON.stringify({
+        name: params.name,
+        version: params.version ?? "1.0.0",
+        dist: {
+          integrity: "sha512-test",
+          shasum: "abc123",
+        },
+      }),
     }),
-  });
+  );
 }
 
 let actualExecModulePromise: Promise<typeof import("../process/exec.js")> | undefined;
@@ -291,82 +294,40 @@ function mockSuccessfulManagedNpmInstall(params: { packageName: string; version?
         },
       });
     }
-    return {
-      code: 0,
-      killed: false,
-      signal: null,
-      stderr: "",
-      termination: "exit",
-      stdout: "",
-    };
+    return createCommandResult();
   });
 }
 
-async function installFromArchiveWithWarnings(params: {
-  archivePath: string;
-  extensionsDir: string;
-  config?: OpenClawConfig;
-  trustedSourceLinkedOfficialInstall?: boolean;
-}) {
-  const warnings: string[] = [];
-  const result = await installPluginFromArchive({
-    archivePath: params.archivePath,
-    config: params.config,
-    trustedSourceLinkedOfficialInstall: params.trustedSourceLinkedOfficialInstall,
-    extensionsDir: params.extensionsDir,
-    logger: {
-      info: () => {},
-      warn: (msg: string) => warnings.push(msg),
-    },
-  });
-  return { result, warnings };
+function updateOpenClawMetadata(pluginDir: string, patch: Record<string, unknown>) {
+  const file = path.join(pluginDir, "package.json");
+  const manifest: { openclaw?: Record<string, unknown> } = JSON.parse(
+    fs.readFileSync(file, "utf8"),
+  );
+  writeJson(file, { ...manifest, openclaw: { ...manifest.openclaw, ...patch } });
 }
 
 function setPluginMinHostVersion(pluginDir: string, minHostVersion: string) {
-  const packageJsonPath = path.join(pluginDir, "package.json");
-  const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8")) as {
-    openclaw?: { install?: Record<string, unknown> };
-  };
-  manifest.openclaw = {
-    ...manifest.openclaw,
-    install: {
-      ...manifest.openclaw?.install,
-      minHostVersion,
-    },
-  };
-  fs.writeFileSync(packageJsonPath, JSON.stringify(manifest), "utf-8");
+  updateOpenClawMetadata(pluginDir, { install: { minHostVersion } });
+}
+function setPluginPackageCompatibility(pluginDir: string, pluginApi: unknown) {
+  updateOpenClawMetadata(pluginDir, { compat: { pluginApi } });
 }
 
-function setPluginPackageCompatibility(pluginDir: string, pluginApiRange: unknown) {
-  const packageJsonPath = path.join(pluginDir, "package.json");
-  const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8")) as {
-    openclaw?: { compat?: Record<string, unknown> };
-  };
-  manifest.openclaw = {
-    ...manifest.openclaw,
-    compat: {
-      ...manifest.openclaw?.compat,
-      pluginApi: pluginApiRange,
-    },
-  };
-  fs.writeFileSync(packageJsonPath, JSON.stringify(manifest), "utf-8");
-}
-
-function expectFailedInstallResult<
-  TResult extends { ok: boolean; code?: string } & Partial<{ error: string }>,
->(params: { result: TResult; code?: string; messageIncludes: readonly string[] }) {
-  expect(params.result.ok).toBe(false);
-  if (params.result.ok) {
+function expectFailedInstallResult(
+  result: Awaited<ReturnType<typeof installPluginFromPath>>,
+  code: string,
+  ...messageIncludes: readonly string[]
+) {
+  expect(result.ok).toBe(false);
+  if (result.ok) {
     throw new Error("expected install failure");
   }
-  if (params.code) {
-    expect(params.result.code).toBe(params.code);
+  expect(result.code).toBe(code);
+  expect(result.error).toBeTypeOf("string");
+  for (const fragment of messageIncludes) {
+    expect(result.error).toContain(fragment);
   }
-  expect(params.result.error).toBeTypeOf("string");
-  params.messageIncludes.forEach((fragment) => {
-    expect(params.result.error).toContain(fragment);
-  });
-  return params.result;
+  return result;
 }
 
 const requireRecord = createRequireRecord("record", "expected-label-object");
@@ -380,13 +341,21 @@ function requireHookPayload(handler: ReturnType<typeof vi.fn>): Record<string, u
   return requireRecord(payload, "before_install hook payload");
 }
 
-function expectHookRequest(
-  payload: Record<string, unknown>,
-  expected: { kind: string; mode: string },
-) {
-  const request = requireRecord(payload.request, "before_install hook request");
-  expect(request.kind).toBe(expected.kind);
-  expect(request.mode).toBe(expected.mode);
+function expectPackageHookPayload(payload: Record<string, unknown>, pluginId: string) {
+  expect(payload).toMatchObject({
+    targetName: pluginId,
+    targetType: "plugin",
+    origin: "plugin-package",
+    request: { kind: "plugin-dir", mode: "install" },
+    builtinScan: { status: "ok", findings: [] },
+  });
+  expect(payload.plugin).toEqual({
+    contentType: "package",
+    pluginId,
+    packageName: pluginId,
+    version: "1.0.0",
+    extensions: ["index.js"],
+  });
 }
 
 function mockSuccessfulCommandRun(run: ReturnType<typeof vi.mocked<typeof runCommandWithTimeout>>) {
@@ -507,7 +476,7 @@ describe("installPluginFromArchive", () => {
       flatRoot: true,
     });
 
-    const { result } = await installFromArchiveWithWarnings({
+    const result = await installPluginFromArchive({
       archivePath,
       extensionsDir,
       config: configWithInstallPolicy(scriptPath, logPath),
@@ -547,10 +516,7 @@ describe("installPluginFromArchive", () => {
     });
     fs.writeFileSync(path.join(pluginDir, "index.ts"), "export {};\n", "utf-8");
 
-    const result = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const result = await installDirectory(pluginDir, extensionsDir);
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -580,16 +546,13 @@ describe("installPluginFromArchive", () => {
       openclaw: { extensions: ["./linked/escape.js"] },
     });
 
-    const result = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const result = await installDirectory(pluginDir, extensionsDir);
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe(PLUGIN_INSTALL_ERROR_CODE.INVALID_OPENCLAW_EXTENSIONS);
-      expect(result.error).toContain("extension entry");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.INVALID_OPENCLAW_EXTENSIONS,
+      "extension entry",
+    );
   });
 
   it("rejects package installs when an extension entry is a hardlinked alias", async () => {
@@ -616,16 +579,13 @@ describe("installPluginFromArchive", () => {
       openclaw: { extensions: ["./escape.js"] },
     });
 
-    const result = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const result = await installDirectory(pluginDir, extensionsDir);
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe(PLUGIN_INSTALL_ERROR_CODE.INVALID_OPENCLAW_EXTENSIONS);
-      expect(result.error).toContain("boundary checks");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.INVALID_OPENCLAW_EXTENSIONS,
+      "boundary checks",
+    );
   });
 
   it("surfaces plugin lifecycle findings from before_install", async () => {
@@ -650,22 +610,11 @@ describe("installPluginFromArchive", () => {
     expect(result.ok).toBe(true);
     expect(handler).toHaveBeenCalledTimes(1);
     const payload = requireHookPayload(handler);
-    expect(payload.targetName).toBe("hook-findings-plugin");
-    expect(payload.targetType).toBe("plugin");
-    expect(payload.origin).toBe("plugin-package");
+    expectPackageHookPayload(payload, "hook-findings-plugin");
+
     expect(payload.sourcePath).toBe(pluginDir);
     expect(payload.sourcePathKind).toBe("directory");
-    expectHookRequest(payload, { kind: "plugin-dir", mode: "install" });
-    const builtinScan = requireRecord(payload.builtinScan, "builtin scan");
-    expect(builtinScan.status).toBe("ok");
-    expect(builtinScan.findings).toEqual([]);
-    expect(payload.plugin).toEqual({
-      contentType: "package",
-      pluginId: "hook-findings-plugin",
-      packageName: "hook-findings-plugin",
-      version: "1.0.0",
-      extensions: ["index.js"],
-    });
+
     expect(firstMockCall(handler)?.[1]).toEqual({
       origin: "plugin-package",
       targetType: "plugin",
@@ -710,10 +659,7 @@ describe("installPluginFromArchive", () => {
       config: configWithInstallPolicy(scriptPath, logPath),
     });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED);
-    }
+    expectFailedInstallResult(result, PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED);
     expect(readCapturedInstallPolicyRequests(logPath)).toHaveLength(1);
     expect(
       fs.existsSync(path.join(extensionsDir, "policy-warning-blocked-plugin", "index.js")),
@@ -748,20 +694,8 @@ describe("installPluginFromArchive", () => {
     }
     expect(handler).toHaveBeenCalledTimes(1);
     const payload = requireHookPayload(handler);
-    expect(payload.targetName).toBe("dangerous-blocked-plugin");
-    expect(payload.targetType).toBe("plugin");
-    expect(payload.origin).toBe("plugin-package");
-    expectHookRequest(payload, { kind: "plugin-dir", mode: "install" });
-    const builtinScan = requireRecord(payload.builtinScan, "builtin scan");
-    expect(builtinScan.status).toBe("ok");
-    expect(builtinScan.findings).toEqual([]);
-    expect(payload.plugin).toEqual({
-      contentType: "package",
-      pluginId: "dangerous-blocked-plugin",
-      packageName: "dangerous-blocked-plugin",
-      version: "1.0.0",
-      extensions: ["index.js"],
-    });
+    expectPackageHookPayload(payload, "dangerous-blocked-plugin");
+
     expect(
       warnings.some((w) => w.includes("blocked by plugin hook: Blocked by plugin lifecycle hook")),
     ).toBe(true);
@@ -773,30 +707,25 @@ describe("installPluginFromArchive", () => {
 
     const { pluginDir, extensionsDir } = setupPluginInstallDirs();
     writeMinimalPackagePlugin(pluginDir, "hook-failure-plugin");
-    const captured = captureSecurityEvents();
+    const { result: installed, events } = await withSecurityEvents(() =>
+      installFromDirWithWarnings({ pluginDir, extensionsDir }),
+    );
+    const { result, warnings } = installed;
 
-    let installed: Awaited<ReturnType<typeof installFromDirWithWarnings>>;
-    try {
-      installed = await installFromDirWithWarnings({ pluginDir, extensionsDir });
-    } finally {
-      captured.stop();
-    }
-    const { result, warnings } = installed!;
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_FAILED);
-      expect(result.error).toContain("before_install hook failed");
-      expect(result.error).toContain("policy process unavailable");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_FAILED,
+      "before_install hook failed",
+      "policy process unavailable",
+    );
     expect(handler).toHaveBeenCalledTimes(1);
     expect(
       warnings.some((warning) =>
         warning.includes("blocked by plugin hook failure: Installation blocked"),
       ),
     ).toBe(true);
-    expect(captured.events).toHaveLength(1);
-    expect(captured.events[0]).toMatchObject({
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
       action: "plugin.audit.failed",
       outcome: "error",
       target: { kind: "plugin", name: "hook-failure-plugin" },
@@ -818,11 +747,11 @@ describe("installPluginFromArchive", () => {
 
     const { result, warnings } = await installFromDirWithWarnings({ pluginDir, extensionsDir });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_FAILED);
-      expect(result.error).toContain("code safety scan failed (Error: scanner exploded)");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_FAILED,
+      "code safety scan failed (Error: scanner exploded)",
+    );
     expect(warnings).toStrictEqual([]);
     scanSpy.mockRestore();
   });
@@ -836,25 +765,20 @@ describe("installPluginFromNpmSpec", () => {
     const { scriptPath, logPath } = writeInstallPolicyScript(root, "block");
     const packageName = "@acme/policy-preflight-plugin";
     mockNpmViewMetadata({ name: packageName });
-    const captured = captureSecurityEvents();
-
-    let result: Awaited<ReturnType<typeof installPluginFromNpmSpec>>;
-    try {
-      result = await installPluginFromNpmSpec({
+    const { result, events } = await withSecurityEvents(() =>
+      installPluginFromNpmSpec({
         spec: `${packageName}@1.0.0`,
         extensionsDir,
         npmDir,
         config: configWithInstallPolicy(scriptPath, logPath),
-      });
-    } finally {
-      captured.stop();
-    }
+      }),
+    );
 
-    expect(result!.ok).toBe(false);
-    if (!result!.ok) {
-      expect(result.code, result.error).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED);
-      expect(result.error).toContain("npm installs are disabled by policy");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED,
+      "npm installs are disabled by policy",
+    );
     expect(countNpmCommands()).toBe(1);
     expect(npmCommandArgs(vi.mocked(runCommandWithTimeout).mock.calls[0]![0])).toEqual([
       "view",
@@ -875,8 +799,8 @@ describe("installPluginFromNpmSpec", () => {
     expect(requests[0]?.sourcePathKind).toBe("file");
     expect(path.basename(requests[0]?.sourcePath ?? "")).toBe("npm-package-metadata.json");
     expect(requests[0]?.plugin?.contentType).toBe("package");
-    expect(captured.events).toHaveLength(1);
-    expect(captured.events[0]).toMatchObject({
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
       action: "plugin.audit.failed",
       outcome: "denied",
       target: { kind: "plugin", name: packageName },
@@ -915,11 +839,11 @@ describe("installPluginFromNpmSpec", () => {
       mode: "update",
     });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code, result.error).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED);
-      expect(result.error).toContain("fresh npm installs are disabled by policy");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED,
+      "fresh npm installs are disabled by policy",
+    );
     const requests = readCapturedInstallPolicyRequests(logPath);
     expect(requests).toHaveLength(1);
     expect(requests[0]?.request.mode).toBe("install");
@@ -946,31 +870,26 @@ describe("installPluginFromNpmSpec", () => {
     const { scriptPath, logPath } = writeInstallPolicyScript(root, "block-install");
     mockNpmViewMetadata({ name: packageName, version: "1.2.3" });
     mockSuccessfulManagedNpmInstall({ packageName, version: "1.2.3" });
-    const captured = captureSecurityEvents();
-
-    let result: Awaited<ReturnType<typeof installPluginFromNpmSpec>>;
-    try {
-      result = await installPluginFromNpmSpec({
+    const { result, events } = await withSecurityEvents(() =>
+      installPluginFromNpmSpec({
         spec: `${packageName}@1.2.3`,
         extensionsDir,
         npmDir,
         config: configWithInstallPolicy(scriptPath, logPath),
         mode: "update",
-      });
-    } finally {
-      captured.stop();
-    }
+      }),
+    );
 
-    expect(result!.ok).toBe(true);
-    if (!result!.ok) {
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
       return;
     }
     expect(result.targetDir).not.toBe(existingPackageDir);
     const requests = readCapturedInstallPolicyRequests(logPath);
     expect(requests.length).toBeGreaterThan(0);
     expect(requests.map((request) => request.request.mode)).toEqual(requests.map(() => "update"));
-    expect(captured.events).toHaveLength(1);
-    expect(captured.events[0]).toMatchObject({
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
       action: "plugin.updated",
       outcome: "success",
       target: { kind: "plugin", name: packageName },
@@ -1044,11 +963,11 @@ describe("installPluginFromNpmSpec", () => {
       mode: "update",
     });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code, result.error).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED);
-      expect(result.error).toContain("fresh npm installs are disabled by policy");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED,
+      "fresh npm installs are disabled by policy",
+    );
     const requests = readCapturedInstallPolicyRequests(logPath);
     expect(requests).toHaveLength(1);
     expect(requests[0]?.request.mode).toBe("install");
@@ -1084,26 +1003,21 @@ describe("installPluginFromNpmSpec", () => {
         },
       ]),
     });
-    const captured = captureSecurityEvents();
-
-    let result: Awaited<ReturnType<typeof installPluginFromNpmPackArchive>>;
-    try {
-      result = await installPluginFromNpmPackArchive({
+    const { result, events } = await withSecurityEvents(() =>
+      installPluginFromNpmPackArchive({
         archivePath,
         extensionsDir,
         npmDir,
         config: configWithInstallPolicy(scriptPath, logPath),
         dryRun: true,
-      });
-    } finally {
-      captured.stop();
-    }
+      }),
+    );
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.code, result.error).toBe(PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED);
-      expect(result.error).toContain("npm installs are disabled by policy");
-    }
+    expectFailedInstallResult(
+      result,
+      PLUGIN_INSTALL_ERROR_CODE.SECURITY_SCAN_BLOCKED,
+      "npm installs are disabled by policy",
+    );
     expect(countNpmCommands()).toBe(1);
     await expect(fsPromises.stat(npmDir)).rejects.toThrow();
     const requests = readCapturedInstallPolicyRequests(logPath);
@@ -1118,8 +1032,8 @@ describe("installPluginFromNpmSpec", () => {
     });
     expect(requests[0]?.sourcePath).toBe(archivePath);
     expect(requests[0]?.sourcePathKind).toBe("file");
-    expect(captured.events).toHaveLength(1);
-    expect(captured.events[0]).toMatchObject({
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
       category: "plugin",
       action: "plugin.audit.failed",
       outcome: "denied",
@@ -1149,21 +1063,13 @@ describe("installPluginFromDir", () => {
 
   it("emits a redacted security event after installing a plugin directory", async () => {
     const { pluginDir, extensionsDir } = setupInstallPluginFromDirFixture();
-    const captured = captureSecurityEvents();
+    const { result: res, events } = await withSecurityEvents(() =>
+      installDirectory(pluginDir, extensionsDir),
+    );
 
-    let res: Awaited<ReturnType<typeof installPluginFromPath>>;
-    try {
-      res = await installPluginFromPath({
-        path: pluginDir,
-        extensionsDir,
-      });
-    } finally {
-      captured.stop();
-    }
-
-    expect(res!.ok).toBe(true);
-    expect(captured.events).toHaveLength(1);
-    expect(captured.events[0]).toMatchObject({
+    expect(res.ok).toBe(true);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
       category: "plugin",
       action: "plugin.installed",
       outcome: "success",
@@ -1180,7 +1086,7 @@ describe("installPluginFromDir", () => {
         trusted_official_source: false,
       },
     });
-    const serialized = JSON.stringify(captured.events);
+    const serialized = JSON.stringify(events);
     expect(serialized).not.toContain(pluginDir);
     expect(serialized).not.toContain(extensionsDir);
   });
@@ -1215,16 +1121,9 @@ describe("installPluginFromDir", () => {
       const { pluginDir, extensionsDir } = setupInstallPluginFromDirFixture();
       setPluginMinHostVersion(pluginDir, minHostVersion);
 
-      const result = await installPluginFromPath({
-        path: pluginDir,
-        extensionsDir,
-      });
+      const result = await installDirectory(pluginDir, extensionsDir);
 
-      expectFailedInstallResult({
-        result,
-        code: expectedCode,
-        messageIncludes: expectedMessageIncludes,
-      });
+      expectFailedInstallResult(result, expectedCode, ...expectedMessageIncludes);
       expect(vi.mocked(runCommandWithTimeout)).not.toHaveBeenCalled();
     },
   );
@@ -1234,16 +1133,14 @@ describe("installPluginFromDir", () => {
     const { pluginDir, extensionsDir } = setupInstallPluginFromDirFixture();
     setPluginPackageCompatibility(pluginDir, 20260527);
 
-    const result = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const result = await installDirectory(pluginDir, extensionsDir);
 
-    expectFailedInstallResult({
+    expectFailedInstallResult(
       result,
-      code: PLUGIN_INSTALL_ERROR_CODE.INVALID_PLUGIN_API,
-      messageIncludes: ["openclaw.compat.pluginApi", "must be a string"],
-    });
+      PLUGIN_INSTALL_ERROR_CODE.INVALID_PLUGIN_API,
+      "openclaw.compat.pluginApi",
+      "must be a string",
+    );
     expect(vi.mocked(runCommandWithTimeout)).not.toHaveBeenCalled();
   });
 
@@ -1261,19 +1158,14 @@ describe("installPluginFromDir", () => {
     };
     fs.writeFileSync(packageJsonPath, JSON.stringify(manifest), "utf-8");
 
-    const result = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const result = await installDirectory(pluginDir, extensionsDir);
 
-    expectFailedInstallResult({
+    expectFailedInstallResult(
       result,
-      code: PLUGIN_INSTALL_ERROR_CODE.INCOMPATIBLE_PLUGIN_API,
-      messageIncludes: [
-        "requires plugin API >=2026.5.27-beta.2",
-        "runtime exposes 2026.5.27-beta.1",
-      ],
-    });
+      PLUGIN_INSTALL_ERROR_CODE.INCOMPATIBLE_PLUGIN_API,
+      "requires plugin API >=2026.5.27-beta.2",
+      "runtime exposes 2026.5.27-beta.1",
+    );
     if (!result.ok) {
       expect(result.error).not.toContain("openclaw.extensions");
     }
@@ -1329,10 +1221,7 @@ describe("installPluginFromDir", () => {
   ] as const)("$name", async ({ setup, expectedPluginId, expectedFiles }) => {
     const { pluginDir, extensionsDir } = setup();
 
-    const res = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const res = await installDirectory(pluginDir, extensionsDir);
 
     expectInstalledWithPluginId(res, extensionsDir, expectedPluginId);
     if (!res.ok) {
@@ -1345,10 +1234,7 @@ describe("installPluginFromDir", () => {
       bundleFormat: "codex",
     });
 
-    const res = await installPluginFromPath({
-      path: pluginDir,
-      extensionsDir,
-    });
+    const res = await installDirectory(pluginDir, extensionsDir);
 
     expect(res.ok).toBe(true);
     if (!res.ok) {
@@ -1362,26 +1248,15 @@ describe("installPluginFromDir", () => {
 
 describe("linkOpenClawPeerDependencies (via installPluginFromDir)", () => {
   const resolveRootMock = vi.mocked(resolveOpenClawPackageRootSync);
-  type HostManifest = Partial<
-    Record<"peerDependencies" | "dependencies" | "optionalDependencies", Record<string, string>>
-  >;
-  function writePluginWithPeerDeps(pluginDir: string, manifest: HostManifest): void {
-    fs.mkdirSync(pluginDir, { recursive: true });
-    writeJson(path.join(pluginDir, "package.json"), {
-      name: "peer-dep-plugin",
-      version: "1.0.0",
-      openclaw: { extensions: ["index.js"] },
-      ...manifest,
-    });
-    fs.writeFileSync(path.join(pluginDir, "index.js"), "export {};\n", "utf-8");
-  }
 
   it("replaces a copied optional host dependency with the host symlink", async () => {
     const { pluginDir, extensionsDir } = setupPluginInstallDirs();
     const fakeHostRoot = suiteTempRootTracker.makeTempDir();
     resolveRootMock.mockReturnValue(fakeHostRoot);
 
-    writePluginWithPeerDeps(pluginDir, { optionalDependencies: { openclaw: "*" } });
+    writeMinimalPackagePlugin(pluginDir, "peer-dep-plugin", {
+      optionalDependencies: { openclaw: "*" },
+    });
     fs.mkdirSync(path.join(pluginDir, "node_modules", "openclaw"), { recursive: true });
     writeJson(path.join(pluginDir, "node_modules", "openclaw", "package.json"), {
       name: "openclaw",

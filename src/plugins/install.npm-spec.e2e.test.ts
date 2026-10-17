@@ -1,4 +1,3 @@
-// Exercises npm-spec plugin install behavior through the CLI path.
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import type http from "node:http";
@@ -78,6 +77,25 @@ function uniquePackageName(prefix: string): string {
 
 async function readJson<T>(filePath: string): Promise<T> {
   return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+}
+
+type ProjectManifest = {
+  version?: string;
+  dependencies?: Record<string, string>;
+  openclaw?: { managedPeerDependencies?: string[] };
+};
+function readProjectManifest(projectRoot: string) {
+  return readJson<ProjectManifest>(path.join(projectRoot, "package.json"));
+}
+function expectPackagePresent(projectRoot: string, name: string) {
+  return expect(
+    fs.lstat(path.join(projectRoot, "node_modules", name, "package.json")),
+  ).resolves.toBeTruthy();
+}
+function expectPackageAbsent(projectRoot: string, name: string) {
+  return expect(
+    fs.lstat(path.join(projectRoot, "node_modules", name, "package.json")),
+  ).rejects.toHaveProperty("code", "ENOENT");
 }
 
 function pluginNpmProjectRoot(npmRoot: string, packageName: string): string {
@@ -444,36 +462,27 @@ describe("installPluginFromNpmSpec e2e", () => {
       },
     ]);
     await useStaticRegistry([{ packageName, latest: "2026.5.27", versions }]);
-    const previousHostVersion = process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION;
-    process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION = "2026.5.10-beta.1";
+    vi.stubEnv("OPENCLAW_COMPATIBILITY_HOST_VERSION", "2026.5.10-beta.1");
     const warnings: string[] = [];
 
-    try {
-      const result = await installPluginFromNpmSpec({
-        spec: packageName,
-        npmDir: npmRoot,
-        logger: { warn: (message) => warnings.push(message) },
-      });
+    const result = await installPluginFromNpmSpec({
+      spec: packageName,
+      npmDir: npmRoot,
+      logger: { warn: (message) => warnings.push(message) },
+    });
 
-      expect(result.ok).toBe(true);
-      if (!result.ok) {
-        return;
-      }
-      expect(result.npmResolution?.version).toBe("2026.5.26");
-      expect(result.npmResolution?.resolvedSpec).toBe(`${packageName}@2026.5.26`);
-      expect(warnings.join("\n")).toContain(`using newest compatible ${packageName}@2026.5.26`);
-      const projectRoot = pluginNpmProjectRoot(npmRoot, packageName);
-      const installedPackageJson = await readJson<{ version?: string }>(
-        path.join(projectRoot, "node_modules", packageName, "package.json"),
-      );
-      expect(installedPackageJson.version).toBe("2026.5.26");
-    } finally {
-      if (previousHostVersion === undefined) {
-        delete process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION;
-      } else {
-        process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION = previousHostVersion;
-      }
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
     }
+    expect(result.npmResolution?.version).toBe("2026.5.26");
+    expect(result.npmResolution?.resolvedSpec).toBe(`${packageName}@2026.5.26`);
+    expect(warnings.join("\n")).toContain(`using newest compatible ${packageName}@2026.5.26`);
+    const projectRoot = pluginNpmProjectRoot(npmRoot, packageName);
+    const installedPackageJson = await readJson<{ version?: string }>(
+      path.join(projectRoot, "node_modules", packageName, "package.json"),
+    );
+    expect(installedPackageJson.version).toBe("2026.5.26");
   });
 
   it("keeps third-party peer dependencies in the owning npm project across later installs", async () => {
@@ -547,16 +556,9 @@ describe("installPluginFromNpmSpec e2e", () => {
     }
 
     const projectRoot = pluginNpmProjectRoot(npmRoot, pluginWithOptionalDependency);
-    await expect(
-      fs.lstat(path.join(projectRoot, "node_modules", optionalDependency, "package.json")),
-    ).resolves.toBeTruthy();
-    await expect(
-      fs.lstat(path.join(projectRoot, "node_modules", runtimePeer, "package.json")),
-    ).resolves.toBeTruthy();
-    const rootManifest = await readJson<{
-      dependencies?: Record<string, string>;
-      openclaw?: { managedPeerDependencies?: string[] };
-    }>(path.join(projectRoot, "package.json"));
+    await expectPackagePresent(projectRoot, optionalDependency);
+    await expectPackagePresent(projectRoot, runtimePeer);
+    const rootManifest = await readProjectManifest(projectRoot);
     expect(["1.0.0", "^1.0.0"]).toContain(rootManifest.dependencies?.[runtimePeer]);
     expect(rootManifest.openclaw?.managedPeerDependencies ?? []).toContain(runtimePeer);
   });
@@ -600,10 +602,7 @@ describe("installPluginFromNpmSpec e2e", () => {
       expect(result.error).toContain("Install blocked by policy");
       expect(result.error).toContain("Reason: blocked installed package tree");
     }
-    const rootManifest = await readJson<{
-      dependencies?: Record<string, string>;
-      openclaw?: { managedPeerDependencies?: string[] };
-    }>(path.join(blockedProjectRoot, "package.json"));
+    const rootManifest = await readProjectManifest(blockedProjectRoot);
     expect(rootManifest.dependencies?.[existingRootDependency]).toBe("1.0.0");
     expect(rootManifest.dependencies?.[blockedPlugin]).toBeUndefined();
     expect(rootManifest.dependencies?.[runtimePeer]).toBeUndefined();
@@ -611,17 +610,9 @@ describe("installPluginFromNpmSpec e2e", () => {
       existingRootDependency,
     );
     expect(rootManifest.openclaw?.managedPeerDependencies ?? []).not.toContain(runtimePeer);
-    await expect(
-      fs.lstat(
-        path.join(blockedProjectRoot, "node_modules", existingRootDependency, "package.json"),
-      ),
-    ).resolves.toBeTruthy();
-    await expect(
-      fs.lstat(path.join(blockedProjectRoot, "node_modules", blockedPlugin, "package.json")),
-    ).rejects.toHaveProperty("code", "ENOENT");
-    await expect(
-      fs.lstat(path.join(blockedProjectRoot, "node_modules", runtimePeer, "package.json")),
-    ).rejects.toHaveProperty("code", "ENOENT");
+    await expectPackagePresent(blockedProjectRoot, existingRootDependency);
+    await expectPackageAbsent(blockedProjectRoot, blockedPlugin);
+    await expectPackageAbsent(blockedProjectRoot, runtimePeer);
   });
 
   it("keeps an earlier isolated openclaw peer link after later plugin installs", async () => {
@@ -658,9 +649,7 @@ describe("installPluginFromNpmSpec e2e", () => {
 
     await expect(fs.lstat(peerLink).then((stat) => stat.isSymbolicLink())).resolves.toBe(true);
     const peerProjectRoot = pluginNpmProjectRoot(npmRoot, peerPackageName);
-    const manifest = await readJson<{
-      dependencies?: Record<string, string>;
-    }>(path.join(peerProjectRoot, "package.json"));
+    const manifest = await readProjectManifest(peerProjectRoot);
     expect(manifest.dependencies?.openclaw).toBeUndefined();
     const lock = await readJson<{
       packages?: Record<string, unknown>;
@@ -698,9 +687,7 @@ describe("installPluginFromNpmSpec e2e", () => {
     expect(result.npmResolution?.version).toBe("1.0.0");
 
     const projectRoot = pluginNpmProjectRoot(npmRoot, packageName);
-    const manifest = await readJson<{
-      dependencies?: Record<string, string>;
-    }>(path.join(projectRoot, "package.json"));
+    const manifest = await readProjectManifest(projectRoot);
     expect(manifest.dependencies?.[packageName]).toBe("1.0.0");
 
     const installedManifest = await readJson<{ version?: string }>(

@@ -51,6 +51,14 @@ export function prunePluginLocalOpenClawPeerLinks(npmRoot: string) {
   }
 }
 
+function writeDependency(dir: string) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify({ name: "required-runtime", version: "1.0.0" }),
+  );
+}
+
 export function registerManagedNpmDependencyTests({
   makeTempDir,
   writeInstalledNpmPlugin,
@@ -83,37 +91,13 @@ export function registerManagedNpmDependencyTests({
   isManagedNpmInstallCommand: (argv: unknown) => argv is string[];
 }) {
   it.each([
-    {
-      payload: "ancestor",
-      mode: "update",
-      existingProject: true,
-      workTimeoutMs: 45_000,
-      expectedTimeoutMs: 45_000,
-    },
-    {
-      payload: "outside-symlink",
-      mode: "update",
-      existingProject: true,
-      workTimeoutMs: null,
-      expectedTimeoutMs: undefined,
-    },
-    {
-      payload: "hoisted",
-      mode: "install",
-      existingProject: false,
-      workTimeoutMs: undefined,
-      expectedTimeoutMs: 300_000,
-    },
-    {
-      payload: "optional",
-      mode: "update",
-      existingProject: true,
-      workTimeoutMs: undefined,
-      expectedTimeoutMs: undefined,
-    },
+    ["ancestor", "update", true, 45_000, 45_000],
+    ["outside-symlink", "update", true, null, undefined],
+    ["hoisted", "install", false, undefined, 300_000],
+    ["optional", "update", true, undefined, undefined],
   ] as const)(
-    "verifies $payload dependency payload after npm success during $mode (existing project: $existingProject)",
-    async ({ payload, mode, existingProject, workTimeoutMs, expectedTimeoutMs }) => {
+    "verifies %s dependency payload during %s (existing project: %s, timeout: %s -> %s)",
+    async (payload, mode, existingProject, workTimeoutMs, expectedTimeoutMs) => {
       const npmRoot = path.join(makeTempDir(), "npm");
       const packageName = "dependency-payload-plugin";
       const spec = `${packageName}@1.0.0`;
@@ -159,21 +143,13 @@ export function registerManagedNpmDependencyTests({
             fs.rmSync(dependencyDir, { recursive: true, force: true });
             if (payload === "ancestor" || payload === "outside-symlink") {
               const outsideDir = path.join(npmRoot, "node_modules", "required-runtime");
-              fs.mkdirSync(outsideDir, { recursive: true });
-              fs.writeFileSync(
-                path.join(outsideDir, "package.json"),
-                JSON.stringify({ name: "required-runtime", version: "1.0.0" }),
-              );
+              writeDependency(outsideDir);
               if (payload === "outside-symlink") {
                 fs.symlinkSync(outsideDir, dependencyDir, "junction");
               }
             } else if (payload === "hoisted") {
               const hoistedDir = path.join(attemptRoot, "node_modules", "required-runtime");
-              fs.mkdirSync(hoistedDir, { recursive: true });
-              fs.writeFileSync(
-                path.join(hoistedDir, "package.json"),
-                JSON.stringify({ name: "required-runtime", version: "1.0.0" }),
-              );
+              writeDependency(hoistedDir);
             } else if (payload === "optional") {
               const manifestPath = path.join(pluginDir, "package.json");
               const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
@@ -214,9 +190,6 @@ export function registerManagedNpmDependencyTests({
           error: expect.stringContaining("required-runtime"),
         });
         expect(onBeforePluginArtifactCommit).not.toHaveBeenCalled();
-        expect(
-          runCommandWithTimeoutMock.mock.calls.filter(([argv]) => isManagedNpmInstallCommand(argv)),
-        ).toHaveLength(1);
         if (existingProject) {
           expect(readTextFileTree(npmProjectRoot)).toEqual(projectBefore);
         } else {
@@ -226,50 +199,43 @@ export function registerManagedNpmDependencyTests({
     },
   );
 
-  it.each([{ mode: "update", declaration: "direct" }] as const)(
-    "preserves the canonical host for a $declaration declaration during $mode",
-    async ({ mode }) => {
-      const npmRoot = path.join(makeTempDir(), "npm");
-      const packageName = "host-dependency-plugin";
-      const npmProjectRoot = resolvePluginNpmProjectDir({ npmDir: npmRoot, packageName });
-      if (mode === "update") {
-        writeInstalledNpmPlugin({
-          npmRoot: npmProjectRoot,
-          packageName,
-          version: "0.9.0",
-        });
-        fs.writeFileSync(path.join(npmProjectRoot, "package.json"), '{"private":true}\n');
-      }
-      mockNpmViewAndInstall({
-        spec: `${packageName}@1.0.0`,
-        packageName,
-        version: "1.0.0",
-        npmRoot,
-        dependency: { name: "openclaw", version: "*" },
-      });
-      const onBeforePluginArtifactCommit = vi.fn(async () => {});
+  it("preserves the canonical host for a direct declaration during update", async () => {
+    const mode = "update";
+    const npmRoot = path.join(makeTempDir(), "npm");
+    const packageName = "host-dependency-plugin";
+    const npmProjectRoot = resolvePluginNpmProjectDir({ npmDir: npmRoot, packageName });
+    writeInstalledNpmPlugin({ npmRoot: npmProjectRoot, packageName, version: "0.9.0" });
+    fs.writeFileSync(path.join(npmProjectRoot, "package.json"), '{"private":true}\n');
 
-      const result = await installPluginFromNpmSpec({
-        spec: `${packageName}@1.0.0`,
-        npmDir: npmRoot,
-        mode,
-        onBeforePluginArtifactCommit,
-        logger: { info: () => {}, warn: () => {} },
-      });
+    mockNpmViewAndInstall({
+      spec: `${packageName}@1.0.0`,
+      packageName,
+      version: "1.0.0",
+      npmRoot,
+      dependency: { name: "openclaw", version: "*" },
+    });
+    const onBeforePluginArtifactCommit = vi.fn(async () => {});
 
-      expect(result, JSON.stringify(result)).toMatchObject({ ok: true, pluginId: packageName });
-      if (!result.ok) {
-        return;
-      }
-      expect(onBeforePluginArtifactCommit).toHaveBeenCalledOnce();
-      const hostLink = path.join(result.targetDir, "node_modules", "openclaw");
-      expect(fs.lstatSync(hostLink).isSymbolicLink()).toBe(true);
-      expect(fs.realpathSync(hostLink)).toBe(
-        fs.realpathSync(resolveOpenClawPackageRootSyncMock.mock.results[0]?.value),
-      );
-      expect(
-        runCommandWithTimeoutMock.mock.calls.filter(([argv]) => isManagedNpmInstallCommand(argv)),
-      ).toHaveLength(1);
-    },
-  );
+    const result = await installPluginFromNpmSpec({
+      spec: `${packageName}@1.0.0`,
+      npmDir: npmRoot,
+      mode,
+      onBeforePluginArtifactCommit,
+      logger: { info: () => {}, warn: () => {} },
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true, pluginId: packageName });
+    if (!result.ok) {
+      return;
+    }
+    expect(onBeforePluginArtifactCommit).toHaveBeenCalledOnce();
+    const hostLink = path.join(result.targetDir, "node_modules", "openclaw");
+    expect(fs.lstatSync(hostLink).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(hostLink)).toBe(
+      fs.realpathSync(resolveOpenClawPackageRootSyncMock.mock.results[0]?.value),
+    );
+    expect(
+      runCommandWithTimeoutMock.mock.calls.filter(([argv]) => isManagedNpmInstallCommand(argv)),
+    ).toHaveLength(1);
+  });
 }

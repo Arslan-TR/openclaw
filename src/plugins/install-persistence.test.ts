@@ -1,4 +1,3 @@
-// Plugin install persistence tests cover saving installed plugin records after install.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -41,6 +40,37 @@ function requireMockCallArg(
   }
   return arg;
 }
+
+async function persistPluginInstall(
+  ...args: Parameters<typeof import("./install-persistence.js").persistPluginInstall>
+) {
+  const owner = await import("./install-persistence.js");
+  return owner.persistPluginInstall(...args);
+}
+
+type PersistOptions = Parameters<typeof import("./install-persistence.js").persistPluginInstall>[0];
+function persistNpm(
+  pluginId: string,
+  config: OpenClawConfig,
+  options: Partial<PersistOptions> = {},
+) {
+  return persistPluginInstall({
+    pluginId,
+    snapshot: installSnapshot(config),
+    install: npmInstall(`${pluginId}@1.0.0`),
+    ...options,
+  });
+}
+
+function npmInstall(spec: string, installPath = `/tmp/${spec.split("@")[0]}`) {
+  return { source: "npm" as const, spec, installPath };
+}
+
+const requiredTokenSchema = {
+  type: "object",
+  required: ["token"],
+  properties: { token: { type: "string" } },
+};
 
 function mockEnabledPlugin(pluginId: string): OpenClawConfig {
   const config = { plugins: { entries: { [pluginId]: { enabled: true } } } };
@@ -97,7 +127,6 @@ beforeEach(() => {
 
 describe("persistPluginInstall", () => {
   it("hands durable batch facts to the coordinator before later output failure", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const record = vi.fn();
     const deferRuntime = { record, deferCleanup: vi.fn() };
     const commit = vi.fn(async () => undefined);
@@ -138,7 +167,6 @@ describe("persistPluginInstall", () => {
   it.each(["before index", "at config publication"])(
     "rejects an expired owner %s and restores tentative state",
     async (phase) => {
-      const { persistPluginInstall } = await import("./install-persistence.js");
       const expired = new Error("approved operation owner expired");
       let ownerActive = phase === "at config publication";
       const replaceConfig = replaceConfigFileMock.getMockImplementation();
@@ -190,22 +218,13 @@ describe("persistPluginInstall", () => {
   });
 
   it("persists installs even when runtime cache invalidation fails", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig: OpenClawConfig = { plugins: { entries: {} } };
     const enabledConfig = mockEnabledPlugin("alpha");
     clearPluginRegistryLoadCacheMock.mockImplementation(() => {
       throw new Error("cache unavailable");
     });
 
-    const next = await persistPluginInstall({
-      snapshot: installSnapshot(baseConfig),
-      pluginId: "alpha",
-      install: {
-        source: "npm",
-        spec: "alpha@1.0.0",
-        installPath: "/tmp/alpha",
-      },
-    });
+    const next = await persistNpm("alpha", baseConfig);
 
     expect(next).toEqual(enabledConfig);
     expect(refreshPluginRegistryMock).toHaveBeenCalledTimes(1);
@@ -213,16 +232,14 @@ describe("persistPluginInstall", () => {
   });
 
   it("removes a replaced managed install directory before refreshing the registry", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig: OpenClawConfig = { plugins: { entries: {} } };
     mockEnabledPlugin("codex");
-    setInstalledPluginIndexInstallRecords({
-      codex: {
-        source: "clawhub",
-        spec: "clawhub:@openclaw/codex",
-        installPath: "/tmp/openclaw/extensions/codex",
-      },
-    });
+    const previousInstall = {
+      source: "clawhub" as const,
+      spec: "clawhub:@openclaw/codex",
+      installPath: "/tmp/openclaw/extensions/codex",
+    };
+    setInstalledPluginIndexInstallRecords({ codex: previousInstall });
     planPluginUninstallMock.mockReturnValueOnce({
       ok: true,
       config: {} as OpenClawConfig,
@@ -237,14 +254,8 @@ describe("persistPluginInstall", () => {
       warnings: [],
     });
 
-    await persistPluginInstall({
-      snapshot: installSnapshot(baseConfig),
-      pluginId: "codex",
-      install: {
-        source: "npm",
-        spec: "@openclaw/codex",
-        installPath: "/tmp/openclaw/npm/node_modules/@openclaw/codex",
-      },
+    await persistNpm("codex", baseConfig, {
+      install: npmInstall("@openclaw/codex", "/tmp/openclaw/npm/node_modules/@openclaw/codex"),
     });
 
     expect(planPluginUninstallMock).toHaveBeenCalledWith(
@@ -252,11 +263,7 @@ describe("persistPluginInstall", () => {
         config: {
           plugins: {
             installs: {
-              codex: {
-                source: "clawhub",
-                spec: "clawhub:@openclaw/codex",
-                installPath: "/tmp/openclaw/extensions/codex",
-              },
+              codex: previousInstall,
             },
           },
         },
@@ -276,34 +283,18 @@ describe("persistPluginInstall", () => {
   });
 
   it("preserves replaced npm install directories across generation updates", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig: OpenClawConfig = { plugins: { entries: {} } };
     mockEnabledPlugin("codex");
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-plugin-persist-"));
     const previousProjectRoot = path.join(tempRoot, "npm", "projects", "codex-v1");
-    const previousInstallPath = path.join(
-      previousProjectRoot,
-      "node_modules",
-      "@openclaw",
-      "codex",
-    );
+    const previousInstallPath = path.join(previousProjectRoot, "node_modules/@openclaw/codex");
     const nextInstallPath = path.join(
       tempRoot,
-      "npm",
-      "projects",
-      "codex-v2",
-      "node_modules",
-      "@openclaw",
-      "codex",
+      "npm/projects/codex-v2/node_modules/@openclaw/codex",
     );
     fs.mkdirSync(previousInstallPath, { recursive: true });
-    setInstalledPluginIndexInstallRecords({
-      codex: {
-        source: "npm",
-        spec: "@openclaw/codex@1.0.0",
-        installPath: previousInstallPath,
-      },
-    });
+    const previousInstall = npmInstall("@openclaw/codex@1.0.0", previousInstallPath);
+    setInstalledPluginIndexInstallRecords({ codex: previousInstall });
     planPluginUninstallMock.mockReturnValueOnce({
       ok: true,
       config: {} as OpenClawConfig,
@@ -321,14 +312,8 @@ describe("persistPluginInstall", () => {
     });
 
     try {
-      await persistPluginInstall({
-        snapshot: installSnapshot(baseConfig),
-        pluginId: "codex",
-        install: {
-          source: "npm",
-          spec: "@openclaw/codex@2.0.0",
-          installPath: nextInstallPath,
-        },
+      await persistNpm("codex", baseConfig, {
+        install: npmInstall("@openclaw/codex@2.0.0", nextInstallPath),
       });
 
       expect(planPluginUninstallMock).toHaveBeenCalledWith(
@@ -336,11 +321,7 @@ describe("persistPluginInstall", () => {
           config: {
             plugins: {
               installs: {
-                codex: {
-                  source: "npm",
-                  spec: "@openclaw/codex@1.0.0",
-                  installPath: previousInstallPath,
-                },
+                codex: previousInstall,
               },
             },
           },
@@ -356,7 +337,6 @@ describe("persistPluginInstall", () => {
   });
 
   it("does not warn when the config-selected source is inside the npm install path", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig: OpenClawConfig = { plugins: { entries: {} } };
     mockEnabledPlugin("discord");
     buildPluginSnapshotReportMock.mockReturnValue({
@@ -371,14 +351,8 @@ describe("persistPluginInstall", () => {
       diagnostics: [],
     });
 
-    await persistPluginInstall({
-      snapshot: installSnapshot(baseConfig),
-      pluginId: "discord",
-      install: {
-        source: "npm",
-        spec: "@openclaw/discord",
-        installPath: "/tmp/openclaw/npm/node_modules/@openclaw/discord",
-      },
+    await persistNpm("discord", baseConfig, {
+      install: npmInstall("@openclaw/discord", "/tmp/openclaw/npm/node_modules/@openclaw/discord"),
     });
 
     expect(pluginsCliRuntimeLogs.join("\n")).not.toContain("is not the active source");
@@ -387,7 +361,6 @@ describe("persistPluginInstall", () => {
 
 describe("persistPluginInstall enablement", () => {
   it("restores runtime child policy when reinstalling its package owner", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig = {
       plugins: {
         allow: ["memory-core"],
@@ -402,14 +375,8 @@ describe("persistPluginInstall enablement", () => {
       diagnostics: [],
     });
 
-    const next = await persistPluginInstall({
-      snapshot: installSnapshot(baseConfig),
-      pluginId: "demo-package",
-      install: {
-        source: "npm",
-        spec: "@openclaw/demo-package@0.0.1",
-        installPath: "/tmp/demo-package",
-      },
+    const next = await persistNpm("demo-package", baseConfig, {
+      install: npmInstall("@openclaw/demo-package@0.0.1", "/tmp/demo-package"),
     });
 
     expect(next.plugins?.allow).toEqual(["memory-core", "demo-plugin-npm"]);
@@ -418,7 +385,6 @@ describe("persistPluginInstall enablement", () => {
   });
 
   it("installs a plugin disabled when its required configuration is missing", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const warn = vi.fn();
     const baseConfig = {
       plugins: {
@@ -432,25 +398,14 @@ describe("persistPluginInstall enablement", () => {
     loadPluginManifestRegistryMock.mockReturnValue({
       plugins: [
         createManifestRecord("needs-config", {
-          configSchema: {
-            type: "object",
-            required: ["token"],
-            properties: { token: { type: "string" } },
-          },
+          configSchema: requiredTokenSchema,
         }),
       ],
       diagnostics: [],
     });
 
-    const next = await persistPluginInstall({
-      snapshot: installSnapshot(baseConfig),
-      pluginId: "needs-config",
+    const next = await persistNpm("needs-config", baseConfig, {
       persistenceLogger: { warn },
-      install: {
-        source: "npm",
-        spec: "needs-config@1.0.0",
-        installPath: "/tmp/needs-config",
-      },
     });
 
     expect(next).toEqual({
@@ -474,15 +429,10 @@ describe("persistPluginInstall enablement", () => {
       writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock,
       "writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock",
     );
-    expect(persistedRecords["needs-config"]).toMatchObject({
-      source: "npm",
-      spec: "needs-config@1.0.0",
-      installPath: "/tmp/needs-config",
-    });
+    expect(persistedRecords["needs-config"]).toMatchObject(npmInstall("needs-config@1.0.0"));
   });
 
   it("rejects a malformed manifest schema instead of treating it as missing config", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig = {
       plugins: { allow: ["memory-core"], deny: ["broken-schema"], entries: {} },
     } as OpenClawConfig;
@@ -498,17 +448,9 @@ describe("persistPluginInstall enablement", () => {
       diagnostics: [],
     });
 
-    await expect(
-      persistPluginInstall({
-        snapshot: installSnapshot(baseConfig),
-        pluginId: "broken-schema",
-        install: {
-          source: "npm",
-          spec: "broken-schema@1.0.0",
-          installPath: "/tmp/broken-schema",
-        },
-      }),
-    ).rejects.toThrow("has invalid configured settings");
+    await expect(persistNpm("broken-schema", baseConfig)).rejects.toThrow(
+      "has invalid configured settings",
+    );
 
     expect(enablePluginInConfigMock).not.toHaveBeenCalled();
     expect(writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock).not.toHaveBeenCalled();
@@ -516,7 +458,6 @@ describe("persistPluginInstall enablement", () => {
   });
 
   it("rejects invalid authored plugin config even for a disabled install", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig = {
       plugins: {
         entries: {
@@ -531,26 +472,15 @@ describe("persistPluginInstall enablement", () => {
     loadPluginManifestRegistryMock.mockReturnValue({
       plugins: [
         createManifestRecord("needs-config", {
-          configSchema: {
-            type: "object",
-            required: ["token"],
-            properties: { token: { type: "string" } },
-          },
+          configSchema: requiredTokenSchema,
         }),
       ],
       diagnostics: [],
     });
 
     await expect(
-      persistPluginInstall({
-        snapshot: installSnapshot(baseConfig),
-        pluginId: "needs-config",
+      persistNpm("needs-config", baseConfig, {
         enable: false,
-        install: {
-          source: "npm",
-          spec: "needs-config@1.0.0",
-          installPath: "/tmp/needs-config",
-        },
       }),
     ).rejects.toThrow("has invalid configured settings");
 
@@ -560,7 +490,6 @@ describe("persistPluginInstall enablement", () => {
   });
 
   it("does not add disabled installs to restrictive allowlists", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const baseConfig = {
       plugins: {
         allow: ["memory-core"],
@@ -568,9 +497,7 @@ describe("persistPluginInstall enablement", () => {
       },
     } as OpenClawConfig;
 
-    const next = await persistPluginInstall({
-      snapshot: installSnapshot(baseConfig),
-      pluginId: "memory-lancedb",
+    const next = await persistNpm("memory-lancedb", baseConfig, {
       enable: false,
       install: {
         source: "path",
@@ -607,7 +534,6 @@ describe("plugin install persistence warning audiences", () => {
   });
 
   it("delivers deferred source cleanup warnings to the live batch consumer", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const cleanups: Parameters<PluginInstallRuntimeDeferral["deferCleanup"]>[0][] = [];
     const lateWarning = vi.fn();
     const warning = "Previous plugin source could not be removed";
@@ -641,7 +567,6 @@ describe("plugin install persistence warning audiences", () => {
   });
 
   it("keeps sensitive install details appropriate for the management audience", async () => {
-    const { persistPluginInstall } = await import("./install-persistence.js");
     const warn = vi.fn();
     const cleanupDetail = "npm stderr PRIVATE_NPM_MARKER /private/previous-source/workboard";
     const refreshDetail = "PRIVATE_REFRESH_MARKER /private/registry-source/workboard";
@@ -682,15 +607,17 @@ describe("plugin install persistence warning audiences", () => {
 
     const warnings = warn.mock.calls.map(([message]) => String(message));
     expect(warnings).toHaveLength(3);
-    expect(warnings.join("\n")).toContain("previous plugin installation");
-    expect(warnings.join("\n")).toContain("registry");
-    expect(warnings.join("\n")).toContain("shadowed");
-    expect(warnings.join("\n")).not.toContain("/private/");
-    expect(warnings.join("\n")).not.toContain("PRIVATE_NPM_MARKER");
-    expect(warnings.join("\n")).not.toContain("PRIVATE_REFRESH_MARKER");
-    expect(pluginsCliRuntimeLogs.join("\n")).toContain(cleanupDetail);
-    expect(pluginsCliRuntimeLogs.join("\n")).toContain(refreshDetail);
-    expect(pluginsCliRuntimeLogs.join("\n")).toContain(configuredSource);
-    expect(pluginsCliRuntimeLogs.join("\n")).toContain(install.installPath);
+    const warningText = warnings.join("\n");
+    const runtimeText = pluginsCliRuntimeLogs.join("\n");
+    expect(warningText).toContain("previous plugin installation");
+    expect(warningText).toContain("registry");
+    expect(warningText).toContain("shadowed");
+    expect(warningText).not.toContain("/private/");
+    expect(warningText).not.toContain("PRIVATE_NPM_MARKER");
+    expect(warningText).not.toContain("PRIVATE_REFRESH_MARKER");
+    expect(runtimeText).toContain(cleanupDetail);
+    expect(runtimeText).toContain(refreshDetail);
+    expect(runtimeText).toContain(configuredSource);
+    expect(runtimeText).toContain(install.installPath);
   });
 });
