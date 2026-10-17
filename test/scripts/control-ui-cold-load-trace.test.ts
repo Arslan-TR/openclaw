@@ -177,7 +177,13 @@ describe("cold-load CPU accounting", () => {
     const directory = tempDirs.make("openclaw-cold-load-emitted-map-");
     const { code, map } = await transform(
       "export function prepareTimestamp(value: number) {\n  return value + 1;\n}\n",
-      { loader: "ts", sourcefile: "../../src/timestamp.ts", sourcemap: "external", minify: true },
+      {
+        loader: "ts",
+        sourcefile: "../../src/timestamp.ts",
+        sourcemap: "external",
+        minify: true,
+        footer: "\nfunction runtime() {}",
+      },
     );
     await writeFile(path.join(directory, "app.js.map"), map);
     const generatedColumn = code.indexOf("+1");
@@ -203,6 +209,10 @@ describe("cold-load CPU accounting", () => {
               columnNumber: 1,
             },
           },
+          {
+            id: 3,
+            callFrame: frame("runtime", "http://localhost/assets/app.js", 2),
+          },
         ],
       },
       { assetBaseUrl: "http://localhost/assets/", assetDirectory: directory },
@@ -217,6 +227,11 @@ describe("cold-load CPU accounting", () => {
       lineNumber: 0,
       columnNumber: 7,
     });
+    expect(code.split("\n")[2]).toBe("function runtime() {}");
+    expect(mapped).toMatchObject({ mappedFrames: 2, unmappedFrames: 1 });
+    expect(mapped.profile.nodes[2]?.callFrame).toEqual(
+      frame("runtime", "http://localhost/assets/app.js", 2),
+    );
   });
 
   it("compares the same emitted function across output directories", async () => {

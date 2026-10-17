@@ -137,7 +137,11 @@ export async function mapColdLoadCpuProfile(
         return node;
       }
       const origin = map.findEntry(frame.lineNumber, frame.columnNumber);
-      if (!("originalSource" in origin) || typeof origin.originalSource !== "string") {
+      if (
+        !("originalSource" in origin) ||
+        typeof origin.originalSource !== "string" ||
+        origin.generatedLine !== frame.lineNumber
+      ) {
         unmappedFrames += 1;
         return node;
       }
