@@ -1,5 +1,6 @@
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { resolvePathViaExistingAncestorSync } from "../infra/boundary-path.js";
+import { getDatabaseEngineInput } from "../infra/database-engine/context.js";
 import { withFileLock } from "../infra/file-lock.js";
 import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
@@ -149,11 +150,43 @@ export async function loadPersistedPluginModelCatalogs(
         }
       },
     });
-    reading = runSqliteReadOnlyOperation(
-      options.path,
-      { type: "pluginCatalog.read", input: { agentId: options.agentId, pluginIds } },
-      { source: "canonical", expectedIdentity: identity.key, env, signal: controller.signal },
-    );
+    if (getDatabaseEngineInput("agent")) {
+      const execution = captureOpenClawAgentDatabaseExecution(options);
+      reading = (async () => {
+        try {
+          return (
+            (await execution.runExisting(
+              {
+                assertCurrent,
+                createAdmission: (binding) => () => ({
+                  nativeLocations: binding.nativeLocations,
+                  admission: createSqliteWorkerOperationAdmission((request, grant) => {
+                    binding.authorize(request);
+                    assertCurrent();
+                    if (!grant()) {
+                      throw new Error("Plugin catalog read authority expired");
+                    }
+                  }, binding.attachment),
+                }),
+              },
+              (scope) =>
+                scope.execute(
+                  { type: "pluginCatalog.read", input: { pluginIds } },
+                  { signal: controller.signal },
+                ),
+            )) ?? []
+          );
+        } finally {
+          await execution.release();
+        }
+      })();
+    } else {
+      reading = runSqliteReadOnlyOperation(
+        options.path,
+        { type: "pluginCatalog.read", input: { agentId: options.agentId, pluginIds } },
+        { source: "canonical", expectedIdentity: identity.key, env, signal: controller.signal },
+      );
+    }
     const catalogs = await reading;
     assertCurrent();
     return catalogs;

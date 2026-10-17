@@ -36,6 +36,19 @@ type Handlers = WorkerOperationHandlers<AgentWorkerOperationContext>;
 export { loadAgentAuthProfileOperations };
 export { loadAgentSchemaInspectionOperations } from "./openclaw-agent-schema-inspection-operations.worker.js";
 
+export async function loadAgentPluginModelCatalogReadOperations() {
+  const { readPluginModelCatalogEntriesInDatabase, PLUGIN_MODEL_CATALOG_CACHE_SCOPE } =
+    await import("../agents/plugin-model-catalog.kernel.js");
+  return {
+    "pluginCatalog.read": (input: { pluginIds?: readonly string[] }, { open }) =>
+      readPluginModelCatalogEntriesInDatabase(
+        open().db,
+        PLUGIN_MODEL_CATALOG_CACHE_SCOPE,
+        input.pluginIds,
+      ),
+  } satisfies Handlers;
+}
+
 export async function loadAgentTranscriptReadOperations() {
   const [
     raw,
@@ -680,6 +693,7 @@ export async function loadSessionRowBackfillOperations() {
 
 export type RegisteredAgentWorkerOperations = WorkerOperations<
   Awaited<ReturnType<typeof loadAgentAuthProfileOperations>> &
+    Awaited<ReturnType<typeof loadAgentPluginModelCatalogReadOperations>> &
     Awaited<ReturnType<typeof loadAgentSchemaInspectionOperations>> &
     Awaited<ReturnType<typeof loadSessionRowBackfillOperations>> &
     Awaited<ReturnType<typeof loadUsageCacheOperations>> &
