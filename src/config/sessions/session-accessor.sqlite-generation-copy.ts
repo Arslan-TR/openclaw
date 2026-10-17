@@ -27,11 +27,7 @@ import {
   reconcileSessionTranscriptIndexInTransaction,
 } from "./session-transcript-index.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import {
-  readTranscriptStorageEncoding,
-  transcriptEventJsonSql,
-  type TranscriptPayloadRecord,
-} from "./transcript-payload.js";
+import { transcriptEventJsonSql, type TranscriptPayloadRecord } from "./transcript-payload.js";
 import { deriveTranscriptPredicateFields } from "./transcript-predicate-fields.js";
 
 export function readSqliteSessionGenerationWindows(
@@ -281,12 +277,7 @@ export function copySqliteSessionGenerationRows(params: {
     .where("session_id", "=", params.sessionId)
     .orderBy("seq");
   const insertEvent = prepareSqliteQuerySync<
-    TranscriptPayloadRecord & {
-      seq: number;
-      created_at: number;
-      model_bytes: number | null;
-      model_without_checkpoint_bytes: number | null;
-    }
+    TranscriptPayloadRecord & { seq: number; created_at: number }
   >(params.destination.db, (parameter) =>
     destinationDb.insertInto("transcript_events").values({
       session_id: params.sessionId,
@@ -303,32 +294,18 @@ export function copySqliteSessionGenerationRows(params: {
       navigation_last_type: parameter((row) => row.navigation_last_type),
       navigation_last_custom_type: parameter((row) => row.navigation_last_custom_type),
       navigation_valid: parameter((row) => row.navigation_valid),
-      model_bytes: parameter((row) => row.model_bytes),
-      model_without_checkpoint_bytes: parameter((row) => row.model_without_checkpoint_bytes),
     }),
   );
   // PostgreSQL receives plain JSON; UTF-16 SQLite retains native TEXT byte accounting.
   // UTF-8 SQLite can preserve encoded payloads without another codec round trip.
-  const destinationEncoding = readTranscriptStorageEncoding(params.destination.db);
-  const sameEngine =
-    isPostgresSqlConnection(params.destination.db) === isPostgresSqlConnection(params.source.db);
-  const preserveByteCounts =
-    sameEngine && destinationEncoding === readTranscriptStorageEncoding(params.source.db);
-  if (
-    !sameEngine ||
-    isPostgresSqlConnection(params.destination.db) ||
-    destinationEncoding !== "UTF-8"
-  ) {
+  const destinationEncoding = isPostgresSqlConnection(params.destination.db)
+    ? undefined
+    : params.destination.db.prepare("PRAGMA encoding").get()?.encoding;
+  if (destinationEncoding !== "UTF-8") {
     for (const row of iterateSqliteQuerySync(
       params.source.db,
       eventQuery
-        .select([
-          "session_id",
-          "seq",
-          "created_at",
-          "model_bytes",
-          "model_without_checkpoint_bytes",
-        ])
+        .select(["session_id", "seq", "created_at"])
         .select(transcriptEventJsonSql(params.source.db).as("event_json")),
     )) {
       insertEvent({
@@ -337,21 +314,11 @@ export function copySqliteSessionGenerationRows(params: {
         event_zstd: null,
         event_utf8_bytes: null,
         navigation_json: null,
-        model_bytes: preserveByteCounts ? row.model_bytes : null,
-        model_without_checkpoint_bytes: preserveByteCounts
-          ? row.model_without_checkpoint_bytes
-          : null,
       });
     }
   } else {
     for (const row of iterateSqliteQuerySync(params.source.db, eventQuery.selectAll())) {
-      insertEvent({
-        ...row,
-        model_bytes: preserveByteCounts ? row.model_bytes : null,
-        model_without_checkpoint_bytes: preserveByteCounts
-          ? row.model_without_checkpoint_bytes
-          : null,
-      });
+      insertEvent(row);
     }
   }
   // Preserve recorded idempotency ownership, which cannot be inferred from the JSON.

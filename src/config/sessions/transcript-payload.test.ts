@@ -52,8 +52,7 @@ function createTable(database: DatabaseSync): void {
     event_utf8_bytes INTEGER, navigation_json TEXT,
     navigation_type TEXT, navigation_custom_type TEXT, navigation_display INTEGER NOT NULL DEFAULT 0,
     message_role TEXT, navigation_last_type TEXT, navigation_last_custom_type TEXT,
-    navigation_valid INTEGER NOT NULL DEFAULT 1,
-    model_bytes INTEGER, model_without_checkpoint_bytes INTEGER
+    navigation_valid INTEGER NOT NULL DEFAULT 1
   ) STRICT`);
   admitSqliteSchema(database);
 }
@@ -117,24 +116,22 @@ function compressedRecord(bytes: Uint8Array, rawBytes = bytes.byteLength): Paylo
 }
 
 describe("transcript payload storage boundary", () => {
-  it("publishes predicates and byte sizes with inserts and rewrites and rolls them back together", () => {
+  it("publishes predicate columns with inserts and rewrites and rolls both back together", () => {
     const database = openNodeSqliteDatabase(":memory:");
     try {
       createTable(database);
       database.exec(`ALTER TABLE transcript_events ADD COLUMN session_id TEXT;
         ALTER TABLE transcript_events ADD COLUMN created_at INTEGER`);
       const write = createTranscriptEventInserter(database, "session");
-      const original = '{"type":"message","message":{"role":"user","role":"assistant"}}';
       write({
         seq: 1,
         createdAt: 1,
-        eventJson: original,
+        eventJson: '{"type":"message","message":{"role":"user","role":"assistant"}}',
       });
       const read = () =>
         database
           .prepare(`SELECT navigation_type, navigation_last_type,
-        navigation_display, message_role, navigation_valid, model_bytes,
-        model_without_checkpoint_bytes FROM transcript_events WHERE seq = 1`)
+        navigation_display, message_role, navigation_valid FROM transcript_events WHERE seq = 1`)
           .get();
       expect(read()).toEqual({
         navigation_type: "message",
@@ -142,17 +139,17 @@ describe("transcript payload storage boundary", () => {
         navigation_display: 0,
         message_role: "user",
         navigation_valid: 1,
-        model_bytes: Buffer.byteLength(original),
-        model_without_checkpoint_bytes: Buffer.byteLength(original),
       });
       database.exec("BEGIN");
-      const rewritten = '{"type":"custom_message","type":"reset","display":true}';
       createTranscriptPayloadUpdater(
         database,
         "session",
       )({
         seq: 1,
-        ...prepareTranscriptPayload(database, rewritten),
+        ...prepareTranscriptPayload(
+          database,
+          '{"type":"custom_message","type":"reset","display":true}',
+        ),
       });
       expect(read()).toEqual({
         navigation_type: "custom_message",
@@ -160,8 +157,6 @@ describe("transcript payload storage boundary", () => {
         navigation_display: 1,
         message_role: null,
         navigation_valid: 1,
-        model_bytes: Buffer.byteLength(rewritten),
-        model_without_checkpoint_bytes: Buffer.byteLength(rewritten),
       });
       database.exec("ROLLBACK");
       expect(read()).toEqual({
@@ -170,8 +165,6 @@ describe("transcript payload storage boundary", () => {
         navigation_display: 0,
         message_role: "user",
         navigation_valid: 1,
-        model_bytes: Buffer.byteLength(original),
-        model_without_checkpoint_bytes: Buffer.byteLength(original),
       });
     } finally {
       database.close();
@@ -201,7 +194,7 @@ describe("transcript payload storage boundary", () => {
       }
       target.exec(`ALTER TABLE transcript_events ADD COLUMN session_id TEXT;
         ALTER TABLE transcript_events ADD COLUMN created_at INTEGER`);
-      const eventJson = `{"type":"custom","id":"first","id":"last","data":"${"fixture雪🦞".repeat(1024)}"}`;
+      const eventJson = `{"type":"custom","id":"first","id":"last","data":"${"fixture".repeat(1024)}"}`;
       const prepared = prepareTranscriptPayloadForReuse(source, eventJson);
       expect(prepared.storageEncoding).toBe(sourceEncoding);
       const insertEvent = createTranscriptEventInserter(target, "session");
@@ -218,15 +211,6 @@ describe("transcript payload storage boundary", () => {
         .get();
       expect(readBody(target, 1)).toBe(eventJson);
       expect(readBody(target, 1, "row")).toBe(eventJson);
-      const expectedBytes = Buffer.byteLength(
-        eventJson,
-        targetEncoding === "UTF-8" ? "utf8" : "utf16le",
-      );
-      expect(
-        target
-          .prepare("SELECT model_bytes, model_without_checkpoint_bytes FROM transcript_events")
-          .get(),
-      ).toEqual({ model_bytes: expectedBytes, model_without_checkpoint_bytes: expectedBytes });
       if (targetEncoding === "UTF-8") {
         expect(stored?.event_json).toBeNull();
         expect(stored?.event_zstd).toBeInstanceOf(Uint8Array);
@@ -249,9 +233,6 @@ describe("transcript payload storage boundary", () => {
     const database = openNodeSqliteDatabase(":memory:");
     try {
       createTable(database);
-      database.exec(`ALTER TABLE transcript_events ADD COLUMN session_id TEXT;
-        ALTER TABLE transcript_events ADD COLUMN created_at INTEGER`);
-      const write = createTranscriptEventInserter(database, "session");
       const originals = [
         ["", null, null, 0],
         ['{"type":"custom", invalid', null, null, 0],
@@ -289,18 +270,7 @@ describe("transcript payload storage boundary", () => {
           navigation_last_custom_type: null,
           navigation_valid: valid,
         });
-        write({ seq, eventJson: original, createdAt: 1 });
-        const sizes = database
-          .prepare(
-            "SELECT model_bytes, model_without_checkpoint_bytes FROM transcript_events WHERE seq = ?",
-          )
-          .get(seq);
-        if (valid === 0) {
-          expect(sizes).toEqual({ model_bytes: null, model_without_checkpoint_bytes: null });
-        } else {
-          expect(sizes?.model_bytes).toEqual(expect.any(Number));
-          expect(sizes?.model_without_checkpoint_bytes).toEqual(expect.any(Number));
-        }
+        insert(database, seq, prepared);
         expect(readBody(database, seq)).toBe(original);
         expect(readBody(database, seq, "row")).toBe(original);
       }
@@ -346,8 +316,6 @@ describe("transcript payload storage boundary", () => {
     const database = openNodeSqliteDatabase(":memory:");
     try {
       createTable(database);
-      database.exec(`ALTER TABLE transcript_events ADD COLUMN session_id TEXT;
-        ALTER TABLE transcript_events ADD COLUMN created_at INTEGER`);
       const original = `{"type":"message","type":"reset","id":"first","id":"last","parentId":"parent","targetId":"target","appendParentId":"append","appendMode":"preserve","firstKeptEntryId":"kept","timestamp":"2026-01-01","message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{"large":"${"argument ".repeat(mode === "large" ? 256 * 1024 : 512)}"}}],"providerReplay":{"type":"checkpoint","data":"opaque"}},"message":{"role":"user","role":"toolResult","toolCallId":"call"}}`;
       const prepared = prepareTranscriptPayload(database, original);
       expect(prepared.event_zstd).not.toBeNull();
@@ -357,14 +325,7 @@ describe("transcript payload storage boundary", () => {
         event_utf8_bytes: null,
         navigation_json: null,
       });
-      createTranscriptEventInserter(
-        database,
-        "session",
-      )({
-        seq: 1,
-        eventJson: original,
-        createdAt: 1,
-      });
+      insert(database, 1, prepared);
       const db = getNodeSqliteKysely<PayloadDatabase>(database);
       const stored = executeSqliteQueryTakeFirstSync(
         database,
@@ -429,31 +390,6 @@ describe("transcript payload storage boundary", () => {
         message: { role: "toolResult" },
       });
       expect(stored).toMatchObject(native!);
-      expect(
-        database
-          .prepare(
-            "SELECT model_bytes, model_without_checkpoint_bytes FROM transcript_events WHERE seq = 1",
-          )
-          .get(),
-      ).toEqual({
-        model_bytes: native!.modelBytes,
-        model_without_checkpoint_bytes: native!.modelWithoutCheckpointBytes,
-      });
-      expect(
-        executeSqliteQueryTakeFirstSync(
-          database,
-          db
-            .selectFrom("transcript_events")
-            .select([
-              transcriptEventModelBytesSql(database, sql.lit(0)).as("modelBytes"),
-              transcriptEventModelBytesSql(database, sql.lit(1)).as("modelWithoutCheckpointBytes"),
-            ])
-            .where("seq", "=", 0),
-        ),
-      ).toEqual({
-        modelBytes: native!.modelBytes,
-        modelWithoutCheckpointBytes: native!.modelWithoutCheckpointBytes,
-      });
       expect(readBody(database, 1)).toBe(original);
       expect(JSON.parse(stored!.model).message.content).toEqual([
         { type: "toolCall", id: "call", name: "read" },

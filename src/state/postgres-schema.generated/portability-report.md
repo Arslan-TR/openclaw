@@ -22,7 +22,7 @@
 | state    | virtualTable  |     0 |          0 |        0 |
 | state    | internalTable |     1 |          0 |        1 |
 | agent    | table         |    45 |         45 |        0 |
-| agent    | column        |   419 |        383 |       36 |
+| agent    | column        |   417 |        381 |       36 |
 | agent    | index         |    98 |         94 |        4 |
 | agent    | foreignKey    |    28 |         28 |        0 |
 | agent    | check         |    66 |         66 |        0 |

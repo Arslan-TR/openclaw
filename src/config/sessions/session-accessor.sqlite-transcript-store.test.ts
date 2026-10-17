@@ -2,8 +2,6 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { cleanupTempDirs, makeTempDir } from "../../../test/helpers/temp-dir.js";
-import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
-import type { DB } from "../../state/openclaw-agent-db.generated.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
@@ -41,7 +39,6 @@ import {
 import { SessionTranscriptProjectionUnavailableError } from "./session-transcript-projection-error.js";
 import { waitForSessionTranscriptIndexReconcile } from "./session-transcript-reconcile.js";
 import { searchSessionTranscriptsReadOnlySync as searchSessionTranscripts } from "./session-transcript-search.js";
-import { transcriptEventModelBytesSql } from "./transcript-payload.js";
 
 const tempDirs: string[] = [];
 
@@ -405,12 +402,6 @@ describe("SQLite exact transcript rewrite", () => {
       expect(after.storage[1]?.event_zstd instanceof Uint8Array).toBe(false);
       expect(after.storage[2]?.event_json === null).toBe(true);
       expect(after.storage[2]?.event_zstd instanceof Uint8Array).toBe(true);
-      for (const [index, event] of [user, last].entries()) {
-        expect(after.storage[index + 1]).toMatchObject({
-          model_bytes: Buffer.byteLength(JSON.stringify(event)),
-          model_without_checkpoint_bytes: Buffer.byteLength(JSON.stringify(event)),
-        });
-      }
       expect(readTranscriptStatsSync(scope)).toMatchObject({
         eventCount: 3,
         sizeBytes: Buffer.byteLength(
@@ -766,21 +757,15 @@ describe("SQLite exact transcript suffix replacement", () => {
       ...plannedTail,
       data: { payload: "opaque retained 🦞 ".repeat(4096) },
     };
-    const root = { ...rewriteEvents[0], id: "retained-root" };
-    const user = { ...rewriteEvents[1], parentId: root.id };
-    const events = [root, user, tail];
-    const expected = [root, user, plannedTail];
-    const next = [root, { ...plannedTail, parentId: root.id }];
+    const events = [rewriteEvents[0], rewriteEvents[1], tail];
+    const expected = [rewriteEvents[0], rewriteEvents[1], plannedTail];
+    const next = [rewriteEvents[0], { ...plannedTail, parentId: "root" }];
     const retainedIds = [tail.id];
     await withRewriteFixture(({ db, snapshot, scope }) => {
       const before = snapshot();
       const beforeStats = readTranscriptStatsSync(scope);
       expect(before.storage[2]?.event_json).toBeNull();
       expect(before.storage[2]?.event_zstd).toBeInstanceOf(Uint8Array);
-      expect(before.storage[2]).toMatchObject({
-        model_bytes: Buffer.byteLength(JSON.stringify(tail)),
-        model_without_checkpoint_bytes: Buffer.byteLength(JSON.stringify(tail)),
-      });
       expect(() =>
         runOpenClawAgentWriteTransaction((database) => {
           replaceSqliteTranscriptSuffixInTransaction(database, scope, {
@@ -796,7 +781,7 @@ describe("SQLite exact transcript suffix replacement", () => {
       expect(readTranscriptStatsSync(scope)).toEqual(beforeStats);
       replaceTranscriptSuffixForTest(scope, expected, next, 1, retainedIds);
       const result = snapshot();
-      const retainedJson = JSON.stringify({ ...tail, parentId: root.id });
+      const retainedJson = JSON.stringify({ ...tail, parentId: "root" });
       expect(result.raw).toEqual([
         before.raw[0],
         { ...before.raw[2], seq: 1, event_json: retainedJson },
@@ -809,29 +794,11 @@ describe("SQLite exact transcript suffix replacement", () => {
         navigation_last_type: "custom",
         navigation_last_custom_type: "openclaw.cache-ttl",
         navigation_valid: 1,
-        model_bytes: null,
-        model_without_checkpoint_bytes: null,
-      });
-      expect(
-        executeSqliteQueryTakeFirstSync(
-          db,
-          getNodeSqliteKysely<DB>(db)
-            .selectFrom("transcript_events")
-            .select((eb) => [
-              transcriptEventModelBytesSql(db, eb.lit(0)).as("modelBytes"),
-              transcriptEventModelBytesSql(db, eb.lit(1)).as("withoutCheckpointBytes"),
-            ])
-            .where("session_id", "=", scope.sessionId)
-            .where("seq", "=", 1),
-        ),
-      ).toEqual({
-        modelBytes: Buffer.byteLength(retainedJson),
-        withoutCheckpointBytes: Buffer.byteLength(retainedJson),
       });
       expect(result).toMatchObject({
         identities: [
           expect.objectContaining({ seq: 0 }),
-          expect.objectContaining({ seq: 1, event_id: tail.id, parent_id: root.id }),
+          expect.objectContaining({ seq: 1, event_id: tail.id, parent_id: "root" }),
         ],
         active: [
           expect.objectContaining({ event_seq: 0 }),
@@ -842,7 +809,7 @@ describe("SQLite exact transcript suffix replacement", () => {
       expect(result.generation).not.toBe(before.generation);
       expect(readTranscriptStatsSync(scope)).toMatchObject({
         eventCount: 2,
-        sizeBytes: Buffer.byteLength(`${JSON.stringify(root)}\n${retainedJson}`),
+        sizeBytes: Buffer.byteLength(`${JSON.stringify(rewriteEvents[0])}\n${retainedJson}`),
       });
       expect(sessionTranscriptIndexNeedsReconcile(db, scope.sessionId)).toBe(false);
     }, events);

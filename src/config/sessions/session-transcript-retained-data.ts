@@ -151,8 +151,6 @@ export function copyRetainedTranscriptPayload(
             "navigation_last_type",
             "navigation_last_custom_type",
             "navigation_valid",
-            "model_bytes",
-            "model_without_checkpoint_bytes",
             "created_at",
           ])
           .expression(
@@ -190,11 +188,6 @@ export function copyRetainedTranscriptPayload(
                   "navigation_last_type",
                   "navigation_last_custom_type",
                   "navigation_valid",
-                  (parentId === undefined ? eb.ref("model_bytes") : eb.val(null)).as("model_bytes"),
-                  (parentId === undefined
-                    ? eb.ref("model_without_checkpoint_bytes")
-                    : eb.val(null)
-                  ).as("model_without_checkpoint_bytes"),
                   "created_at",
                 ];
               })

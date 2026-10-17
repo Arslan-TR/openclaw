@@ -260,14 +260,13 @@ const tableNames: readonly (readonly [string, readonly string[]])[] = [
       "idx_agent_session_nodes_updated_at",
     ],
   ],
-  ["transcript_events", []],
   ["state_leases", []],
 ];
 const fingerprints: Readonly<Record<string, CatalogReference>> = {
   // agent, agent-version-29
-  b660cb9aae336ff772a5e30e88128ae6f0dc46105711abff37466a092a8d18d0: [
+  abf65b8c18ccb84f0e65b8e4faa6fef6abc23b6bab5e93086339f640d2146082: [
     "agent",
-    "ebb81868d9dcd59902cbfc8568aa201a7dbb0abb8830bda740fe7ab87889a4e0",
+    "ede47c9558c7c22dfd89ed56f0bc28a9d22e512aa69af0ae3acacc989337dc0e",
     [
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
       26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
@@ -359,7 +358,7 @@ const fingerprints: Readonly<Record<string, CatalogReference>> = {
     [
       0, 1, 2, 3, 4, 5, 74, 7, 8, 9, 10, 58, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
       26, 27, 75, 29, 30, 31, 62, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 63, 46, 47, 48,
-      49, 50, 51, 52, 64, 76, 55,
+      49, 50, 51, 52, 64, 54, 55,
     ],
     [],
   ],
@@ -370,7 +369,7 @@ const fingerprints: Readonly<Record<string, CatalogReference>> = {
     [
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 58, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
       26, 27, 75, 29, 30, 31, 62, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 63, 46, 47, 48,
-      49, 50, 51, 52, 64, 76, 55,
+      49, 50, 51, 52, 64, 54, 55,
     ],
     [],
   ],
@@ -381,7 +380,7 @@ const fingerprints: Readonly<Record<string, CatalogReference>> = {
     [
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
       26, 27, 75, 29, 30, 31, 62, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-      49, 50, 51, 52, 53, 76, 55,
+      49, 50, 51, 52, 53, 54, 55,
     ],
     [],
   ],
@@ -427,7 +426,7 @@ const fingerprints: Readonly<Record<string, CatalogReference>> = {
   fdc21b6dc361c491311c11d91fbda296535a9c34dd20f0ab03b949b8a698ded0: [
     "agent-retired-state-leases",
     "6117e088b6b48fe1007de8ef29868981f820404cc3be99040c2bcd899902b7cc",
-    [77],
+    [76],
     [],
   ],
   // agent-legacy-participants

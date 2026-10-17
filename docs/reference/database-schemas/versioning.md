@@ -117,15 +117,9 @@ the verified pre-upgrade backup for rollback.
 Agent [schema 29](/reference/database-schemas/agent-schema-history#agent-schema-29)
 and shared-state [schema 27](/reference/database-schemas/state-schema-history#state-schema-27)
 retire four unused or redundant indexes and narrow the shared lease-owner index.
-Agent schema 29 also adds nullable SQLite-native transcript byte projections
-without a backfill; existing SQLite rows use the existing SQL size calculation
-until written again. PostgreSQL carries the columns for portable backups and
-round trips, uses native SQL sizing, and clears cached values on payload writes.
-Generation copies preserve values only when engine and encoding match, and clear
-them otherwise.
-The bundle preserves keys and retained payloads. Column and index DDL and version
-publication remain atomic on both engines; verified backups retain predecessor
-column and index definitions for rollback.
+The bundle preserves every table's columns, keys, and retained rows. Index DDL
+and version publication remain atomic on both engines; verified backups retain
+the predecessor index definitions for rollback.
 
 Target-release checks distinguish the target's schema support from the running
 inspector's capabilities. When shared state is too new for the target but still

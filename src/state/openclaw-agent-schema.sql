@@ -449,8 +449,6 @@ CREATE TABLE IF NOT EXISTS transcript_events (
   navigation_last_type TEXT,
   navigation_last_custom_type TEXT,
   navigation_valid INTEGER NOT NULL DEFAULT 1,
-  model_bytes INTEGER,
-  model_without_checkpoint_bytes INTEGER,
   PRIMARY KEY (session_id, seq),
   FOREIGN KEY (session_id) REFERENCES "session_windows"(session_id) ON DELETE CASCADE,
   CHECK (

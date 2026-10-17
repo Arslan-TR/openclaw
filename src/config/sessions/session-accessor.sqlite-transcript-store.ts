@@ -83,7 +83,6 @@ import {
   createTranscriptPayloadUpdater,
   prepareTranscriptPayload,
   transcriptEventJsonSql,
-  transcriptPayloadModelByteColumns,
   transcriptSerializedBytes,
 } from "./transcript-payload.js";
 
@@ -584,8 +583,9 @@ export function rewriteSqliteTranscriptEventRowsInTransaction(
   );
   const run = () =>
     withSqliteDatabaseWriteScope(database.db, [...writeScopes], () => {
+      const db = getSessionKysely(database.db);
       const rewrite = prepareSqliteQuerySync<(typeof rewrites)[number]>(database.db, (parameter) =>
-        getSessionKysely(database.db)
+        db
           .updateTable("transcript_events")
           .set(
             options.legacyTextStorage
@@ -604,11 +604,6 @@ export function rewriteSqliteTranscriptEventRowsInTransaction(
                     (row) => row.payload!.navigation_last_custom_type,
                   ),
                   navigation_valid: parameter((row) => row.payload!.navigation_valid),
-                  ...transcriptPayloadModelByteColumns(database.db, {
-                    eventJson: parameter((row) => row.payload!.event_json ?? "null"),
-                    navigationJson: parameter((row) => row.payload!.navigation_json),
-                    navigationValid: parameter((row) => row.payload!.navigation_valid),
-                  }),
                 },
           )
           .where("session_id", "=", resolved.sessionId)

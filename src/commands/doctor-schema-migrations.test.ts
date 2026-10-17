@@ -454,14 +454,7 @@ it("preserves orphan history before admitting a group of scoped version migratio
         original.windows.filter((row) => row.session_id === "retained"),
       );
       expect(retained.events).toEqual(
-        original.events
-          .filter((row) => row.session_id === "retained")
-          .map((row) =>
-            Object.assign({}, row, {
-              model_bytes: null,
-              model_without_checkpoint_bytes: null,
-            }),
-          ),
+        original.events.filter((row) => row.session_id === "retained"),
       );
     }
     const backups = fs

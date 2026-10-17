@@ -32,25 +32,3 @@ export const AGENT_INDEX_RETIREMENT_SQL = `
   DROP INDEX IF EXISTS idx_agent_session_nodes_last_interaction_at;
   DROP INDEX IF EXISTS idx_agent_session_reactions_message;
 `;
-export const AGENT_MODEL_BYTE_COLUMNS = ["model_bytes", "model_without_checkpoint_bytes"] as const;
-
-/** Historical admission and rebuilds predate the nullable schema-29 projections. */
-export function withoutAgentModelByteColumns(schema: string): string {
-  let historicalSchema = schema;
-  for (const column of AGENT_MODEL_BYTE_COLUMNS) {
-    historicalSchema = historicalSchema
-      .replace(`  ${column} INTEGER,\n`, "")
-      .replace(`  "${column}" bigint,\n`, "");
-  }
-  return historicalSchema;
-}
-
-export const AGENT_MODEL_BYTE_SQLITE_MIGRATION_SQL = `
-  ALTER TABLE transcript_events ADD COLUMN model_bytes INTEGER;
-  ALTER TABLE transcript_events ADD COLUMN model_without_checkpoint_bytes INTEGER;
-`;
-
-export const AGENT_MODEL_BYTE_POSTGRES_MIGRATION_SQL = `
-  ALTER TABLE "transcript_events" ADD COLUMN "model_bytes" bigint;
-  ALTER TABLE "transcript_events" ADD COLUMN "model_without_checkpoint_bytes" bigint;
-`;

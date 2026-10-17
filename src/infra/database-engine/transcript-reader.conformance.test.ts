@@ -76,8 +76,7 @@ const schema = `CREATE TABLE transcript_events (
   session_id TEXT NOT NULL, seq INTEGER PRIMARY KEY, event_json TEXT, event_zstd BYTEA,
   event_utf8_bytes INTEGER, navigation_json TEXT, navigation_type TEXT, navigation_custom_type TEXT,
   navigation_display INTEGER, message_role TEXT, navigation_last_type TEXT,
-  navigation_last_custom_type TEXT, navigation_valid INTEGER, created_at INTEGER,
-  model_bytes BIGINT, model_without_checkpoint_bytes BIGINT
+  navigation_last_custom_type TEXT, navigation_valid INTEGER, created_at INTEGER
 )`;
 
 it.skipIf(typeof connection !== "string")(

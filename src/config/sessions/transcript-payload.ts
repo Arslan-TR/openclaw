@@ -68,11 +68,6 @@ export function createTranscriptEventInserter(database: EngineConnection, sessio
         navigation_last_type: parameter((row) => row.navigation_last_type),
         navigation_last_custom_type: parameter((row) => row.navigation_last_custom_type),
         navigation_valid: parameter((row) => row.navigation_valid),
-        ...transcriptPayloadModelByteColumns(database, {
-          eventJson: parameter((row) => row.event_json ?? "null"),
-          navigationJson: parameter((row) => row.navigation_json),
-          navigationValid: parameter((row) => row.navigation_valid),
-        }),
         created_at: parameter((row) => row.createdAt),
       }),
   );
@@ -110,11 +105,6 @@ export function createTranscriptPayloadUpdater(database: EngineConnection, sessi
         navigation_last_type: parameter((row) => row.navigation_last_type),
         navigation_last_custom_type: parameter((row) => row.navigation_last_custom_type),
         navigation_valid: parameter((row) => row.navigation_valid),
-        ...transcriptPayloadModelByteColumns(database, {
-          eventJson: parameter((row) => row.event_json ?? "null"),
-          navigationJson: parameter((row) => row.navigation_json),
-          navigationValid: parameter((row) => row.navigation_valid),
-        }),
       })
       .where("session_id", "=", sessionId)
       .where(
@@ -453,12 +443,20 @@ export function transcriptEventModelNavigationSql(
   );
 }
 
-function projectedModelBytesSql(
+/** Model admission retains projected byte costs, which can be much smaller than canonical JSON. */
+export function transcriptEventModelBytesSql(
   database: EngineConnection,
-  identity: Expression<string>,
-  metadata: Expression<string | null>,
   omitCheckpoint: Expression<number>,
+  alias: TranscriptPayloadAlias = "transcript_events",
 ): RawBuilder<number> {
+  const metadata =
+    /* kysely-allow-raw: closed transcript aliases select native projection accounting. */ sql.ref(
+      `${alias}.navigation_json`,
+    );
+  const identity =
+    /* kysely-allow-raw: closed transcript aliases select the native identity fallback. */ sql.ref<string>(
+      `${alias}.event_json`,
+    );
   return /* kysely-allow-raw: native fallback preserves UTF-16 byte units; metadata excludes the JSONL separator. */ sql<number>`CASE WHEN ${metadata} IS NULL
     THEN octet_length(${projectModelContextEventSql(database, identity, omitCheckpoint)})
     ELSE ${jsonPathValue(
@@ -468,62 +466,6 @@ function projectedModelBytesSql(
       THEN '$.modelWithoutCheckpointBytes' ELSE '$.modelBytes' END`,
       "number",
     )} END`;
-}
-
-/** Publish SQLite byte accounting in the existing payload write, without decoding compressed rows. */
-export function transcriptPayloadModelByteColumns(
-  database: EngineConnection,
-  payload: {
-    eventJson: Expression<string>;
-    navigationJson: Expression<string | null>;
-    navigationValid: Expression<number>;
-  },
-) {
-  if (isPostgresSqlConnection(database)) {
-    // Imported SQLite counts are opaque on PostgreSQL; rewrites discard those cached units.
-    return { model_bytes: null, model_without_checkpoint_bytes: null };
-  }
-  const bytes = (omitCheckpoint: number) =>
-    /* kysely-allow-raw: the payload owner's validity fact preserves malformed identity writes without reparsing them. */ sql<
-      number | null
-    >`CASE WHEN ${payload.navigationValid} = 1 THEN ${projectedModelBytesSql(
-      database,
-      payload.eventJson,
-      payload.navigationJson,
-      sql.lit(omitCheckpoint),
-    )} ELSE NULL END`;
-  return { model_bytes: bytes(0), model_without_checkpoint_bytes: bytes(1) };
-}
-
-/** Model admission retains projected byte costs, which can be much smaller than canonical JSON. */
-export function transcriptEventModelBytesSql(
-  database: EngineConnection,
-  omitCheckpoint: Expression<number>,
-  alias: TranscriptPayloadAlias = "transcript_events",
-): RawBuilder<number> {
-  const identity =
-    /* kysely-allow-raw: closed transcript aliases select the native identity fallback. */ sql.ref<string>(
-      `${alias}.event_json`,
-    );
-  if (isPostgresSqlConnection(database)) {
-    // PostgreSQL's JSON projection has different byte costs from imported SQLite metadata.
-    return /* kysely-allow-raw: budget the destination engine's projected JSON, never another engine's cached size. */ sql<number>`octet_length(${projectModelContextEventSql(database, identity, omitCheckpoint)})`;
-  }
-  const metadata =
-    /* kysely-allow-raw: closed transcript aliases select native projection accounting. */ sql.ref<
-      string | null
-    >(`${alias}.navigation_json`);
-  const modelBytes =
-    /* kysely-allow-raw: closed transcript aliases select owner-published byte accounting. */ sql.ref(
-      `${alias}.model_bytes`,
-    );
-  const withoutCheckpointBytes =
-    /* kysely-allow-raw: closed transcript aliases select owner-published checkpoint-free accounting. */ sql.ref(
-      `${alias}.model_without_checkpoint_bytes`,
-    );
-  return /* kysely-allow-raw: nullable migration leaves untouched rows on their exact native fallback. */ sql<number>`COALESCE(
-    CASE WHEN ${omitCheckpoint} = 1 THEN ${withoutCheckpointBytes} ELSE ${modelBytes} END,
-    ${projectedModelBytesSql(database, identity, metadata, omitCheckpoint)})`;
 }
 
 /** Suffix admission can retain opaque custom data without charging or decoding its body. */

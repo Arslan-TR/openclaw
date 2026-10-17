@@ -19,11 +19,7 @@ import {
   readExistingAgentSchemaMeta,
 } from "../../state/openclaw-agent-db-schema-helpers.js";
 import { ensureOpenClawAgentDatabaseSchema } from "../../state/openclaw-agent-db-schema.js";
-import {
-  AGENT_MODEL_BYTE_COLUMNS,
-  withLegacyAgentPostgresIndexes,
-  withoutAgentModelByteColumns,
-} from "../../state/openclaw-agent-index-retirement-migration.js";
+import { withLegacyAgentPostgresIndexes } from "../../state/openclaw-agent-index-retirement-migration.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "../../state/openclaw-agent-schema.js";
 import { agentTranscriptSearchSchema } from "../../state/openclaw-agent-search-schema.js";
 import { withLegacyAgentPostgresWriteLayout } from "../../state/openclaw-agent-write-layout-migration.js";
@@ -118,8 +114,8 @@ export async function loadAgentPortDescriptor(
     if (backup?.version === sourceVersion && backup.id === "agent") {
       return backup;
     }
-    // These predecessors share the table layout before v29's nullable size columns.
-    // A later schema needs its own historical descriptor.
+    // v27→29 changes only indexes in PostgreSQL. Pin the shared table catalog
+    // so a later column change needs its own predecessor descriptor.
     if (
       backup ||
       OPENCLAW_AGENT_SCHEMA_VERSION !== 29 ||
@@ -301,52 +297,33 @@ export async function loadAgentPortDescriptor(
       );
     },
   };
-  if (sourceVersion === agentEngineSchema.version) {
-    return descriptor;
-  }
-  const modelByteColumns = new Set<(typeof catalog)[number]>(
-    columns.filter(
-      (fact) =>
-        fact.table === "transcript_events" &&
-        AGENT_MODEL_BYTE_COLUMNS.some((name) => name === fact.value.name),
-    ),
-  );
-  return {
-    ...descriptor,
-    version: sourceVersion,
-    tables: descriptor.tables.map((table) =>
-      table.name === "transcript_events"
-        ? {
-            ...table,
-            columns: table.columns.filter(
-              (column) => !AGENT_MODEL_BYTE_COLUMNS.some((name) => name === column.name),
-            ),
-          }
-        : table,
-    ),
-    sqlite: getOpenClawAgentMigrationSchema(sourceVersion).replace(
-      /^INSERT OR IGNORE INTO[^;]+;/gm,
-      "",
-    ),
-    preData: withoutAgentModelByteColumns(descriptor.preData),
-    postData:
-      sourceVersion < 28
-        ? withLegacyAgentPostgresWriteLayout(withLegacyAgentPostgresIndexes(descriptor.postData))
-        : withLegacyAgentPostgresIndexes(descriptor.postData),
-    expectedCatalog: catalog
-      .filter((fact) => !modelByteColumns.has(fact))
-      .map((fact) =>
-        fact.kind === "indexes" &&
-        (fact.table === "session_nodes" || fact.table === "session_reactions")
-          ? { table: fact.table, kind: fact.kind, value: Number(fact.value) + 1 }
-          : sourceVersion < 28 &&
-              fact.table === "transcript_event_identities" &&
-              fact.kind === "indexes"
-            ? { table: fact.table, kind: fact.kind, value: 5 }
-            : fact,
-      ),
-    inspectSqliteSource: undefined,
-    migrateSqliteSource: undefined,
-    admit: undefined,
-  };
+  return sourceVersion === agentEngineSchema.version
+    ? descriptor
+    : {
+        ...descriptor,
+        version: sourceVersion,
+        sqlite: getOpenClawAgentMigrationSchema(sourceVersion).replace(
+          /^INSERT OR IGNORE INTO[^;]+;/gm,
+          "",
+        ),
+        postData:
+          sourceVersion < 28
+            ? withLegacyAgentPostgresWriteLayout(
+                withLegacyAgentPostgresIndexes(descriptor.postData),
+              )
+            : withLegacyAgentPostgresIndexes(descriptor.postData),
+        expectedCatalog: catalog.map((fact) =>
+          fact.kind === "indexes" &&
+          (fact.table === "session_nodes" || fact.table === "session_reactions")
+            ? { table: fact.table, kind: fact.kind, value: Number(fact.value) + 1 }
+            : sourceVersion < 28 &&
+                fact.table === "transcript_event_identities" &&
+                fact.kind === "indexes"
+              ? { table: fact.table, kind: fact.kind, value: 5 }
+              : fact,
+        ),
+        inspectSqliteSource: undefined,
+        migrateSqliteSource: undefined,
+        admit: undefined,
+      };
 }

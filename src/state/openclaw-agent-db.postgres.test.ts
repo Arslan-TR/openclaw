@@ -18,7 +18,6 @@ import { acquireGatewayStateOwner } from "../infra/gateway-state-owner.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { isPostgresSqlConnection, type EngineConnection } from "../infra/sql-connection.js";
 import { retireSqliteDatabaseAdmissionForPath } from "../infra/sqlite-database-admission.js";
-import { restoreHistoricalTranscriptTable } from "./agent-historical-transcript.postgres.test-support.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
 import { readOpenClawAgentDatabaseIdentity } from "./openclaw-agent-db-identity.js";
 import { createOpenClawDatabaseMaintenanceScope } from "./openclaw-state-db-async-lifecycle.js";
@@ -92,7 +91,6 @@ async function loadOwners() {
     deleteSessionEntryLifecycle: lifecycle.deleteSessionEntryLifecycle,
     admitAgentEngineSearchExtensions: engine.admitAgentEngineSearchExtensions,
     openAgentEngineStore: engine.openAgentEngineStore,
-    agentEngineSchema: engine.agentEngineSchema,
     withAgentDatabaseMaintenanceLease: maintenance.withAgentDatabaseMaintenanceLease,
   };
 }
@@ -289,14 +287,6 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
       await owners.cleanupSessionStateForTest({ stateDir: root });
       retireSqliteDatabaseAdmissionForPath(database.path);
       // Restore the historical catalog under exclusive fixture custody, including an unsealed marker.
-      const predecessor = owners.agentEngineSchema.postgresMigrations!.find(
-        (step) => step.version === 28,
-      )!;
-      await restoreHistoricalTranscriptTable(
-        client,
-        facts.namespace,
-        predecessor.fromSchema.postgres,
-      );
       await client.query(`BEGIN;
         SET LOCAL search_path TO "${facts.namespace}";
         DROP INDEX idx_agent_session_windows_conversation;

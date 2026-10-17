@@ -22,7 +22,6 @@ import {
   assertOpenClawAgentSchemaContains,
   getOpenClawAgentMigrationSchema,
 } from "./openclaw-agent-db-schema-helpers.js";
-import { AGENT_MODEL_BYTE_COLUMNS } from "./openclaw-agent-index-retirement-migration.js";
 import { AGENT_JSON_PREDICATE_COLUMNS } from "./openclaw-agent-json-predicate-schema.js";
 import { withoutOutboxEnqueueSequence } from "./openclaw-agent-outbox-sequence-migration.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "./openclaw-state-db-contract.js";
@@ -68,10 +67,6 @@ type OpenClawMigrationWitnessOwner = { role: "agent"; agentId: string } | { role
 const derivedMigrationColumns = new Map<string, ReadonlySet<string>>(
   Object.entries({
     ...AGENT_JSON_PREDICATE_COLUMNS,
-    transcript_events: [
-      ...AGENT_JSON_PREDICATE_COLUMNS.transcript_events,
-      ...AGENT_MODEL_BYTE_COLUMNS,
-    ],
     session_windows: ["row_transcript_json", "row_transcript_updated_at"],
   }).map(([table, columns]) => [table, new Set<string>(columns)]),
 );
@@ -148,7 +143,7 @@ function parseOpenClawMigrationWitness(value: unknown): OpenClawMigrationWitness
   return witness;
 }
 
-// These migrations change only derived facts. persistAgentSchemaMetadata also
+// Schemas 25 and 26 change these derived facts only. persistAgentSchemaMetadata also
 // publishes the target app version and timestamp; payload and creation time stay exact.
 function migrationColumn(role: OpenClawMigrationWitness["role"], table: string, column: string) {
   return !(
@@ -161,7 +156,6 @@ function migrationColumn(role: OpenClawMigrationWitness["role"], table: string, 
 }
 
 type Cell = string | Uint8Array | null;
-type WitnessColumn = { name: string; pk: number; hidden: number; cid: number };
 type RegistryMigrationContext = {
   sourcePath: string;
   agents: readonly { agentId: string; path: string; requireRegistration: boolean }[];
@@ -208,7 +202,12 @@ function captureTable(
     db
       .selectFrom(
         // kysely-allow-raw: schema-owned table metadata, including declared primary-key order.
-        sql<WitnessColumn>`pragma_table_xinfo(${table})`.as("columns"),
+        sql<{
+          name: string;
+          pk: number;
+          hidden: number;
+          cid: number;
+        }>`pragma_table_xinfo(${table})`.as("columns"),
       )
       .select(["name", "pk", "hidden"])
       .where("hidden", "!=", 1)

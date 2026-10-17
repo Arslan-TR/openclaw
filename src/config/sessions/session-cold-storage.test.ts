@@ -684,16 +684,6 @@ describe("cold transcript storage workers", () => {
     "restores exact history and projections from %s after reopening",
     async (storage) => {
       const fixture = await createFixture();
-      runOpenClawAgentWriteTransaction(({ db }) => {
-        db.prepare(`UPDATE transcript_events SET model_bytes = NULL,
-          model_without_checkpoint_bytes = NULL WHERE session_id = ?`).run(historicalId);
-      }, fixture.options);
-      const expectedModelBytes = fixture.original.events
-        .filter((row) => row.session_id === historicalId)
-        .map((row) => {
-          const bytes = Buffer.byteLength(JSON.stringify(JSON.parse(row.event_json)));
-          return { model_bytes: bytes, model_without_checkpoint_bytes: bytes };
-        });
       if (storage === "sqlite") {
         await embedFixtureArchive(fixture);
       } else {
@@ -710,12 +700,6 @@ describe("cold transcript storage workers", () => {
       try {
         await restoreSessionColdTranscript(fixture.scope);
         expect(fixture.snapshot(readOnly())).toEqual(fixture.original);
-        expect(
-          readOnly()
-            .prepare(`SELECT model_bytes, model_without_checkpoint_bytes
-              FROM transcript_events WHERE session_id = ? ORDER BY seq`)
-            .all(historicalId),
-        ).toEqual(expectedModelBytes);
         expect(
           readOnly()
             .prepare(`SELECT navigation_type, navigation_custom_type, navigation_display,

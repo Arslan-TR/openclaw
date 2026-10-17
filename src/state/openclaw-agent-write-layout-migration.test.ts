@@ -30,7 +30,6 @@ const scope = [
   "sqlite_stat1",
   "sqlite_stat4",
   "transcript_event_identities",
-  "transcript_events",
 ];
 
 function seed(database: DatabaseSync): void {

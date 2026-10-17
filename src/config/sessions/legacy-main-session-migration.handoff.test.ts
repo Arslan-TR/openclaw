@@ -486,12 +486,7 @@ describe("legacy main session history handoff", () => {
       );
       expect(after.events).toEqual(
         kind === "utf16"
-          ? before.events.map((event) => ({
-              ...event,
-              event_utf8_bytes: null,
-              model_bytes: null,
-              model_without_checkpoint_bytes: null,
-            }))
+          ? before.events.map((event) => ({ ...event, event_utf8_bytes: null }))
           : before.events,
       );
       expect(after.events.filter((event) => event.seq === 2)).toEqual(
