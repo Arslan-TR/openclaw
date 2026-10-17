@@ -1,9 +1,9 @@
 import fs from "node:fs/promises";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, vi } from "vitest";
 import * as chromeMcpConnect from "./chrome-mcp-connect.js";
 import type {
   ChromeMcpSession,
-  ChromeMcpToolResult,
   NormalizedChromeMcpProfileOptions,
 } from "./chrome-mcp-contracts.js";
 import { closeChromeMcpSession } from "./chrome-mcp-session.js";
@@ -56,7 +56,7 @@ export function fakeListPagesResult() {
   return textResult("## Pages\n1: https://example.com [selected]");
 }
 
-export function textResult(text: string, isError = false): ChromeMcpToolResult {
+export function textResult(text: string, isError = false): CallToolResult {
   return { ...(isError ? { isError } : {}), content: [{ type: "text", text }] };
 }
 
