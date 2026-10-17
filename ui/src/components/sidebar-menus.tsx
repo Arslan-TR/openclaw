@@ -188,7 +188,8 @@ export function createSidebarMenus(deps: {
     }).then((work) => {
       if (
         version === sessionMenuWorkVersion &&
-        host.sessionDataContext === context &&
+        // A replacement provider wrapper may retain the same Gateway and client.
+        host.sessionDataContext?.gateway === context.gateway &&
         context.gateway.snapshot.client === client
       ) {
         setField("sessionMenuWork", { loading: false, ...work });
