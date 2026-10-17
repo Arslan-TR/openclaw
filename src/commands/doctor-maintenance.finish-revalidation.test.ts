@@ -37,6 +37,7 @@ import {
   snapshotSourceFamily,
   writeUnreadableNewerStateSchema,
 } from "../state/openclaw-database-preflight.test-support.js";
+import { createDanglingSkillWorkshopReviewIndex } from "../state/openclaw-state-db-corruption.test-support.js";
 import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
@@ -50,6 +51,7 @@ import {
   stoppedSystemdBinding,
   useDoctorMaintenanceRuntimeDirectory,
 } from "./doctor-maintenance.test-support.js";
+import { createCapturingTestRuntime, createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const mocks = vi.hoisted(() => ({
   resolveService: vi.fn<() => GatewayService>(),
@@ -239,19 +241,9 @@ async function runDoctorFinishForStoppedUnit(
         }
         const pathname = openOpenClawStateDatabase().path;
         closeOpenClawStateDatabaseForTest();
-        // Damaged legacy bytes are input to Doctor, not a managed schema publication.
-        const db = new DatabaseSync(pathname);
-        try {
-          db.exec(
-            "CREATE TABLE IF NOT EXISTS skill_workshop_collection_reviews (review_id TEXT NOT NULL PRIMARY KEY, owner_agent_id TEXT NOT NULL, backup_id TEXT NOT NULL, create_time INTEGER NOT NULL, kept_names_json TEXT NOT NULL, written_names_json TEXT NOT NULL, dropped_json TEXT NOT NULL) STRICT; CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time ON skill_workshop_collection_reviews(review_id, create_time DESC);",
-          );
-          db.enableDefensive?.(false);
-          db.exec("PRAGMA writable_schema = ON");
-          db.prepare("UPDATE sqlite_schema SET sql = ? WHERE type = 'index' AND name = ?").run(
-            `CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time ON skill_workshop_collection_reviews(workspace_dir, create_time DESC, review_id DESC)`,
-            "idx_skill_workshop_collection_reviews_workspace_time",
-          );
-          if (scenario === "gateway-lifecycle-contended") {
+        if (scenario === "gateway-lifecycle-contended") {
+          const db = new DatabaseSync(pathname);
+          try {
             const startedAt = getFileLockProcessStartTime(process.pid);
             if (startedAt === null) {
               throw new Error("Current process start identity is unavailable");
@@ -273,14 +265,12 @@ async function runDoctorFinishForStoppedUnit(
               now,
               now,
             );
+          } finally {
+            db.close();
           }
-          const schema = db.prepare("PRAGMA schema_version").get() as { schema_version: number };
-          db.exec(
-            `PRAGMA writable_schema = OFF; PRAGMA schema_version = ${schema.schema_version + 1}`,
-          );
-        } finally {
-          db.close();
         }
+        // Publish damaged bytes only after seeding the serving lease in the valid catalog.
+        createDanglingSkillWorkshopReviewIndex(pathname);
         const readArtifacts = () =>
           snapshotSourceFamily(pathname).files.map(({ pathname: file, bytes, mtimeNs }) => ({
             file,
@@ -474,7 +464,7 @@ async function runDoctorFinishForStoppedUnit(
         vi.stubEnv("OPENCLAW_UPDATE_RUN_ID", undefined);
         vi.stubEnv("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION", undefined);
       }
-      const logs: string[] = [];
+      const { runtime, logs } = createCapturingTestRuntime();
       const databasePath = path.join(home, ".openclaw", "state", "openclaw.sqlite");
       otherOwner =
         scenario === "lifecycle-contended" || gatewayContended
@@ -496,13 +486,7 @@ async function runDoctorFinishForStoppedUnit(
         root: process.cwd(),
         ...(parentOwnsService ? { runId } : {}),
         options: { repair: true },
-        runtime: {
-          log: (...args: Array<unknown>) => {
-            logs.push(args.map((entry) => String(entry)).join(" "));
-          },
-          error: () => {},
-          exit: () => {},
-        },
+        runtime,
       }).finally(() => {
         otherOwner?.release();
         if (!activateCompetingUpdate) {
@@ -524,7 +508,7 @@ async function runDoctorFinishForStoppedUnit(
             const child = await beginDoctorMaintenance({
               root: process.cwd(),
               options: { repair: true },
-              runtime: { log: () => {}, error: () => {}, exit: () => {} },
+              runtime: createTestRuntime(),
             });
             await child?.finish({});
           },
@@ -635,7 +619,7 @@ it("refuses offline Doctor repair of a newer schema without recommending repair 
   const admission = beginDoctorMaintenance({
     root: null,
     options: { repair: true, nonInteractive: true },
-    runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+    runtime: createTestRuntime(),
   });
   await expect(admission).rejects.toThrow("newer schema version");
   await expect(admission).rejects.toThrow(/restore.*backup/);

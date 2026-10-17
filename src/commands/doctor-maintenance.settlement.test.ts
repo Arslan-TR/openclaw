@@ -76,20 +76,6 @@ function fail(name: "readLeases" | "lease" | "gatewayAcquire" | "ownerAssert", e
   });
 }
 
-function processOwner(release: () => void) {
-  return {
-    release,
-    assertCurrent: (assertPolicy?: () => void) => {
-      boundary.ownerAssert();
-      assertPolicy?.();
-    },
-    run<T>(operation: () => T): T {
-      boundary.ownerAssert();
-      return operation();
-    },
-  };
-}
-
 function afterStop(effect: () => void) {
   const stop = boundary.stop.getMockImplementation()!;
   boundary.stop.mockImplementation(async (params) => {
@@ -502,12 +488,16 @@ it("waits for the stopped Gateway to release lifecycle ownership", async () => {
 it("restores a service after state ownership fails without retaining a partial maintenance scope", async () => {
   boundary.owner.mockReturnValue({ state: "live", mode: "supervised" });
   let heldLeases = 0;
+  const acquire = boundary.gatewayAcquire.getMockImplementation()!;
   boundary.gatewayAcquire
     .mockImplementation(() => {
       heldLeases++;
-      return processOwner(() => {
-        heldLeases--;
-      });
+      return {
+        ...acquire(),
+        release: () => {
+          heldLeases--;
+        },
+      };
     })
     .mockImplementationOnce(() => {
       throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
@@ -542,14 +532,18 @@ it.each(["acquired", "native-revoked", "install-drift"] as const)(
     let stopCustody: (() => void) | undefined;
     let capturedStopAdmission: (() => void) | undefined;
     boundary.owner.mockReturnValue({ state: "live", mode: "supervised" });
+    const acquire = boundary.gatewayAcquire.getMockImplementation()!;
     boundary.gatewayAcquire.mockImplementation(() => {
       if (ticks < 2) {
         throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
       }
       gatewayHeld = true;
-      return processOwner(() => {
-        gatewayHeld = false;
-      });
+      return {
+        ...acquire(),
+        release: () => {
+          gatewayHeld = false;
+        },
+      };
     });
     boundary.ownerAssert.mockImplementation(() => {
       expect(gatewayHeld).toBe(true);
@@ -655,6 +649,7 @@ it("leaves an already stopped Gateway with its legacy update parent after repair
 const leaseGuidance =
   "Doctor could not enter maintenance. An agent database is in use. Stop other OpenClaw processes using this state, then retry the update.";
 const leaseCode = "agent-database-lease-active";
+const leaseFact = { check: "doctor", code: leaseCode, message: leaseGuidance };
 const privateCause =
   "private-lease-class /synthetic/private-state/private.db token=fixture-only-token alice@example.invalid";
 
@@ -678,7 +673,7 @@ it("refuses an external active agent lease before serving-Gateway coordinator co
   expect(refusal).toBeInstanceOf(UpdateDoctorError);
   expect(refusal).toMatchObject({ message: leaseGuidance });
   const facts = collectUpdateDoctorFailureFacts(refusal);
-  expect(facts).toEqual([{ check: "doctor", code: leaseCode, message: leaseGuidance }]);
+  expect(facts).toEqual([leaseFact]);
   expect(await projectPublicUpdateFailureIdentifiers(facts[0]!)).toEqual({
     check: "doctor",
     code: leaseCode,
@@ -705,9 +700,7 @@ it("rechecks external leases under the process owner after an empty observation"
     throw new OpenClawAgentDatabaseLeaseActiveError(privateCause);
   });
   const refusal: unknown = await begin().catch((error: unknown) => error);
-  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([
-    { check: "doctor", code: leaseCode, message: leaseGuidance },
-  ]);
+  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([leaseFact]);
   expectCalls(1, "readLeases", "gatewayAcquire", "ownerAssert");
   expectOrder("readLeases", "gatewayAcquire");
   expectOrder("ownerAssert", "lease");
@@ -779,7 +772,7 @@ it("carries an actual typed lease refusal through Doctor IPC, finalization and p
   expectOrder("complete", "restart");
 
   const facts = collectUpdateDoctorFailureFacts(refusal);
-  expect(facts).toEqual([{ check: "doctor", code: leaseCode, message: leaseGuidance }]);
+  expect(facts).toEqual([leaseFact]);
   vi.stubEnv("OPENCLAW_TMP_DIR", tempDirs.make("openclaw-typed-refusal-"));
   const resultPath = createUpdatePostInstallDoctorResultPath();
   await writeUpdatePostInstallDoctorResult({
@@ -827,7 +820,7 @@ it("carries an actual typed lease refusal through Doctor IPC, finalization and p
       stateDir: "/synthetic/private-state",
     }),
   };
-  expect(publicFact).toEqual({ check: "doctor", code: leaseCode, message: leaseGuidance });
+  expect(publicFact).toEqual(leaseFact);
   expect(JSON.stringify({ result, failed, publicFact })).not.toContain(privateCause);
 });
 
@@ -843,9 +836,7 @@ it("retains the typed refusal and restoration failure in the aggregate", async (
     errors: [expect.any(UpdateDoctorError), restore],
   });
   expect(collectNestedErrorCandidates(refusal)).toContain(cause);
-  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([
-    { check: "doctor", code: leaseCode, message: leaseGuidance },
-  ]);
+  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([leaseFact]);
   expectCalls(1, "release", "complete");
   expectCalls(0, "restart");
 });
@@ -863,9 +854,7 @@ it("does not settle a typed refusal while command cleanup remains uncertain", as
   });
   expect(hasCommandProcessCleanupError(refusal)).toBe(true);
   expect(collectNestedErrorCandidates(refusal)).toContain(cause);
-  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([
-    { check: "doctor", code: leaseCode, message: leaseGuidance },
-  ]);
+  expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([leaseFact]);
   expectCalls(0, "release", "resume", "complete", "restart");
 });
 

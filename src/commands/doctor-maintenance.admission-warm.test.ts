@@ -43,19 +43,13 @@ async function withMaintenance(
     context.admission,
     source === "admitted-read-only" ? context.database : undefined,
   );
-  const peers: DatabaseSync[] = [];
-  const openPeer = () => {
-    const peer = new DatabaseSync(context.database);
-    peers.push(peer);
-    return peer;
-  };
+  let peer: DatabaseSync | undefined;
+  const openPeer = () => (peer ??= new DatabaseSync(context.database));
   try {
     await maintenance.run(() => action({ ...context, maintenance, openPeer }));
   } finally {
     await maintenance.close();
-    for (const peer of peers) {
-      peer.close();
-    }
+    peer?.close();
   }
 }
 

@@ -1,7 +1,6 @@
 import "../flows/doctor-health.test-support.js";
 import fs from "node:fs";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runCommandWithRuntime } from "../cli/cli-utils.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -52,17 +51,15 @@ const runRepair = (runtime: ReturnType<typeof runtimeMock>) =>
 const outputOf = (runtime: ReturnType<typeof runtimeMock>) =>
   [...runtime.log.mock.calls, ...runtime.error.mock.calls].flat().join("\n");
 
-function inspectDatabase<T>(pathname: string, inspect: (db: DatabaseSync) => T): T {
+function readRows(pathname: string, sql: string, ...params: string[]) {
   const { DatabaseSync } = requireNodeSqlite();
   const db = new DatabaseSync(pathname, { readOnly: true });
   try {
-    return inspect(db);
+    return db.prepare(sql).all(...params);
   } finally {
     db.close();
   }
 }
-const readRows = (pathname: string, sql: string) =>
-  inspectDatabase(pathname, (db) => db.prepare(sql).all());
 
 function writeDatabase(pathname: string, sql: string) {
   fs.mkdirSync(path.dirname(pathname), { recursive: true });
@@ -233,12 +230,9 @@ it("preserves audit rows and missing deletion history through index repair", asy
     } finally {
       copy.mockRestore();
       cleanup.mockRestore();
-      try {
-        await cleanupSnapshotOperations();
-        await testApi.flushFileLogQueueForTests();
-      } finally {
-        setLoggerOverride(null);
-      }
+      await cleanupSnapshotOperations()
+        .then(() => testApi.flushFileLogQueueForTests())
+        .finally(() => setLoggerOverride(null));
     }
     expect(snapshotPath && fs.existsSync(snapshotPath)).toBe(false);
 
@@ -296,14 +290,14 @@ it("Doctor refuses to rebuild an index that hides the external state owner", asy
       const index = "sqlite_autoindex_config_machine_state_1";
       corruptSqliteIndexKey(databasePath, index, STATE_SUPERVISION_KEY, "gateway.supervisioX");
       const before = fs.readFileSync(databasePath);
-      inspectDatabase(databasePath, (damaged) => {
-        const readOwner = (scan: string) =>
-          damaged
-            .prepare(`SELECT value_json FROM config_machine_state ${scan} WHERE state_key = ?`)
-            .get(STATE_SUPERVISION_KEY);
-        expect(readOwner("")).toBeUndefined();
-        expect(readOwner("NOT INDEXED")).toEqual({ value_json: JSON.stringify(ownership) });
-      });
+      const readOwner = (scan: string) =>
+        readRows(
+          databasePath,
+          `SELECT value_json FROM config_machine_state ${scan} WHERE state_key = ?`,
+          STATE_SUPERVISION_KEY,
+        );
+      expect(readOwner("")).toEqual([]);
+      expect(readOwner("NOT INDEXED")).toEqual([{ value_json: JSON.stringify(ownership) }]);
       const findings = readRows(databasePath, integrity);
       expect(findings).toContainEqual({
         integrity_check: expect.stringContaining(`missing from index ${index}`),

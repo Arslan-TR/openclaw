@@ -58,13 +58,13 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const unitName = "openclaw-gateway.service";
 const unitFile = `/etc/systemd/system/${unitName}`;
 const unitObject = "/org/freedesktop/systemd1/unit/openclaw_2dgateway_2eservice";
-type Scenario =
-  | "account-refused"
-  | "account-reassigned-at-activation"
-  | "manager-replaced"
-  | "broker-replaced"
-  | "capture-unavailable"
-  | "inspection-failed";
+const refusalCases = [
+  ["account-refused", "systemd-account-refused"],
+  ["account-reassigned-at-activation", "systemd-account-refused"],
+  ["manager-replaced", "systemd-manager-changed"],
+  ["broker-replaced", "systemd-manager-changed"],
+] as const;
+type Scenario = (typeof refusalCases)[number][0] | "capture-unavailable" | "inspection-failed";
 type Property = { type: string; data: unknown };
 const cleanEnv = Object.fromEntries(
   "HOME CONFIG_PATH PROFILE SUPERVISOR_MODE SERVICE_REPAIR_POLICY SERVICE_MARKER SERVICE_KIND SYSTEMD_UNIT UPDATE_RUN_ID UPDATE_IN_PROGRESS UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION"
@@ -281,14 +281,9 @@ async function repair(scenario: Scenario) {
   );
 }
 
-it.each([
-  { scenario: "account-refused", reason: "systemd-account-refused" },
-  { scenario: "account-reassigned-at-activation", reason: "systemd-account-refused" },
-  { scenario: "manager-replaced", reason: "systemd-manager-changed" },
-  { scenario: "broker-replaced", reason: "systemd-manager-changed" },
-] as const)(
-  "Doctor preserves native $scenario after stopping its Gateway",
-  async ({ scenario, reason }) => {
+it.each(refusalCases)(
+  "Doctor preserves native %s after stopping its Gateway",
+  async (scenario, reason) => {
     const result = await repair(scenario);
     expect(result).toMatchObject({
       effects: ["stop"],

@@ -80,12 +80,10 @@ it.each([
   async (_name, code, signal) => {
     vi.mocked(runUtf8CommandWithTimeout).mockImplementation(async (_argv, options) => {
       assert(typeof options !== "number" && options.signal);
-      const abortSignal = options.signal;
-      const stopped = new Promise<void>((resolve) => {
-        abortSignal.addEventListener("abort", () => resolve(), { once: true });
-      });
+      const stopped = createDeferredCore();
+      options.signal.addEventListener("abort", () => stopped.resolve(), { once: true });
       options.onOutputChunk?.(Buffer.from(report), "stdout");
-      await stopped;
+      await stopped.promise;
       return workerResult({
         code,
         signal,
