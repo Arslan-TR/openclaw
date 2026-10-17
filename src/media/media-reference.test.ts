@@ -6,17 +6,17 @@ import {
   classifyMediaReferenceSource,
   MediaReferenceError,
   parseInboundMediaUri,
-  resolveInboundMediaReference,
+  resolveInboundMediaReference as resolveInbound,
   resolveMediaReferenceLocalPath,
   resolveMediaReferenceLocalPathInfo,
   resolveMediaReferenceSandboxPath,
 } from "./media-reference.js";
 
 async function expectMediaReferenceError(
-  run: () => Promise<unknown>,
+  source: string,
   expectedCode: MediaReferenceError["code"],
 ) {
-  const mediaError: unknown = await run().catch((error: unknown) => error);
+  const mediaError: unknown = await resolveInbound(source).catch((error: unknown) => error);
   expect(mediaError).toBeInstanceOf(MediaReferenceError);
   expect(mediaError).toMatchObject({ name: "MediaReferenceError", code: expectedCode });
 }
@@ -123,23 +123,18 @@ describe("media reference helpers", () => {
     const filePaths = await Promise.all(ids.map(createInboundFile));
 
     try {
-      for (const [index, id] of ids.entries()) {
-        const filePath = filePaths[index];
-        if (!filePath) {
-          throw new Error("missing test path");
-        }
-        await expect(resolveInboundMediaReference(filePath)).resolves.toStrictEqual({
+      for (const id of ids) {
+        const filePath = inboundPath(id);
+        await expect(resolveInbound(filePath)).resolves.toStrictEqual({
           id,
           normalizedSource: filePath,
           physicalPath: await fs.realpath(filePath),
           sourceType: "path",
         });
       }
+      await expect(resolveInbound(inboundPath(path.join("nested", ids[0])))).resolves.toBeNull();
       await expect(
-        resolveInboundMediaReference(inboundPath(path.join("nested", ids[0]))),
-      ).resolves.toBeNull();
-      await expect(
-        resolveInboundMediaReference(path.join(stateDir, "media", "outbound", ids[0])),
+        resolveInbound(path.join(stateDir, "media", "outbound", ids[0])),
       ).resolves.toBeNull();
     } finally {
       await Promise.all(filePaths.map((filePath) => fs.rm(filePath, { force: true })));
@@ -153,7 +148,7 @@ describe("media reference helpers", () => {
       ["media://inbound/", "invalid-path"],
       ["media://inbound/%00.png", "invalid-path"],
     ] as const) {
-      await expectMediaReferenceError(() => resolveInboundMediaReference(source), code);
+      await expectMediaReferenceError(source, code);
     }
     expect(() => parseInboundMediaUri("media://inbound/nested%2Fa.png")).toThrow(
       MediaReferenceError,
@@ -180,11 +175,8 @@ describe("media reference helpers", () => {
     await fs.symlink(targetPath, linkPath);
 
     try {
-      await expectMediaReferenceError(
-        () => resolveInboundMediaReference(`media://inbound/${id}`),
-        "invalid-path",
-      );
-      await expectMediaReferenceError(() => resolveInboundMediaReference(linkPath), "invalid-path");
+      await expectMediaReferenceError(`media://inbound/${id}`, "invalid-path");
+      await expectMediaReferenceError(linkPath, "invalid-path");
     } finally {
       await fs.rm(linkPath, { force: true });
       await fs.rm(targetDir, { recursive: true, force: true });
