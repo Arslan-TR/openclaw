@@ -11,7 +11,10 @@ import { resolveRuntimeProcessEntrypointUrl } from "./runtime-process-url.js";
 import { resolveRuntimeWorkerArgv } from "./runtime-worker-url.js";
 import { readSqliteIntegrityFileIdentity } from "./sqlite-file-generation.js";
 import { SqliteIntegrityWorkerInterruptedError } from "./sqlite-integrity-worker-error.js";
-import type { SqliteIntegrityCheckTiming } from "./sqlite-integrity.js";
+import type {
+  SqliteIntegrityCheckOptions,
+  SqliteIntegrityCheckTiming,
+} from "./sqlite-integrity.js";
 import { throwSqliteLifecycleErrors } from "./sqlite-lifecycle-errors.js";
 import {
   isSqliteInspectionDeadlineOwnedByCaller,
@@ -26,6 +29,7 @@ export type SqliteIntegrityWorkerInput = {
   identity: FileIdentityStat;
   busyTimeoutMs: number;
   reuse?: true;
+  integrity?: SqliteIntegrityCheckOptions;
 };
 
 export type SqliteIntegrityWorkerResult =
@@ -145,6 +149,7 @@ export function assertSqliteIntegrityInWorker(
   callerSignal: AbortSignal,
   databaseLabel = pathname,
   timing?: SqliteIntegrityCheckTiming,
+  integrity?: SqliteIntegrityCheckOptions,
 ): Promise<void> {
   const scope = integrityScope.getStore();
   const run = async (heldScope?: IntegrityScope) =>
@@ -155,6 +160,7 @@ export function assertSqliteIntegrityInWorker(
       databaseLabel,
       timing,
       heldScope,
+      integrity,
     );
   if (!scope) {
     return run();
@@ -188,6 +194,7 @@ function assertSqliteIntegrityWithProcess(
   databaseLabel: string,
   timing?: SqliteIntegrityCheckTiming,
   scope?: IntegrityScope,
+  integrity?: SqliteIntegrityCheckOptions,
 ): Promise<void> {
   const signal = resolveSqliteInspectionSignal(callerSignal) ?? callerSignal;
   if (timing) {
@@ -362,6 +369,7 @@ function assertSqliteIntegrityWithProcess(
           databaseLabel,
           identity,
           busyTimeoutMs,
+          integrity,
           ...(scope ? { reuse: true as const } : {}),
         } satisfies SqliteIntegrityWorkerInput,
         (error) => {

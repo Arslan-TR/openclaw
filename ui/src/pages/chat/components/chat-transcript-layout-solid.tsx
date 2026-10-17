@@ -10,12 +10,9 @@ import {
   Switch,
   untrack,
 } from "solid-js";
+import { PRESENTATION_CHANGED_EVENT, type PresentationBinding } from "../../../lib/presentation.ts";
 import { ApplicationProvider } from "../../../lib/reactive/context.ts";
 import { ContentPresentation } from "../../../lib/solid/presentation.ts";
-import {
-  PRESENTATION_CHANGED_EVENT,
-  type PresentationBinding,
-} from "../../../lit/presentation-binding.ts";
 import type { AfterCommitEffect } from "../render-lifecycle.ts";
 import {
   createSolidRenderLifecycle,
@@ -91,6 +88,7 @@ function GuardedRow(props: { value: GuardedTranscriptItem }): JSX.Element {
   });
   const current = createMemo(() => {
     dependencies();
+    // The explicit row dependency vector keeps unrelated streaming snapshots out of this row.
     return untrack(() => props.value);
   });
   return <Show when={current().native}>{(view) => <NativeRow value={view()} />}</Show>;
@@ -133,6 +131,7 @@ function TranscriptRows(props: { snapshot: TranscriptLayoutProps }) {
                   ? virtualRow().start - previous.end
                   : 0;
               });
+              // The keyed row owns one measurement binding for its entire mounted lifetime.
               const measureRef = untrack(() =>
                 props.snapshot.measureRowRefFor(String(virtualRow().key)),
               );
@@ -243,6 +242,7 @@ export class ChatTranscriptRenderer {
     this.lifecycle.afterCommit(
       () => {
         this.commitQueued = false;
+        // Commit observes the accepted DOM snapshot without subscribing its imperative caller.
         const current = untrack(() => this.lifecycle?.snapshot());
         if (!current || !this.element) {
           return;

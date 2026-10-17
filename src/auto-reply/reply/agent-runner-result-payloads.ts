@@ -120,7 +120,7 @@ export async function prepareReplyAgentPayloads(state: {
     terminalFailurePayload,
     usage,
   } = accounting;
-  let { activeSessionEntry, didLogHeartbeatStrip } = accounting;
+  let { activeSessionEntry } = accounting;
   const terminalReplyExpectation =
     followupRun.run.terminalReplyExpectation ??
     resolveSourceReplyExpectation({
@@ -343,7 +343,6 @@ export async function prepareReplyAgentPayloads(state: {
       payloads,
       conversationContext: sessionCtx.agentText ?? sessionCtx.BodyForAgent,
       isHeartbeat,
-      didLogHeartbeatStrip,
       silentExpected: followupRun.run.silentExpected,
       blockStreamingEnabled,
       blockReplyPipeline,
@@ -365,7 +364,6 @@ export async function prepareReplyAgentPayloads(state: {
       accountId: sessionCtx.AccountId,
       normalizeMediaPaths: replyMediaContext.normalizePayload,
     });
-    didLogHeartbeatStrip = result.didLogHeartbeatStrip;
     return result.replyPayloads;
   };
   const returnSilentFallbackFailureIfNeeded = async (): Promise<ReplyPayload | undefined> => {
@@ -400,7 +398,8 @@ export async function prepareReplyAgentPayloads(state: {
     return returnWithQueuedFollowupDrain(preparedPayload);
   };
   const recordMissingReply = () => {
-    if (completion.outcome === "missing" && !replyOperation.result) {
+    const emptyHeartbeat = isHeartbeat && completion.outcome === "empty";
+    if ((completion.outcome === "missing" || emptyHeartbeat) && !replyOperation.result) {
       replyOperation.retainFailureUntilComplete();
       replyOperation.fail("run_failed", new Error(MISSING_REPLY_NOTICE_TEXT));
       recordReplyOperationAgentTurn(followupRun.replyOperationRunStates, replyOperation, {

@@ -1,7 +1,6 @@
 import { execFile, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
-import { performance } from "node:perf_hooks";
 import { formatByteSize } from "@openclaw/normalization-core";
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { resolveForwardedNodeCompilerArgs } from "../bootstrap/node-compiler-args.js";
@@ -586,7 +585,6 @@ export function runSqliteReadOnlyWorkerSync(
 ): string {
   assertChildRuntimeAvailable();
   const { timeoutMs, size } = readSqliteInspectionBudget("read-only snapshot", pathname);
-  const started = log.isEnabled("trace") ? performance.now() : undefined;
   const result = spawnSync(
     process.execPath,
     sqliteReadOnlyWorkerArgv(pathname, { mode, stagingRoot }).argv,
@@ -598,9 +596,6 @@ export function runSqliteReadOnlyWorkerSync(
       killSignal: "SIGKILL",
     },
   );
-  if (started !== undefined) {
-    log.trace(`SQLite read-only snapshot child durationMs=${performance.now() - started}`);
-  }
   const runtimeFailure = classifyChildRuntimeFailure({
     error: result.error,
     stderr: result.stderr,

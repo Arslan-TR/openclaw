@@ -1,4 +1,4 @@
-import { createEffect, createMemo, onCleanup, onSettled, Show } from "solid-js";
+import { createMemo, onCleanup, onSettled, Show } from "solid-js";
 import type { SolidRouteProps } from "../../app-route-types.ts";
 import { ImageLightbox } from "../../components/image-lightbox.tsx";
 import { SessionBackgroundView } from "../../components/session-background-view.tsx";
@@ -11,14 +11,15 @@ import "../../styles/chat/composer.css";
 import "../../styles/chat/composer-surface.css";
 import "../../styles/new-session.css";
 import "../../styles/new-session-attachment-panel.css";
-import { defineSolidBridge } from "../../lit/solid-bridge.ts";
+import { defineSolidBridge } from "../../lib/solid-bridge.ts";
 import { focusChatComposerFromPrintableKeydown } from "../chat/chat-pane-shared.ts";
 import { chatStartupStatusLabel } from "../chat/chat-run-startup.ts";
+import { ComposerDictationStatus } from "../chat/components/chat-composer-controls.tsx";
 import { ChatPermissionPicker } from "../chat/components/chat-permission-picker.tsx";
 import { installChatComposerPickerDismissal } from "../chat/components/chat-picker-overlay.ts";
 import { CatalogBar } from "./catalog-target-view.tsx";
 import * as catalog from "./catalog-target.ts";
-import { NewSessionDictationStatus, NewSessionDictationView } from "./composer-dictation-view.tsx";
+import { NewSessionDictationView } from "./composer-dictation-view.tsx";
 import { NewSessionComposer } from "./composer.tsx";
 import { ConnectMachineDialog } from "./connect-machine-dialog-view.tsx";
 import { isWorktreeNameValid } from "./create-params.ts";
@@ -71,7 +72,7 @@ function DraftBlock(props: {
     onNavigate: (route, routeOptions) => props.page().context?.navigate(route, routeOptions),
     onFocusComposer: () =>
       submission().composerTextarea.getTextarea()?.focus({ preventScroll: true }),
-    requestUpdate: () => props.page().changed(),
+    onChange: () => props.page().changed(),
   }));
   const permissionControl = (
     <Show when={!catalog.isTarget(props.page().data)}>
@@ -86,7 +87,7 @@ function DraftBlock(props: {
     </Show>
   );
   const dictationStatus = (
-    <NewSessionDictationStatus control={props.page().dictation} renderRevision={props.revision()} />
+    <ComposerDictationStatus readDictation={() => props.page().dictation.dictation} />
   );
   const voiceControl = (
     <NewSessionDictationView
@@ -188,21 +189,17 @@ function PageContent(_props: { data: NewSessionRouteData | undefined }, host: Pa
   const page = pageState.read;
   const revision = createMemo(() => ({ value: pageState.revision() }));
   owner.titlePreparation = createNewSessionTitle(() => ({
-    context: page().context,
-    data: page().data,
-    place: page().place,
-    submission: page().submission,
-    dictating: page().dictation.active,
+    context: owner.context,
+    data: owner.data,
+    place: owner.place,
+    submission: owner.submission,
+    dictating: owner.dictation.active,
   }));
   // Both draft presentations share one preparation per revision, not one per binding.
   const options = createMemo(() => page().composerOptions());
-  // Gateway facts must be bound before the first effect adopts draft defaults.
+  // Bind gateway facts before publishing the first reconciled draft snapshot.
   owner.connect();
   onCleanup(() => owner.disconnect());
-  createEffect(revision, () => {
-    owner.synchronize();
-    owner.updated();
-  });
   onSettled(() => {
     const context = owner.context;
     const notify = owner.changed;
@@ -217,7 +214,7 @@ function PageContent(_props: { data: NewSessionRouteData | undefined }, host: Pa
           context.config,
         ].map((source) => source.subscribe(notify))
       : [];
-    const document = owner.ownerDocument;
+    const document = host.ownerDocument;
     const window = document.defaultView!;
     const dismiss = installChatComposerPickerDismissal(document);
     const keydown = (event: KeyboardEvent) => focusChatComposerFromPrintableKeydown(host, event);
@@ -328,11 +325,7 @@ function PageContent(_props: { data: NewSessionRouteData | undefined }, host: Pa
           )}
           onOpenImage={owner.setImageLightbox}
         />
-        <CreationComposer
-          composer={creationComposer()}
-          onOpenImage={owner.setImageLightbox}
-          renderRevision={revision()}
-        />
+        <CreationComposer composer={creationComposer()} onOpenImage={owner.setImageLightbox} />
         <ConnectMachineDialog
           {...page().connectMachine.view(page().place.isAdmin(), () => {
             owner.connectMachine.close();
@@ -390,14 +383,12 @@ defineSolidBridge<
   { data: NewSessionRouteData | undefined },
   {
     focusComposer(): void;
-    requestUpdate(): void;
   }
 >("openclaw-new-session-page", PageContent, {
   properties: { data: { default: undefined, attribute: false } },
   propertyChanged: (host) => pageOwners.get(host)?.changed(),
   methods: {
     focusComposer: (host) => pageOwners.get(host)?.focusComposer(),
-    requestUpdate: (host) => pageOwners.get(host)?.changed(),
   },
 });
 

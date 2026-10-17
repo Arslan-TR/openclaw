@@ -109,7 +109,6 @@ export function composerFixture(
         mentionDirectory: unsupported ? undefined : directory,
         mentionsUnsupported: unsupported,
         onDraftChange: onInput,
-        onRequestUpdate: renderCurrent,
         onSlashCommand: slashCommand,
         canAbort: true,
         onAbort: abort,
@@ -128,7 +127,7 @@ export function composerFixture(
         getMentions: () => mentions,
         canSubmit: true,
         requiresModifier: false,
-        requestUpdate: renderCurrent,
+        onChange: renderCurrent,
         submitting: false,
         textareaController: controller,
         onInput: (next, selected) => {
