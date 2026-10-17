@@ -52,16 +52,16 @@ export async function readDiscussionHistory(params: {
     revocation = await prepareClickClackDiscussionChannelRevocation({ runtime, ...binding });
     session = await prepareDiscussionSessionEntry(runtime, sessionKey);
     // SAFETY: account resolution only reads the SDK's schema-validated configuration.
-    if (
-      resolveDiscussionBindingAccount(runtime.config.current() as CoreConfig, binding).state !==
-      "active"
-    ) {
+    const config = runtime.config.current() as CoreConfig;
+    if (resolveDiscussionBindingAccount(config, binding).state !== "active") {
       return { text: "No discussion is bound to this session." };
     }
     const history = await client.latestChannelMessages(binding.channelId, limit);
     try {
       session.source();
       const current = bindingFacts.read();
+      // SAFETY: account resolution only reads the SDK's schema-validated configuration.
+      const currentConfig = runtime.config.current() as CoreConfig;
       if (
         !current ||
         current.externalRef !== binding.externalRef ||
@@ -69,8 +69,7 @@ export async function readDiscussionHistory(params: {
         current.channelId !== binding.channelId ||
         session.entry?.sessionId !== binding.sessionId ||
         session.entry.archivedAt !== undefined ||
-        resolveDiscussionBindingAccount(runtime.config.current() as CoreConfig, binding).state !==
-          "active" ||
+        resolveDiscussionBindingAccount(currentConfig, binding).state !== "active" ||
         revocation.isRevoked(current)
       ) {
         return { text: "No discussion is bound to this session." };

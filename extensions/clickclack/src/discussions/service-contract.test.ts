@@ -770,7 +770,9 @@ describe("ClickClack discussion service contracts", () => {
       const harness = createHarness({ label: "History authority" });
       const sessionKey = "agent:main:history-authority";
       await harness.service.open(sessionKey);
-      const binding = harness.store.lookup(sessionKey);
+      const binding = await getClickClackDiscussionBindingStore(harness.runtime).getAsync(
+        sessionKey,
+      );
       if (!binding) {
         throw new Error("Expected the opened discussion binding");
       }

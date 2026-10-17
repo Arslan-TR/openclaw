@@ -18,6 +18,7 @@ import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.pa
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 
 const sandboxContextMocks = vi.hoisted(() => ({ resolveSandboxContext: vi.fn() }));
+// mock-isolation: suspend provisioning at its effect guard without launching a sandbox backend.
 vi.mock("../../agents/sandbox/context.js", () => sandboxContextMocks);
 
 import { createPluginRuntime } from "./index.js";

@@ -3,6 +3,7 @@ import { vi } from "vitest";
 
 // In-memory session fixture; receipt publication itself is covered by the
 // session-entry-current-check owner's native/worker integration tests.
+// mock-isolation: retain the fixture's in-memory sessions without opening a real session database.
 vi.mock("./session-authority.js", () => ({
   prepareDiscussionSessionEntry: async (runtime: PluginRuntime, sessionKey: string) => {
     const entry = await runtime.agent.session.getSessionEntryAsync({ sessionKey });
