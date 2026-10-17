@@ -36,10 +36,7 @@ import { clearAgentRunUsage, resetAgentRunUsageForTest } from "./agent-run-usage
 export type { AgentRunDelegatedAuthority } from "./agent-run-authority.types.js";
 export { getAgentRunContextOwnerStatus } from "./agent-run-registry-state.js";
 export { listAgentRunsForSession } from "./agent-run-registry-state.js";
-export {
-  getAgentRunLifecycleGeneration,
-  readAgentRunIndexVersion,
-} from "./agent-run-registry-state.js";
+export { getAgentRunLifecycleGeneration, readAgentRunIndexVersion };
 export type { ProjectedAgentRunIndex } from "./agent-run-registry.types.js";
 
 const delegatedAuthorityFailures = new WeakMap<AgentRunDelegatedAuthority, { cause: unknown }>();
