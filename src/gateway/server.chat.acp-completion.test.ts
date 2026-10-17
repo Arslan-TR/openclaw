@@ -88,6 +88,15 @@ function acpSessionEntry(sessionId: string) {
   return { sessionId, updatedAt: Date.now(), acp: createAcpSessionMeta({ agent: "main" }) };
 }
 
+function widgetResult(id: string) {
+  const widget = {
+    kind: "canvas",
+    presentation: { target: "assistant_message", title: "Status", sandbox: "scripts" },
+    view: { id, url: `/__openclaw__/canvas/documents/${id}/index.html` },
+  };
+  return { content: [{ type: "text", text: JSON.stringify(widget) }] };
+}
+
 describe("Gateway ACP completion ownership", () => {
   afterEach(() => {
     dispatchInboundMessageMock.mockReset();
@@ -162,7 +171,7 @@ describe("Gateway ACP completion ownership", () => {
     let turnStarted = createDeferred();
     let releaseTurn = createDeferred();
     let activeRunId = "";
-    type CapturedAdmission = { runId: string; release: Promise<void> | undefined };
+    type CapturedAdmission = { release: Promise<void> | undefined };
     const dispatchAdmissions = new Map<string, Deferred<CapturedAdmission>>();
     const admittedReleases = new Set<Promise<void>>();
     await writeSessionStore({
@@ -189,25 +198,7 @@ describe("Gateway ACP completion ownership", () => {
             data: {
               phase: "result",
               name: "show_widget",
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify({
-                      kind: "canvas",
-                      presentation: {
-                        target: "assistant_message",
-                        title: "Status",
-                        sandbox: "scripts",
-                      },
-                      view: {
-                        id: activeRunId,
-                        url: `/__openclaw__/canvas/documents/${activeRunId}/index.html`,
-                      },
-                    }),
-                  },
-                ],
-              },
+              result: widgetResult(activeRunId),
             },
           });
         }
@@ -250,7 +241,7 @@ describe("Gateway ACP completion ownership", () => {
       }
       const runId = inboundReplyOptions?.runId;
       if (runId) {
-        dispatchAdmissions.get(runId)?.resolve({ runId, release });
+        dispatchAdmissions.get(runId)?.resolve({ release });
       }
       return actualDispatch.dispatchInboundMessage({
         ctx,
@@ -315,7 +306,6 @@ describe("Gateway ACP completion ownership", () => {
         state?: string;
         seq?: number;
         message?: unknown;
-        reason?: string;
         stream?: string;
         data?: { phase?: string; reason?: string };
         errorKind?: string;
@@ -382,7 +372,6 @@ describe("Gateway ACP completion ownership", () => {
           releaseTurn.resolve();
         }
         const admitted = await admissionCapture.promise;
-        expect(admitted.runId).toBe(runId);
         expect(admitted.release).toBeDefined();
         // Notifications coalesce; the captured owner releases only after post-dispatch cleanup.
         await admitted.release;
