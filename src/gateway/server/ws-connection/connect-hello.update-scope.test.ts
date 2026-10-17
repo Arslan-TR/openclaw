@@ -3,20 +3,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import type { HelloOk } from "../../../../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import * as systemPresence from "../../../infra/system-presence.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { resolveGatewayAuth } from "../../auth-resolve.js";
 import { startGatewayTailscaleExposure } from "../../server-tailscale.js";
 import { prepareTailscalePublishedOrigin } from "../../tailscale-published-origin.js";
 import type { GatewayWsClient } from "../ws-types.js";
 
-const tailOrigin = "https://gateway.tailnet.ts.net";
-const teamOrigin = "https://team.example.test";
+// Hello update-scope tests cover authenticated role/scope and recovery ownership projection.
 
-const mocks = vi.hoisted(() => ({
-  securityEvent: vi.fn(),
-  tabs: vi.fn((_scopes: readonly string[]) => []),
-  widgets: vi.fn((_scopes: readonly string[]) => []),
-  snapshot: vi.fn((opts?: { includeUpdateDetails?: boolean }) => {
+const {
+  buildGatewaySnapshotMock,
+  emitGatewayAuthSecurityEventMock,
+  getSessionRowProjectionMock,
+  listControlUiPluginTabsMock,
+  listControlUiPluginWidgetKindsMock,
+} = vi.hoisted(() => ({
+  emitGatewayAuthSecurityEventMock: vi.fn(),
+  getSessionRowProjectionMock: vi.fn(),
+  listControlUiPluginTabsMock: vi.fn((_scopes: readonly string[]) => []),
+  listControlUiPluginWidgetKindsMock: vi.fn((_scopes: readonly string[]) => []),
+  buildGatewaySnapshotMock: vi.fn((opts?: { includeUpdateDetails?: boolean }) => {
     const updateAvailable = {
       currentVersion: "2026.8.7",
       latestVersion: "2026.8.8",
@@ -24,7 +31,15 @@ const mocks = vi.hoisted(() => ({
     };
     return {
       presence: [],
+      health: {},
       stateVersion: { presence: 1, health: 1 },
+      uptimeMs: 1,
+      sessionDefaults: {
+        defaultAgentId: "main",
+        mainKey: "main",
+        mainSessionKey: "main",
+        scope: "per-sender",
+      },
       updateAvailable: opts?.includeUpdateDetails
         ? {
             ...updateAvailable,
@@ -37,18 +52,26 @@ const mocks = vi.hoisted(() => ({
         : updateAvailable,
       ...(opts?.includeUpdateDetails
         ? {
-            updateSchedule: { channel: "dev", autoEnabled: true, install: { kind: "git" } },
+            updateSchedule: {
+              channel: "dev",
+              autoEnabled: true,
+              install: { kind: "git" },
+            },
           }
         : {}),
     };
   }),
 }));
 
-// mock-isolation: Supply deterministic update facts without starting health services.
 vi.mock("../health-state.js", () => ({
-  buildGatewaySnapshot: mocks.snapshot,
+  buildGatewaySnapshot: buildGatewaySnapshotMock,
   getHealthCache: vi.fn(() => null),
   getHealthVersion: vi.fn(() => 1),
+}));
+
+vi.mock("../../session-row-projection-access.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../session-row-projection-access.js")>()),
+  getSessionRowProjection: getSessionRowProjectionMock,
 }));
 
 vi.mock("../../../state/user-profile-list.js", async (importOriginal) => ({
@@ -56,16 +79,14 @@ vi.mock("../../../state/user-profile-list.js", async (importOriginal) => ({
   hasMultipleResidentSessionSharingIdentities: vi.fn(() => false),
 }));
 
-// mock-isolation: Control plugin UI descriptors independently of the active registry.
 vi.mock("../../control-ui-plugin-tabs.js", () => ({
   listControlUiLinkReaders: vi.fn(() => []),
-  listControlUiPluginTabs: mocks.tabs,
-  listControlUiPluginWidgetKinds: mocks.widgets,
+  listControlUiPluginTabs: listControlUiPluginTabsMock,
+  listControlUiPluginWidgetKinds: listControlUiPluginWidgetKindsMock,
 }));
 
-// mock-isolation: Observe security events without publishing them outside the fixture.
 vi.mock("./connect-auth-security.js", () => ({
-  emitGatewayAuthSecurityEvent: mocks.securityEvent,
+  emitGatewayAuthSecurityEvent: emitGatewayAuthSecurityEventMock,
 }));
 
 vi.mock("../../../version.js", async (importOriginal) => ({
@@ -83,8 +104,8 @@ vi.mock("../../../infra/tailscale.js", () => ({
 import { sendGatewayHello } from "./connect-hello.js";
 
 function makeContext(
-  role: "operator" | "node" = "operator",
-  scopes: string[] = ["operator.read"],
+  role: "operator" | "node",
+  scopes: string[],
   client?: Pick<GatewayWsClient, "internal" | "preparedSessionProfile">,
 ) {
   return {
@@ -111,10 +132,27 @@ function makeContext(
       scopes,
     },
     configSnapshot: {},
-    sendFrame: vi.fn(async (_frame: unknown) => undefined),
+    sendFrame: vi.fn(async () => undefined),
     onHelloDelivered: vi.fn(),
     pendingNodePairingCleanup: {},
     releasePendingNodePairingCleanup: vi.fn(async () => undefined),
+  };
+}
+
+function makeState(role: "operator" | "node", scopes: string[]) {
+  return {
+    resolvedAuth: { mode: "none" },
+    role,
+    scopes,
+    device: null,
+    hasTokenAuth: false,
+    hasPasswordAuth: false,
+    authResult: { ok: true, method: "none" },
+    authMethod: "none",
+    issuedBootstrapProfile: null,
+    handoffBootstrapProfile: null,
+    deviceToken: null,
+    bootstrapDeviceTokens: [],
   };
 }
 
@@ -123,58 +161,80 @@ function helloPayload(context: ReturnType<typeof makeContext>) {
   return response?.payload;
 }
 
+function helloSnapshot(context: ReturnType<typeof makeContext>) {
+  return helloPayload(context)?.snapshot;
+}
+
 function expectRedactedHelloSnapshot(context: ReturnType<typeof makeContext>) {
-  const access = { client: null, includeSensitive: false, includeUpdateDetails: false };
-  expect(mocks.snapshot).toHaveBeenCalledWith(access);
-  expect(helloPayload(context)?.snapshot.updateAvailable).toEqual({
-    currentVersion: "2026.8.7",
-    latestVersion: "2026.8.8",
-    channel: "dev",
-  });
-  expect(helloPayload(context)?.snapshot.updateSchedule).toBeUndefined();
-}
-
-function publishRoute(origin = tailOrigin, mode: "serve" | "funnel" = "serve") {
-  return prepareTailscalePublishedOrigin({ origin, mode });
-}
-
-const tailscaleState = { resolvedAuth: { mode: "token", allowTailscale: true } };
-
-function deviceToken(token: string, scopes = ["operator.read"]) {
-  return { token, role: "operator", scopes, createdAtMs: 1 };
-}
-
-async function sendHello(
-  context: ReturnType<typeof makeContext>,
-  state: Partial<Parameters<typeof sendGatewayHello>[1]> = {},
-  principal?: string,
-) {
-  await sendGatewayHello(
-    context as never,
-    {
-      resolvedAuth: { mode: "none" },
-      authResult: { ok: true, method: "none" },
-      authMethod: "none",
-      bootstrapDeviceTokens: [],
-      role: context.connectParams.role,
-      scopes: context.connectParams.scopes,
-      ...state,
-    } as never,
-    {},
-    principal,
+  expect(helloSnapshot(context)).toEqual(
+    expect.objectContaining({
+      updateAvailable: {
+        currentVersion: "2026.8.7",
+        latestVersion: "2026.8.8",
+        channel: "dev",
+      },
+    }),
   );
+  expect(helloSnapshot(context)?.updateSchedule).toBeUndefined();
 }
 
 describe("sendGatewayHello update detail scope", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    getSessionRowProjectionMock.mockReset();
     prepareTailscalePublishedOrigin({ origin: "https://reset.test", mode: "serve" })();
   });
 
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([undefined, []])(
+    "sends hello without membership reads for idle presence (%j)",
+    async (watchedSessions) => {
+      vi.spyOn(systemPresence, "listSystemPresence").mockReturnValue([
+        { text: "idle peer", ts: 1, watchedSessions },
+      ]);
+      const projection = {
+        needsMembershipPreparation: vi.fn(() => true),
+        prepareMembership: vi.fn(async () => {
+          throw new Error("unexpected membership read");
+        }),
+      };
+      getSessionRowProjectionMock.mockReturnValue(projection);
+      const context = makeContext("operator", ["operator.read"]);
+
+      await sendGatewayHello(
+        context as never,
+        makeState("operator", ["operator.read"]) as never,
+        {},
+      );
+
+      expect(projection.needsMembershipPreparation).not.toHaveBeenCalled();
+      expect(projection.prepareMembership).not.toHaveBeenCalled();
+      expect(context.sendFrame).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("sends hello while watched-session membership preparation is pending", async () => {
+    vi.spyOn(systemPresence, "listSystemPresence").mockReturnValue([
+      { text: "watching peer", ts: 1, watchedSessions: ["agent:main:watched"] },
+    ]);
+    const projection = {
+      needsMembershipPreparation: vi.fn(() => true),
+      prepareMembership: vi.fn(() => new Promise<void>(() => {})),
+    };
+    getSessionRowProjectionMock.mockReturnValue(projection);
+    const context = makeContext("operator", ["operator.read"]);
+
+    await sendGatewayHello(context as never, makeState("operator", ["operator.read"]) as never, {});
+
+    expect(context.sendFrame).toHaveBeenCalledOnce();
+    expect(projection.prepareMembership).not.toHaveBeenCalled();
+  });
 
   it.each(["write", "suggest", "view", "none", undefined] as const)(
-    "projects optional session cap %s",
+    "projects the current operator session cap %s only when configured",
     async (sessionCap) => {
       const context = makeContext("operator", ["operator.write"], {
         internal: { operatorRoleActor: { kind: "operator", profileId: "profile-riley" } },
@@ -185,22 +245,27 @@ describe("sendGatewayHello update detail scope", () => {
         },
       });
       if (sessionCap !== undefined) {
-        const collaborator = {
-          sessions: { others: sessionCap },
-          agents: ["main"],
-          scopes: ["operator.write"],
-        };
         context.configSnapshot = {
           gateway: {
             roles: {
               default: "collaborator",
-              definitions: { collaborator },
+              definitions: {
+                collaborator: {
+                  sessions: { others: sessionCap },
+                  agents: ["main"],
+                  scopes: ["operator.write"],
+                },
+              },
             },
           },
         } satisfies OpenClawConfig;
       }
 
-      await sendHello(context);
+      await sendGatewayHello(
+        context as never,
+        makeState("operator", ["operator.write"]) as never,
+        {},
+      );
 
       const auth = helloPayload(context)?.auth;
       if (sessionCap === undefined) {
@@ -223,56 +288,45 @@ describe("sendGatewayHello update detail scope", () => {
     { mode: "password", tailscale: "funnel", allowTailscale: true, expected: false },
     { mode: "none", tailscale: "off", expected: false },
     { mode: "none", tailscale: "serve", expected: false },
-    { mode: "trusted-proxy", tailscale: "serve", expected: false, role: "node" },
-    { mode: "trusted-proxy", tailscale: "serve", expected: false, publicOrigin: undefined },
-    {
-      mode: "trusted-proxy",
-      tailscale: "serve",
-      expected: false,
-      publicOrigin: "http://127.0.0.1:18789",
-    },
-    { mode: "trusted-proxy", tailscale: "serve", expected: false, enabled: false },
   ] as const)(
-    "advertises dashboard: $mode / $tailscale / $expected",
+    "advertises the personal dashboard for resolved $mode auth with $tailscale",
     async ({ mode, tailscale, expected, ...options }) => {
       if (tailscale !== "off") {
-        publishRoute(undefined, tailscale);
+        prepareTailscalePublishedOrigin({
+          origin: "https://gateway.tailnet.ts.net",
+          mode: tailscale,
+        });
       }
       const config: OpenClawConfig = {
         gateway: {
-          publicOrigin: "publicOrigin" in options ? options.publicOrigin : teamOrigin,
+          publicOrigin:
+            "publicOrigin" in options ? options.publicOrigin : "https://team.example.test",
           auth: {
             mode,
             ...("allowTailscale" in options ? { allowTailscale: options.allowTailscale } : {}),
           },
           tailscale: { mode: tailscale },
-          controlUi: {
-            basePath: " /team/ ",
-            ...("enabled" in options ? { enabled: options.enabled } : {}),
-          },
+          controlUi: { basePath: " /team/ " },
         },
       };
-      const role = "role" in options ? options.role : "operator";
-      const context = makeContext(role);
+      const context = makeContext("operator", ["operator.read"]);
       context.configSnapshot = config;
       const state = {
+        ...makeState("operator", ["operator.read"]),
         resolvedAuth: resolveGatewayAuth({
           authConfig: config.gateway?.auth,
           tailscaleMode: tailscale,
           env: {},
         }),
       };
-      await sendHello(context, state as never);
-      expect(helloPayload(context)?.snapshot.controlUiIdentityUrl).toBe(
+      await sendGatewayHello(context as never, state as never, {});
+      expect(helloSnapshot(context)?.controlUiIdentityUrl).toBe(
         expected
           ? mode === "trusted-proxy"
-            ? `${teamOrigin}/team/`
-            : `${tailOrigin}/team/`
+            ? "https://team.example.test/team/"
+            : "https://gateway.tailnet.ts.net/team/"
           : undefined,
       );
-      if (!expected && ("role" in options || "publicOrigin" in options || "enabled" in options)) {
-        expect(helloPayload(context)?.snapshot).not.toHaveProperty("controlUiIdentityUrl");
-      }
       prepareTailscalePublishedOrigin({ origin: "https://reset.test", mode: "serve" })();
       if (expected && mode !== "trusted-proxy") {
         expect(context.handler.close).toHaveBeenCalledWith(1012, expect.any(String));
@@ -282,23 +336,30 @@ describe("sendGatewayHello update detail scope", () => {
     },
   );
 
-  it.each(["before", "after", "during"] as const)(
-    "releases live announcement owners: %s delivery",
+  it.each(["before hello delivery", "after hello delivery", "during hello delivery"] as const)(
+    "releases only live announcement owners when withdrawn %s",
     async (phase) => {
-      const clear = publishRoute();
-      const context = makeContext();
-      if (phase === "before") {
+      const clear = prepareTailscalePublishedOrigin({
+        origin: "https://gateway.tailnet.ts.net",
+        mode: "serve",
+      });
+      const context = makeContext("operator", ["operator.read"]);
+      const state = {
+        ...makeState("operator", ["operator.read"]),
+        resolvedAuth: { mode: "token", allowTailscale: true },
+      };
+      if (phase === "before hello delivery") {
         context.handler.isClosed.mockReturnValue(true);
         context.handler.socket.emit("close");
       }
-      if (phase === "during") {
+      if (phase === "during hello delivery") {
         context.sendFrame.mockImplementation(async () => {
           clear();
         });
       }
-      await sendHello(context, tailscaleState as never);
-      if (phase !== "during") {
-        if (phase === "after") {
+      await sendGatewayHello(context as never, state as never, {});
+      if (phase !== "during hello delivery") {
+        if (phase === "after hello delivery") {
           context.handler.socket.emit("close");
         }
         clear();
@@ -310,7 +371,7 @@ describe("sendGatewayHello update detail scope", () => {
   );
 
   it.each(["exit", "cleanup", "replacement"] as const)(
-    "renews hello after route %s",
+    "retires an announced Serve connection on route %s and renews its hello",
     async (withdrawal) => {
       const gatewayMethods = ["health", "config.get"];
       const exited = createDeferredCore();
@@ -338,19 +399,29 @@ describe("sendGatewayHello update detail scope", () => {
         clients.push(client);
         await once(client, "open");
         const [socket] = (await accepted) as [WebSocket];
-        const context = makeContext();
+        const context = makeContext("operator", ["operator.read"]);
+        const state = {
+          ...makeState("operator", ["operator.read"]),
+          resolvedAuth: { mode: "token", allowTailscale: true },
+        };
         const response = once(client, "message");
-        Object.assign(context.handler, {
-          gatewayMethods,
-          socket,
-          close: (code?: number, reason?: string) => socket.close(code, reason),
-        });
-        context.sendFrame.mockImplementation(async (frame) => {
-          await new Promise<void>((resolve, reject) => {
-            socket.send(JSON.stringify(frame), (error) => (error ? reject(error) : resolve()));
-          });
-        });
-        await sendHello(context, tailscaleState as never);
+        await sendGatewayHello(
+          {
+            ...context,
+            handler: {
+              ...context.handler,
+              gatewayMethods,
+              socket,
+              close: (code?: number, reason?: string) => socket.close(code, reason),
+            },
+            sendFrame: (frame: unknown) =>
+              new Promise<void>((resolve, reject) => {
+                socket.send(JSON.stringify(frame), (error) => (error ? reject(error) : resolve()));
+              }),
+          } as never,
+          state as never,
+          {},
+        );
         const [frame] = await response;
         const hello = JSON.parse(String(frame)) as { payload: HelloOk };
         return { client, hello: hello.payload, close: vi.fn() };
@@ -358,14 +429,19 @@ describe("sendGatewayHello update detail scope", () => {
       try {
         const original = await connect();
         expect(original.hello.features.methods).toEqual(gatewayMethods);
-        expect(original.hello.snapshot.controlUiIdentityUrl).toBe(`${tailOrigin}/`);
+        expect(original.hello.snapshot.controlUiIdentityUrl).toBe(
+          "https://gateway.tailnet.ts.net/",
+        );
         original.client.on("close", original.close);
         if (withdrawal === "exit") {
           exited.resolve();
         } else if (withdrawal === "cleanup") {
           await cleanup?.();
         } else {
-          publishRoute("https://replacement.tailnet.ts.net");
+          prepareTailscalePublishedOrigin({
+            origin: "https://replacement.tailnet.ts.net",
+            mode: "serve",
+          });
           // A late old cleanup must not withdraw the replacement's announcement.
           await cleanup?.();
         }
@@ -379,7 +455,10 @@ describe("sendGatewayHello update detail scope", () => {
         );
         expect(renewed.client.readyState).toBe(WebSocket.OPEN);
       } finally {
-        for (const socket of [...clients, ...server.clients]) {
+        for (const client of clients) {
+          client.terminate();
+        }
+        for (const socket of server.clients) {
           socket.terminate();
         }
         await new Promise<void>((resolve) => {
@@ -391,52 +470,125 @@ describe("sendGatewayHello update detail scope", () => {
   );
 
   it.each([
+    { role: "node", origin: "https://team.example.test", enabled: true },
+    { role: "operator", origin: undefined, enabled: true },
+    { role: "operator", origin: "http://127.0.0.1:18789", enabled: true },
+    { role: "operator", origin: "https://team.example.test", enabled: false },
+  ] as const)(
+    "does not advertise unavailable browser identity ($role, $origin, $enabled)",
+    async (testCase) => {
+      const clear = prepareTailscalePublishedOrigin({
+        origin: "https://gateway.tailnet.ts.net",
+        mode: "serve",
+      });
+      const context = makeContext(testCase.role, ["operator.read"]);
+      context.configSnapshot = {
+        gateway: { publicOrigin: testCase.origin, controlUi: { enabled: testCase.enabled } },
+      };
+      const state = {
+        ...makeState(testCase.role, ["operator.read"]),
+        resolvedAuth: { mode: "trusted-proxy", allowTailscale: false },
+      };
+      await sendGatewayHello(context as never, state as never, {});
+      expect(helloSnapshot(context)).not.toHaveProperty("controlUiIdentityUrl");
+      clear();
+      expect(context.handler.close).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
     { label: "pairing-only operator", role: "operator" as const, scopes: ["operator.pairing"] },
     { label: "node", role: "node" as const, scopes: ["operator.read"] },
   ])("omits update details for a $label", async ({ role, scopes }) => {
     const context = makeContext(role, scopes);
-    await sendHello(context);
+    await sendGatewayHello(context as never, makeState(role, scopes) as never, {});
+
+    expect(buildGatewaySnapshotMock).toHaveBeenCalledWith({
+      client: null,
+      includeSensitive: false,
+      includeUpdateDetails: false,
+    });
     expectRedactedHelloSnapshot(context);
     expect(helloPayload(context)?.features.capabilities).toContain("node-permission-errors");
     expect(helloPayload(context)?.features.capabilities).toContain("agent-session-id-create-v1");
   });
 
-  const remote = { publicOrigin: teamOrigin };
   it.each([
-    [{}, "bundled", true, undefined],
-    [{ controlUi: { enabled: true } }, "bundled", true, undefined],
-    [{ controlUi: { enabled: false } }, "bundled", false, undefined],
-    [{ controlUi: { root: "/custom/ui" } }, "configured", false, undefined],
-    [
-      { ...remote, controlUi: { basePath: " /remote/// " } },
-      "bundled",
-      true,
-      `${teamOrigin}/remote`,
-    ],
-    [{ ...remote, controlUi: { enabled: false } }, "bundled", false, undefined],
-  ] as const)(
-    "projects UI metadata for %j",
-    async (gateway, source, browserFocus, controlUiUrl) => {
-      const context = makeContext();
-      context.configSnapshot = { gateway };
-      await sendHello(context);
-      const hello = helloPayload(context);
-      expect(hello?.server).toMatchObject({ buildId: "build-a", controlUiBuildSource: source });
-      expect(hello?.features.capabilities?.includes("control-ui-browser-focus")).toBe(browserFocus);
-      expect(hello?.controlUiUrl).toBe(controlUiUrl);
-      if (controlUiUrl === undefined) {
-        expect(hello).not.toHaveProperty("controlUiUrl");
-      }
+    { label: "default bundled UI", controlUi: undefined, source: "bundled", browserFocus: true },
+    {
+      label: "enabled bundled UI",
+      controlUi: { enabled: true },
+      source: "bundled",
+      browserFocus: true,
+    },
+    {
+      label: "disabled bundled UI",
+      controlUi: { enabled: false },
+      source: "bundled",
+      browserFocus: false,
+    },
+    {
+      label: "configured UI",
+      controlUi: { root: "/custom/ui" },
+      source: "configured",
+      browserFocus: false,
+    },
+  ])(
+    "reports Gateway build identity and browser focus support for $label",
+    async ({ controlUi, source, browserFocus }) => {
+      const context = makeContext("operator", ["operator.read"]);
+      context.configSnapshot = { gateway: { controlUi } };
+
+      await sendGatewayHello(
+        context as never,
+        makeState("operator", ["operator.read"]) as never,
+        {},
+      );
+
+      expect(helloPayload(context)?.server.buildId).toBe("build-a");
+      expect(helloPayload(context)?.server.controlUiBuildSource).toBe(source);
+      expect(
+        helloPayload(context)?.features.capabilities?.includes("control-ui-browser-focus"),
+      ).toBe(browserFocus);
     },
   );
 
+  it.each([
+    [
+      { publicOrigin: "https://gateway.example.test", controlUi: { basePath: " /remote/// " } },
+      "https://gateway.example.test/remote",
+    ],
+    [{ publicOrigin: "https://gateway.example.test", controlUi: { enabled: false } }, undefined],
+    [{}, undefined],
+  ])("advertises the configured Control UI address: %j", async (gateway, controlUiUrl) => {
+    const context = makeContext("operator", ["operator.read"]);
+    context.configSnapshot = { gateway };
+    await sendGatewayHello(context as never, makeState("operator", ["operator.read"]) as never, {});
+    expect(helloPayload(context)?.controlUiUrl).toBe(controlUiUrl);
+    if (controlUiUrl === undefined) {
+      expect(helloPayload(context)).not.toHaveProperty("controlUiUrl");
+    }
+  });
+
   it("keeps hello projection and telemetry at effective scopes", async () => {
     const state = {
-      deviceToken: deviceToken("paired-token", ["operator.read", "operator.admin"]),
+      ...makeState("operator", ["operator.pairing"]),
+      deviceToken: {
+        token: "paired-token",
+        role: "operator",
+        scopes: ["operator.read", "operator.admin"],
+        createdAtMs: 1,
+      },
     };
 
     const context = makeContext("operator", ["operator.pairing"]);
-    await sendHello(context, state as never, "owner-profile");
+    await sendGatewayHello(context as never, state as never, {}, "owner-profile");
+
+    expect(buildGatewaySnapshotMock).toHaveBeenCalledWith({
+      client: null,
+      includeSensitive: false,
+      includeUpdateDetails: false,
+    });
     expectRedactedHelloSnapshot(context);
     expect(helloPayload(context)?.auth).toEqual({
       method: "none",
@@ -447,25 +599,31 @@ describe("sendGatewayHello update detail scope", () => {
       deviceToken: "paired-token",
       issuedAtMs: 1,
     });
-    expect(mocks.tabs).toHaveBeenCalledWith(["operator.pairing"], {
+    expect(listControlUiPluginTabsMock).toHaveBeenCalledWith(["operator.pairing"], {
       requireGatewayAuthGrant: false,
     });
-    expect(mocks.widgets).toHaveBeenCalledWith(["operator.pairing"]);
-    expect(mocks.securityEvent).toHaveBeenCalledWith(
+    expect(listControlUiPluginWidgetKindsMock).toHaveBeenCalledWith(["operator.pairing"]);
+    expect(emitGatewayAuthSecurityEventMock).toHaveBeenCalledWith(
       expect.objectContaining({ role: "operator", scopes: ["operator.pairing"] }),
     );
   });
 
   it("keeps recovery scope owned by the canonical authenticated principal", async () => {
     const sendFor = async (principal: string, token: string, generation: string) => {
-      const context = makeContext();
+      const context = makeContext("operator", ["operator.read"]);
       const state = {
+        ...makeState("operator", ["operator.read"]),
         authResult: { ok: true, method: "trusted-proxy", user: `${principal}@example.test` },
         device: { id: "device-a" },
-        deviceToken: deviceToken(token),
+        deviceToken: {
+          token,
+          role: "operator",
+          scopes: ["operator.read"],
+          createdAtMs: 1,
+        },
         sessionSharedGatewaySessionGeneration: generation,
       };
-      await sendHello(context, state as never, principal);
+      await sendGatewayHello(context as never, state as never, {}, principal);
       const auth = helloPayload(context)?.auth;
       expect(auth?.recoveryMigrationAllowed).toBeUndefined();
       return auth?.recoveryScope;
