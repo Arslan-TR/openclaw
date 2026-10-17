@@ -66,7 +66,8 @@ it
               : kind === "version"
                 ? "echo \"node: /fixture/libstdc++.so.6: version 'GLIBCXX_3.4.29' not found (required by /fixture/plugin.node)\" >&2\n"
                 : "") +
-        `exit ${ordinaryExit}`,
+        // Admit the request before exiting so the control observes a worker crash, not EPIPE.
+        `dd bs=1 count=1 <&3 >/dev/null 2>&1\nexit ${ordinaryExit}`,
     );
     const crashed = session();
     await expect(crashed.run("fixture", { mode: "staging-create" })).rejects.toThrow(

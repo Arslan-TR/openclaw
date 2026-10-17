@@ -196,23 +196,22 @@ export function createSqliteReadOnlyWorkerSession(
   child.once("close", (code, signal) => {
     nativeClosed = true;
     retired = true;
+    const failure =
+      pending?.failure ??
+      createSqliteReadOnlyWorkerError(
+        `exited with ${signal ? `signal ${signal}` : `code ${code}`}`,
+        stderr,
+      );
     const runtimeFailure = classifyChildRuntimeFailure({
       execPath: executable,
-      error: pending?.failure,
+      error: failure,
       stderr,
       signal,
       started: receivedMessage,
     });
     if (pending) {
       const request = releasePending(pending);
-      request.reject(
-        runtimeFailure ??
-          request.failure ??
-          createSqliteReadOnlyWorkerError(
-            `exited with ${signal ? `signal ${signal}` : `code ${code}`}`,
-            stderr,
-          ),
-      );
+      request.reject(runtimeFailure ?? failure);
     }
     resolveClosed();
   });

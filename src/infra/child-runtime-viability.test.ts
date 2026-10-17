@@ -1,4 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   classifyChildRuntimeFailure,
@@ -13,6 +16,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 const log = vi.hoisted(() => ({ error: vi.fn() }));
+// mock-isolation: Capture this process-wide diagnosis without writing host logs.
 vi.mock("../logging/subsystem.js", () => ({ createSubsystemLogger: () => log }));
 
 const removedCellarPath = "/opt/homebrew/Cellar/node@24/24.20.0/bin/node";
@@ -81,6 +85,38 @@ it("does not latch an unchanged runtime when both worker and diagnostic probe ab
   expect(classifyChildRuntimeFailure({ signal: "SIGABRT" })).toBeUndefined();
   expect(readChildRuntimeViability().available).toBe(true);
 });
+
+it.each([false, true])(
+  "confirms a pre-handshake IPC failure with the runtime probe (broken: %s)",
+  (broken) => {
+    const directory = mkdtempSync(path.join(tmpdir(), "openclaw-runtime-probe-"));
+    const execPath = path.join(directory, "node");
+    writeFileSync(execPath, "fixture", { mode: 0o700 });
+    vi.mocked(spawnSync).mockReturnValueOnce({
+      pid: 123,
+      output: [null, "", ""],
+      stdout: broken ? "" : "v26.12.0",
+      stderr: broken ? "node: error while loading shared libraries: libnode.so" : "",
+      status: broken ? 127 : 0,
+      signal: null,
+    });
+    try {
+      const failure = classifyChildRuntimeFailure({
+        execPath,
+        error: new Error("Child process IPC channel is closed"),
+        signal: "SIGKILL",
+      });
+      if (broken) {
+        expect(failure).toMatchObject({ code: "NODE_RUNTIME_UNAVAILABLE" });
+      } else {
+        expect(failure).toBeUndefined();
+      }
+      expect(readChildRuntimeViability({ execPath }).available).toBe(!broken);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 it("classifies an executable changed since startup when its bare runtime also aborts", () => {
   vi.mocked(spawnSync).mockReturnValueOnce({

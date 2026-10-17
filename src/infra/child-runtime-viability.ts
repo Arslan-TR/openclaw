@@ -169,20 +169,14 @@ export function classifyChildRuntimeFailure(params: {
   if (params.error && !readChildRuntimeViability({ execPath }).available) {
     unavailable = true;
   }
-  const execError =
-    params.error instanceof Error &&
-    "path" in params.error &&
-    params.error.path === execPath &&
-    ["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ENOEXEC"].some((code) =>
-      hasErrnoCode(params.error, code),
-    );
   if (
     !unavailable &&
-    (params.signal === "SIGABRT" || execError || ambiguousLoaderFailure.test(params.stderr ?? ""))
+    (params.error ||
+      params.signal === "SIGABRT" ||
+      ambiguousLoaderFailure.test(params.stderr ?? ""))
   ) {
-    // A worker bug or memory pressure can abort too. Require a loader diagnostic
-    // or an observed executable change before treating a bare abort as permanent.
-    // These loader messages can also come from worker-only native modules.
+    // IPC can fail before startup stderr arrives. Confirm the bare runtime;
+    // ordinary crashes and worker-only native modules must not disable healthy Node.
     const probe = probeChildRuntimeExecutable(execPath);
     const changed =
       execPath !== runtime.initialPath || executableIdentity(execPath) !== runtime.initialIdentity;

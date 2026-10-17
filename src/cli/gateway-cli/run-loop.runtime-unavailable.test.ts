@@ -5,6 +5,7 @@ import {
   classifyChildRuntimeFailure,
   readChildRuntimeViability,
 } from "../../infra/child-runtime-viability.js";
+import { resolveTestNodeExecPath } from "../../test-utils/node-process.js";
 import { runLoopFixture as fixture } from "./run-loop-mocks.test-support.js";
 import { createLifecycleGate, createActiveWorkSnapshot } from "./run-loop.test-support.js";
 
@@ -12,6 +13,7 @@ import { createLifecycleGate, createActiveWorkSnapshot } from "./run-loop.test-s
 vi.mock("../../daemon/service-state.js", () => ({ readGatewayServiceState: vi.fn() }));
 
 const originalExecPath = process.execPath;
+const serviceNodeExecPath = resolveTestNodeExecPath();
 afterEach(() => {
   process.execPath = originalExecPath;
   fixture.requestGatewayRestartWithSignalAdmission
@@ -32,7 +34,7 @@ it("closes admission and drains active work before handing runtime recovery to t
     loadState: { status: "loaded" },
     running: true,
     env: {},
-    command: { programArguments: [originalExecPath, "/fixture/openclaw.mjs", "gateway", "run"] },
+    command: { programArguments: [serviceNodeExecPath, "/fixture/openclaw.mjs", "gateway", "run"] },
   });
   fixture.restartGatewayProcessWithFreshPid.mockReturnValue({ mode: "supervised" });
   const drain = createLifecycleGate();

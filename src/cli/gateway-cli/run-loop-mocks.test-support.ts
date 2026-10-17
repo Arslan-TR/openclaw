@@ -118,7 +118,9 @@ const m = {
   resetGatewaySuspendCoordinatorForLifecycleRestart: vi.fn(),
   disarmGatewaySuspendHandoff: vi.fn(),
   rollbackGatewayRestartSignalAdmission: vi.fn(),
-  requestGatewayRestartWithSignalAdmission: vi.fn(() => ({ status: "emitted" as const })),
+  requestGatewayRestartWithSignalAdmission: vi.fn<
+    typeof import("../../infra/restart.js").requestGatewayRestartWithSignalAdmission
+  >(() => ({ status: "emitted" })),
   writeGatewayRestartHandoff: vi.fn<
     typeof import("../../infra/restart-handoff.js").writeGatewayRestartHandoff
   >(async () => ({
