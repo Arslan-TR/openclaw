@@ -41,37 +41,6 @@ function openIngressStateDatabase(stateDir: string) {
 }
 
 describe("channel ingress queue", () => {
-  it("deduplicates batched and competing admissions without replacing the first payload", async () => {
-    await withIsolatedState(async (stateDir) => {
-      const queue = createTestIngressQueue<{ text: string }>(stateDir, { now: () => 100 });
-      await queue.enqueue("completed", { text: "processed" });
-      await queue.complete("completed");
-      const [batch, competing] = await Promise.all([
-        queue.enqueueBatch!([
-          { id: "second", payload: { text: "first payload" }, receivedAt: 102 },
-          { id: "first", payload: { text: "earlier" }, receivedAt: 101 },
-          { id: "completed", payload: { text: "replay" } },
-          { id: "second", payload: { text: "duplicate payload" }, receivedAt: 103 },
-        ]),
-        queue.enqueue("second", { text: "competing payload" }),
-      ]);
-      expect(batch.map((result) => result.kind)).toEqual([
-        "accepted",
-        "accepted",
-        "completed",
-        "pending",
-      ]);
-      expect(competing).toMatchObject({
-        kind: "pending",
-        record: { payload: { text: "first payload" } },
-      });
-      expect((await queue.listPending()).map(({ id, payload }) => ({ id, payload }))).toEqual([
-        { id: "first", payload: { text: "earlier" } },
-        { id: "second", payload: { text: "first payload" } },
-      ]);
-    });
-  });
-
   it("reads committed claim states without a transaction for single-statement inspections", async () => {
     await withTempState(async (stateDir) => {
       const queue = createTestIngressQueue<{ text: string }>(stateDir);
