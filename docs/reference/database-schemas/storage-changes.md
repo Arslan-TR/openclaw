@@ -120,6 +120,14 @@ fragment activation/dependencies and the expected catalog for the state owner;
 it does not maintain a separate schema definition. They omit transaction wrappers and fixed schema qualification;
 the owning connection supplies the namespace and transaction. The `agent.postgres.sql` artifact follows the same runtime-only convention.
 
+The transcript navigation CHECK keeps its JSON validation for present metadata.
+Its PostgreSQL helper is strict, so absent metadata passes the CHECK without
+calling the helper. A fixed `pg_catalog` search path avoids repeatedly parsing
+the helper's CTE during unsuccessful SQL-function inlining attempts.
+Agent schema 29 applies these attributes to existing PostgreSQL stores through
+the migration owner without rewriting rows. Historical admission and rollback
+preserve the predecessor function attributes.
+
 For a manual state-schema check, run `psql` from the generated directory and
 supply the transaction and chosen schema explicitly:
 

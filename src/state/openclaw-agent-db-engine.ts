@@ -90,6 +90,8 @@ export const agentEngineSchema: StoreSchema = {
       fromSchema: { postgres: agentPostgresV28Sql },
       schema: { postgres: agentPostgresSql },
       sql: `${AGENT_INDEX_RETIREMENT_SQL}
+        ALTER FUNCTION openclaw_transcript_navigation_check(text)
+          STRICT SET search_path = pg_catalog;
         UPDATE schema_meta
         SET schema_version = ${AGENT_INDEX_RETIREMENT_SCHEMA_VERSION},
           app_version = '${VERSION.replaceAll("'", "''")}',

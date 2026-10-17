@@ -206,7 +206,7 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
     });
   });
 
-  it("migrates version 27 indexes through the current schema while retaining rows and search", async () => {
+  it("migrates version 27 indexes and navigation validation while retaining rows and search", async () => {
     const target = {
       agentId: "migration",
       sessionId: "migration-session",
@@ -289,6 +289,8 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
       // Restore the historical catalog under exclusive fixture custody, including an unsealed marker.
       await client.query(`BEGIN;
         SET LOCAL search_path TO "${facts.namespace}";
+        ALTER FUNCTION openclaw_transcript_navigation_check(text)
+          CALLED ON NULL INPUT RESET search_path;
         DROP INDEX idx_agent_session_windows_conversation;
         CREATE INDEX idx_agent_session_windows_conversation
           ON session_windows(primary_conversation_id ASC NULLS FIRST,
@@ -374,6 +376,15 @@ describe.skipIf(!connection)("PostgreSQL agent database owner", () => {
           indexname: "idx_agent_session_windows_conversation",
           indexdef: `CREATE INDEX idx_agent_session_windows_conversation ON ${facts.namespace}.session_windows USING btree (primary_conversation_id NULLS FIRST) WHERE (primary_conversation_id IS NOT NULL)`,
         },
+      ]);
+      const navigationFunction = await client.query(
+        `SELECT p.proisstrict, p.proconfig FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = $1 AND p.proname = 'openclaw_transcript_navigation_check'`,
+        [facts.namespace],
+      );
+      expect(navigationFunction.rows).toEqual([
+        { proisstrict: true, proconfig: ["search_path=pg_catalog"] },
       ]);
       expect(
         (

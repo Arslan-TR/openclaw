@@ -17,8 +17,11 @@ CREATE TABLE IF NOT EXISTS board_tabs (`,
     );
 }
 
+/** Historical admission and rollback retain v28's navigation-check attributes too. */
 export function withLegacyAgentPostgresIndexes(schema: string): string {
   return `${schema}
+    ALTER FUNCTION openclaw_transcript_navigation_check(text)
+      CALLED ON NULL INPUT RESET search_path;
     CREATE INDEX "idx_agent_session_nodes_last_interaction_at"
       ON "session_nodes" (("last_interaction_at") DESC NULLS LAST,
         ("session_key") ASC NULLS FIRST);

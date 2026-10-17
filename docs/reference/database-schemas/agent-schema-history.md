@@ -73,6 +73,12 @@ Schema 29 removes `idx_agent_session_nodes_last_interaction_at` and
 reaction primary key already supplies the removed index's lookup prefix and
 continues enforcing reaction uniqueness. Neither migration rewrites rows.
 
+PostgreSQL also makes `openclaw_transcript_navigation_check(text)` strict with a
+fixed `pg_catalog` search path. Absent navigation metadata skips JSON validation;
+present metadata retains the same CHECK. The versioned step updates existing
+stores without rewriting transcript rows. Historical backups retain the old
+function attributes for rollback.
+
 SQLite and PostgreSQL publish the index changes and schema metadata in one
 transaction. A scoped SQLite backup covers `session_nodes`, `session_reactions`,
 and planner statistics. Historical admission and PostgreSQL rollback retain the

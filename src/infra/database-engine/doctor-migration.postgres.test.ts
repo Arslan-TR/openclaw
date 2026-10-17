@@ -626,6 +626,8 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         await client.query(`SELECT fingerprint FROM "${agentNamespace}".openclaw_schema_meta`)
       ).rows[0].fingerprint;
       await client.query(`
+        ALTER FUNCTION "${agentNamespace}".openclaw_transcript_navigation_check(text)
+          CALLED ON NULL INPUT RESET search_path;
         DROP INDEX "${agentNamespace}".idx_agent_session_windows_conversation;
         CREATE INDEX idx_agent_session_windows_conversation
           ON "${agentNamespace}".session_windows
@@ -686,6 +688,15 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
         (
           await client.query(`SELECT last_value, is_called
           FROM "${agentNamespace}".context_engine_turn_outbox_enqueue_sequence_seq`)
+        ).rows;
+      const readNavigationFunction = async () =>
+        (
+          await client.query(
+            `SELECT p.proisstrict, p.proconfig FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = $1 AND p.proname = 'openclaw_transcript_navigation_check'`,
+            [agentNamespace],
+          )
         ).rows;
       const readIndexes = async () =>
         (
@@ -821,6 +832,9 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
             ).rows,
           ).toEqual([{ version: String(candidate.version), fingerprint: targetAgentFingerprint }]);
           expect(await readAllocation()).toEqual([{ last_value: "72", is_called: true }]);
+          expect(await readNavigationFunction()).toEqual([
+            { proisstrict: true, proconfig: ["search_path=pg_catalog"] },
+          ]);
           expect(await readIndexes()).toEqual([
             {
               indexname: "idx_agent_session_windows_conversation",
@@ -880,6 +894,7 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           (await client.query(`SELECT version FROM "${agentNamespace}".openclaw_schema_meta`)).rows,
         ).toEqual([{ version: String(installed.version) }]);
         expect(await readAllocation()).toEqual([{ last_value: "71", is_called: true }]);
+        expect(await readNavigationFunction()).toEqual([{ proisstrict: false, proconfig: null }]);
         expect(await readIndexes()).toEqual(beforeIndexes);
         expect(
           (
