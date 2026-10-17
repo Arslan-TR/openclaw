@@ -7,8 +7,8 @@ import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempHomeEnv, type TempHomeEnv } from "../test-utils/temp-home.js";
 import {
-  settlePlaybackTranscodeJobsForTest,
-  waitForPlaybackTranscodeJobsForTest,
+  settlePlaybackTranscodeJobsForTest as settleJobs,
+  waitForPlaybackTranscodeJobsForTest as waitForJobs,
 } from "./playback-transcode.test-support.js";
 
 const { runFfmpeg, observeWorkspaceRoot } = vi.hoisted(() => ({
@@ -44,13 +44,17 @@ vi.mock("./media-probe.js", async (importOriginal) => ({
   })),
 }));
 
-let playback: typeof import("./playback-transcode.js");
+let resolveTranscode: typeof import("./playback-transcode.js").resolvePlaybackTranscode;
+let resolveMetadata: typeof import("./playback-transcode.js").resolvePlaybackMetadataForSource;
 let tempHome: TempHomeEnv;
 
 beforeAll(async () => {
   vi.resetModules();
   tempHome = await createTempHomeEnv("openclaw-playback-staging-");
-  playback = await import("./playback-transcode.js");
+  ({
+    resolvePlaybackTranscode: resolveTranscode,
+    resolvePlaybackMetadataForSource: resolveMetadata,
+  } = await import("./playback-transcode.js"));
 });
 
 afterAll(async () => {
@@ -76,6 +80,8 @@ async function createSource(fileName: string, contents: string | Buffer) {
   const sourceStat = await fs.stat(sourcePath);
   return {
     sourcePath,
+    mimeType: "audio/x-caf",
+    kind: "audio" as const,
     sourceStat: {
       size: sourceStat.size,
       mtimeMs: sourceStat.mtimeMs,
@@ -83,6 +89,10 @@ async function createSource(fileName: string, contents: string | Buffer) {
       exactIdentity: await fs.stat(sourcePath, { bigint: true }),
     },
   };
+}
+
+async function expectPreparing(source: Awaited<ReturnType<typeof createSource>>) {
+  expect(await resolveTranscode(source)).toEqual({ kind: "preparing" });
 }
 
 describe("playback input staging", () => {
@@ -103,21 +113,16 @@ describe("playback input staging", () => {
       return "";
     });
     try {
-      const params = {
-        ...source,
-        mimeType: "audio/x-caf",
-        kind: "audio" as const,
-      };
-      expect(await playback.resolvePlaybackTranscode(params)).toEqual({ kind: "preparing" });
-      await waitForPlaybackTranscodeJobsForTest("all");
+      await expectPreparing(source);
+      await waitForJobs("all");
       expect(runFfmpeg).toHaveBeenCalledOnce();
-      expect(await playback.resolvePlaybackTranscode(params)).toMatchObject({
+      expect(await resolveTranscode(source)).toMatchObject({
         kind: "transcoded",
         contentType: "audio/mp4",
       });
       await expect(fs.stat(inputPath!)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      await settlePlaybackTranscodeJobsForTest();
+      await settleJobs();
     }
   });
 
@@ -125,12 +130,7 @@ describe("playback input staging", () => {
     "rejects a source that changes after open via %s before starting ffmpeg",
     async (change) => {
       const source = await createSource(`changed-${change}.caf`, "stable-source");
-      const params = {
-        ...source,
-        mimeType: "audio/x-caf",
-        kind: "audio" as const,
-      };
-      await expect(playback.resolvePlaybackMetadataForSource(params)).resolves.toMatchObject({
+      await expect(resolveMetadata(source)).resolves.toMatchObject({
         playback: "transcode",
       });
       let changed = false;
@@ -160,16 +160,16 @@ describe("playback input staging", () => {
         },
       });
       try {
-        expect(await playback.resolvePlaybackTranscode(params)).toEqual({ kind: "preparing" });
-        await expect(waitForPlaybackTranscodeJobsForTest("all")).rejects.toThrow(
+        await expectPreparing(source);
+        await expect(waitForJobs("all")).rejects.toThrow(
           change === "grow" ? /exceeds limit/ : /changed|mismatch/,
         );
         expect(changed).toBe(true);
         expect(runFfmpeg).not.toHaveBeenCalled();
-        expect(await playback.resolvePlaybackTranscode(params)).toEqual({ kind: "fallback" });
+        expect(await resolveTranscode(source)).toEqual({ kind: "fallback" });
       } finally {
         __setFsSafeTestHooksForTest(undefined);
-        await settlePlaybackTranscodeJobsForTest();
+        await settleJobs();
       }
     },
   );
@@ -204,28 +204,17 @@ describe("playback input staging", () => {
       };
     });
     try {
-      expect(
-        await playback.resolvePlaybackTranscode({
-          ...source,
-          mimeType: "audio/x-caf",
-          kind: "audio",
-        }),
-      ).toEqual({ kind: "preparing" });
-      const outcome = await waitForPlaybackTranscodeJobsForTest("all").then(
-        () => ({ ok: true }),
-        (error: unknown) => ({ ok: false, error }),
-      );
-      expect(writerWasOpenAtMove).toBe(true);
-      expect(outcome).toEqual({
-        ok: false,
-        error: expect.objectContaining({ message: expect.stringMatching(/changed|mismatch/) }),
+      await expectPreparing(source);
+      await expect(waitForJobs("all")).rejects.toMatchObject({
+        message: expect.stringMatching(/changed|mismatch/),
       });
+      expect(writerWasOpenAtMove).toBe(true);
       expect(replaced).toBe(true);
       expect(runFfmpeg).not.toHaveBeenCalled();
       expect(writer?.fd).toBe(-1);
     } finally {
       observeWorkspaceRoot.mockReset();
-      await settlePlaybackTranscodeJobsForTest();
+      await settleJobs();
     }
   });
 
@@ -244,19 +233,14 @@ describe("playback input staging", () => {
       return "";
     });
     try {
-      const params = {
-        ...source,
-        mimeType: "audio/x-caf",
-        kind: "audio" as const,
-      };
-      expect(await playback.resolvePlaybackTranscode(params)).toEqual({ kind: "preparing" });
-      await expect(waitForPlaybackTranscodeJobsForTest("all")).rejects.toBe(cleanupError);
+      await expectPreparing(source);
+      await expect(waitForJobs("all")).rejects.toBe(cleanupError);
       expect(runFfmpeg).toHaveBeenCalledOnce();
       expect(quarantine).toBeDefined();
-      expect(await playback.resolvePlaybackTranscode(params)).toEqual({ kind: "fallback" });
+      expect(await resolveTranscode(source)).toEqual({ kind: "fallback" });
     } finally {
       __setFsSafeTestHooksForTest(undefined);
-      await settlePlaybackTranscodeJobsForTest();
+      await settleJobs();
       if (quarantine) {
         await fs.rm(quarantine, { recursive: true, force: true });
       }
