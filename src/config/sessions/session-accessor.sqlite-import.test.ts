@@ -34,25 +34,21 @@ function target(state: OpenClawTestState, id: string) {
     entry: { sessionId: id, updatedAt: 42 },
   };
 }
-const message = {
-  type: "message",
-  id: "one",
-  parentId: null,
-  message: { role: "user", content: "preserved" },
-};
 function turn(
   id: string,
   parentId: string | null | undefined,
   role: "user" | "assistant",
   content: string | { type: "text"; text: string }[],
+  providerFields: { provider?: string; api?: string } = {},
 ) {
   return {
     type: "message",
     id,
     ...(parentId === undefined ? {} : { parentId }),
-    message: { role, content },
+    message: { ...providerFields, role, content },
   };
 }
+const message = turn("one", null, "user", "preserved");
 function header(id: string) {
   return { type: "session", version: 3, id, timestamp: "2026-08-30T00:00:00Z", cwd: "/fixture" };
 }
@@ -94,12 +90,11 @@ it("preserves a current session introduced after staging while importing unrelat
         {
           ...first,
           historicalOnly: true,
-          beforePersistentApply: () => {
+          beforePersistentApply: () =>
             runOpenClawAgentWriteTransaction(
               (database) => writeSessionEntry(database, first.sessionKey, current),
               { agentId: "main", env: state.env },
-            );
-          },
+            ),
         },
         { ...second, historicalOnly: true },
       ]),
@@ -254,9 +249,8 @@ it("deduplicates existing and incoming bytes and identities, preserves aliases, 
       transcriptEvents: 2,
       sessionKey: params.sessionKey,
     });
-    expect(await importSqliteSessionRows({ ...params, readTranscriptEvents })).toMatchObject({
-      transcriptEvents: 0,
-    });
+    const rerun = await importSqliteSessionRows({ ...params, readTranscriptEvents });
+    expect(rerun).toMatchObject({ transcriptEvents: 0 });
     expect(rows(db, "SELECT session_key FROM session_nodes")).toEqual([
       { session_key: params.sessionKey },
     ]);
@@ -280,25 +274,18 @@ it("deduplicates existing and incoming bytes and identities, preserves aliases, 
     expect(db.prepare("SELECT generation FROM transcript_rewrite_watermarks").get()).toEqual(
       generation,
     );
-    expect(stages()).toHaveLength(3);
-    expect(stages().every((dir) => !fs.existsSync(dir))).toBe(true);
+    expect(stages().map((dir) => fs.existsSync(dir))).toEqual([false, false, false]);
   });
 });
 
 it("keeps legacy Codex assistant rows that precede later transcript rows during repair", async () => {
   await withOpenClawTestState({ label: "import-codex-rows" }, async (state) => {
     const params = target(state, "codex");
-    const codexReply = (id: string, parentId: string, content: string) => ({
-      type: "message",
-      id,
-      parentId,
-      message: {
-        role: "assistant",
+    const codexReply = (id: string, parentId: string, content: string) =>
+      turn(id, parentId, "assistant", content, {
         provider: id === "reply-1" ? "openai-codex" : "codex",
         api: id === "reply-1" ? "openai-codex-responses" : "openai-chatgpt-responses",
-        content,
-      },
-    });
+      });
     const events = [
       { type: "session", id: "codex", version: 3 },
       turn("user-1", null, "user", "hi"),
@@ -429,9 +416,7 @@ it.each(["implicit", "root", "opaque"])(
       const appendParentId = hasOpaque ? "post-leaf" : leafControl ? null : "visible";
       expect(persisted).toEqual([
         sessionHeader,
-        ...(leafControl ? [{ ...parent, parentId: null }] : []),
-        leafControl ? { ...visible, parentId: "parent" } : visible,
-        ...(leafControl ? [{ ...answer, parentId: "visible" }] : []),
+        ...(leafControl ? [parent, visible, answer] : [visible]),
         ...(hasOpaque ? [{ ...opaque[0], parentId: "answer" }] : []),
         ...(mode === "opaque" ? [opaque[1], postLeaf] : []),
         ...(leafControl ? [leaf(hasOpaque ? "post-leaf" : "answer", appendParentId)] : []),
@@ -461,39 +446,25 @@ it.each(["implicit", "root", "opaque"])(
 it("repairs an identical repeated event and reruns idempotently", async () => {
   const repeated = turn("repeated", "root", "assistant", "same replay");
   await withOpenClawTestState({ label: "import-identical-replay" }, async (state) => {
-    const scope = { ...target(state, "identical-replay"), repairLegacyTranscript: true };
-    const events = [
-      header("identical-replay"),
-      turn("root", null, "user", "root"),
-      repeated,
-      repeated,
-    ];
+    const scope = { ...target(state, "replay"), repairLegacyTranscript: true };
+    const events = [header("replay"), turn("root", null, "user", "root"), repeated, repeated];
     const imported = await importEvents(scope, events);
     const recovery = { complete: true, events: 3, repaired: true };
-    expect(imported).toMatchObject({
-      recovery,
-      transcriptEvents: 3,
-    });
+    expect(imported).toMatchObject({ recovery, transcriptEvents: 3 });
     expect(
-      loadTranscriptEventsSync({ ...scope, sessionId: "identical-replay" }).map(
+      loadTranscriptEventsSync({ ...scope, sessionId: "replay" }).map(
         (event) => (event as { id?: string }).id,
       ),
-    ).toEqual(["identical-replay", "root", "repeated"]);
+    ).toEqual(["replay", "root", "repeated"]);
 
-    await expect(importEvents(scope, events)).resolves.toMatchObject({
-      recovery,
-      transcriptEvents: 0,
-    });
+    const rerun = await importEvents(scope, events);
+    expect(rerun).toMatchObject({ recovery, transcriptEvents: 0 });
     const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
     expect(
       rows(
         database.db,
         "SELECT event_id, COUNT(*) AS count FROM transcript_event_identities GROUP BY event_id ORDER BY event_id",
       ),
-    ).toEqual([
-      { event_id: "identical-replay", count: 1 },
-      { event_id: "repeated", count: 1 },
-      { event_id: "root", count: 1 },
-    ]);
+    ).toEqual(["repeated", "replay", "root"].map((event_id) => ({ event_id, count: 1 })));
   });
 });

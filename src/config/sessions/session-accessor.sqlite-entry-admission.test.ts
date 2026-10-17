@@ -292,10 +292,10 @@ it("returns an accepted unchanged patch receipt without publishing a new source"
 
 it("captures the queued ambient state owner before admission", async () => {
   const f = fixture();
-  const original = { ...f.scope, env: { ...f.env } };
+  const original = f.scope;
   const successor = roots.make("session-patch-successor-");
   const release = createDeferred();
-  releases.push(() => release.resolve());
+  releases.push(release.resolve);
   const blocker = own(
     runExclusiveSqliteSessionWrite(
       resolveSqliteScope(original),
@@ -355,9 +355,8 @@ it("retains FIFO, caller context and publication across cold admission", async (
   const contexts = new AsyncLocalStorage<string>();
   const order: string[] = [];
   const updateRelease = createDeferred();
-  releases.push(() => updateRelease.resolve());
+  releases.push(updateRelease.resolve);
   const enteredUpdater = createDeferred();
-  let holdUpdater = false;
   const unsubscribe = onSessionIdentityMutation((mutation) => {
     if (mutation.kind !== "delete" && mutation.current.sessionKeys.includes(f.scope.sessionKey)) {
       order.push(`published:${mutation.current.sessionId}`);
@@ -370,16 +369,13 @@ it("retains FIFO, caller context and publication across cold admission", async (
       async () => {
         order.push(`update:${contexts.getStore()}`);
         enteredUpdater.resolve();
-        if (holdUpdater) {
-          await updateRelease.promise;
-        }
+        await updateRelease.promise;
         return { sessionId: "first" };
       },
       { onCommitted: () => order.push(`commit:${contexts.getStore()}`) },
     ),
   );
   await expectAdmission(gate, first);
-  holdUpdater = true;
   const second = contexts.run("second", () =>
     patch(
       f.scope,

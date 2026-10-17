@@ -49,6 +49,7 @@ import {
   restoreSessionColdTranscript,
   runSessionColdStorageMaintenance,
 } from "./session-cold-storage.js";
+import { maintenanceConfig } from "./session-cold-storage.test-support.js";
 import * as sqliteTargets from "./session-sqlite-target.js";
 import { deleteSessionTranscriptIndexInTransaction } from "./session-transcript-index.js";
 import { waitForSessionTranscriptIndexReconcile } from "./session-transcript-reconcile.js";
@@ -118,15 +119,7 @@ async function createHotRaceSeed(state: OpenClawTestState) {
   }, options);
   const database = openOpenClawAgentDatabase(options);
   await expect(
-    runSessionColdStorageMaintenance({
-      config: {
-        agents: { entries: { main: {} } },
-        session: {
-          store: database.path,
-          maintenance: { coldStorage: { enabled: true, afterDays: 30 } },
-        },
-      },
-    }),
+    runSessionColdStorageMaintenance({ config: maintenanceConfig(database.path) }),
   ).resolves.toMatchObject({ archivedTranscripts: 1 });
   const descriptor = executeSqliteQueryTakeFirstSync(
     database.db,
@@ -231,23 +224,21 @@ async function prepareRace(state: OpenClawTestState) {
 
 type Race = Awaited<ReturnType<typeof prepareRace>>;
 
-function withRace(run: (race: Race, state: OpenClawTestState) => Promise<void>) {
-  return () =>
-    withOpenClawTestState({ label: "cold-read-race" }, async (state) => {
-      await captureRuntimeConfigAsyncReader()();
-      const race = await prepareRace(state);
-      try {
-        await run(race, state);
-      } finally {
-        vi.restoreAllMocks();
-        race.writer.close();
-      }
-    });
+async function withRace(run: (race: Race, state: OpenClawTestState) => Promise<void>) {
+  await withOpenClawTestState({ label: "cold-read-race" }, async (state) => {
+    await captureRuntimeConfigAsyncReader()();
+    const race = await prepareRace(state);
+    try {
+      await run(race, state);
+    } finally {
+      vi.restoreAllMocks();
+      race.writer.close();
+    }
+  });
 }
 
-it(
-  "detects an archive committed before a warm incremental read begins",
-  withRace(async (race) => {
+it("detects an archive committed before a warm incremental read begins", async () => {
+  await withRace(async (race) => {
     const read = race.readRows;
     const original = read();
     expect(original.length).toBeGreaterThan(0);
@@ -262,12 +253,11 @@ it(
     expect(race.committed()).toBe(true);
     exec.mockRestore();
     await expect(readRestoredSessionTranscript(race.scope, read)).resolves.toEqual(original);
-  }),
-);
+  });
+});
 
-it(
-  "joins caller snapshots without savepoints and observes the next archive",
-  withRace(async (race) => {
+it("joins caller snapshots without savepoints and observes the next archive", async () => {
+  await withRace(async (race) => {
     const read = race.readRows;
     const original = read();
     expect(original.length).toBeGreaterThan(0);
@@ -284,12 +274,11 @@ it(
       exec.mockRestore();
     });
     expect(() => read()).toThrow(/cold storage/);
-  }),
-);
+  });
+});
 
-it(
-  "attributes slow transcript matching while retaining its hot snapshot",
-  withRace(async (race, state) => {
+it("attributes slow transcript matching while retaining its hot snapshot", async () => {
+  await withRace(async (race, state) => {
     const file = state.path("hot-read.log");
     setLoggerOverride({ level: "info", consoleLevel: "silent", file });
     let clock = Date.now();
@@ -337,12 +326,11 @@ it(
       await flushLogger();
       setLoggerOverride(null);
     }
-  }),
-);
+  });
+});
 
-it(
-  "bounds hot and cold transcript stats selections in batches",
-  withRace(async (race) => {
+it("bounds hot and cold transcript stats selections in batches", async () => {
+  await withRace(async (race) => {
     const expectedStats = readTranscriptStatsSync(race.scope);
     const scopes = [race.scope, ...missingScopes(race.scope, 410), race.scope];
     const read = () => readTranscriptStatsBatchReadOnlySync(scopes);
@@ -369,10 +357,10 @@ it(
     } finally {
       reads.restore();
     }
-  }),
-);
+  });
+});
 
-it.each(["batch stats", "search", "mutation"] as const)(
+it.each(["batch stats", "search", "mutation", "inventory"] as const)(
   "keeps %s coherent when another connection archives",
   async (kind) => {
     await withRace(async (race) => {
@@ -381,15 +369,21 @@ it.each(["batch stats", "search", "mutation"] as const)(
           readTranscriptStatsBatchReadOnlySync([race.scope, ...missingScopes(race.scope, 10)]),
         search: () => searchSessionTranscripts({ ...race.scope, query: "Original" }),
         mutation: () => readTranscriptMutationStateSync(race.scope),
+        inventory: () => readSessionColdStorageInventory(race.database),
       }[kind];
-      const original = read();
+      const original =
+        kind === "inventory"
+          ? { hotTranscripts: 1, coldTranscripts: 0, embeddedArchiveBytes: 0 }
+          : read();
       race.commitAfterMarkerRead(
         (query) =>
-          kind === "mutation"
-            ? query.includes('from "session_windows"')
-            : kind === "batch stats"
-              ? query.includes('from "transcript_events"')
-              : query.includes('"session_transcript_cold_archives"'),
+          kind === "inventory"
+            ? query.includes('from "session_windows" as "window"') && query.includes("count(*)")
+            : kind === "mutation"
+              ? query.includes('from "session_windows"')
+              : kind === "batch stats"
+                ? query.includes('from "transcript_events"')
+                : query.includes('"session_transcript_cold_archives"'),
         kind === "batch stats"
           ? () => {
               race.writer
@@ -408,10 +402,12 @@ it.each(["batch stats", "search", "mutation"] as const)(
         expect(read()).toEqual(
           expect.arrayContaining([expect.objectContaining({ lastMutationAtMs: 222 })]),
         );
+      } else if (kind === "inventory") {
+        expect(read()).toEqual({ hotTranscripts: 0, coldTranscripts: 1, embeddedArchiveBytes: 0 });
       } else {
         expect(read()).toEqual(original);
       }
-    })();
+    });
   },
 );
 
@@ -472,9 +468,8 @@ it("preserves partial-store stats, UTF-8 bytes, and batch scope-cache freshness"
   });
 });
 
-it(
-  "retries restoration when a peer archives before the atomic read",
-  withRace(async (race) => {
+it("retries restoration when a peer archives before the atomic read", async () => {
+  await withRace(async (race) => {
     let reads = 0;
     const result = await readRestoredSessionTranscript(race.scope, () => {
       if (++reads === 1) {
@@ -484,12 +479,11 @@ it(
     });
     expect(result).toMatchObject({ type: "session", id: race.scope.sessionId });
     expect(reads).toBe(2);
-  }),
-);
+  });
+});
 
-it(
-  "retries Gateway visitation after a peer archives",
-  withRace(async (race) => {
+it("retries Gateway visitation after a peer archives", async () => {
+  await withRace(async (race) => {
     const visited: Array<{ message: unknown; seq: number }> = [];
     race.commitAfterMarkerRead();
     const count = await visitSessionMessagesAsync(
@@ -506,12 +500,11 @@ it(
     expect(race.database.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()).toMatchObject({
       busy: 0,
     });
-  }),
-);
+  });
+});
 
-it(
-  "copies a coherent canonical-repair snapshot while a peer archives",
-  withRace(async (race, state) => {
+it("copies a coherent canonical-repair snapshot while a peer archives", async () => {
+  await withRace(async (race, state) => {
     const destinationOptions = {
       agentId: "main",
       env: state.env,
@@ -536,25 +529,5 @@ it(
         .db.prepare("SELECT * FROM transcript_events ORDER BY seq")
         .all(),
     ).toEqual(original);
-  }),
-);
-
-it(
-  "counts hot and cold transcripts atomically while a peer archives",
-  withRace(async (race) => {
-    race.commitAfterMarkerRead(
-      (query) => query.includes('from "session_windows" as "window"') && query.includes("count(*)"),
-    );
-    expect(readSessionColdStorageInventory(race.database)).toEqual({
-      hotTranscripts: 1,
-      coldTranscripts: 0,
-      embeddedArchiveBytes: 0,
-    });
-    expect(race.committed()).toBe(true);
-    expect(readSessionColdStorageInventory(race.database)).toEqual({
-      hotTranscripts: 0,
-      coldTranscripts: 1,
-      embeddedArchiveBytes: 0,
-    });
-  }),
-);
+  });
+});

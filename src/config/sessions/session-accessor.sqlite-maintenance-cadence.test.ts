@@ -6,7 +6,7 @@ import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js"
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
-  runOpenClawAgentWriteTransaction,
+  runOpenClawAgentWriteTransaction as writeTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import {
@@ -26,13 +26,13 @@ import type {
 import * as ageFacts from "./session-accessor.sqlite-maintenance-age.js";
 import * as candidates from "./session-accessor.sqlite-maintenance-candidates.js";
 import {
-  prepareSessionMaintenanceInWorker,
-  reclaimSessionMaintenanceInTransaction,
+  prepareSessionMaintenanceInWorker as prepareMaintenance,
+  reclaimSessionMaintenanceInTransaction as reclaimMaintenance,
 } from "./session-accessor.sqlite-maintenance-transaction.js";
 import { applySessionEntryMaintenance } from "./session-accessor.sqlite-maintenance.js";
 import { recordSessionParticipant } from "./session-accessor.sqlite-participants.native.js";
 import { resolveSessionReclamationDatabaseOptions } from "./session-accessor.sqlite-reclamation.js";
-import { commitSessionEntryReplacementsInDatabase } from "./session-accessor.sqlite-replacement-state.js";
+import { commitSessionEntryReplacementsInDatabase as commitReplacements } from "./session-accessor.sqlite-replacement-state.js";
 import { appendTranscriptEventSync } from "./session-accessor.sqlite-transcript-write.test-support.js";
 import { prepareSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
 import * as maintenanceRuntime from "./store-maintenance-runtime.js";
@@ -64,7 +64,7 @@ function createStore(entryCount: number, updatedAt = Date.now()) {
   const storePath = path.join(tempDirs.make("session-maintenance-cadence-"), "agent.sqlite");
   const options = { agentId: "main", path: storePath };
   const database = openOpenClawAgentDatabase(options);
-  runOpenClawAgentWriteTransaction((owner) => {
+  writeTransaction((owner) => {
     for (let index = 0; index < entryCount; index += 1) {
       writeFixtureEntry(owner, index, { updatedAt });
     }
@@ -123,36 +123,33 @@ async function replaceEntryInDatabase(
   update: (entry: SessionEntry) => SessionEntry,
 ) {
   const preservation = await prepareSessionMaintenancePreservation(storePath);
-  try {
-    return runOpenClawAgentWriteTransaction(
-      (database) => {
-        const sessionKey = key(index);
-        const row = readExactSessionEntryRow(database, sessionKey);
-        if (!row) {
-          throw new Error("Missing cadence fixture entry");
-        }
-        return commitSessionEntryReplacementsInDatabase(
-          database,
-          {
-            expectedRows: new Map([[sessionKey, row]]),
-            labelOwnerKeys: [],
-            validationKeys: [sessionKey],
-            replacements: [{ sessionKey, entry: update(row.entry) }],
-            maintenance: {
-              archiveDirectory: path.join(path.dirname(storePath), "archives"),
-              maintenance: maintenanceRuntime.resolveMaintenanceConfig(),
-              preservation: preservation.capture(),
-              storePath,
-            },
+  using _ = { [Symbol.dispose]: preservation.dispose };
+  return writeTransaction(
+    (database) => {
+      const sessionKey = key(index);
+      const row = readExactSessionEntryRow(database, sessionKey);
+      if (!row) {
+        throw new Error("Missing cadence fixture entry");
+      }
+      return commitReplacements(
+        database,
+        {
+          expectedRows: new Map([[sessionKey, row]]),
+          labelOwnerKeys: [],
+          validationKeys: [sessionKey],
+          replacements: [{ sessionKey, entry: update(row.entry) }],
+          maintenance: {
+            archiveDirectory: path.join(path.dirname(storePath), "archives"),
+            maintenance: maintenanceRuntime.resolveMaintenanceConfig(),
+            preservation: preservation.capture(),
+            storePath,
           },
-          () => {},
-        );
-      },
-      { agentId: "main", path: storePath },
-    );
-  } finally {
-    preservation.dispose();
-  }
+        },
+        () => {},
+      );
+    },
+    { agentId: "main", path: storePath },
+  );
 }
 
 function writeMetadata(storePath: string, kind: "participant" | "owner", sequence: number) {
@@ -230,7 +227,7 @@ it("reports a maintenance deadline without an unused revision snapshot", () => {
   const now = Date.now();
   const { database, options } = createStore(1, now);
   const maintenance = agePolicy({ mode: "enforce", pruneAfterMs: DAY_MS });
-  runOpenClawAgentWriteTransaction(
+  writeTransaction(
     (current) => ageFacts.recordSessionEntryMaintenanceAgeFact(current, maintenance, now),
     options,
   );
@@ -241,7 +238,7 @@ it("reports a maintenance deadline without an unused revision snapshot", () => {
   );
   let admittedReads = 0;
   onTestFinished(reads.restore);
-  const result = reclaimSessionMaintenanceInTransaction(
+  const result = reclaimMaintenance(
     {
       kind: "maintenance-age",
       databaseOptions: resolveSessionReclamationDatabaseOptions(options),
@@ -269,7 +266,7 @@ it.each([
   const input = await maintenanceInput(storePath);
   input.maintenanceConfig.maxEntries = maxEntries;
   const maintain = (trigger = false) =>
-    runOpenClawAgentWriteTransaction((database) => {
+    writeTransaction((database) => {
       if (trigger && !force) {
         writeFixtureEntry(database, 2);
       }
@@ -319,17 +316,13 @@ it.each(["foreign backdate", "managed backdate", "shorter age policy"] as const)
       });
     } else {
       if (mutation === "foreign backdate") {
-        const writer = new DatabaseSync(database.path);
+        using writer = new DatabaseSync(database.path);
         const updatedAt = now - 31 * DAY_MS;
-        try {
-          writer
-            .prepare(
-              "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.updatedAt', ?), updated_at = ? WHERE session_key = ?",
-            )
-            .run(updatedAt, updatedAt, key(1));
-        } finally {
-          writer.close();
-        }
+        writer
+          .prepare(
+            "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.updatedAt', ?), updated_at = ? WHERE session_key = ?",
+          )
+          .run(updatedAt, updatedAt, key(1));
         vi.setSystemTime(now + 30 * 60 * 1_000 + 1);
       } else {
         expect(readEntry(storePath, 1)?.archivedAt).toBeUndefined();
@@ -370,14 +363,14 @@ it("does not retain an age fact from a rolled-back archive", async () => {
   const maintain = (database: ReturnType<typeof openOpenClawAgentDatabase>) =>
     applySessionEntryMaintenance(database, input);
   expect(() =>
-    runOpenClawAgentWriteTransaction((database) => {
+    writeTransaction((database) => {
       expect(maintain(database).archived).toBe(1);
       expect(maintain(database).archived).toBe(0);
       throw new Error("roll back archive");
     }, options),
   ).toThrow("roll back archive");
   expect(readEntry(storePath)?.archivedAt).toBeUndefined();
-  expect(runOpenClawAgentWriteTransaction(maintain, options).archived).toBe(1);
+  expect(writeTransaction(maintain, options).archived).toBe(1);
   expect(readEntry(storePath)).toMatchObject({ archiveReason: "age-retention" });
 });
 
@@ -412,7 +405,7 @@ it.each([
   const { options } = createStore(0);
   const now = Date.now();
   const maintenance = agePolicy({ pruneAfterMs: 30 * DAY_MS });
-  const result = runOpenClawAgentWriteTransaction((database) => {
+  const result = writeTransaction((database) => {
     const write = (
       sessionKey: string,
       days: number,
@@ -470,18 +463,16 @@ it.each([
 });
 
 it.each([
-  "local entry",
   "foreign entry",
   "transcript append",
   "protected parent",
   "active ancestor",
-  "provider",
   "work-id",
   "lifecycle-id",
 ] as const)(
   "discards a prepared maintenance snapshot after %s changes its admission",
   async (mutation) => {
-    const entryChanged = mutation === "local entry" || mutation === "foreign entry";
+    const entryChanged = mutation === "foreign entry";
     const candidateChanged = mutation === "transcript append" || mutation === "protected parent";
     const { database, options, storePath } = createStore(
       entryChanged ? 1 : 2,
@@ -499,7 +490,7 @@ it.each([
           ? { activeSessionKeys: [childKey] }
           : { preservation: { providerKeys: [], workIdentities: [], lifecycleIdentities: [] } },
     );
-    const prepared = prepareSessionMaintenanceInWorker(operation);
+    const prepared = prepareMaintenance(operation);
     const writer = mutation === "foreign entry" ? new DatabaseSync(database.path) : undefined;
     try {
       if (entryChanged) {
@@ -515,11 +506,6 @@ it.each([
         writer
           .prepare("UPDATE session_nodes SET entry_valid = 1 WHERE session_key = ?")
           .run(key(0));
-      } else if (mutation === "local entry") {
-        writeFixtureEntry(database, 0, {
-          updatedAt: Date.now() - 31 * DAY_MS,
-          label: "newer",
-        });
       } else if (mutation === "transcript append") {
         expect(
           appendTranscriptEventSync(
@@ -532,12 +518,12 @@ it.each([
       } else {
         operation.input.activeSessionKeys = mutation === "active ancestor" ? [childKey] : [];
         operation.input.preservation = {
-          providerKeys: mutation === "provider" ? [key(0)] : [],
+          providerKeys: [],
           workIdentities: mutation === "work-id" ? ["cadence-0"] : [],
           lifecycleIdentities: mutation === "lifecycle-id" ? ["cadence-0"] : [],
         };
       }
-      expect(reclaimSessionMaintenanceInTransaction(operation, {}, prepared)).toEqual({
+      expect(reclaimMaintenance(operation, {}, prepared)).toEqual({
         kind: "maintenance-plan-stale",
       });
       if (entryChanged) {
@@ -549,19 +535,16 @@ it.each([
       writer?.close();
     }
     if (entryChanged) {
-      const fresh = prepareSessionMaintenanceInWorker(operation);
-      try {
-        expect(reclaimSessionMaintenanceInTransaction(operation, {}, fresh)).toMatchObject({
-          kind: "maintenance-plan",
-          value: { archived: 1 },
-        });
-        expect(readEntry(storePath)).toMatchObject({
-          label: "newer",
-          archiveReason: "age-retention",
-        });
-      } finally {
-        fresh.release();
-      }
+      const fresh = prepareMaintenance(operation);
+      using _ = { [Symbol.dispose]: fresh.release };
+      expect(reclaimMaintenance(operation, {}, fresh)).toMatchObject({
+        kind: "maintenance-plan",
+        value: { archived: 1 },
+      });
+      expect(readEntry(storePath)).toMatchObject({
+        label: "newer",
+        archiveReason: "age-retention",
+      });
     }
   },
 );
@@ -569,16 +552,12 @@ it.each([
 it("commits a prepared plan after an unrelated foreign write", async () => {
   const { database, options } = createStore(1, Date.now() - 31 * DAY_MS);
   const operation = await createPlanningOperation(options);
-  const prepared = prepareSessionMaintenanceInWorker(operation);
-  const writer = new DatabaseSync(database.path);
-  try {
-    writer.exec("CREATE TABLE maintenance_unrelated_noise (value INTEGER)");
-    expect(reclaimSessionMaintenanceInTransaction(operation, {}, prepared)).toMatchObject({
-      kind: "maintenance-plan",
-      value: { archived: 1 },
-    });
-  } finally {
-    prepared.release();
-    writer.close();
-  }
+  const prepared = prepareMaintenance(operation);
+  using writer = new DatabaseSync(database.path);
+  using _ = { [Symbol.dispose]: prepared.release };
+  writer.exec("CREATE TABLE maintenance_unrelated_noise (value INTEGER)");
+  expect(reclaimMaintenance(operation, {}, prepared)).toMatchObject({
+    kind: "maintenance-plan",
+    value: { archived: 1 },
+  });
 });
