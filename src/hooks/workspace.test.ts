@@ -153,6 +153,24 @@ describe("hooks workspace", () => {
     expect(warnMock).not.toHaveBeenCalled();
   });
 
+  it.each(["EIO", "EACCES"])("warns when hook metadata cannot be read (%s)", (code) => {
+    const { hooksRoot } = makeHooksWorkspace();
+    const hookDir = writePlainHook(hooksRoot, "unreadable-hook");
+    const hookMdPath = path.join(hookDir, "HOOK.md");
+    const read = vi.spyOn(fs, "readSync").mockImplementationOnce(() => {
+      throw Object.assign(new Error("private metadata contents"), { code });
+    });
+    try {
+      expect(loadWorkspaceEntriesFromHooksRoot(hooksRoot)).toEqual([]);
+      expect(warnMock).toHaveBeenCalledExactlyOnceWith(
+        `Failed to read hook metadata ${hookMdPath}; check file permissions and disk health.`,
+      );
+    } finally {
+      read.mockRestore();
+    }
+    expect(hookNames(loadWorkspaceEntriesFromHooksRoot(hooksRoot))).toEqual(["unreadable-hook"]);
+  });
+
   it("rejects package symlink escapes without scanning unlisted children", () => {
     const { root, hooksRoot } = makeHooksWorkspace();
 
