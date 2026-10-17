@@ -49,15 +49,11 @@ it.each(["allowed", "forbidden", "revoked"] as const)(
       api: "openai-chatgpt-responses",
       baseUrl: "https://chatgpt.com/backend-api/codex",
     };
-    const config: OpenClawConfig = {
-      auth: {
-        profiles: {
-          "openai:allowed": { provider: "openai", mode: "oauth" },
-          "openai:forbidden": { provider: "openai", mode: "api_key" },
-        },
-        order: { openai: ["openai:allowed"] },
-      },
+    const profiles = {
+      "openai:allowed": { provider: "openai", mode: "oauth" as const },
+      "openai:forbidden": { provider: "openai", mode: "api_key" as const },
     };
+    const config: OpenClawConfig = { auth: { profiles, order: { openai: ["openai:allowed"] } } };
     const credential = (identity: string) => ({
       type: "oauth" as const,
       provider: "openai",

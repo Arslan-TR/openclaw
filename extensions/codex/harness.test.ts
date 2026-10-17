@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { AgentHarnessSupportContext } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createNativeSessionBindingScope } from "openclaw/plugin-sdk/agent-harness-session-runtime";
 import {
   getSessionEntry,
@@ -64,6 +65,11 @@ function makeHarness(
   });
 }
 
+const supportHarness = makeHarness();
+function supports(context: Partial<AgentHarnessSupportContext>) {
+  return supportHarness.supports({ provider: "openai", requestedRuntime: "codex", ...context });
+}
+
 function codexConfig(config: Record<string, unknown>) {
   return { plugins: { entries: { codex: { config } } } };
 }
@@ -101,14 +107,14 @@ const isolatedTask = {
 };
 
 describe("Codex agent harness supports()", () => {
+  const harness = supportHarness;
+
   it("keeps computer-control denies out of the native-surface exemption", () => {
     expect(harness.conversationToolPolicySafeDenyTools).toContain("image_generate");
     expect(harness.conversationToolPolicySafeDenyTools).not.toEqual(
       expect.arrayContaining(["browser", "computer", "mobile_ui", "nodes", "screen"]),
     );
   });
-
-  const harness = makeHarness();
 
   it.each([
     { enableUltrafast: false, expected: ["priority", "flex"] },
@@ -220,10 +226,8 @@ describe("Codex agent harness supports()", () => {
 
   it("lets explicitly selected Codex discover a new model with harness-owned auth", () => {
     expect(
-      harness.supports({
-        provider: "openai",
+      supports({
         modelId: "gpt-future",
-        requestedRuntime: "codex",
         modelProvider: { requestTransportOverrides: "none", preparedAuth: { source: "harness" } },
       }),
     ).toEqual({ supported: true, priority: 100 });
@@ -243,8 +247,7 @@ describe("Codex agent harness supports()", () => {
   ] as const)(
     "does not infer native model access for %s",
     (_label, requestedRuntime, modelProvider) => {
-      const result = harness.supports({
-        provider: "openai",
+      const result = supports({
         modelId: "gpt-future",
         requestedRuntime,
         modelProvider: { requestTransportOverrides: "none", ...modelProvider },
@@ -260,9 +263,7 @@ describe("Codex agent harness supports()", () => {
     ["Platform key", { source: "profile", mode: "api_key", requirement: "api-key" }, true],
     ["unvalidated subscription", { source: "harness", requirement: "subscription" }, false],
   ] as const)("reports %s reproducibility", (_label, preparedAuth, supported) => {
-    const result = harness.supports({
-      provider: "openai",
-      requestedRuntime: "codex",
+    const result = supports({
       modelProvider: {
         api:
           preparedAuth.requirement === "api-key" ? "openai-responses" : "openai-chatgpt-responses",
@@ -283,9 +284,7 @@ describe("Codex agent harness supports()", () => {
   });
 
   it("rejects a prepared route that does not declare Codex compatibility", () => {
-    const result = harness.supports({
-      provider: "openai",
-      requestedRuntime: "codex",
+    const result = supports({
       modelProvider: {
         api: "openai-responses",
         baseUrl: "https://relay.example.test/v1",
@@ -298,9 +297,7 @@ describe("Codex agent harness supports()", () => {
   });
 
   it("rejects authored request overrides defensively", () => {
-    const result = harness.supports({
-      provider: "openai",
-      requestedRuntime: "codex",
+    const result = supports({
       modelProvider: {
         api: "openai-responses",
         baseUrl: "https://api.openai.com/v1",
@@ -363,45 +360,37 @@ describe("Codex agent harness supports()", () => {
 });
 
 describe("Codex agent harness reset()", () => {
-  it("clears an in-place session generation without stranding its replacement", async () => {
+  it.each<[string, boolean, string]>([
+    ["clears an in-place generation", false, "thread-2"],
+    ["repairs a retirement fence", true, "thread-recovered"],
+  ])("%s without stranding its replacement", async (_name, fenced, replacement) => {
     const bindingStore = createCodexTestBindingStore();
+    const storePath = fenced ? path.join(sessionDirs.make(), "sessions.json") : undefined;
+    if (storePath) {
+      await upsertSessionEntry({
+        agentId: resetSession.agentId,
+        sessionKey: resetSession.sessionKey,
+        storePath,
+        entry: { sessionId: resetSession.sessionId, updatedAt: 1 },
+      });
+    }
     await setBinding(bindingStore, resetIdentity);
-    const harness = makeHarness({ bindingStore });
+    if (fenced) {
+      await bindingStore.retireSessionGeneration(resetIdentity);
+    }
+    const harness = makeHarness({
+      bindingStore,
+      resolveConfig: storePath ? () => ({ session: { store: storePath } }) : undefined,
+    });
     if (!harness.reset) {
       throw new Error("expected Codex harness reset hook");
     }
-
     await harness.reset({ ...resetSession, reason: "reset" });
-
     expect(bindingStore.read(resetIdentity)).toBeUndefined();
     await expect(
-      setBinding(bindingStore, resetIdentity, { threadId: "thread-2", cwd: "/repo" }),
+      setBinding(bindingStore, resetIdentity, { threadId: replacement, cwd: "/repo" }),
     ).resolves.toBe(true);
-    expect(bindingStore.read(resetIdentity)).toMatchObject({ threadId: "thread-2" });
-  });
-
-  it("repairs a retirement fence left by an earlier in-place reset", async () => {
-    const root = sessionDirs.make();
-    const storePath = path.join(root, "sessions.json");
-    const bindingStore = createCodexTestBindingStore();
-    await upsertSessionEntry({
-      agentId: resetSession.agentId,
-      sessionKey: resetSession.sessionKey,
-      storePath,
-      entry: { sessionId: resetSession.sessionId, updatedAt: 1 },
-    });
-    await setBinding(bindingStore, resetIdentity);
-    await bindingStore.retireSessionGeneration(resetIdentity);
-    const harness = makeHarness({
-      bindingStore,
-      resolveConfig: () => ({ session: { store: storePath } }),
-    });
-
-    await harness.reset?.({ ...resetSession, reason: "reset" });
-
-    await expect(
-      setBinding(bindingStore, resetIdentity, { threadId: "thread-recovered", cwd: "/repo" }),
-    ).resolves.toBe(true);
+    expect(bindingStore.read(resetIdentity)).toMatchObject({ threadId: replacement });
   });
 
   it("withSessionContextReset removes bindings at the session commit boundary", async () => {

@@ -89,30 +89,25 @@ function expectModelCalls(...models: string[]) {
   expect(runAttempt.mock.calls.map(([, options]) => options.runtimeModelId)).toEqual(models);
 }
 
-it.each(["spawn", "abort"] as const)(
-  "retains a denied fallback's result after a %s",
-  async (effect) => {
-    const { params, refusal } = await refused(`acted-${effect}`);
-    const telemetry = buildEmptyToolTelemetry();
-    if (effect === "spawn") {
-      telemetry.acceptedSessionSpawns = [
-        { runId: "child-run", childSessionKey: "agent:main:subagent:child" },
-      ];
-    }
-    const denied = await turnResult(params, "denied", telemetry);
-    if (effect === "abort") {
-      denied.terminal = attemptTerminal.normalize({
-        aborted: true,
-        promptError: "Unexpected status 403: forbidden",
-        promptErrorSource: "prompt",
-      });
-    }
-    runAttempt.mockReset().mockResolvedValueOnce(refusal).mockResolvedValueOnce(denied);
-    await expect(createHarness().runAttempt?.(params)).resolves.toBe(denied);
-    expect(runAttempt).toHaveBeenCalledTimes(2);
-    expectNotice(params.onAgentEvent, "unavailable");
-  },
-);
+it.each(["spawn", "abort"])("retains denied fallback after %s", async (effect) => {
+  const { params, refusal } = await refused(`acted-${effect}`);
+  const telemetry = buildEmptyToolTelemetry();
+  if (effect === "spawn") {
+    telemetry.acceptedSessionSpawns = [{ runId: "child", childSessionKey: "agent:a:subagent:c" }];
+  }
+  const denied = await turnResult(params, "denied", telemetry);
+  if (effect === "abort") {
+    denied.terminal = attemptTerminal.normalize({
+      aborted: true,
+      promptError: "Unexpected status 403: forbidden",
+      promptErrorSource: "prompt",
+    });
+  }
+  runAttempt.mockReset().mockResolvedValueOnce(refusal).mockResolvedValueOnce(denied);
+  await expect(createHarness().runAttempt?.(params)).resolves.toBe(denied);
+  expect(runAttempt).toHaveBeenCalledTimes(2);
+  expectNotice(params.onAgentEvent, "unavailable");
+});
 
 it("retains read-only tool progress before a fallback authorization failure", async () => {
   const { params, refusal } = await refused("read-only-progress");

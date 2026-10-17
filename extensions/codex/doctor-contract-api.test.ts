@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -120,9 +121,7 @@ async function bindingFixture(
     ...options.binding,
   });
   const migration = stateMigrations[0];
-  if (!migration) {
-    throw new Error("missing Codex binding migration");
-  }
+  assert(migration, "missing Codex binding migration");
   const params = {
     config: {},
     env,
@@ -147,9 +146,7 @@ async function bindingFixture(
     }),
     readBinding: async () => {
       const binding = await createStoredCodexAppServerBinding(await readJson(sidecarPath));
-      if (!binding) {
-        throw new Error("missing imported Codex binding");
-      }
+      assert(binding, "missing imported Codex binding");
       return binding;
     },
     readSession: (sessionKey: string, agentId = "main", from = storePath) =>
@@ -696,9 +693,7 @@ describe("codex doctor contract", () => {
       context: createDoctorContext(env),
     };
     const migration = stateMigrations[0];
-    if (!migration) {
-      throw new Error("missing Codex binding migration");
-    }
+    assert(migration, "missing Codex binding migration");
 
     await expect(migration.detectLegacyState(params)).resolves.toBeNull();
   });
