@@ -411,12 +411,16 @@ attribute capture-induced stalls when analyzing an individual capture; it cannot
 be subtracted from aggregate event-loop maxima or percentiles. The measurement
 reports the cost; it does not prevent or interrupt the native stall.
 
-From a source checkout, attribute native self samples to their nearest JavaScript
-parent with:
+For a full `profile` result, a source checkout can attribute native self samples
+to their nearest JavaScript parent with:
 
 ```bash
 node scripts/diagnostic-cpu-native-parents.mts cpu-1.json cpu-2.json
 ```
+
+This analyzer requires a full profile. For a truncated result, inspect its
+`summary` rows directly: each `stack` starts at the sampled function and continues
+through its nearest callers, with `sampleCount` recording how often it was sampled.
 
 The script accepts saved RPC results or raw V8 profiles and prints the top 20
 parents for each capture. Add `--json` for all parent rows. Percentages use elapsed
