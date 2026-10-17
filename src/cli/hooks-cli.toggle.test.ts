@@ -5,8 +5,8 @@ import type { TransformConfigFileParams } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { GatewayTransportError } from "../gateway/transport-error.js";
 import type { HookStatusEntry, HookStatusReport } from "../hooks/hooks-status.js";
+import { makeHookStatusEntry } from "./cli-fixtures.test-support.js";
 import { ExpectedCliError } from "./failure-output.js";
-import { createEmptyInstallChecks } from "./requirements-test-fixtures.js";
 import { createCliRuntimeCapture } from "./test-runtime-capture.js";
 
 const mocks = vi.hoisted(() => ({
@@ -149,23 +149,13 @@ const sourceConfig = {
   },
 };
 
-const hook: HookStatusEntry = {
+const hook = makeHookStatusEntry({
   name: "display-name",
   description: "Hook with a metadata config-key override",
   source: "openclaw-workspace",
-  filePath: "/tmp/openclaw-hook-workspace/HOOK.md",
   baseDir: "/tmp/openclaw-hook-workspace",
-  handlerPath: "/tmp/openclaw-hook-workspace/handler.js",
   hookKey: "metadata-key",
-  events: ["command:new"],
-  unknownEvents: [],
-  always: false,
-  enabledByConfig: true,
-  requirementsSatisfied: true,
-  loadable: true,
-  managedByPlugin: false,
-  ...createEmptyInstallChecks(),
-};
+});
 
 const report: HookStatusReport = {
   workspaceDir: "/tmp/openclaw-hook-workspace",
@@ -419,7 +409,6 @@ describe("hooks CLI metadata config keys", () => {
   it("uses hooks.status for the check read command", async () => {
     mocks.listAgentIds.mockReturnValue(["main", "research"]);
     mocks.callGateway.mockResolvedValue({ ...report, workspaceDir: "/gateway/research" });
-    mocks.buildWorkspaceHookStatus.mockClear();
     await runHooks("check", "--agent", "research", "--json");
     expect(mocks.getRuntimeConfig).toHaveBeenCalledWith({ skipPluginValidation: true });
     expect(mocks.callGateway).toHaveBeenCalledWith({

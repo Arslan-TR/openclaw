@@ -6,9 +6,9 @@ import { withContendedConfigMutation } from "../../test/helpers/config-mutation-
 import { readConfigFileSnapshot } from "../config/config.js";
 import type { HookStatusEntry, HookStatusReport } from "../hooks/hooks-status.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { makeHookStatusEntry } from "./cli-fixtures.test-support.js";
 import { formatHookInfo, formatHooksCheck, formatHooksList } from "./hooks-cli.format.js";
 import { registerHooksCli } from "./hooks-cli.js";
-import { createEmptyInstallChecks } from "./requirements-test-fixtures.js";
 
 const runPluginInstallCommandMock = vi.hoisted(() => vi.fn());
 const runPluginUpdateCommandMock = vi.hoisted(() => vi.fn());
@@ -21,25 +21,10 @@ vi.mock("./plugins-update-command.js", () => ({
   runPluginUpdateCommand: runPluginUpdateCommandMock,
 }));
 
-const hook: HookStatusEntry = {
-  name: "session-memory",
-  description: "Save session context to memory",
-  source: "openclaw-bundled",
-  filePath: "/tmp/hooks/session-memory/HOOK.md",
-  baseDir: "/tmp/hooks/session-memory",
-  handlerPath: "/tmp/hooks/session-memory/handler.js",
-  hookKey: "session-memory",
+const hook = makeHookStatusEntry({
   emoji: "💾",
   homepage: "https://docs.openclaw.ai/automation/hooks#session-memory",
-  events: ["command:new"],
-  unknownEvents: [],
-  always: false,
-  enabledByConfig: true,
-  requirementsSatisfied: true,
-  loadable: true,
-  managedByPlugin: false,
-  ...createEmptyInstallChecks(),
-};
+});
 function withHook(overrides: Partial<HookStatusEntry> = {}): HookStatusReport {
   return {
     workspaceDir: "/tmp/workspace",

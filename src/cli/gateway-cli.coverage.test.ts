@@ -5,6 +5,7 @@ import { Command } from "commander";
 import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createEmptyCostUsageTotals } from "../infra/session-cost-usage-totals.js";
 import type { CostUsageSummary } from "../infra/session-cost-usage.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { registerGatewayCli } from "./gateway-cli.js";
@@ -128,23 +129,6 @@ async function expectJsonValidationFailure(args: string[], message: unknown) {
   expect(runtimeErrors).toHaveLength(0);
 }
 
-function costTotals(overrides: Partial<CostUsageSummary["totals"]>): CostUsageSummary["totals"] {
-  return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    totalCost: 0,
-    inputCost: 0,
-    outputCost: 0,
-    cacheReadCost: 0,
-    cacheWriteCost: 0,
-    missingCostEntries: 0,
-    ...overrides,
-  };
-}
-
 describe("gateway-cli coverage", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
@@ -215,7 +199,8 @@ describe("gateway-cli coverage", () => {
       updatedAt: 1,
       days: 7,
       daily: [],
-      totals: costTotals({
+      totals: {
+        ...createEmptyCostUsageTotals(),
         input: 12,
         totalTokens: 12,
         missingCostEntries: 12,
@@ -223,7 +208,7 @@ describe("gateway-cli coverage", () => {
           "openai/gpt-5.6-sol": 10,
           "openai-codex/gpt-5.5": 2,
         },
-      }),
+      },
       cacheStatus: {
         status: "fresh",
         cachedFiles: 1,
@@ -240,13 +225,14 @@ describe("gateway-cli coverage", () => {
   });
 
   it("preserves the first unavailable partial usage-cost result", async () => {
-    const totals = costTotals({
+    const totals: CostUsageSummary["totals"] = {
+      ...createEmptyCostUsageTotals(),
       input: 100,
       totalTokens: 100,
       totalCost: 0.1,
       inputCost: 0.1,
       usageReport: { state: "unavailable" },
-    });
+    };
     const summary: CostUsageSummary = {
       updatedAt: 1,
       days: 7,
@@ -265,7 +251,6 @@ describe("gateway-cli coverage", () => {
     });
     const output = runtimeLogs.join("\n");
     const figures = "unavailable (known subtotal: $0.10 · 100 tokens)";
-    expect(output).toContain(`Total: ${figures}`);
     expect(output).toContain(`Latest day: 2026-09-01 · ${figures}`);
     expect(output).toContain(
       `Usage totals may be incomplete (partial). Run this command again later.\nTotal: ${figures}`,
@@ -384,10 +369,7 @@ describe("gateway-cli coverage", () => {
             usedHeapSizeBytes: 1536,
             heapSizeLimitBytes: 4096,
           },
-          activeResources: {
-            total: 2,
-            byType: { Timeout: 2 },
-          },
+          activeResources: { total: 2, byType: { Timeout: 2 } },
           topSessionFiles: [
             {
               relativePath: "agents/<agent>/sessions/<session>.jsonl",
@@ -402,8 +384,6 @@ describe("gateway-cli coverage", () => {
         capacity: 1000,
         count: 1,
         dropped: 0,
-        firstSeq: 1,
-        lastSeq: 1,
         events: [
           {
             seq: 1,
@@ -546,51 +526,45 @@ describe("gateway-cli coverage", () => {
     );
   });
 
-  it.each(["--log-bytes"])(
-    "rejects an explicitly empty gateway diagnostics export %s",
-    async (flag) => {
-      callGateway.mockClear();
-      const tempDir = tempDirs.make("openclaw-gateway-cli-empty-");
-      const outputPath = path.join(tempDir, "diagnostics.zip");
-      await withEnvAsync(
-        { OPENCLAW_STATE_DIR: tempDir, OPENCLAW_TEST_FILE_LOG: undefined },
-        async () => {
-          await expectGatewayExit([
-            "diagnostics",
-            "export",
-            flag,
-            "",
-            "--output",
-            outputPath,
-            "--json",
-          ]);
-        },
-      );
+  it("rejects an explicitly empty gateway diagnostics export --log-bytes", async () => {
+    const flag = "--log-bytes";
+    callGateway.mockClear();
+    const tempDir = tempDirs.make("openclaw-gateway-cli-empty-");
+    const outputPath = path.join(tempDir, "diagnostics.zip");
+    await withEnvAsync(
+      { OPENCLAW_STATE_DIR: tempDir, OPENCLAW_TEST_FILE_LOG: undefined },
+      async () => {
+        await expectGatewayExit([
+          "diagnostics",
+          "export",
+          flag,
+          "",
+          "--output",
+          outputPath,
+          "--json",
+        ]);
+      },
+    );
 
-      expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
-        ok: false,
-        error: { type: "cli_error", message: `${flag} must be a positive integer.` },
-      });
-      expect(runtimeErrors).toHaveLength(0);
-      expect(callGateway).not.toHaveBeenCalled();
-      expect(fs.existsSync(outputPath)).toBe(false);
-    },
-  );
+    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({
+      ok: false,
+      error: { type: "cli_error", message: `${flag} must be a positive integer.` },
+    });
+    expect(runtimeErrors).toHaveLength(0);
+    expect(callGateway).not.toHaveBeenCalled();
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
 
   it.each([
     {
       name: "prefers the resolved service address over TXT hints",
       beacon: {
         instanceName: "Studio gateway",
-        displayName: "Studio",
-        domain: "openclaw.internal.",
         host: "studio.openclaw.internal",
         port: 18789,
         lanHost: "untrusted.example.test",
         tailnetDns: "untrusted.tailnet.test",
         gatewayPort: 12345,
-        sshPort: 22,
-        txt: { gatewayPort: "12345" },
       } satisfies DiscoveredBeacon,
       wsUrl: "ws://studio.openclaw.internal:18789",
     },
@@ -626,24 +600,22 @@ describe("gateway-cli coverage", () => {
     );
   });
 
-  it.each([29443])(
-    "forwards the resolved Gateway port %i in discovery SSH tunnel hints",
-    async (port) => {
-      discoverGatewayBeacons.mockResolvedValueOnce([
-        {
-          instanceName: "Remote gateway",
-          host: "gateway.example",
-          port,
-          gatewayPort: 41111,
-          sshPort: 2222,
-        },
-      ]);
+  it("forwards the resolved Gateway port in discovery SSH tunnel hints", async () => {
+    const port = 29443;
+    discoverGatewayBeacons.mockResolvedValueOnce([
+      {
+        instanceName: "Remote gateway",
+        host: "gateway.example",
+        port,
+        gatewayPort: 41111,
+        sshPort: 2222,
+      },
+    ]);
 
-      await runGatewayCommand(["discover"]);
+    await runGatewayCommand(["discover"]);
 
-      const output = runtimeLogs.join("\n");
-      expect(output).toContain(`ws://gateway.example:${port}`);
-      expect(output).toContain(`ssh -N -L 18789:127.0.0.1:${port} <user>@gateway.example -p 2222`);
-    },
-  );
+    const output = runtimeLogs.join("\n");
+    expect(output).toContain(`ws://gateway.example:${port}`);
+    expect(output).toContain(`ssh -N -L 18789:127.0.0.1:${port} <user>@gateway.example -p 2222`);
+  });
 });

@@ -198,68 +198,59 @@ async function runHooksCli(params: {
   child.stderr.setEncoding("utf8");
   child.stdin.end(params.stdin ?? "");
 
-  return await new Promise<{
-    code: number | null;
-    signal: NodeJS.Signals | null;
-    stderr: string;
-    stdout: string;
-  }>((resolve, reject) => {
-    let timedOut = false;
-    let outputObserved = false;
-    const processState = () => ({
-      outputObserved,
-      exitCode: child.exitCode,
-      signalCode: child.signalCode,
-      stdoutClosed: child.stdout.closed,
-      stderrClosed: child.stderr.closed,
-    });
-    let timeoutState: ReturnType<typeof processState> | undefined;
-    const onTimeout = () => {
-      timedOut = true;
-      timeoutState ??= processState();
-      child.kill("SIGKILL");
-    };
-    // Silent relay success has no stream milestone. Give it an exit deadline
-    // while keeping the tighter post-output deadline for leaked handles.
-    const initialTimeoutMs = params.completion === "exit" ? exitOnlyTimeoutMs : outputTimeoutMs;
-    let timer = setTimeout(onTimeout, initialTimeoutMs);
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      if (timedOut || params.completion === "exit" || outputObserved) {
-        return;
-      }
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    },
+  );
+  let outputObserved = false;
+  const processState = () => ({
+    outputObserved,
+    exitCode: child.exitCode,
+    signalCode: child.signalCode,
+    stdoutClosed: child.stdout.closed,
+    stderrClosed: child.stderr.closed,
+  });
+  let timeoutState: ReturnType<typeof processState> | undefined;
+  const onTimeout = () => {
+    timeoutState ??= processState();
+    child.kill("SIGKILL");
+  };
+  // Silent relays need an exit deadline; output-producing commands must release handles after output.
+  let timer = setTimeout(
+    onTimeout,
+    params.completion === "exit" ? exitOnlyTimeoutMs : outputTimeoutMs,
+  );
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+    if (!timeoutState && params.completion !== "exit" && !outputObserved) {
       outputObserved = true;
       clearTimeout(timer);
       timer = setTimeout(onTimeout, exitAfterOutputTimeoutMs);
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      activeChildren.delete(child);
-      reject(error);
-    });
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      activeChildren.delete(child);
-      if (timedOut) {
-        const timeoutMessage =
-          params.completion === "exit"
-            ? `${params.label} did not exit within ${exitOnlyTimeoutMs}ms`
-            : timeoutState?.outputObserved
-              ? `${params.label} did not exit within ${exitAfterOutputTimeoutMs}ms after emitting output`
-              : `${params.label} did not emit output within ${outputTimeoutMs}ms`;
-        reject(
-          new Error(
-            `${timeoutMessage}\nprocess: ${JSON.stringify({ beforeKill: timeoutState, atClose: processState() })}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
-          ),
-        );
-        return;
-      }
-      resolve({ code, signal, stderr, stdout });
-    });
+    }
   });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  try {
+    const exit = await closed;
+    if (timeoutState) {
+      const timeoutMessage =
+        params.completion === "exit"
+          ? `${params.label} did not exit within ${exitOnlyTimeoutMs}ms`
+          : timeoutState.outputObserved
+            ? `${params.label} did not exit within ${exitAfterOutputTimeoutMs}ms after emitting output`
+            : `${params.label} did not emit output within ${outputTimeoutMs}ms`;
+      throw new Error(
+        `${timeoutMessage}\nprocess: ${JSON.stringify({ beforeKill: timeoutState, atClose: processState() })}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      );
+    }
+    return { ...exit, stderr, stdout };
+  } finally {
+    clearTimeout(timer);
+    activeChildren.delete(child);
+  }
 }
 
 describe("hooks CLI process lifecycle", () => {

@@ -209,47 +209,45 @@ async function expectInProcessHelp(program: Command, args: string[], output: { s
   expect(output.stderr).toBe("");
 }
 
+const logRecord = (level: string, message: unknown) => expect.objectContaining({ level, message });
+
 describe("CLI help process exit", () => {
-  it("exits promptly after root --help", async () => {
-    // Keep this precomputed-help case off plugin discovery; plugin-sensitive root help is covered
-    // separately, so the shared child timeout remains a deadlock guard rather than a startup SLO.
-    const result = await runCliProcess({
-      args: ["--help"],
-      config: { logging: { consoleStyle: "json", level: "silent" } },
-      forbidTlsImport: true,
-      forbidForcedExit: true,
-      env: { NODE_USE_SYSTEM_CA: "0" },
-    });
-
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: openclaw [options] [command]");
-    expect(() => parseJsonLines(result.stdout)).toThrow();
+  it.each([
+    {
+      name: "precomputed root",
+      params: {
+        args: ["--help"],
+        config: { logging: { consoleStyle: "json", level: "silent" } },
+        forbidTlsImport: true,
+        env: { NODE_USE_SYSTEM_CA: "0" },
+      },
+      usage: "Usage: openclaw [options] [command]",
+      plainText: true,
+    },
+    {
+      name: "plugin-sensitive root",
+      params: {
+        args: ["--help"],
+        config: { plugins: { enabled: false } },
+        env: { NODE_USE_SYSTEM_CA: "0" },
+      },
+      usage: "Usage: openclaw [options] [command]",
+      plainText: false,
+    },
+    {
+      name: "lazy group",
+      params: { args: ["backup", "--help"], entry: preparedCliEntry },
+      usage: "Usage: openclaw backup [options] [command]",
+      plainText: false,
+    },
+  ])("exits naturally after $name help", async ({ params, usage, plainText }) => {
+    const result = await runCliProcess({ ...params, forbidForcedExit: true });
+    expect(result).toMatchObject({ stderr: "", stdout: expect.stringContaining(usage) });
+    if (plainText) {
+      expect(() => parseJsonLines(result.stdout)).toThrow();
+    }
   });
 
-  it("exits naturally after plugin-sensitive root help", async () => {
-    const result = await runCliProcess({
-      args: ["--help"],
-      config: { plugins: { enabled: false } },
-      forbidForcedExit: true,
-      env: { NODE_USE_SYSTEM_CA: "0" },
-    });
-
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: openclaw [options] [command]");
-  });
-
-  // One lazy process is representative by design; the matrix below exercises
-  // both core and sub-CLI registrars without multiplying Node+tsx launches.
-  it("exits promptly after a lazy group --help", async () => {
-    const result = await runCliProcess({
-      args: ["backup", "--help"],
-      entry: preparedCliEntry,
-      forbidForcedExit: true,
-    });
-
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: openclaw backup [options] [command]");
-  });
   it("flushes explicitly requested entry traces on precomputed help", async () => {
     const result = await runCliProcess({
       args: ["gateway", "--help"],
@@ -261,10 +259,7 @@ describe("CLI help process exit", () => {
 
     expect(parseJsonLines(result.stderr)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          level: "info",
-          message: expect.stringContaining("startup trace: entry.bootstrap"),
-        }),
+        logRecord("info", expect.stringContaining("startup trace: entry.bootstrap")),
       ]),
     );
   });
@@ -578,10 +573,7 @@ describe("JSON console style process output", () => {
       });
 
       expect(parseJsonLines(result.stderr)).toEqual([
-        expect.objectContaining({
-          level: "error",
-          message: expect.stringContaining("--container requires a value"),
-        }),
+        logRecord("error", expect.stringContaining("--container requires a value")),
       ]);
     },
     SLOW_DOTENV_TEST_TIMEOUT_MS,
@@ -607,18 +599,9 @@ describe("JSON console style process output", () => {
 
       expect(parseJsonLines(result.stderr)).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({
-            level: "info",
-            message: expect.stringContaining("startup trace: entry.bootstrap"),
-          }),
-          expect.objectContaining({
-            level: "error",
-            message: "[openclaw] Could not start the CLI.",
-          }),
-          expect.objectContaining({
-            level: "error",
-            message: "[openclaw] For help, run `openclaw doctor`.",
-          }),
+          logRecord("info", expect.stringContaining("startup trace: entry.bootstrap")),
+          logRecord("error", "[openclaw] Could not start the CLI."),
+          logRecord("error", "[openclaw] For help, run `openclaw doctor`."),
         ]),
       );
       expect(result.stderr).not.toContain("forced run-main import failure");

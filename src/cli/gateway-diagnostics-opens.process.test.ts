@@ -107,7 +107,7 @@ fs.mkdtempSync = function(prefix, ...rest) {
 const open = fs.openSync;
 fs.openSync = function(file, flags, ...rest) {
   if (String(file) === ${JSON.stringify(databasePath)}) {
-    record({ kind: "source", flags, stack: new Error().stack });
+    record({ kind: "source" });
   }
   return open.call(this, file, flags, ...rest);
 };
@@ -122,29 +122,24 @@ record({ kind: "preload" });
 `,
   );
   try {
+    const commands: Array<[string, Record<string, unknown>]> = message
+      ? [
+          [
+            "message read --channel discord --target 123456789012345678 --limit 1",
+            { action: "read", channel: "discord", payload: { messages: [] } },
+          ],
+        ]
+      : [
+          ["cron list", { jobs: [] }],
+          ["gateway call cron.status", { enabled: true }],
+        ];
     for (const online of [true, false]) {
       if (!online) {
         await closeActiveGatewayServers();
         await lock?.release();
       }
-      const commands = message
-        ? [
-            [
-              "message",
-              "read",
-              "--channel",
-              "discord",
-              "--target",
-              "123456789012345678",
-              "--limit",
-              "1",
-            ],
-          ]
-        : [
-            ["cron", "list"],
-            ["gateway", "call", "cron.status"],
-          ];
-      for (const args of commands) {
+      for (const [command, expected] of commands) {
+        const args = command.split(" ");
         await fs.writeFile(opensPath, "");
         await fs.writeFile(timelinePath, "");
         const result = await runIsolatedGatewayCli({
@@ -171,13 +166,7 @@ record({ kind: "preload" });
         });
         expect(result, result.stderr).toMatchObject({ code: online ? 0 : 1, signal: null });
         if (online) {
-          expect(JSON.parse(result.stdout)).toMatchObject(
-            args[0] === "message"
-              ? { action: "read", channel: "discord", payload: { messages: [] } }
-              : args[0] === "cron"
-                ? { jobs: [] }
-                : { enabled: true },
-          );
+          expect(JSON.parse(result.stdout)).toMatchObject(expected);
         } else {
           expect(result.stdout + result.stderr).toContain("Gateway not reachable");
         }
@@ -193,7 +182,7 @@ record({ kind: "preload" });
               ? event.kind === "snapshot" || event.kind === "capture"
               : event.kind !== "preload",
           ),
-          `${online ? "online" : "offline"} ${args.join(" ")}`,
+          `${online ? "online" : "offline"} ${command}`,
         ).toEqual([]);
       }
     }

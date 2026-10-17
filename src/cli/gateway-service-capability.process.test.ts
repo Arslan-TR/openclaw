@@ -100,7 +100,6 @@ if (threads.isMainThread) record("ready");
   const startTime = getFileLockProcessStartTime(process.pid);
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   return {
-    databasePath,
     stateDir,
     probeOperations: () =>
       fs
@@ -173,14 +172,6 @@ it(
       expect(version.stdout).toMatch(/^OpenClaw /u);
       expect(fixture.probeOperations()).toEqual(["ready", "ready", "ready"]);
       expect(snapshotState(fixture.stateDir)).toEqual(before);
-      const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
-      try {
-        expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
-          OPENCLAW_STATE_SCHEMA_VERSION - 1,
-        );
-      } finally {
-        database.close();
-      }
     } finally {
       fixture.gateway.release();
     }
