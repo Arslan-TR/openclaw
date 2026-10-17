@@ -16,6 +16,7 @@ import { withOwnedSessionTranscriptWrites } from "../config/sessions/transcript-
 import { getAgentEventLifecycleGeneration } from "../infra/agent-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { readAgentRunProviderReview } from "../sessions/provider-review-terminal.js";
+import { AgentDeletionPendingError } from "../sessions/session-agent-work-admission.js";
 import { parseCronRunScopeSuffix } from "../sessions/session-key-utils.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
 import {
@@ -96,7 +97,16 @@ export function prepareGatewaySessionLifecycleEvent(params: GatewaySessionLifecy
   });
   // Queue waits must not leave an early read rejection unobserved.
   void prepared.catch(() => undefined);
-  return async () => persistPreparedGatewaySessionLifecycleEvent(params, phase, await prepared);
+  return async () => {
+    try {
+      await persistPreparedGatewaySessionLifecycleEvent(params, phase, await prepared);
+    } catch (error) {
+      // Deletion refuses late projections while still waiting for the run's actual cleanup.
+      if (phase === "start" || !(error instanceof AgentDeletionPendingError)) {
+        throw error;
+      }
+    }
+  };
 }
 
 async function persistPreparedGatewaySessionLifecycleEvent(

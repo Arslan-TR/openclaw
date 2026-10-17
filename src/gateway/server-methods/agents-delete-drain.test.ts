@@ -13,14 +13,24 @@ import {
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import * as sessionInventory from "../../config/sessions/session-entry-read-runtime.js";
+import { CronService } from "../../cron/service.js";
+import { emitAgentEvent } from "../../infra/agent-events.js";
 import {
   beginSessionWorkAdmission,
   type SessionWorkAdmissionLease,
 } from "../../sessions/session-lifecycle-admission.js";
 import * as deletionJournals from "../../state/agent-deletion-journal.js";
+import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { runWithChatAbortExecution } from "../chat-abort-lifecycle-internal.js";
+import { registerChatAbortController } from "../chat-abort.js";
 import { resumeAgentDeletions } from "../server-agent-deletion-recovery.js";
+import {
+  createSessionEventSubscriberRegistry,
+  createSessionMessageSubscriberRegistry,
+} from "../server-chat-state.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
+import { startGatewayEventSubscriptions } from "../server-runtime-subscriptions.js";
 import { TerminalSessionManager } from "../terminal/session-manager.js";
 import {
   agentTerminalOwner,
@@ -38,6 +48,123 @@ import { drainAgentDeletionRuns } from "./agents-delete-drain.js";
 import { deleteGatewayAgent } from "./agents-delete.js";
 
 afterEach(() => vi.restoreAllMocks());
+
+it("deletes an agent after its refused terminal projection and raw execution have settled", async () => {
+  await withOpenClawTestState({ label: "deletion-terminal-drain" }, async (state) => {
+    await state.writeConfig({
+      agents: {
+        ownership: "explicit",
+        entries: { keeper: { workspace: state.workspaceDir }, doomed: {} },
+      },
+    });
+    await captureRuntimeConfigAsyncReader()();
+    const sessionKey = "agent:doomed:dashboard:ending";
+    const sessionId = "ending-session";
+    const runId = "ending-run";
+    await replaceSessionEntry(
+      { agentId: "doomed", sessionKey },
+      { sessionId, lifecycleRunId: runId, updatedAt: 1 },
+    );
+    const scheduler = createTestGatewayScheduler();
+    const cron = new CronService({
+      scheduler,
+      storePath: state.statePath("cron/jobs.json"),
+      cronEnabled: false,
+      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
+    });
+    const context = createDirectChatContext({ cron, getRuntimeConfig });
+    const subscriptions = startGatewayEventSubscriptions({
+      scheduler,
+      signal: new AbortController().signal,
+      log: context.logGateway,
+      broadcast: context.broadcast,
+      broadcastToConnIds: context.broadcastToConnIds,
+      nodeHasSessionSubscribers: () => false,
+      nodeSendToSession: context.nodeSendToSession,
+      agentRunSeq: context.agentRunSeq,
+      chatRunState: context.chatRunState,
+      toolEventRecipients: context.chatRunState.toolEventRecipients,
+      sessionEventSubscribers: createSessionEventSubscriberRegistry(),
+      sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
+      chatAbortControllers: context.chatAbortControllers,
+      restartRecoveryCandidates: new Map(),
+      refreshConnectedUserProfiles: vi.fn(),
+    });
+    const registration = registerChatAbortController({
+      chatAbortControllers: context.chatAbortControllers,
+      agentId: "doomed",
+      sessionKey,
+      sessionId,
+      runId,
+      kind: "agent",
+      timeoutMs: 60_000,
+    });
+    if (!registration.entry) {
+      throw new Error("Expected an active run registration");
+    }
+    const entry = registration.entry;
+    const aborted = createDeferred();
+    const terminalSettled = createDeferred();
+    const finishExecution = createDeferred();
+    let terminalPersistence: Promise<void> | undefined;
+    registration.controller.signal.addEventListener("abort", () => aborted.resolve(), {
+      once: true,
+    });
+    const execution = runWithChatAbortExecution(
+      entry,
+      async () => {
+        await aborted.promise;
+        emitAgentEvent({
+          runId,
+          sessionId,
+          sessionKey,
+          agentId: "doomed",
+          stream: "lifecycle",
+          data: { phase: "error", aborted: true, stopReason: "aborted" },
+        });
+        registration.cleanup();
+        terminalPersistence = entry.projectSessionTerminalPersistence;
+        await terminalPersistence?.catch(() => {});
+        terminalSettled.resolve();
+        await finishExecution.promise;
+      },
+      registration.cleanup,
+    );
+    const deleting = deleteGatewayAgent("doomed", true, context);
+    const deletionResult = Promise.allSettled([deleting]);
+    try {
+      await awaitGateBeforeSettlement(
+        terminalSettled.promise,
+        deleting,
+        "deletion skipped cancellation",
+      );
+      expect(terminalPersistence).toBeInstanceOf(Promise);
+      expect(context.chatAbortControllers.get(runId)).toBe(entry);
+      expect(getRuntimeConfig().agents?.entries?.doomed).toBeDefined();
+      await expect(
+        patchSessionEntryCore({ agentId: "doomed", sessionKey }, () => ({ label: "late write" })),
+      ).rejects.toThrow("deletion is draining active work");
+      finishExecution.resolve();
+      await execution;
+      await expect(deleting).resolves.toMatchObject({ ok: true, agentId: "doomed" });
+      expect(context.chatAbortControllers.has(runId)).toBe(false);
+      expect(getRuntimeConfig().agents?.entries?.doomed).toBeUndefined();
+    } finally {
+      aborted.resolve();
+      finishExecution.resolve();
+      await execution;
+      await deletionResult;
+      registration.cleanup();
+      await subscriptions.agentUnsub();
+      subscriptions.heartbeatUnsub();
+      subscriptions.transcriptUnsub();
+      subscriptions.lifecycleUnsub();
+    }
+  });
+});
 
 it.each(["rollback", "rollback during recovery"] as const)(
   "keeps session writes fenced after a draining deletion fails until %s",
