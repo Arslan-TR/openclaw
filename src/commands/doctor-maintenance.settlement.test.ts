@@ -32,26 +32,61 @@ import * as nocow from "./doctor-sqlite-nocow.js";
 const settlement = await import("./doctor-maintenance.settlement.test-support.js");
 const { begin, boundary, cleanupBarrier, root, tempDirs } = settlement;
 
+type BoundaryMock = Exclude<keyof typeof boundary, "scopeAssert">;
+
+function expectCalls(count: number, ...names: BoundaryMock[]) {
+  for (const name of names) {
+    expect(boundary[name], name).toHaveBeenCalledTimes(count);
+  }
+}
+
+function expectOrder(first: BoundaryMock, second: BoundaryMock) {
+  expect(boundary[first].mock.invocationCallOrder[0]!).toBeLessThan(
+    boundary[second].mock.invocationCallOrder[0]!,
+  );
+}
+
+function beginOffline(databaseGenerations?: Record<string, string | null>) {
+  return beginDoctorMaintenance({
+    root: null,
+    options: { repair: true, nonInteractive: true },
+    runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
+    databaseGenerations,
+  });
+}
+
+function seedEvidence(pathname: string) {
+  const db = new DatabaseSync(pathname);
+  db.exec("CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)");
+  db.close();
+}
+
+async function waitForCleanup(
+  work: Promise<unknown>,
+  barrier: ReturnType<typeof cleanupBarrier>,
+  message: string,
+) {
+  await Promise.race([
+    barrier.joining,
+    work.then(() => {
+      throw new Error(message);
+    }),
+  ]);
+}
+
 it("refuses rollback attribution for writes preceding Doctor admission", async () => {
   vi.spyOn(updateState, "readUpdateDatabaseGenerationsIsolated").mockImplementation(async (paths) =>
     readUpdateDatabaseGenerations(paths),
   );
   const pathname = path.join(settlement.tempDirs.make("doctor-write-receipt-"), "agent.sqlite");
   const missing = `${pathname}.missing`;
-  const seed = new DatabaseSync(pathname);
-  seed.exec("CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)");
-  seed.close();
+  seedEvidence(pathname);
   const databaseGenerations = readUpdateDatabaseGenerations([pathname, missing]);
   const foreign = new DatabaseSync(pathname);
   foreign.exec("INSERT INTO evidence VALUES (99)");
   foreign.close();
   const admitted = readUpdateDatabaseGenerations([pathname, missing]);
-  const maintenance = await beginDoctorMaintenance({
-    root: null,
-    options: { repair: true, nonInteractive: true },
-    runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
-    databaseGenerations,
-  });
+  const maintenance = await beginOffline(databaseGenerations);
   expect(maintenance?.databaseWrites).toBeUndefined();
   await maintenance!.releaseState();
   const receipt = maintenance!.databaseWrites;
@@ -76,9 +111,7 @@ it("refuses automatic restore after a NOCOW physical replacement during Doctor m
     readUpdateDatabaseGenerations(paths),
   );
   const pathname = path.join(settlement.tempDirs.make("doctor-nocow-receipt-"), "agent.sqlite");
-  const seed = new DatabaseSync(pathname);
-  seed.exec("CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)");
-  seed.close();
+  seedEvidence(pathname);
   const generations = readUpdateDatabaseGenerations([pathname]);
   const rewrite = vi.spyOn(nocow, "repairDoctorSqliteNoCow").mockImplementation(async () => {
     expect(boundary.close).toHaveBeenCalled();
@@ -86,12 +119,7 @@ it("refuses automatic restore after a NOCOW physical replacement during Doctor m
     fs.renameSync(`${pathname}.new`, pathname);
     return { changes: ["NOCOW rewrite complete"], warnings: [] };
   });
-  const maintenance = await beginDoctorMaintenance({
-    root: null,
-    options: { repair: true, nonInteractive: true },
-    runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
-    databaseGenerations: generations,
-  });
+  const maintenance = await beginOffline(generations);
   await maintenance!.repairSqliteNoCow([pathname]);
   await maintenance!.release();
   expect(rewrite).toHaveBeenCalledOnce();
@@ -115,12 +143,7 @@ it("keeps fingerprint failures advisory and publishes no database write proof", 
   );
   const pathname = path.join(settlement.tempDirs.make("doctor-write-proof-unavailable-"), "db");
   fs.mkdirSync(pathname);
-  const maintenance = await beginDoctorMaintenance({
-    root: null,
-    options: { repair: true, nonInteractive: true },
-    runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
-    databaseGenerations: { [pathname]: null },
-  });
+  const maintenance = await beginOffline({ [pathname]: null });
   await expect(maintenance!.finish({})).resolves.toBeUndefined();
   expect(maintenance!.databaseWrites).toBeUndefined();
   expect(maintenance!.warnings).toContainEqual(
@@ -157,18 +180,16 @@ it.each([
       await maintenance!.finish({});
     })().catch((error: unknown) => error);
     try {
-      await Promise.race([
-        barrier.joining,
-        work.then(() => {
-          throw new Error("Database custody ended before fingerprint worker cleanup joined");
-        }),
-      ]);
+      await waitForCleanup(
+        work,
+        barrier,
+        "Database custody ended before fingerprint worker cleanup joined",
+      );
       expect(boundary.release).not.toHaveBeenCalled();
       if (phase === "admission") {
         expect(boundary.stop).toHaveBeenCalledTimes(1);
       }
-      expect(boundary.resume).not.toHaveBeenCalled();
-      expect(boundary.restart).not.toHaveBeenCalled();
+      expectCalls(0, "resume", "restart");
       expect(maintenance?.databaseWrites).toBeUndefined();
     } finally {
       barrier.cleanup.resolve(cleanup);
@@ -177,8 +198,7 @@ it.each([
     const error = await work;
     if (cleanup === "forced") {
       expect(error).toBeUndefined();
-      expect(boundary.release).toHaveBeenCalledOnce();
-      expect(boundary.restart).toHaveBeenCalledOnce();
+      expectCalls(1, "release", "restart");
       expect(maintenance?.databaseWrites).toEqual({
         unchanged: true,
         fromGenerations: databaseGenerations,
@@ -192,10 +212,7 @@ it.each([
       await expect(maintenance.release()).rejects.toSatisfy(hasCommandProcessCleanupError);
       await expect(maintenance.releaseState()).rejects.toSatisfy(hasCommandProcessCleanupError);
     }
-    expect(boundary.release).not.toHaveBeenCalled();
-    expect(boundary.resume).not.toHaveBeenCalled();
-    expect(boundary.complete).not.toHaveBeenCalled();
-    expect(boundary.restart).not.toHaveBeenCalled();
+    expectCalls(0, "release", "resume", "complete", "restart");
   },
 );
 
@@ -205,27 +222,17 @@ it("restores the stopped Gateway before reporting a settled state-owner release 
   const maintenance = await begin();
 
   await expect(maintenance!.finish({})).rejects.toBe(failure);
-  expect(boundary.close).toHaveBeenCalledOnce();
-  expect(boundary.resume).toHaveBeenCalledOnce();
-  expect(boundary.restart).toHaveBeenCalledOnce();
-  expect(boundary.health).toHaveBeenCalledOnce();
+  expectCalls(1, "close", "resume", "restart", "health");
 });
 
-it.each([undefined])(
-  "reports a settled state-release failure without a managed Gateway (%j)",
-  async (config) => {
-    const failure = new Error("settled state release failed");
-    const maintenance = await beginDoctorMaintenance({
-      root: null,
-      options: { repair: true, nonInteractive: true },
-      runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
-    });
-    boundary.release.mockRejectedValueOnce(failure);
-    await expect(maintenance!.finish(config)).rejects.toBe(failure);
-    expect(boundary.close).toHaveBeenCalledOnce();
-    expect(boundary.restart).not.toHaveBeenCalled();
-  },
-);
+it("reports a settled state-release failure without a managed Gateway", async () => {
+  const failure = new Error("settled state release failed");
+  const maintenance = await beginOffline();
+  boundary.release.mockRejectedValueOnce(failure);
+  await expect(maintenance!.finish(undefined)).rejects.toBe(failure);
+  expectCalls(1, "close");
+  expectCalls(0, "restart");
+});
 
 it("retains state custody when the resource scope cannot close", async () => {
   const cleanupFailure = new Error("persistent resource cleanup failure");
@@ -235,10 +242,8 @@ it("retains state custody when the resource scope cannot close", async () => {
   await expect(maintenance!.finish({})).rejects.toThrow(
     "Doctor maintenance resource cleanup failed",
   );
-  expect(boundary.close).toHaveBeenCalledTimes(2);
-  expect(boundary.release).not.toHaveBeenCalled();
-  expect(boundary.restart).not.toHaveBeenCalled();
-  expect(boundary.health).not.toHaveBeenCalled();
+  expectCalls(2, "close");
+  expectCalls(0, "release", "restart", "health");
   expect(maintenance!.databaseWrites).toBeUndefined();
 });
 
@@ -248,10 +253,8 @@ it("restores the Gateway after a transient resource close failure settles on ret
   const maintenance = await begin();
 
   await expect(maintenance!.finish({})).rejects.toBe(transient);
-  expect(boundary.close).toHaveBeenCalledTimes(2);
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.restart).toHaveBeenCalledOnce();
-  expect(boundary.health).toHaveBeenCalledOnce();
+  expectCalls(2, "close");
+  expectCalls(1, "release", "restart", "health");
 });
 
 it("does not restart a Gateway already activated by config repair", async () => {
@@ -301,9 +304,9 @@ it("releases its acquired process owner without deferring a one-shot authority r
     }
   });
   await expect(begin(assertCurrent)).rejects.toBe(refused);
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.restart).not.toHaveBeenCalled();
-  expect(boundary.stop).toHaveBeenCalledOnce();
+  expectCalls(1, "release");
+  expectCalls(0, "restart");
+  expectCalls(1, "stop");
 });
 
 it("preserves caller cancellation after a settled maintenance inspection", async () => {
@@ -323,8 +326,8 @@ it("preserves caller cancellation after a settled maintenance inspection", async
     throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
   });
   await expect(withCommandProcessScope(() => begin(), controller.signal)).rejects.toBe(cancelled);
-  expect(boundary.stop).toHaveBeenCalledOnce();
-  expect(boundary.restart).not.toHaveBeenCalled();
+  expectCalls(1, "stop");
+  expectCalls(0, "restart");
 });
 
 it.each(["forced", "uncertain"] as const)(
@@ -343,16 +346,8 @@ it.each(["forced", "uncertain"] as const)(
     });
     const work = begin().catch((error: unknown) => error);
     try {
-      await Promise.race([
-        barrier.joining,
-        work.then(() => {
-          throw new Error("Admission compensated before physical cleanup joined");
-        }),
-      ]);
-      expect(boundary.resume).not.toHaveBeenCalled();
-      expect(boundary.complete).not.toHaveBeenCalled();
-      expect(boundary.restart).not.toHaveBeenCalled();
-      expect(boundary.release).not.toHaveBeenCalled();
+      await waitForCleanup(work, barrier, "Admission compensated before physical cleanup joined");
+      expectCalls(0, "resume", "complete", "restart", "release");
     } finally {
       barrier.cleanup.resolve(cleanup);
       await work;
@@ -360,9 +355,7 @@ it.each(["forced", "uncertain"] as const)(
     const error = await work;
     expect(collectNestedErrorCandidates(error)).toContain(original);
     expect(hasCommandProcessCleanupError(error)).toBe(cleanup === "uncertain");
-    expect(boundary.restart).toHaveBeenCalledTimes(cleanup === "forced" ? 1 : 0);
-    expect(boundary.resume).toHaveBeenCalledTimes(cleanup === "forced" ? 1 : 0);
-    expect(boundary.complete).toHaveBeenCalledTimes(cleanup === "forced" ? 1 : 0);
+    expectCalls(cleanup === "forced" ? 1 : 0, "restart", "resume", "complete");
     if (cleanup === "uncertain") {
       expect(boundary.release).not.toHaveBeenCalled();
     }
@@ -409,22 +402,13 @@ it.each([
     }
     const work = maintenance.finish({}).catch((error: unknown) => error);
     try {
-      await Promise.race([
-        barrier.joining,
-        work.then(() => {
-          throw new Error("Restoration advanced before physical cleanup joined");
-        }),
-      ]);
-      expect(boundary.restart).not.toHaveBeenCalled();
-      expect(boundary.health).not.toHaveBeenCalled();
-      expect(boundary.unlock).not.toHaveBeenCalled();
+      await waitForCleanup(work, barrier, "Restoration advanced before physical cleanup joined");
+      expectCalls(0, "restart", "health", "unlock");
       if (phase === "autostart") {
-        expect(boundary.complete).not.toHaveBeenCalled();
-        expect(boundary.read).not.toHaveBeenCalled();
+        expectCalls(0, "complete", "read");
       } else if (phase === "installation") {
-        expect(boundary.read).toHaveBeenCalledOnce();
-        expect(boundary.revalidate).toHaveBeenCalledOnce();
-        expect(boundary.resume).not.toHaveBeenCalled();
+        expectCalls(1, "read", "revalidate");
+        expectCalls(0, "resume");
         expect(boundary.complete).toHaveBeenCalledExactlyOnceWith(false);
       }
     } finally {
@@ -434,11 +418,10 @@ it.each([
     const error = await work;
     if (cleanup === "forced") {
       expect(error).toBeUndefined();
-      expect(boundary.restart).not.toHaveBeenCalled();
-      expect(boundary.health).toHaveBeenCalledOnce();
-      expect(boundary.read).toHaveBeenCalledTimes(2);
-      expect(boundary.revalidate).toHaveBeenCalledTimes(2);
-      expect(boundary.repair).toHaveBeenCalledOnce();
+      expectCalls(0, "restart");
+      expectCalls(1, "health");
+      expectCalls(2, "read", "revalidate");
+      expectCalls(1, "repair");
       expect(boundary.log).toHaveBeenCalledWith(
         "Gateway restarted and verified after Doctor repair.",
       );
@@ -456,11 +439,10 @@ it.each([
       const refusal = await release().catch((failure: unknown) => failure);
       expect(hasCommandProcessCleanupError(refusal)).toBe(true);
     }
-    expect(boundary.resume).toHaveBeenCalledTimes(resumes);
-    expect(boundary.complete).toHaveBeenCalledTimes(completions);
-    expect(boundary.release).toHaveBeenCalledTimes(releases);
-    expect(boundary.restart).not.toHaveBeenCalled();
-    expect(boundary.health).not.toHaveBeenCalled();
+    expectCalls(resumes, "resume");
+    expectCalls(completions, "complete");
+    expectCalls(releases, "release");
+    expectCalls(0, "restart", "health");
     expect(boundary.log).not.toHaveBeenCalledWith(
       "Gateway restarted and verified after Doctor repair.",
     );
@@ -668,11 +650,8 @@ it.each([false, true])(
       expect(String(refusal)).toContain("OpenClaw state database is busy at");
     }
     expect(elapsed).toBe(GATEWAY_SERVICE_STOP_TIMEOUT_MS);
-    expect(boundary.ownerAssert).not.toHaveBeenCalled();
-    expect(boundary.lease).not.toHaveBeenCalled();
-    expect(boundary.close).not.toHaveBeenCalled();
-    expect(boundary.restart).toHaveBeenCalledOnce();
-    expect(boundary.health).toHaveBeenCalledOnce();
+    expectCalls(0, "ownerAssert", "lease", "close");
+    expectCalls(1, "restart", "health");
     expect(boundary.log).toHaveBeenCalledWith(
       expect.stringMatching(/Warning:.*state ownership.*Restoring its service/),
     );
@@ -684,8 +663,7 @@ it("leaves an already stopped Gateway with its legacy update parent after repair
   boundary.stop.mockImplementation(async () => ({ ...settlement.stopped, stopped: false }));
   const maintenance = await begin();
   await maintenance!.finish({});
-  expect(boundary.restart).not.toHaveBeenCalled();
-  expect(boundary.health).not.toHaveBeenCalled();
+  expectCalls(0, "restart", "health");
 });
 
 const leaseGuidance =
@@ -720,14 +698,8 @@ it("refuses an external active agent lease before serving-Gateway coordinator co
     code: leaseCode,
   });
   expect(JSON.stringify(facts)).not.toContain("private");
-  expect(boundary.readLeases).toHaveBeenCalledOnce();
-  expect(boundary.gatewayAcquire).not.toHaveBeenCalled();
-  expect(boundary.ownerAssert).not.toHaveBeenCalled();
-  expect(boundary.lease).not.toHaveBeenCalled();
-  expect(boundary.stop).not.toHaveBeenCalled();
-  expect(boundary.restart).not.toHaveBeenCalled();
-  expect(boundary.close).not.toHaveBeenCalled();
-  expect(boundary.release).not.toHaveBeenCalled();
+  expectCalls(1, "readLeases");
+  expectCalls(0, "gatewayAcquire", "ownerAssert", "lease", "stop", "restart", "close", "release");
 });
 
 it("does not use an empty external lease observation to bypass coordinator contention", async () => {
@@ -739,12 +711,8 @@ it("does not use an empty external lease observation to bypass coordinator conte
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toMatchObject({ cause: contention });
   expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([]);
-  expect(boundary.readLeases).toHaveBeenCalledOnce();
-  expect(boundary.gatewayAcquire).toHaveBeenCalledOnce();
-  expect(boundary.ownerAssert).not.toHaveBeenCalled();
-  expect(boundary.lease).not.toHaveBeenCalled();
-  expect(boundary.stop).not.toHaveBeenCalled();
-  expect(boundary.close).not.toHaveBeenCalled();
+  expectCalls(1, "readLeases", "gatewayAcquire");
+  expectCalls(0, "ownerAssert", "lease", "stop", "close");
 });
 
 it("rechecks external leases under the process owner after an empty observation", async () => {
@@ -756,21 +724,13 @@ it("rechecks external leases under the process owner after an empty observation"
   expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([
     { check: "doctor", code: leaseCode, message: leaseGuidance },
   ]);
-  expect(boundary.readLeases).toHaveBeenCalledOnce();
-  expect(boundary.gatewayAcquire).toHaveBeenCalledOnce();
-  expect(boundary.ownerAssert).toHaveBeenCalledOnce();
-  expect(boundary.readLeases.mock.invocationCallOrder[0]!).toBeLessThan(
-    boundary.gatewayAcquire.mock.invocationCallOrder[0]!,
-  );
-  expect(boundary.ownerAssert.mock.invocationCallOrder[0]!).toBeLessThan(
-    boundary.lease.mock.invocationCallOrder[0]!,
-  );
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.stop).not.toHaveBeenCalled();
-  expect(boundary.close).toHaveBeenCalledOnce();
-  expect(boundary.close.mock.invocationCallOrder[0]!).toBeLessThan(
-    boundary.release.mock.invocationCallOrder[0]!,
-  );
+  expectCalls(1, "readLeases", "gatewayAcquire", "ownerAssert");
+  expectOrder("readLeases", "gatewayAcquire");
+  expectOrder("ownerAssert", "lease");
+  expectCalls(1, "release");
+  expectCalls(0, "stop");
+  expectCalls(1, "close");
+  expectOrder("close", "release");
 });
 
 it("fails closed on an unknown external lease observation without exposing private details", async () => {
@@ -796,15 +756,10 @@ it("fails closed on an unknown external lease observation without exposing priva
       stateDir: "/synthetic/private-state",
     }),
   ).toBe("DoctorMaintenanceRefusalError: Doctor could not enter maintenance.");
-  expect(boundary.gatewayAcquire).toHaveBeenCalledOnce();
-  expect(boundary.ownerAssert).toHaveBeenCalledOnce();
-  expect(boundary.lease).toHaveBeenCalledOnce();
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.stop).not.toHaveBeenCalled();
-  expect(boundary.close).toHaveBeenCalledOnce();
-  expect(boundary.close.mock.invocationCallOrder[0]!).toBeLessThan(
-    boundary.release.mock.invocationCallOrder[0]!,
-  );
+  expectCalls(1, "gatewayAcquire", "ownerAssert", "lease", "release");
+  expectCalls(0, "stop");
+  expectCalls(1, "close");
+  expectOrder("close", "release");
 });
 
 it("preserves held-owner unreadable-state guidance after an external diagnostic read fails", async () => {
@@ -828,14 +783,8 @@ it("preserves held-owner unreadable-state guidance after an external diagnostic 
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toBeInstanceOf(DoctorUnreadableStateDatabaseError);
   expect(String(refusal)).toContain("restore this file from a verified backup");
-  expect(boundary.gatewayAcquire).toHaveBeenCalledOnce();
-  expect(boundary.ownerAssert).toHaveBeenCalledOnce();
-  expect(boundary.lease).toHaveBeenCalledOnce();
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.close).toHaveBeenCalledOnce();
-  expect(boundary.close.mock.invocationCallOrder[0]!).toBeLessThan(
-    boundary.release.mock.invocationCallOrder[0]!,
-  );
+  expectCalls(1, "gatewayAcquire", "ownerAssert", "lease", "release", "close");
+  expectOrder("close", "release");
   expect(boundary.stop).not.toHaveBeenCalled();
 });
 
@@ -847,21 +796,12 @@ it("carries an actual typed lease refusal through Doctor IPC, finalization and p
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toBeInstanceOf(UpdateDoctorError);
   expect(refusal).toMatchObject({ cause, message: leaseGuidance });
-  expect(boundary.readLeases).not.toHaveBeenCalled();
-  expect(boundary.close).toHaveBeenCalledOnce();
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.close.mock.invocationCallOrder[0]!).toBeLessThan(
-    boundary.release.mock.invocationCallOrder[0]!,
-  );
-  expect(boundary.resume).toHaveBeenCalledOnce();
-  expect(boundary.complete).toHaveBeenCalledOnce();
-  expect(boundary.restart).toHaveBeenCalledOnce();
-  expect(boundary.release.mock.invocationCallOrder[0]).toBeLessThan(
-    boundary.resume.mock.invocationCallOrder[0]!,
-  );
-  expect(boundary.complete.mock.invocationCallOrder[0]).toBeLessThan(
-    boundary.restart.mock.invocationCallOrder[0]!,
-  );
+  expectCalls(0, "readLeases");
+  expectCalls(1, "close", "release");
+  expectOrder("close", "release");
+  expectCalls(1, "resume", "complete", "restart");
+  expectOrder("release", "resume");
+  expectOrder("complete", "restart");
 
   const facts = collectUpdateDoctorFailureFacts(refusal);
   expect(facts).toEqual([{ check: "doctor", code: leaseCode, message: leaseGuidance }]);
@@ -933,9 +873,8 @@ it("retains the typed refusal and restoration failure in the aggregate", async (
   expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([
     { check: "doctor", code: leaseCode, message: leaseGuidance },
   ]);
-  expect(boundary.release).toHaveBeenCalledOnce();
-  expect(boundary.complete).toHaveBeenCalledOnce();
-  expect(boundary.restart).not.toHaveBeenCalled();
+  expectCalls(1, "release", "complete");
+  expectCalls(0, "restart");
 });
 
 it("does not settle a typed refusal while command cleanup remains uncertain", async () => {
@@ -947,12 +886,7 @@ it("does not settle a typed refusal while command cleanup remains uncertain", as
   });
   const work = begin().catch((error: unknown) => error);
   try {
-    await Promise.race([
-      barrier.joining,
-      work.then(() => {
-        throw new Error("Admission settled before command cleanup");
-      }),
-    ]);
+    await waitForCleanup(work, barrier, "Admission settled before command cleanup");
     expect(boundary.release).not.toHaveBeenCalled();
   } finally {
     barrier.cleanup.resolve("uncertain");
@@ -964,10 +898,7 @@ it("does not settle a typed refusal while command cleanup remains uncertain", as
   expect(collectUpdateDoctorFailureFacts(refusal)).toEqual([
     { check: "doctor", code: leaseCode, message: leaseGuidance },
   ]);
-  expect(boundary.release).not.toHaveBeenCalled();
-  expect(boundary.resume).not.toHaveBeenCalled();
-  expect(boundary.complete).not.toHaveBeenCalled();
-  expect(boundary.restart).not.toHaveBeenCalled();
+  expectCalls(0, "release", "resume", "complete", "restart");
 });
 
 it.each([
@@ -1007,8 +938,8 @@ it.each([
   });
   const maintenance = await begin();
   await expect(maintenance!.finish({}, async (cfg) => cfg)).resolves.toBeUndefined();
-  expect(boundary.repair).toHaveBeenCalledOnce();
-  expect(boundary.restart).toHaveBeenCalledTimes(outcome === "owned-offline" ? 1 : 0);
+  expectCalls(1, "repair");
+  expectCalls(outcome === "owned-offline" ? 1 : 0, "restart");
   const verified = outcome === "owned-offline";
   expect(boundary.health).toHaveBeenCalledTimes(verified ? 1 : 0);
   if (!verified) {

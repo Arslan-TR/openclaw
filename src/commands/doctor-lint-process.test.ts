@@ -34,6 +34,20 @@ function workerResult(overrides: Partial<SpawnResult> = {}): SpawnResult {
   };
 }
 
+function reportingWorker(result: SpawnResult | Promise<SpawnResult> = workerResult()) {
+  vi.mocked(runUtf8CommandWithTimeout).mockImplementation((_argv, options) => {
+    assert(typeof options !== "number");
+    options.onOutputChunk?.(Buffer.from(report), "stdout");
+    return Promise.resolve(result);
+  });
+}
+
+function expectRefusal(reason: string) {
+  expect(reason.length).toBeLessThanOrEqual(200);
+  expect(stdout).toHaveBeenCalledExactlyOnceWith(report);
+  expect(stderr).toHaveBeenCalledExactlyOnceWith(`[openclaw] Reason: ${reason}\n`);
+}
+
 beforeEach(() => {
   vi.mocked(drainProcessOutput).mockImplementation((done) => done());
   for (const [key, value] of Object.entries({
@@ -118,11 +132,7 @@ it.each([
 ] as const)(
   "rejects $name without an accepted supervisor abort",
   async ({ code, signal, termination }) => {
-    vi.mocked(runUtf8CommandWithTimeout).mockImplementation(async (_argv, options) => {
-      assert(typeof options !== "number");
-      options.onOutputChunk?.(Buffer.from(report), "stdout");
-      return workerResult({ code, signal, cleanup: "forced", termination });
-    });
+    reportingWorker(workerResult({ code, signal, cleanup: "forced", termination }));
     await expect(
       runUpdateDoctorLintProcess({ json: true }, { disposalDeadlineMs: 0 }),
     ).resolves.toBe(2);
@@ -137,11 +147,7 @@ it.each(["caller", "signal barrier", "combined"])(
     const caller = new AbortController();
     vi.mocked(resolveCommandProcessSignal).mockReturnValue(caller.signal);
     const worker = createDeferredCore<SpawnResult>();
-    vi.mocked(runUtf8CommandWithTimeout).mockImplementation((_argv, options) => {
-      assert(typeof options !== "number");
-      options.onOutputChunk?.(Buffer.from(report), "stdout");
-      return worker.promise;
-    });
+    reportingWorker(worker.promise);
     const completion = runUpdateDoctorLintProcess({ json: true }, { disposalDeadlineMs: 0 });
     const cancellation = mode === "caller" ? caller.abort() : waitForSignalExitBarriers();
     if (mode === "combined") {
@@ -164,9 +170,7 @@ it.each(["caller", "signal barrier", "combined"])(
       mode === "combined"
         ? "Doctor lint settlement refused: signal-barrier,caller-signal,output-error,worker-output,output-limit,cleanup-uncertain; disposal-requested,kill-issued-by-abort,termination=no-output-timeout."
         : `Doctor lint settlement refused: ${mode === "caller" ? "caller-signal" : "signal-barrier"}; disposal-requested,kill-issued-by-abort,termination=signal.`;
-    expect(reason.length).toBeLessThanOrEqual(200);
-    expect(stdout).toHaveBeenCalledExactlyOnceWith(report);
-    expect(stderr).toHaveBeenCalledExactlyOnceWith(`[openclaw] Reason: ${reason}\n`);
+    expectRefusal(reason);
     expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("[warning] Doctor disposal"));
   },
 );
@@ -178,11 +182,7 @@ it.each([
   { name: "cleanup-uncertain", output: false, stream: false, cap: false, cleanup: true },
 ])("reports observed settlement refusal $name without private output", async (failure) => {
   const worker = createDeferredCore<SpawnResult>();
-  vi.mocked(runUtf8CommandWithTimeout).mockImplementation((_argv, options) => {
-    assert(typeof options !== "number");
-    options.onOutputChunk?.(Buffer.from(report), "stdout");
-    return worker.promise;
-  });
+  reportingWorker(worker.promise);
   const completion = runUpdateDoctorLintProcess({ json: true }, { disposalDeadlineMs: 0 });
   if (failure.output) {
     process.stdout.emit("error", new Error("private output token=synthetic-doctor-secret"));
@@ -199,9 +199,7 @@ it.each([
   );
   await expect(completion).resolves.toBe(2);
   const reason = `Doctor lint settlement refused: ${failure.name}; disposal-requested,kill-issued-by-abort,termination=no-output-timeout.`;
-  expect(reason.length).toBeLessThanOrEqual(200);
-  expect(stdout).toHaveBeenCalledExactlyOnceWith(report);
-  expect(stderr).toHaveBeenCalledExactlyOnceWith(`[openclaw] Reason: ${reason}\n`);
+  expectRefusal(reason);
 });
 
 it.each(["output-error", "caller-signal", "signal-barrier"] as const)(
@@ -211,11 +209,7 @@ it.each(["output-error", "caller-signal", "signal-barrier"] as const)(
     vi.mocked(resolveCommandProcessSignal).mockReturnValue(caller.signal);
     const draining = createDeferredCore<() => void>();
     vi.mocked(drainProcessOutput).mockImplementation((done) => draining.resolve(done));
-    vi.mocked(runUtf8CommandWithTimeout).mockImplementation(async (_argv, options) => {
-      assert(typeof options !== "number");
-      options.onOutputChunk?.(Buffer.from(report), "stdout");
-      return workerResult();
-    });
+    reportingWorker();
     const completion = runUpdateDoctorLintProcess({ json: true });
     const drained = await draining.promise;
     if (failure === "output-error") {

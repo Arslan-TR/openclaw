@@ -154,6 +154,17 @@ type Continuation =
   | "terminal-dead-before-restart";
 type LegacyCatalog = "exact" | "conflict-on-recheck" | "different-state";
 
+function withLegacyWriter<T>(pathname: string, write: (db: DatabaseSync) => T): T {
+  const db = openNodeSqliteDatabase(pathname);
+  try {
+    db.enableDefensive?.(false);
+    db.exec("PRAGMA writable_schema = ON");
+    return write(db);
+  } finally {
+    db.close();
+  }
+}
+
 async function runDoctorFinishForStoppedUnit(
   scenario: StoppedUnitState,
   continuation?: Continuation,
@@ -164,15 +175,7 @@ async function runDoctorFinishForStoppedUnit(
     | "copied-release"
     | "consumed"
     | "released-during-inspection" = "owned",
-): Promise<{
-  finishError: unknown;
-  restartCalls: number;
-  startCalls: number;
-  logs: string[];
-  takeoverSteps: number;
-  runStatus: string | undefined;
-  unauthorizedRestarts: number;
-}> {
+) {
   const home = tempDirs.make("openclaw-doctor-finish-");
   return await withEnvAsync(
     {
@@ -289,10 +292,7 @@ async function runDoctorFinishForStoppedUnit(
         let beforeCatalog = fs.readFileSync(pathname);
         if (scenario === "gateway-lifecycle-contended") {
           releaseServingLease = () => {
-            const writer = openNodeSqliteDatabase(pathname);
-            try {
-              writer.enableDefensive?.(false);
-              writer.exec("PRAGMA writable_schema = ON");
+            withLegacyWriter(pathname, (writer) => {
               expect(
                 writer
                   .prepare(
@@ -300,9 +300,7 @@ async function runDoctorFinishForStoppedUnit(
                   )
                   .run().changes,
               ).toBe(1);
-            } finally {
-              writer.close();
-            }
+            });
             // Only the simulated Gateway's shutdown writes; Doctor must preserve its result.
             beforeCatalog = fs.readFileSync(pathname);
           };
@@ -313,20 +311,14 @@ async function runDoctorFinishForStoppedUnit(
         expect(() => listUpdateRuns()).toThrow(/legacy-workshop-review-index.*doctor --fix/);
         assertPreStopArtifactsUnchanged();
         if (lateRun) {
-          activateCompetingUpdate = () => {
-            const writer = openNodeSqliteDatabase(pathname);
-            try {
-              writer.enableDefensive?.(false);
-              writer.exec("PRAGMA writable_schema = ON");
+          activateCompetingUpdate = () =>
+            withLegacyWriter(pathname, (writer) => {
               writer
                 .prepare(
                   "UPDATE update_runs SET status = 'running', phase = 'validating', finished_at_ms = NULL WHERE run_id = ?",
                 )
                 .run(lateRun.runId);
-            } finally {
-              writer.close();
-            }
-          };
+            });
         }
       }
       mockDoctorServicePlatform("linux");
@@ -631,9 +623,8 @@ it.each([
   "restores the unchanged Gateway after $scenario inspection (catalog: $catalog)",
   async ({ scenario, catalog }) => {
     const result = await runDoctorFinishForStoppedUnit(scenario, undefined, catalog);
-    expect(result.finishError).toBeUndefined();
+    expect(result).toMatchObject({ finishError: undefined, restartCalls: 1 });
     expect(mocks.stops).toBe(1);
-    expect(result.restartCalls).toBe(1);
     expect(result.logs).toContain("Gateway restarted and verified after Doctor repair.");
   },
 );
@@ -669,14 +660,8 @@ it.each<{
     scenario: "lifecycle-contended",
     message: "is undergoing offline maintenance; retry when it finishes.",
   },
-  {
-    catalog: "conflict-on-recheck",
-    message: "remains recorded as running",
-  },
-  {
-    catalog: "different-state",
-    message: "non-default state dir or config path",
-  },
+  { catalog: "conflict-on-recheck", message: "remains recorded as running" },
+  { catalog: "different-state", message: "non-default state dir or config path" },
   { continuation: "foreign", message: "other-host.invalid" },
   { continuation: "unknown-adopter", message: "unrecorded adopter" },
   { continuation: "own-child", message: "update parent must stop the managed Gateway" },
@@ -690,39 +675,35 @@ it.each<{
 );
 
 it("continues owning-run Doctor maintenance", async () => {
-  const { finishError, restartCalls, logs } = await runDoctorFinishForStoppedUnit(
-    "retained",
-    "own",
-  );
-  expect(finishError).toBeUndefined();
+  const result = await runDoctorFinishForStoppedUnit("retained", "own");
+  expect(result).toMatchObject({ finishError: undefined, restartCalls: 1 });
   expect(mocks.stops).toBe(1);
-  expect(restartCalls).toBe(1);
-  expect(logs).toContain("Stopped the managed Gateway for Doctor repair.");
-  expect(logs).toContain("Gateway restarted and verified after Doctor repair.");
+  expect(result.logs).toContain("Stopped the managed Gateway for Doctor repair.");
+  expect(result.logs).toContain("Gateway restarted and verified after Doctor repair.");
 });
 
 it("rechecks update admission after failed restoration inspection", async () => {
-  const { finishError, restartCalls, startCalls } =
-    await runDoctorFinishForStoppedUnit("inspection-competing");
-  expect(finishError).toMatchObject({
-    message: expect.stringContaining("remains recorded as running"),
+  expect(await runDoctorFinishForStoppedUnit("inspection-competing")).toMatchObject({
+    finishError: { message: expect.stringContaining("remains recorded as running") },
+    restartCalls: 0,
+    startCalls: 0,
   });
-  expect(restartCalls).toBe(0);
-  expect(startCalls).toBe(0);
 });
 
 it.each(["ownership-refused-wrapped", "launchd-owned"] as const)(
   "preserves the native ownership refusal without activation: %s",
   async (scenario) => {
     const result = await runDoctorFinishForStoppedUnit(scenario);
-    expect(result.startCalls).toBe(0);
-    expect(result.restartCalls).toBe(0);
-    expect(result.finishError).toMatchObject({
-      failureFacts: expect.arrayContaining([
-        expect.objectContaining({
-          code: scenario === "launchd-owned" ? "launchd-system-owned" : "systemd-account-refused",
-        }),
-      ]),
+    expect(result).toMatchObject({
+      startCalls: 0,
+      restartCalls: 0,
+      finishError: {
+        failureFacts: expect.arrayContaining([
+          expect.objectContaining({
+            code: scenario === "launchd-owned" ? "launchd-system-owned" : "systemd-account-refused",
+          }),
+        ]),
+      },
     });
     expect(result.logs.join("\n")).not.toContain("restoration inspection was inconclusive");
     expect(waitForGatewayHealthyRestart).not.toHaveBeenCalled();
@@ -732,21 +713,21 @@ it.each(["ownership-refused-wrapped", "launchd-owned"] as const)(
 it.each(["runtime-timeout-changed-manager", "runtime-timeout-changed-command"] as const)(
   "refuses activation after %s during repair",
   async (scenario) => {
-    const { finishError, restartCalls, startCalls } = await runDoctorFinishForStoppedUnit(scenario);
-    expect(finishError).toMatchObject({
-      message: expect.stringMatching(/ownership or manager identity changed/),
+    expect(await runDoctorFinishForStoppedUnit(scenario)).toMatchObject({
+      finishError: { message: expect.stringMatching(/ownership or manager identity changed/) },
+      restartCalls: 0,
+      startCalls: 0,
     });
-    expect(restartCalls).toBe(0);
-    expect(startCalls).toBe(0);
   },
 );
 
 it("restores the Gateway and records one takeover when the owner terminalizes and dies", async () => {
-  const { finishError, restartCalls, logs, takeoverSteps, runStatus } =
-    await runDoctorFinishForStoppedUnit("retained", "terminal-dead-before-restart");
-  expect(finishError).toBeUndefined();
-  expect(restartCalls).toBe(1);
-  expect(takeoverSteps).toBe(1);
-  expect(runStatus).toBe("failed");
-  expect(logs).toContain("Gateway restarted and verified after Doctor repair.");
+  const result = await runDoctorFinishForStoppedUnit("retained", "terminal-dead-before-restart");
+  expect(result).toMatchObject({
+    finishError: undefined,
+    restartCalls: 1,
+    takeoverSteps: 1,
+    runStatus: "failed",
+  });
+  expect(result.logs).toContain("Gateway restarted and verified after Doctor repair.");
 });
