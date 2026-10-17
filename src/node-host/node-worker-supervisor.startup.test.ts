@@ -350,65 +350,62 @@ describe("node worker supervisor initialization", () => {
     await active.close();
   });
 
-  it.each(["reused"] as const)(
-    "retains Windows restart capacity when the recorded worker root is %s",
-    async (rootState) => {
-      const { bundleRoot, env, supervisor, workspaceDir } = fixture();
-      const store = new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env }));
-      const input = launchInput(workspaceDir, `windows-${rootState}`, "wait");
-      const claim = {
-        ...testNodeWorkerLaunchIdentity(input),
-        gatewayNamespace: input.gatewayNamespace,
-      };
-      const previousSupervisor = { pid: 2_000_000_001, startTime: 1 };
-      const worker = { pid: 2_000_000_002, startTime: 2 };
-      await store.claim(claim, previousSupervisor, 1);
-      await store.markRunning({
-        ...claim,
-        supervisor: previousSupervisor,
-        worker,
-        cleanupMode: "process-group",
-      });
+  it("retains Windows restart capacity when the recorded worker root is reused", async () => {
+    const { bundleRoot, env, supervisor, workspaceDir } = fixture();
+    const store = new NodeWorkerLaunchStore(new NodeWorkerJournalWorker({ env }));
+    const input = launchInput(workspaceDir, "windows-reused", "wait");
+    const claim = {
+      ...testNodeWorkerLaunchIdentity(input),
+      gatewayNamespace: input.gatewayNamespace,
+    };
+    const previousSupervisor = { pid: 2_000_000_001, startTime: 1 };
+    const worker = { pid: 2_000_000_002, startTime: 2 };
+    await store.claim(claim, previousSupervisor, 1);
+    await store.markRunning({
+      ...claim,
+      supervisor: previousSupervisor,
+      worker,
+      cleanupMode: "process-group",
+    });
 
-      const inspectIdentity = workerProcessIdentity.inspectNodeWorkerProcessIdentity;
-      vi.spyOn(workerProcessIdentity, "inspectNodeWorkerProcessIdentity").mockImplementation(
-        (identity) => {
-          if (identity.pid === previousSupervisor.pid) {
-            return "dead";
-          }
-          return identity.pid === worker.pid ? rootState : inspectIdentity(identity);
-        },
-      );
-      const inspectTree = workerTreeControl.inspectOwnedNodeWorkerTree;
-      vi.spyOn(workerTreeControl, "inspectOwnedNodeWorkerTree").mockImplementation((identity) => {
-        // Scope the Windows observation to its owner; the real database remains host-native.
-        const platform = mockProcessPlatform("win32");
-        try {
-          return inspectTree(identity);
-        } finally {
-          platform.mockRestore();
+    const inspectIdentity = workerProcessIdentity.inspectNodeWorkerProcessIdentity;
+    vi.spyOn(workerProcessIdentity, "inspectNodeWorkerProcessIdentity").mockImplementation(
+      (identity) => {
+        if (identity.pid === previousSupervisor.pid) {
+          return "dead";
         }
-      });
-      const signal = vi.spyOn(workerTreeControl, "signalOwnedNodeWorkerTree").mockResolvedValue();
-      const capacities: Array<{ total: number; available: number }> = [];
-      const recovered = createNodeWorkerSupervisor({
-        bundleRoot,
-        env,
-        capacity: 1,
-        onCapacityChanged: (value) => capacities.push(value),
-      });
+        return identity.pid === worker.pid ? "reused" : inspectIdentity(identity);
+      },
+    );
+    const inspectTree = workerTreeControl.inspectOwnedNodeWorkerTree;
+    vi.spyOn(workerTreeControl, "inspectOwnedNodeWorkerTree").mockImplementation((identity) => {
+      // Scope the Windows observation to its owner; the real database remains host-native.
+      const platform = mockProcessPlatform("win32");
       try {
-        await recovered.initialize();
-        expect(await store.get(input.launchId)).toMatchObject({ state: "running", worker });
-        expect(capacities.at(-1)).toEqual({ total: 1, available: 0 });
-        expect(await recovered.hasActiveWork()).toBe(true);
-        expect(signal).not.toHaveBeenCalled();
+        return inspectTree(identity);
       } finally {
-        await recovered.close();
-        await supervisor.close();
+        platform.mockRestore();
       }
-    },
-  );
+    });
+    const signal = vi.spyOn(workerTreeControl, "signalOwnedNodeWorkerTree").mockResolvedValue();
+    const capacities: Array<{ total: number; available: number }> = [];
+    const recovered = createNodeWorkerSupervisor({
+      bundleRoot,
+      env,
+      capacity: 1,
+      onCapacityChanged: (value) => capacities.push(value),
+    });
+    try {
+      await recovered.initialize();
+      expect(await store.get(input.launchId)).toMatchObject({ state: "running", worker });
+      expect(capacities.at(-1)).toEqual({ total: 1, available: 0 });
+      expect(await recovered.hasActiveWork()).toBe(true);
+      expect(signal).not.toHaveBeenCalled();
+    } finally {
+      await recovered.close();
+      await supervisor.close();
+    }
+  });
 });
 
 it.skipIf(process.platform === "win32").for(["uncertain", "confirmed"] as const)(

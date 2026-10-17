@@ -237,7 +237,11 @@ function fixture(capacity = 1, container = false) {
   });
   return {
     supervisor,
+    [Symbol.asyncDispose]: () => supervisor.close(),
     snapshots,
+    expectCapacity(available: number, reclaimableIdle = 0) {
+      expect(snapshots.at(-1)).toEqual({ total: capacity, available, reclaimableIdle });
+    },
     launches,
     children,
     async launch(value: ReturnType<typeof input>) {
@@ -253,53 +257,49 @@ function fixture(capacity = 1, container = false) {
 
 describe("node worker idle retention", () => {
   it("routes process observations after turn settlement and fences stale or retired owners", async () => {
-    const f = fixture();
-    try {
-      const value = input("process-owner");
-      const owner = await f.launch(value);
-      await owner.complete(value.launchId, "background");
-      const target = {
-        ...testNodeWorkerEnvironmentIdentity(value),
-        placementGeneration: value.placementGeneration,
-        expectedBundleHash: value.expectedBundleHash,
-        operation: { action: "list" as const },
-      };
-      mocks.send.mockClear();
-      await expect(
-        f.supervisor.observeProcesses({ ...target, ownerEpoch: target.ownerEpoch + 1 }),
-      ).rejects.toThrow("owner changed");
-      await expect(
-        f.supervisor.observeProcesses({ ...target, expectedBundleHash: "b".repeat(64) }),
-      ).rejects.toThrow("owner changed");
-      expect(mocks.send).not.toHaveBeenCalled();
-      const list = { sessionId: target.sessionId, processes: [], truncated: false };
-      mocks.send.mockImplementationOnce(async (adapter, message) => {
-        expect(adapter).toBe(owner.adapter);
-        if (message.type !== "process") {
-          throw new Error("Expected process request");
-        }
-        await owner.emit({ type: "process-result", requestId: message.requestId, result: list });
-      });
-      await expect(f.supervisor.observeProcesses(target)).resolves.toEqual(list);
-      expect((await f.supervisor.status(value.launchId))?.state).toBe("completed");
-      const dispatched = createDeferred();
-      mocks.send.mockImplementationOnce(async () => {
-        dispatched.resolve();
-      });
-      const pending = f.supervisor.observeProcesses(target);
-      const rejected = expect(pending).rejects.toThrow(/owner ended|owner changed/);
-      await dispatched.promise;
-      await f.supervisor.close();
-      await rejected;
-    } finally {
-      await f.supervisor.close();
-    }
+    await using f = fixture();
+    const value = input("process-owner");
+    const owner = await f.launch(value);
+    await owner.complete(value.launchId, "background");
+    const target = {
+      ...testNodeWorkerEnvironmentIdentity(value),
+      placementGeneration: value.placementGeneration,
+      expectedBundleHash: value.expectedBundleHash,
+      operation: { action: "list" as const },
+    };
+    mocks.send.mockClear();
+    await expect(
+      f.supervisor.observeProcesses({ ...target, ownerEpoch: target.ownerEpoch + 1 }),
+    ).rejects.toThrow("owner changed");
+    await expect(
+      f.supervisor.observeProcesses({ ...target, expectedBundleHash: "b".repeat(64) }),
+    ).rejects.toThrow("owner changed");
+    expect(mocks.send).not.toHaveBeenCalled();
+    const list = { sessionId: target.sessionId, processes: [], truncated: false };
+    mocks.send.mockImplementationOnce(async (adapter, message) => {
+      expect(adapter).toBe(owner.adapter);
+      if (message.type !== "process") {
+        throw new Error("Expected process request");
+      }
+      await owner.emit({ type: "process-result", requestId: message.requestId, result: list });
+    });
+    await expect(f.supervisor.observeProcesses(target)).resolves.toEqual(list);
+    expect((await f.supervisor.status(value.launchId))?.state).toBe("completed");
+    const dispatched = createDeferred();
+    mocks.send.mockImplementationOnce(async () => {
+      dispatched.resolve();
+    });
+    const pending = f.supervisor.observeProcesses(target);
+    const rejected = expect(pending).rejects.toThrow(/owner ended|owner changed/);
+    await dispatched.promise;
+    await f.supervisor.close();
+    await rejected;
   });
 
   it.each(["completed", "closed", "aborted"] as const)(
     "releases prepared workspace custody when public launch is %s",
     async (outcome) => {
-      const f = fixture();
+      await using f = fixture();
       const lease = {
         workspaceDir: "/synthetic/workspace",
         homeDir: "/synthetic/home",
@@ -360,49 +360,44 @@ describe("node worker idle retention", () => {
         acquired.resolve(lease);
         startup.resolve();
         await pending.catch(() => undefined);
-        await f.supervisor.close();
       }
     },
   );
 
   it("reuses the physical child with fresh turn authority and clears its old expiry", async () => {
-    const f = fixture();
-    try {
-      const first = input("first");
-      const owner = await f.launch(first);
-      await owner.complete(first.launchId, "idle");
-      expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 0, reclaimableIdle: 1 });
-      expect(await f.supervisor.hasActiveWork()).toBe(false);
-      await vi.advanceTimersByTimeAsync(119_999);
-      const next = input("second");
-      next.descriptor.admission.credential = "fresh-turn-credential";
-      next.descriptor.assignment.agentRuntimeIdentityToken = "fresh-runtime-authority";
-      next.descriptor.assignment.prompt = "fresh prompt";
-      expect(await f.supervisor.launch(next, TEST_WORKER_ENDPOINT)).toMatchObject({
-        worker: owner.receipt.worker,
-      });
-      expect(mocks.prepare).toHaveBeenCalledTimes(1);
-      expect(mocks.send).toHaveBeenCalledWith(owner.adapter, {
-        type: "turn",
-        turnId: next.launchId,
-        idleRetention: true,
-        descriptor: { ...next.descriptor, connectionEndpoint: TEST_WORKER_ENDPOINT },
-      });
-      expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 0, reclaimableIdle: 0 });
-      expect(await f.supervisor.hasActiveWork()).toBe(true);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(owner.adapter.kill).not.toHaveBeenCalled();
-      await owner.complete(next.launchId, "idle");
-      await vi.advanceTimersByTimeAsync(120_000);
-      expect(owner.adapter.dispose).toHaveBeenCalledOnce();
-      expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 1, reclaimableIdle: 0 });
-    } finally {
-      await f.supervisor.close();
-    }
+    await using f = fixture();
+    const first = input("first");
+    const owner = await f.launch(first);
+    await owner.complete(first.launchId, "idle");
+    f.expectCapacity(0, 1);
+    expect(await f.supervisor.hasActiveWork()).toBe(false);
+    await vi.advanceTimersByTimeAsync(119_999);
+    const next = input("second");
+    next.descriptor.admission.credential = "fresh-turn-credential";
+    next.descriptor.assignment.agentRuntimeIdentityToken = "fresh-runtime-authority";
+    next.descriptor.assignment.prompt = "fresh prompt";
+    expect(await f.supervisor.launch(next, TEST_WORKER_ENDPOINT)).toMatchObject({
+      worker: owner.receipt.worker,
+    });
+    expect(mocks.prepare).toHaveBeenCalledTimes(1);
+    expect(mocks.send).toHaveBeenCalledWith(owner.adapter, {
+      type: "turn",
+      turnId: next.launchId,
+      idleRetention: true,
+      descriptor: { ...next.descriptor, connectionEndpoint: TEST_WORKER_ENDPOINT },
+    });
+    f.expectCapacity(0);
+    expect(await f.supervisor.hasActiveWork()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(owner.adapter.kill).not.toHaveBeenCalled();
+    await owner.complete(next.launchId, "idle");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(owner.adapter.dispose).toHaveBeenCalledOnce();
+    f.expectCapacity(1);
   });
 
   it("publishes idle only after settlement and starts TTL at background idle-ready", async () => {
-    const f = fixture();
+    await using f = fixture();
     const release = createDeferred();
     try {
       const value = input("background");
@@ -433,14 +428,13 @@ describe("node worker idle retention", () => {
       expect(owner.adapter.dispose).toHaveBeenCalledOnce();
     } finally {
       release.resolve();
-      await f.supervisor.close();
     }
   });
 
   it.each(["before", "at"] as const)(
     "settles idle cleanup %s the admission deadline",
     async (timing) => {
-      const f = fixture();
+      await using f = fixture();
       const cleanup = createDeferred();
       try {
         const old = input("old", "old-environment");
@@ -458,7 +452,7 @@ describe("node worker idle retention", () => {
           );
         await owner.killed.promise;
         expect(mocks.prepare).toHaveBeenCalledTimes(1);
-        expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 0, reclaimableIdle: 0 });
+        f.expectCapacity(0);
         if (timing === "before") {
           await vi.advanceTimersByTimeAsync(9_999);
           expect(owner.adapter.kill).toHaveBeenCalledTimes(2);
@@ -484,13 +478,12 @@ describe("node worker idle retention", () => {
           expect(f.launches.get("old")?.state).toBe("interrupted");
           expect(f.launches.has("replacement")).toBe(false);
           expect(mocks.prepare).toHaveBeenCalledTimes(1);
-          expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 1, reclaimableIdle: 0 });
+          f.expectCapacity(1);
           expect(vi.getTimerCount()).toBe(0);
         }
         expect(owner.adapter.dispose).toHaveBeenCalledOnce();
       } finally {
         cleanup.resolve();
-        await f.supervisor.close();
       }
     },
   );
@@ -498,7 +491,7 @@ describe("node worker idle retention", () => {
   it.each(["deadline", "abort", "close"] as const)(
     "bounds admission by %s while retaining stalled idle cleanup",
     async (boundary) => {
-      const f = fixture();
+      await using f = fixture();
       const cleanup = createDeferred();
       const controller = new AbortController();
       const failure = new Error("Caller cancelled capacity admission");
@@ -546,7 +539,7 @@ describe("node worker idle retention", () => {
         expect(mocks.prepare).toHaveBeenCalledTimes(1);
         expect(f.launches.get("old")?.state).toBe("running");
         expect(f.launches.has("replacement")).toBe(false);
-        expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 0, reclaimableIdle: 0 });
+        f.expectCapacity(0);
         let closed = false;
         closing = (closing ?? f.supervisor.close()).then(() => {
           closed = true;
@@ -555,7 +548,7 @@ describe("node worker idle retention", () => {
         expect(closed).toBe(false);
         cleanup.resolve();
         await closing;
-        expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 1, reclaimableIdle: 0 });
+        f.expectCapacity(1);
         expect(mocks.prepare).toHaveBeenCalledTimes(1);
         expect(vi.getTimerCount()).toBe(0);
       } finally {
@@ -567,7 +560,7 @@ describe("node worker idle retention", () => {
   );
 
   it("rejects reuse when idle expiry revokes the owner during turn admission", async () => {
-    const f = fixture();
+    await using f = fixture();
     const release = createDeferred();
     try {
       const owner = await f.launch(input("first"));
@@ -591,62 +584,53 @@ describe("node worker idle retention", () => {
       await rejection;
       expect(mocks.send).not.toHaveBeenCalled();
       expect(await f.supervisor.status("expired-reuse")).toBeUndefined();
-      expect(f.snapshots.at(-1)).toEqual({ total: 1, available: 1, reclaimableIdle: 0 });
+      f.expectCapacity(1);
     } finally {
       release.resolve();
-      await f.supervisor.close();
     }
   });
 
   it("retains at most two idle children and reclaims the least recently used, never background", async () => {
-    const f = fixture(4);
-    try {
-      const background = await f.launch(input("background", "background-env"));
-      await background.complete("background", "background");
-      const a = await f.launch(input("a", "a-env"));
-      await a.complete("a", "idle");
-      await vi.advanceTimersByTimeAsync(1);
-      const b = await f.launch(input("b", "b-env"));
-      await b.complete("b", "idle");
-      await vi.advanceTimersByTimeAsync(1);
-      await f.supervisor.launch(input("a-next", "a-env"), TEST_WORKER_ENDPOINT);
-      await a.complete("a-next", "idle");
-      await vi.advanceTimersByTimeAsync(1);
-      const c = await f.launch(input("c", "c-env"));
-      await c.complete("c", "idle");
-      await vi.advanceTimersByTimeAsync(0);
-      expect(b.adapter.dispose).toHaveBeenCalledOnce();
-      expect(a.adapter.kill).not.toHaveBeenCalled();
-      expect(c.adapter.kill).not.toHaveBeenCalled();
-      expect(background.adapter.kill).not.toHaveBeenCalled();
-      expect(f.snapshots.at(-1)).toEqual({ total: 4, available: 1, reclaimableIdle: 2 });
-    } finally {
-      await f.supervisor.close();
-    }
+    await using f = fixture(4);
+    const background = await f.launch(input("background", "background-env"));
+    await background.complete("background", "background");
+    const a = await f.launch(input("a", "a-env"));
+    await a.complete("a", "idle");
+    await vi.advanceTimersByTimeAsync(1);
+    const b = await f.launch(input("b", "b-env"));
+    await b.complete("b", "idle");
+    await vi.advanceTimersByTimeAsync(1);
+    await f.supervisor.launch(input("a-next", "a-env"), TEST_WORKER_ENDPOINT);
+    await a.complete("a-next", "idle");
+    await vi.advanceTimersByTimeAsync(1);
+    const c = await f.launch(input("c", "c-env"));
+    await c.complete("c", "idle");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(b.adapter.dispose).toHaveBeenCalledOnce();
+    expect(a.adapter.kill).not.toHaveBeenCalled();
+    expect(c.adapter.kill).not.toHaveBeenCalled();
+    expect(background.adapter.kill).not.toHaveBeenCalled();
+    f.expectCapacity(1, 2);
   });
 
   it.each(["stop", "close"] as const)(
     "%s retires idle through physical cleanup and preserves the completed turn",
     async (operation) => {
-      const f = fixture();
-      try {
-        const value = input("completed");
-        const owner = await f.launch(value);
-        await owner.complete(value.launchId, "idle");
-        const identity = testNodeWorkerEnvironmentIdentity(value);
-        await f.supervisor.stopEnvironment({ ...identity, ownerEpoch: identity.ownerEpoch - 1 });
-        expect(owner.adapter.kill).not.toHaveBeenCalled();
-        if (operation === "stop") {
-          await f.supervisor.stopEnvironment(identity);
-        } else {
-          await f.supervisor.close();
-        }
-        expect(owner.adapter.dispose).toHaveBeenCalledOnce();
-        expect(await f.supervisor.status(value.launchId)).toMatchObject({ state: "completed" });
-        expect(await f.supervisor.hasActiveWork()).toBe(false);
-      } finally {
+      await using f = fixture();
+      const value = input("completed");
+      const owner = await f.launch(value);
+      await owner.complete(value.launchId, "idle");
+      const identity = testNodeWorkerEnvironmentIdentity(value);
+      await f.supervisor.stopEnvironment({ ...identity, ownerEpoch: identity.ownerEpoch - 1 });
+      expect(owner.adapter.kill).not.toHaveBeenCalled();
+      if (operation === "stop") {
+        await f.supervisor.stopEnvironment(identity);
+      } else {
         await f.supervisor.close();
       }
+      expect(owner.adapter.dispose).toHaveBeenCalledOnce();
+      expect(await f.supervisor.status(value.launchId)).toMatchObject({ state: "completed" });
+      expect(await f.supervisor.hasActiveWork()).toBe(false);
     },
   );
 
@@ -654,62 +638,48 @@ describe("node worker idle retention", () => {
     "retries failed %s idle cleanup without freeing its slot or evicting background work",
     async (trigger) => {
       const capacity = trigger === "limit" ? 4 : 2;
-      const f = fixture(capacity, true);
-      try {
-        const background = await f.launch(input("background", "background-env"));
-        await background.complete("background", "background");
-        const idle = await f.launch(input("idle", "idle-env"));
-        await idle.complete("idle", "idle");
-        mocks.remove.mockRejectedValueOnce(new Error("Synthetic container removal failure"));
+      await using f = fixture(capacity, true);
+      const background = await f.launch(input("background", "background-env"));
+      await background.complete("background", "background");
+      const idle = await f.launch(input("idle", "idle-env"));
+      await idle.complete("idle", "idle");
+      mocks.remove.mockRejectedValueOnce(new Error("Synthetic container removal failure"));
 
-        if (trigger === "explicit") {
-          await expect(f.supervisor.retireIdle()).rejects.toThrow(
-            "node worker idle cleanup failed",
-          );
-        } else if (trigger === "expiry") {
-          await vi.advanceTimersByTimeAsync(120_000);
-        } else {
-          for (const turnId of ["second-idle", "third-idle"]) {
-            const child = await f.launch(input(turnId, turnId));
-            await child.complete(turnId, "idle");
-          }
-          await vi.advanceTimersByTimeAsync(0);
+      if (trigger === "explicit") {
+        await expect(f.supervisor.retireIdle()).rejects.toThrow("node worker idle cleanup failed");
+      } else if (trigger === "expiry") {
+        await vi.advanceTimersByTimeAsync(120_000);
+      } else {
+        for (const turnId of ["second-idle", "third-idle"]) {
+          const child = await f.launch(input(turnId, turnId));
+          await child.complete(turnId, "idle");
         }
-        expect(f.snapshots.at(-1)).toEqual({
-          total: capacity,
-          available: 0,
-          reclaimableIdle: capacity - 2,
-        });
-        expect(f.launches.get("idle")).toMatchObject({
-          state: "running",
-          container: idle.receipt.container,
-        });
-        expect(idle.adapter.kill).not.toHaveBeenCalled();
-        expect(background.adapter.kill).not.toHaveBeenCalled();
-        expect(mocks.remove).toHaveBeenCalledExactlyOnceWith(
-          idle.receipt.container,
-          expect.objectContaining({ launchId: "idle" }),
-        );
-
-        if (trigger === "explicit") {
-          await f.supervisor.retireIdle();
-        } else {
-          await vi.advanceTimersByTimeAsync(120_000);
-        }
-        expect(
-          mocks.remove.mock.calls.filter(([, owner]) => owner.launchId === "idle"),
-        ).toHaveLength(2);
-        expect(idle.adapter.dispose).toHaveBeenCalledOnce();
-        expect(background.adapter.kill).not.toHaveBeenCalled();
-        expect(f.snapshots.at(-1)).toEqual({
-          total: capacity,
-          available: capacity - 1,
-          reclaimableIdle: 0,
-        });
-        expect(await f.supervisor.status("idle")).toMatchObject({ state: "completed" });
-      } finally {
-        await f.supervisor.close();
+        await vi.advanceTimersByTimeAsync(0);
       }
+      f.expectCapacity(0, capacity - 2);
+      expect(f.launches.get("idle")).toMatchObject({
+        state: "running",
+        container: idle.receipt.container,
+      });
+      expect(idle.adapter.kill).not.toHaveBeenCalled();
+      expect(background.adapter.kill).not.toHaveBeenCalled();
+      expect(mocks.remove).toHaveBeenCalledExactlyOnceWith(
+        idle.receipt.container,
+        expect.objectContaining({ launchId: "idle" }),
+      );
+
+      if (trigger === "explicit") {
+        await f.supervisor.retireIdle();
+      } else {
+        await vi.advanceTimersByTimeAsync(120_000);
+      }
+      expect(mocks.remove.mock.calls.filter(([, owner]) => owner.launchId === "idle")).toHaveLength(
+        2,
+      );
+      expect(idle.adapter.dispose).toHaveBeenCalledOnce();
+      expect(background.adapter.kill).not.toHaveBeenCalled();
+      f.expectCapacity(capacity - 1);
+      expect(await f.supervisor.status("idle")).toMatchObject({ state: "completed" });
     },
   );
 });

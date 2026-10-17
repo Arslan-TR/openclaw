@@ -80,11 +80,12 @@ function evictWorkerCredentialsOnRegistration() {
 describe("node worker supervisor", () => {
   it("releases the physical capacity claim when the first turn cannot be journaled", async () => {
     const capacities: Array<{ total: number; available: number }> = [];
-    const { env, supervisor, workspaceDir } = fixture({
+    await using f = fixture({
       capacity: 1,
       capacityWaitMs: 25,
       onCapacityChanged: (capacity) => capacities.push(capacity),
     });
+    const { env, supervisor, workspaceDir } = f;
     const input = launchInput(workspaceDir, "turn-claim-failure");
     const claim = vi
       .spyOn(NodeWorkerTurnStore.prototype, "claim")
@@ -109,12 +110,12 @@ describe("node worker supervisor", () => {
       expect((await waitForTerminal(supervisor, next.launchId)).state).toBe("completed");
     } finally {
       claim.mockRestore();
-      await supervisor.close();
     }
   });
 
   it("launches idempotently and persists only bounded non-secret facts", async () => {
-    const { env, supervisor, workspaceDir } = fixture();
+    await using f = fixture();
+    const { env, supervisor, workspaceDir } = f;
     const input = launchInput(workspaceDir, "success-launch");
     let adapter: workerLaunchTransport.NodeWorkerChildAdapter | undefined;
     const captureAdapter = observeNodeWorkerAdapters((child) => {
@@ -163,17 +164,17 @@ describe("node worker supervisor", () => {
       expect(JSON.stringify(row)).not.toContain(TEST_WORKER_CREDENTIAL);
     } finally {
       captureAdapter.mockRestore();
-      await supervisor.close();
     }
   });
 
   it("admits two durable launches and releases one physical slot at a time", async () => {
     const capacitySnapshots: Array<{ total: number; available: number }> = [];
-    const { env, supervisor, workspaceDir } = fixture({
+    await using f = fixture({
       capacity: 2,
       capacityWaitMs: 5_000,
       onCapacityChanged: (capacity) => capacitySnapshots.push(capacity),
     });
+    const { env, supervisor, workspaceDir } = f;
     const first = launchInput(workspaceDir, "capacity-a", "wait");
     const second = launchInput(workspaceDir, "capacity-b", "wait");
     const third = launchInput(workspaceDir, "capacity-c", "wait");
@@ -246,7 +247,8 @@ describe("node worker supervisor", () => {
   });
 
   it("aborts saturated admission when the supervisor closes", async () => {
-    const { env, supervisor, workspaceDir } = fixture({ capacity: 1, capacityWaitMs: 5_000 });
+    await using f = fixture({ capacity: 1, capacityWaitMs: 5_000 });
+    const { env, supervisor, workspaceDir } = f;
     const running = launchInput(workspaceDir, "capacity-close-running", "wait");
     const waiting = launchInput(workspaceDir, "capacity-close-waiting", "wait");
     await supervisor.launch(running, TEST_WORKER_ENDPOINT);
@@ -269,8 +271,7 @@ describe("node worker supervisor", () => {
     const root = tempDirs.make("node-worker-env-");
     const { bundleRoot, env, workspaceDir } = writeNodeWorkerFixture(root);
     const suppliedPathKey = process.platform === "win32" ? "Path" : "PATH";
-    const suppliedEnv: NodeJS.ProcessEnv = {
-      ...env,
+    const allowedEnv: NodeJS.ProcessEnv = {
       [suppliedPathKey]: process.env.PATH,
       HOME: path.join(root, "worker-home"),
       LANG: "en_US.UTF-8",
@@ -278,11 +279,15 @@ describe("node worker supervisor", () => {
       DISPLAY: ":99",
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/fixture/bus",
       XDG_RUNTIME_DIR: path.join(root, "desktop-runtime"),
-      NODE_COMPILE_CACHE: path.join(root, "host-compile-cache"),
-      NODE_DISABLE_COMPILE_CACHE: "1",
       NODE_EXTRA_CA_CERTS: path.join(root, "private-ca.pem"),
       NODE_USE_SYSTEM_CA: "1",
       OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: "1",
+    };
+    const suppliedEnv: NodeJS.ProcessEnv = {
+      ...env,
+      ...allowedEnv,
+      NODE_COMPILE_CACHE: path.join(root, "host-compile-cache"),
+      NODE_DISABLE_COMPILE_CACHE: "1",
       OPENCLAW_LAUNCHD_LABEL: "ai.openclaw.node",
       OPENCLAW_SERVICE_KIND: "node",
       OPENCLAW_SUPPLIED_SECRET: "supplied-openclaw-secret",
@@ -302,18 +307,9 @@ describe("node worker supervisor", () => {
       },
       async () => {
         const expectedWorkerEnv: NodeJS.ProcessEnv = {
-          HOME: suppliedEnv.HOME,
-          LANG: suppliedEnv.LANG,
-          LC_TIME: suppliedEnv.LC_TIME,
-          DISPLAY: suppliedEnv.DISPLAY,
-          DBUS_SESSION_BUS_ADDRESS: suppliedEnv.DBUS_SESSION_BUS_ADDRESS,
-          XDG_RUNTIME_DIR: suppliedEnv.XDG_RUNTIME_DIR,
-          NODE_EXTRA_CA_CERTS: suppliedEnv.NODE_EXTRA_CA_CERTS,
-          NODE_USE_SYSTEM_CA: suppliedEnv.NODE_USE_SYSTEM_CA,
+          ...allowedEnv,
           NODE_COMPILE_CACHE: expect.stringContaining("node-worker-compile-cache"),
-          OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: suppliedEnv.OPENCLAW_ALLOW_INSECURE_PRIVATE_WS,
           OPENCLAW_NO_RESPAWN: "1",
-          [suppliedPathKey]: suppliedEnv[suppliedPathKey],
         };
         const supervisor = createNodeWorkerSupervisor({ bundleRoot, env: suppliedEnv });
         suppliedEnv.HOME = path.join(root, "mutated-home");
@@ -448,11 +444,12 @@ describe("node worker supervisor", () => {
 
   it("bounds a blocked cancellation write and stops only its physical owner", async () => {
     const capacities: Array<{ total: number; available: number }> = [];
-    const { env, supervisor, workspaceDir } = fixture({
+    await using f = fixture({
       capacity: 2,
       capacityWaitMs: 25,
       onCapacityChanged: (capacity) => capacities.push(capacity),
     });
+    const { env, supervisor, workspaceDir } = f;
     const input = launchInput(workspaceDir, "blocked-cancel", "wait");
     const sibling = launchInput(workspaceDir, "unrelated-worker", "wait");
     const adapters = new Map<number, workerLaunchTransport.NodeWorkerChildAdapter>();

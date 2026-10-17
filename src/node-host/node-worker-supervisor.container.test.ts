@@ -48,6 +48,18 @@ function containerFixture(options: Parameters<typeof createNodeWorkerContainerFi
   return {
     ...fixture,
     store,
+    eventsFor(command: string) {
+      return fixture.events().filter((event) => event.argv[0] === command);
+    },
+    async waitForCommand(command: string, count?: number) {
+      await vi.waitFor(
+        () =>
+          count === undefined
+            ? expect(this.eventsFor(command)).not.toHaveLength(0)
+            : expect(this.eventsFor(command)).toHaveLength(count),
+        { timeout: 5_000 },
+      );
+    },
     ownOperation<T>(operation: Promise<T>): Promise<T> {
       // Keep the original result assertable while disposal owns early failures.
       void operation.catch(() => undefined);
@@ -190,7 +202,7 @@ describe("node worker supervisor container isolation", () => {
         endpoint,
       });
 
-      const create = fixture.events().find((event) => event.argv[0] === "create");
+      const create = fixture.eventsFor("create")[0];
       expect(create?.container?.labels).toEqual({
         [hostLabel]: fixture.owner,
         [gatewayLabel]: "gateway-1",
@@ -216,7 +228,7 @@ describe("node worker supervisor container isolation", () => {
       expect(create?.container?.env).not.toHaveProperty("NODE_OPTIONS");
       expect(create?.container?.env).not.toHaveProperty("SUPPLIED_SECRET");
       expect(create?.container?.env).not.toHaveProperty("OPENCLAW_STATE_DIR");
-      const started = fixture.events().find((event) => event.argv[0] === "start");
+      const started = fixture.eventsFor("start")[0];
       expect(started?.argv).toEqual([
         "start",
         "--attach",
@@ -332,10 +344,7 @@ describe("node worker supervisor container isolation", () => {
 
     try {
       const launch = fixture.ownOperation(fixture.supervisor.launch(input, endpoint));
-      await vi.waitFor(
-        () => expect(fixture.events().some((event) => event.argv[0] === "create")).toBe(true),
-        { timeout: 5_000 },
-      );
+      await fixture.waitForCommand("create");
       expect((await store.get(input.launchId))?.state).toBe("pending");
 
       const cancellation = fixture.ownOperation(
@@ -345,10 +354,7 @@ describe("node worker supervisor container isolation", () => {
       expect((await store.get(input.launchId))?.state).toBe("pending");
 
       fs.unlinkSync(createMarker);
-      await vi.waitFor(
-        () => expect(fixture.events().some((event) => event.argv[0] === "rm")).toBe(true),
-        { timeout: 5_000 },
-      );
+      await fixture.waitForCommand("rm");
       expect((await store.get(input.launchId))?.state).toMatch(/^(?:pending|running)$/u);
       expect(capacitySnapshots.at(-1)).toEqual({ total: 1, available: 0 });
 
@@ -356,9 +362,7 @@ describe("node worker supervisor container isolation", () => {
       await expect(cancellation).resolves.toMatchObject({ state: "cancelled" });
       await launch;
       expect(capacitySnapshots.at(-1)).toEqual({ total: 1, available: 1 });
-      expect(fixture.events().find((event) => event.argv[0] === "rm")?.journal?.state).toMatch(
-        /^(?:pending|running)$/u,
-      );
+      expect(fixture.eventsFor("rm")[0]?.journal?.state).toMatch(/^(?:pending|running)$/u);
     } finally {
       for (const marker of [createMarker, removalMarker]) {
         fs.rmSync(marker, { force: true });
@@ -383,11 +387,8 @@ describe("node worker supervisor container isolation", () => {
       const launch = fixture.ownOperation(
         fixture.supervisor.launch(input, endpoint, controller.signal),
       );
-      await vi.waitFor(
-        () => expect(fixture.events().some((event) => event.argv[0] === "create")).toBe(true),
-        { timeout: 5_000 },
-      );
-      const container = fixture.events().find((event) => event.argv[0] === "create")?.container;
+      await fixture.waitForCommand("create");
+      const container = fixture.eventsFor("create")[0]?.container;
       if (!container) {
         throw new Error("expected a claimed container under creation");
       }
@@ -589,10 +590,7 @@ describe("node worker supervisor container isolation", () => {
     try {
       const failedWorker = await fixture.supervisor.launch(first, endpoint);
       const siblingWorker = await fixture.supervisor.launch(sibling, endpoint);
-      await vi.waitFor(
-        () => expect(fixture.events().filter((event) => event.argv[0] === "start")).toHaveLength(2),
-        { timeout: 5_000 },
-      );
+      await fixture.waitForCommand("start", 2);
       fs.writeFileSync(removalMarker, "hold");
 
       const closing = fixture.supervisor.close();
@@ -654,7 +652,7 @@ describe("node worker supervisor container isolation", () => {
         "injected durable container identity failure",
       );
 
-      const create = fixture.events().find((event) => event.argv[0] === "create");
+      const create = fixture.eventsFor("create")[0];
       expect(create?.container?.id).toMatch(/^[a-f0-9]{64}$/u);
       expect(writes).toEqual([]);
       expect(fixture.events().some((event) => event.argv[0] === "rm")).toBe(true);
