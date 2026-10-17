@@ -70,6 +70,34 @@ const read = () =>
     { path: journal(), env: process.env },
   );
 
+function updateRecord(
+  changes: Partial<Pick<ImmutableInstallRecord, "descriptor" | "prepared" | "activation">>,
+) {
+  original = updateImmutableInstallRecord(original, { ...original, ...changes }, () => {});
+}
+
+function writeReaderVersion(version?: number) {
+  fsSync.writeFileSync(
+    path.join(bridgePath, "package.json"),
+    JSON.stringify({ openclaw: { immutableInstallDescriptorVersion: version } }),
+  );
+}
+
+async function prepareRetentionUpgrade() {
+  await adoptImmutableInstall(params);
+  original = read();
+  mocks.launcher.mockClear();
+}
+
+async function expectRetentionRejected(reason: string) {
+  const before = fsSync.readFileSync(journal());
+  await expect(adoptImmutableInstall({ ...params, inspectReleaseRetention: true })).rejects.toThrow(
+    reason,
+  );
+  expect(fsSync.readFileSync(journal())).toEqual(before);
+  expect(mocks.launcher).not.toHaveBeenCalled();
+}
+
 function retainPendingActivation() {
   const descriptor = {
     ...original.descriptor,
@@ -130,11 +158,7 @@ function retainPendingActivation() {
       helperDigest: "6".repeat(64),
     },
   };
-  original = updateImmutableInstallRecord(
-    original,
-    { ...original, descriptor, activation: { operation } },
-    () => {},
-  );
+  updateRecord({ descriptor, activation: { operation } });
 }
 
 describe.skipIf(process.platform !== "linux")("explicit immutable adoption after a bridge", () => {
@@ -257,20 +281,15 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
         if (preparedKind === "unrelated") {
           fsSync.mkdirSync(candidatePath, { mode: 0o755 });
         }
-        original = updateImmutableInstallRecord(
-          original,
-          {
-            ...original,
-            prepared: {
-              sha,
-              path: candidatePath,
-              identity: identity(candidatePath),
-              buildDigest: preparedKind === "selected" ? bridgeDigest : "3".repeat(64),
-              preparedAtMs: 12,
-            },
+        updateRecord({
+          prepared: {
+            sha,
+            path: candidatePath,
+            identity: identity(candidatePath),
+            buildDigest: preparedKind === "selected" ? bridgeDigest : "3".repeat(64),
+            preparedAtMs: 12,
           },
-          () => {},
-        );
+        });
       }
       const pointerIdentity = identity(path.join(root, "current"));
       const result = await adoptImmutableInstall(params);
@@ -345,14 +364,9 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
         servingPath = original.descriptor.current.path;
       }
       if (change === "enabled") {
-        original = updateImmutableInstallRecord(
-          original,
-          {
-            ...original,
-            descriptor: { ...original.descriptor, version: 2, activationEnabled: true },
-          },
-          () => {},
-        );
+        updateRecord({
+          descriptor: { ...original.descriptor, version: 2, activationEnabled: true },
+        });
       }
       if (change === "disabled") {
         params.enableActivation = false;
@@ -376,15 +390,8 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
   );
 
   it("adopts retention inspection only after the serving version-2 bridge and launcher settle", async () => {
-    await adoptImmutableInstall(params);
-    original = read();
-    mocks.launcher.mockClear();
-    fsSync.writeFileSync(
-      path.join(bridgePath, "package.json"),
-      JSON.stringify({
-        openclaw: { immutableInstallDescriptorVersion: 3 },
-      }),
-    );
+    await prepareRetentionUpgrade();
+    writeReaderVersion(3);
     const result = await adoptImmutableInstall({ ...params, inspectReleaseRetention: true });
     expect(read()).toMatchObject({
       descriptor: {
@@ -410,39 +417,16 @@ describe.skipIf(process.platform !== "linux")("explicit immutable adoption after
   it.each([undefined, 2, 4])(
     "refuses a serving reader marker of %s before adopting retention",
     async (version) => {
-      await adoptImmutableInstall(params);
-      const before = fsSync.readFileSync(journal());
-      mocks.launcher.mockClear();
-      fsSync.writeFileSync(
-        path.join(bridgePath, "package.json"),
-        JSON.stringify({
-          openclaw: { immutableInstallDescriptorVersion: version },
-        }),
-      );
-      await expect(
-        adoptImmutableInstall({ ...params, inspectReleaseRetention: true }),
-      ).rejects.toThrow("cannot read this control format");
-      expect(fsSync.readFileSync(journal())).toEqual(before);
-      expect(mocks.launcher).not.toHaveBeenCalled();
+      await prepareRetentionUpgrade();
+      writeReaderVersion(version);
+      await expectRetentionRejected("cannot read this control format");
     },
   );
 
   it("preserves pending recovery before any retention-format upgrade", async () => {
-    await adoptImmutableInstall(params);
-    original = read();
+    await prepareRetentionUpgrade();
     retainPendingActivation();
-    const before = fsSync.readFileSync(journal());
-    mocks.launcher.mockClear();
-    fsSync.writeFileSync(
-      path.join(bridgePath, "package.json"),
-      JSON.stringify({
-        openclaw: { immutableInstallDescriptorVersion: 3 },
-      }),
-    );
-    await expect(
-      adoptImmutableInstall({ ...params, inspectReleaseRetention: true }),
-    ).rejects.toThrow("Complete version-2 bridge activation and recovery");
-    expect(fsSync.readFileSync(journal())).toEqual(before);
-    expect(mocks.launcher).not.toHaveBeenCalled();
+    writeReaderVersion(3);
+    await expectRetentionRejected("Complete version-2 bridge activation and recovery");
   });
 });

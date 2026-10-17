@@ -191,22 +191,17 @@ it("refuses a current pointer outside releases", async () => {
   expect(mocks.record).not.toHaveBeenCalled();
 });
 
-it.each([undefined])(
-  "resolves a dry-run target without filesystem or receipt changes (%s)",
-  async (sha) => {
-    const before = await fs.readdir(root);
-    const result = await prepareImmutableUpdate({ root, sha, dryRun: true });
-    expect(result).toMatchObject({ status: "dry-run", targetSha: nextSha });
-    expect(result.coverage?.target).toEqual({ sha: nextSha, preparation: "unknown" });
-    expect(await fs.readdir(root)).toEqual(before);
-    expect(await pointer()).toBe(`releases/${currentSha}`);
-    expect(mocks.build).not.toHaveBeenCalled();
-    expect(mocks.record).not.toHaveBeenCalled();
-    expect(mocks.command.mock.calls.filter(([argv]) => argv.includes("ls-remote"))).toHaveLength(
-      sha ? 0 : 1,
-    );
-  },
-);
+it("resolves a dry-run target without filesystem or receipt changes", async () => {
+  const before = await fs.readdir(root);
+  const result = await prepareImmutableUpdate({ root, dryRun: true });
+  expect(result).toMatchObject({ status: "dry-run", targetSha: nextSha });
+  expect(result.coverage?.target).toEqual({ sha: nextSha, preparation: "unknown" });
+  expect(await fs.readdir(root)).toEqual(before);
+  expect(await pointer()).toBe(`releases/${currentSha}`);
+  expect(mocks.build).not.toHaveBeenCalled();
+  expect(mocks.record).not.toHaveBeenCalled();
+  expect(mocks.command.mock.calls.filter(([argv]) => argv.includes("ls-remote"))).toHaveLength(1);
+});
 
 it("refuses abbreviated targets before fetching or building", async () => {
   expect(await prepareImmutableUpdate({ root, sha: "abcdef", dryRun: true })).toMatchObject({
@@ -255,10 +250,10 @@ it.skipIf(process.platform !== "linux")(
   },
 );
 
-it.skipIf(process.platform !== "linux").each([undefined])(
-  "freezes the exact candidate, seals and records it without selecting it (%s)",
-  async (sha) => {
-    const result = await prepareImmutableUpdate({ root, sha });
+it.skipIf(process.platform !== "linux")(
+  "freezes the exact candidate, seals and records it without selecting it",
+  async () => {
+    const result = await prepareImmutableUpdate({ root });
     const destination = path.join(root, "releases", nextSha);
     expect(result).toMatchObject({
       status: "prepared",
@@ -272,9 +267,7 @@ it.skipIf(process.platform !== "linux").each([undefined])(
     expect(await fs.readFile(path.join(record.descriptor.current.path, "serving"), "utf8")).toBe(
       "previous Gateway bytes",
     );
-    expect(mocks.command.mock.calls.filter(([argv]) => argv.includes("ls-remote"))).toHaveLength(
-      sha ? 0 : 1,
-    );
+    expect(mocks.command.mock.calls.filter(([argv]) => argv.includes("ls-remote"))).toHaveLength(1);
     expect(mocks.seal).toHaveBeenCalledOnce();
     expect(mocks.record).toHaveBeenCalledOnce();
     expect(await fs.readdir(root)).toEqual(["current", "releases"]);
