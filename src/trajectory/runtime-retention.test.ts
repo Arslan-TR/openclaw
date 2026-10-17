@@ -25,12 +25,11 @@ const fixture = vi.hoisted(() => {
     unregisterRoot: vi.fn(),
     write: vi.fn<() => Promise<unknown>>(),
     read: vi.fn(),
-    releaseReader: vi.fn<() => void>(() => {
-      throw readerFailure;
-    }),
-    releaseExecution: vi.fn<() => Promise<void>>(async () => {
-      throw executionFailure;
-    }),
+    releaseReader: vi.fn<() => void>(),
+    releaseExecution: vi.fn<() => Promise<void>>(),
+    unexpectedNativeWork: async () => {
+      throw new Error("Unexpected native retention work");
+    },
   };
 });
 
@@ -92,15 +91,9 @@ vi.mock("../state/openclaw-agent-execution.js", () => ({
       throw new Error("Unexpected generation capture");
     },
     capturePreparedGenerationClaim: () => undefined,
-    async prepare() {
-      throw new Error("Unexpected database preparation");
-    },
-    async adoptNativeDatabase() {
-      throw new Error("Unexpected native database adoption");
-    },
-    async runExisting() {
-      throw new Error("Revoked retention must not write");
-    },
+    prepare: fixture.unexpectedNativeWork,
+    adoptNativeDatabase: fixture.unexpectedNativeWork,
+    runExisting: fixture.unexpectedNativeWork,
     release: fixture.releaseExecution,
   }),
 }));
@@ -146,9 +139,7 @@ it("retains failed cleanup custody and exposes the original failure to lifecycle
   assert(agent && root);
   // Revocation cancels the owned immediate before it can admit native work.
   const closing = agent.close();
-  const outcomes = await Promise.allSettled([pending, closing]);
-  const original = outcomes[0];
-  const joined = outcomes[1];
+  const [original, joined] = await Promise.allSettled([pending, closing]);
   assert(original?.status === "rejected" && joined?.status === "rejected");
   expect(original.reason).toMatchObject({
     errors: [fixture.readerFailure, fixture.executionFailure],

@@ -43,6 +43,7 @@ const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-trajectory-reten
 describe("SQLite trajectory runtime retention", () => {
   let tempDir: string;
   let storePath: string;
+  const now = Date.parse("2026-07-26T00:00:00.000Z");
   beforeEach(async () => {
     tempDir = sessionDirs.make();
     storePath = path.join(tempDir, "agents", "main", "sessions", "sessions.json");
@@ -54,6 +55,29 @@ describe("SQLite trajectory runtime retention", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
+
+  function currentEvent(
+    type: string,
+    options: Omit<Parameters<typeof createTrajectoryEvent>[0], "type"> = {},
+  ) {
+    return createTrajectoryEvent({ type, ts: new Date(Date.now()).toISOString(), ...options });
+  }
+
+  function append(sessionId: string, events: TrajectoryEvent[], maxGlobalRuntimeBytes?: number) {
+    appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath, maxGlobalRuntimeBytes }, events);
+  }
+
+  function startCurrent(payloadSize?: number) {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const current = currentEvent("current", { payloadSize });
+    append("session-1", [current]);
+    return current;
+  }
+
+  function eventBytes(events: readonly TrajectoryEvent[]) {
+    return events.reduce((total, row) => total + Buffer.byteLength(JSON.stringify(row)) + 1, 0);
+  }
 
   it.each(["missing", "invalidated", "empty"] as const)(
     "admits a retention write only for a current selection (%s)",
@@ -85,12 +109,7 @@ describe("SQLite trajectory runtime retention", () => {
         writeTransaction: (operationLabel, _owner, write) =>
           runOpenClawAgentWriteTransaction(write, options, { operationLabel }),
       };
-      const statements: string[] = [];
-      const exec = database.db.exec.bind(database.db);
-      const observe = vi.spyOn(database.db, "exec").mockImplementation((sql) => {
-        statements.push(sql);
-        exec(sql);
-      });
+      const observe = vi.spyOn(database.db, "exec");
       try {
         expect(
           operations["trajectory.retention.delete"]({ sweepId, snapshot }, context),
@@ -99,7 +118,7 @@ describe("SQLite trajectory runtime retention", () => {
           refresh: mode !== "empty",
           deleted: 0,
         });
-        expect(statements.filter((sql) => sql === "BEGIN IMMEDIATE")).toHaveLength(
+        expect(observe.mock.calls.filter(([sql]) => sql === "BEGIN IMMEDIATE")).toHaveLength(
           mode === "empty" ? 1 : 0,
         );
       } finally {
@@ -110,14 +129,9 @@ describe("SQLite trajectory runtime retention", () => {
   );
 
   it("rejects only changed runs while draining an eviction plan under competing writes", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() }),
-    ]);
+    startCurrent();
     await addSession("history");
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, [
+    append("history", [
       createTrajectoryEvent({ sessionId: "history", type: "old" }),
       createTrajectoryEvent({ sessionId: "history", runId: "unchanged", type: "evict" }),
     ]);
@@ -129,10 +143,7 @@ describe("SQLite trajectory runtime retention", () => {
             "UPDATE trajectory_runtime_events SET created_at = ? WHERE session_id = ? AND run_id = 'run-1'",
           )
           .run(Date.now(), "history"),
-      () =>
-        appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-          createTrajectoryEvent({ type: "trigger", ts: new Date(Date.now()).toISOString() }),
-        ]),
+      () => append("session-1", [currentEvent("trigger")]),
     );
     await expect(runtimeEventTypes("history")).resolves.toEqual(["old"]);
   });
@@ -140,32 +151,12 @@ describe("SQLite trajectory runtime retention", () => {
   it.each(["sibling", "managed"])(
     "preserves recent runs when a %s trim removes global budget pressure",
     async (writer) => {
-      const now = Date.parse("2026-07-26T00:00:00.000Z");
-      vi.useFakeTimers();
-      vi.setSystemTime(now);
-      const current = createTrajectoryEvent({
-        type: "current",
-        payloadSize: 4096,
-        ts: new Date(now).toISOString(),
-      });
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+      const current = startCurrent(4096);
       await addSession("history");
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, [
-        createTrajectoryEvent({
-          sessionId: "history",
-          type: "recent",
-          ts: new Date(now).toISOString(),
-        }),
-      ]);
+      append("history", [currentEvent("recent", { sessionId: "history" })]);
       vi.advanceTimersByTime(60 * 60 * 1_000);
-      const trigger = createTrajectoryEvent({
-        type: "trigger",
-        ts: new Date(Date.now()).toISOString(),
-      });
-      const maxGlobalRuntimeBytes = [current, trigger].reduce(
-        (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1,
-        0,
-      );
+      const trigger = currentEvent("trigger");
+      const maxGlobalRuntimeBytes = eventBytes([current, trigger]);
       withCompetingSelectionWrite(
         (competing) => {
           if (writer === "sibling") {
@@ -188,11 +179,7 @@ describe("SQLite trajectory runtime retention", () => {
             );
           }
         },
-        () =>
-          appendSqliteTrajectoryRuntimeEvents(
-            { sessionId: "session-1", storePath, maxGlobalRuntimeBytes },
-            [trigger],
-          ),
+        () => append("session-1", [trigger], maxGlobalRuntimeBytes),
         1,
         writer === "managed",
       );
@@ -202,11 +189,7 @@ describe("SQLite trajectory runtime retention", () => {
   );
 
   it("reselects a trimmed older run before evicting newer budget-only history", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    const current = createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() });
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+    const current = startCurrent();
     await addSession("history");
     const history = ["older", "older", "newer"].map((runId, index) =>
       createTrajectoryEvent({
@@ -217,26 +200,16 @@ describe("SQLite trajectory runtime retention", () => {
         ts: new Date(now - 1000 + index).toISOString(),
       }),
     );
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, history);
+    append("history", history);
     vi.advanceTimersByTime(60 * 60 * 1000);
-    const trigger = createTrajectoryEvent({
-      type: "trigger",
-      ts: new Date(Date.now()).toISOString(),
-    });
-    const maxGlobalRuntimeBytes = [current, history[2], trigger].reduce(
-      (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1,
-      0,
-    );
+    const trigger = currentEvent("trigger");
+    const maxGlobalRuntimeBytes = eventBytes([current, history[2], trigger]);
     withCompetingSelectionWrite(
       (competing) =>
         competing.exec(
           "DELETE FROM trajectory_runtime_events WHERE session_id = 'history' AND seq = 0",
         ),
-      () =>
-        appendSqliteTrajectoryRuntimeEvents(
-          { sessionId: "session-1", storePath, maxGlobalRuntimeBytes },
-          [trigger],
-        ),
+      () => append("session-1", [trigger], maxGlobalRuntimeBytes),
     );
     await expect(runtimeEventTypes("history")).resolves.toEqual(["newer"]);
   });
@@ -244,11 +217,7 @@ describe("SQLite trajectory runtime retention", () => {
   it.each(["expired", "recent"] as const)(
     "reselects older %s arrivals before evicting newer history",
     async (age) => {
-      const now = Date.parse("2026-07-26T00:00:00.000Z");
-      vi.useFakeTimers();
-      vi.setSystemTime(now);
-      const current = createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() });
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+      const current = startCurrent();
       await addSession("history");
       const expiredAt = now - 15 * 24 * 60 * 60 * 1000;
       const history = ["older", "newer"].map((type, index) =>
@@ -262,16 +231,10 @@ describe("SQLite trajectory runtime retention", () => {
           ).toISOString(),
         }),
       );
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, history);
+      append("history", history);
       vi.advanceTimersByTime(60 * 60 * 1000);
-      const trigger = createTrajectoryEvent({
-        type: "trigger",
-        ts: new Date(Date.now()).toISOString(),
-      });
-      const maxGlobalRuntimeBytes = [current, history[1], trigger].reduce(
-        (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1,
-        0,
-      );
+      const trigger = currentEvent("trigger");
+      const maxGlobalRuntimeBytes = eventBytes([current, history[1], trigger]);
       const arrival = createTrajectoryEvent({
         sessionId: "history",
         runId: "arrival",
@@ -291,11 +254,7 @@ describe("SQLite trajectory runtime retention", () => {
             (session_id, seq, run_id, event_json, created_at) VALUES ('history', 2, 'arrival', ?, ?)`)
             .run(JSON.stringify(arrival), Date.parse(arrival.ts));
         },
-        () =>
-          appendSqliteTrajectoryRuntimeEvents(
-            { sessionId: "session-1", storePath, maxGlobalRuntimeBytes },
-            [trigger],
-          ),
+        () => append("session-1", [trigger], maxGlobalRuntimeBytes),
       );
       await expect(runtimeEventTypes("history")).resolves.toEqual([
         age === "expired" ? "newer" : "older",
@@ -304,11 +263,7 @@ describe("SQLite trajectory runtime retention", () => {
   );
 
   it("settles a budget sweep without waiting for a write-free reader pass", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    const current = createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() });
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+    const current = startCurrent();
     await addSession("history");
     const history = ["A", "B", "C"].map((type) =>
       createTrajectoryEvent({
@@ -318,31 +273,20 @@ describe("SQLite trajectory runtime retention", () => {
         ts: new Date(now - 1000).toISOString(),
       }),
     );
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, history);
+    append("history", history);
     vi.advanceTimersByTime(60 * 60 * 1000);
-    const trigger = createTrajectoryEvent({
-      type: "trigger",
-      ts: new Date(Date.now()).toISOString(),
-    });
-    const maxGlobalRuntimeBytes = [current, trigger, ...history.slice(0, 2)].reduce(
-      (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1,
-      0,
-    );
+    const trigger = currentEvent("trigger");
+    const maxGlobalRuntimeBytes = eventBytes([current, trigger, ...history.slice(0, 2)]);
     let arrivals = 0;
     withCompetingSelectionWrite(
       () => {
         const type = String.fromCharCode("D".charCodeAt(0) + arrivals);
-        const event = createTrajectoryEvent({
-          sessionId: "history",
-          runId: type,
-          type,
-          ts: new Date(Date.now()).toISOString(),
-        });
+        const arrival = currentEvent(type, { sessionId: "history", runId: type });
         arrivals++;
         appendSqliteTrajectoryRuntimeEventsWithWriter(
           {
             sessionId: "history",
-            events: [{ runId: event.runId, ts: event.ts, line: JSON.stringify(event) }],
+            events: [{ runId: arrival.runId, ts: arrival.ts, line: JSON.stringify(arrival) }],
           },
           (operationLabel, write) =>
             runOpenClawAgentWriteTransaction(
@@ -352,11 +296,7 @@ describe("SQLite trajectory runtime retention", () => {
             ),
         );
       },
-      () =>
-        appendSqliteTrajectoryRuntimeEvents(
-          { sessionId: "session-1", storePath, maxGlobalRuntimeBytes },
-          [trigger],
-        ),
+      () => append("session-1", [trigger], maxGlobalRuntimeBytes),
       // Let a regressed sweep finish once the competing writer goes quiet.
       4,
       true,
@@ -368,11 +308,7 @@ describe("SQLite trajectory runtime retention", () => {
   it.each(["budget", "age"] as const)(
     "rechecks an empty selection after competing %s growth",
     async (reason) => {
-      const now = Date.parse("2026-07-26T00:00:00.000Z");
-      vi.useFakeTimers();
-      vi.setSystemTime(now);
-      const current = createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() });
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+      const current = startCurrent();
       await addSession("history");
       const history = ["older", "newer"].map((type, index) =>
         createTrajectoryEvent({
@@ -383,21 +319,11 @@ describe("SQLite trajectory runtime retention", () => {
           ts: new Date(now - 1000 + index).toISOString(),
         }),
       );
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, history);
+      append("history", history);
       vi.advanceTimersByTime(60 * 60 * 1000);
-      const trigger = createTrajectoryEvent({
-        type: "trigger",
-        ts: new Date(Date.now()).toISOString(),
-      });
-      const initialBytes = [current, ...history, trigger].reduce(
-        (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1,
-        0,
-      );
-      const growth = createTrajectoryEvent({
-        type: "growth",
-        payloadSize: 1024,
-        ts: new Date(Date.now()).toISOString(),
-      });
+      const trigger = currentEvent("trigger");
+      const initialBytes = eventBytes([current, ...history, trigger]);
+      const growth = currentEvent("growth", { payloadSize: 1024 });
       const maxGlobalRuntimeBytes = reason === "budget" ? initialBytes : initialBytes * 2;
       const growthSession = reason === "budget" ? "session-1" : "history";
       const growthTime = reason === "budget" ? Date.now() : now - 15 * 24 * 60 * 60 * 1000;
@@ -407,11 +333,7 @@ describe("SQLite trajectory runtime retention", () => {
             .prepare(`INSERT INTO trajectory_runtime_events
         (session_id, seq, run_id, event_json, created_at) VALUES (?, 2, 'growth', ?, ?)`)
             .run(growthSession, JSON.stringify(growth), growthTime),
-        () =>
-          appendSqliteTrajectoryRuntimeEvents(
-            { sessionId: "session-1", storePath, maxGlobalRuntimeBytes },
-            [trigger],
-          ),
+        () => append("session-1", [trigger], maxGlobalRuntimeBytes),
       );
       await expect(runtimeEventTypes("history")).resolves.toEqual(
         reason === "budget" ? ["newer"] : ["older", "newer"],
@@ -423,16 +345,9 @@ describe("SQLite trajectory runtime retention", () => {
   );
 
   it("keeps the committed append when retention fails and retries retention on the next append", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() }),
-    ]);
+    startCurrent();
     await addSession("history");
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "history", storePath }, [
-      createTrajectoryEvent({ sessionId: "history", type: "old" }),
-    ]);
+    append("history", [createTrajectoryEvent({ sessionId: "history", type: "old" })]);
     const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
     using _ = { [Symbol.dispose]: retainAgentDatabase(database.db) };
     database.db.exec(`CREATE TEMP TRIGGER reject_retention
@@ -440,9 +355,7 @@ describe("SQLite trajectory runtime retention", () => {
       BEGIN SELECT RAISE(ABORT, 'synthetic retention failure'); END`);
     vi.advanceTimersByTime(60 * 60 * 1_000);
     try {
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-        createTrajectoryEvent({ type: "retention-failed", ts: new Date(Date.now()).toISOString() }),
-      ]);
+      append("session-1", [currentEvent("retention-failed")]);
       await expect(runtimeEventTypes("session-1")).resolves.toEqual([
         "current",
         "retention-failed",
@@ -451,9 +364,7 @@ describe("SQLite trajectory runtime retention", () => {
     } finally {
       database.db.exec("DROP TRIGGER reject_retention");
     }
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "retry-retention", ts: new Date(Date.now()).toISOString() }),
-    ]);
+    append("session-1", [currentEvent("retry-retention")]);
     await expect(runtimeEventTypes("history")).resolves.toEqual([]);
     await expect(runtimeEventTypes("session-1")).resolves.toEqual([
       "current",
@@ -465,12 +376,9 @@ describe("SQLite trajectory runtime retention", () => {
   it.each([0, -1])(
     "evicts complete runs at the global UTF-8 byte budget (%i-byte adjustment)",
     async (delta) => {
-      const now = Date.parse("2026-07-26T00:00:00.000Z");
       vi.useFakeTimers();
       vi.setSystemTime(now);
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-        createTrajectoryEvent({ payloadSize: 200, type: "current-initial" }),
-      ]);
+      append("session-1", [createTrajectoryEvent({ payloadSize: 200, type: "current-initial" })]);
       for (const [index, sessionId] of ["oldest", "middle", "newest"].entries()) {
         await addSession(sessionId);
         const events = [0, 1].map((part) => {
@@ -486,12 +394,11 @@ describe("SQLite trajectory runtime retention", () => {
           event.data = { payload: "日本語🦞".repeat(40) };
           return event;
         });
-        appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath }, events);
+        append(sessionId, events);
       }
       const bytesBefore = runtimeBytesBySession();
-      const trigger = createTrajectoryEvent({
+      const trigger = currentEvent("current-newest", {
         payloadSize: 200,
-        type: "current-newest",
         ts: new Date(now + 60 * 60 * 1_000).toISOString(),
       });
       const triggerBytes = Buffer.byteLength(JSON.stringify(trigger), "utf8") + 1;
@@ -569,10 +476,7 @@ describe("SQLite trajectory runtime retention", () => {
       });
       try {
         vi.advanceTimersByTime(60 * 60 * 1_000);
-        appendSqliteTrajectoryRuntimeEvents(
-          { maxGlobalRuntimeBytes, sessionId: "session-1", storePath },
-          [trigger],
-        );
+        append("session-1", [trigger], maxGlobalRuntimeBytes);
         expect(aggregates).toBeGreaterThan(0);
       } finally {
         clearNodeSqliteKyselyCacheForDatabase(native);
@@ -593,17 +497,12 @@ describe("SQLite trajectory runtime retention", () => {
   );
 
   it("drains complete runs through byte-bounded transactions despite writes between batches", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() }),
-    ]);
+    startCurrent();
     for (let index = 0; index < 12; index++) {
       const sessionId = `history-${String(index).padStart(2, "0")}`;
       await addSession(sessionId);
-      appendSqliteTrajectoryRuntimeEvents(
-        { sessionId, storePath },
+      append(
+        sessionId,
         Array.from({ length: 4 }, (_, part) =>
           createTrajectoryEvent({
             sessionId,
@@ -649,9 +548,7 @@ describe("SQLite trajectory runtime retention", () => {
     });
     vi.advanceTimersByTime(60 * 60 * 1_000);
     try {
-      appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-        createTrajectoryEvent({ type: "sweep", ts: new Date(Date.now()).toISOString() }),
-      ]);
+      append("session-1", [currentEvent("sweep")]);
     } finally {
       commits.mockRestore();
       competing.close();
@@ -675,11 +572,7 @@ describe("SQLite trajectory runtime retention", () => {
     ["a", "Z"],
     ["a\uFE0F", "a\u{E0100}"],
   ])("preserves locale/BINARY order and null-first ties (%s, %s)", async (older, newer) => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    const current = createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() });
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+    const current = startCurrent();
     const runs: TrajectoryEvent[] = [];
     for (const sessionId of [newer, older]) {
       await addSession(sessionId);
@@ -693,32 +586,18 @@ describe("SQLite trajectory runtime retention", () => {
         return event;
       });
       runs.push(...events);
-      appendSqliteTrajectoryRuntimeEvents({ sessionId, storePath }, events);
+      append(sessionId, events);
     }
     vi.advanceTimersByTime(60 * 60 * 1_000);
-    const trigger = createTrajectoryEvent({
-      type: "trigger",
-      ts: new Date(Date.now()).toISOString(),
-    });
+    const trigger = currentEvent("trigger");
     const retained = runs.find((event) => event.sessionId === newer && event.runId === "")!;
-    const maxGlobalRuntimeBytes = [current, trigger, retained].reduce(
-      (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event), "utf8") + 1,
-      0,
-    );
-    appendSqliteTrajectoryRuntimeEvents(
-      { sessionId: "session-1", storePath, maxGlobalRuntimeBytes },
-      [trigger],
-    );
+    append("session-1", [trigger], eventBytes([current, trigger, retained]));
     await expect(runtimeEventTypes(older)).resolves.toEqual([]);
     await expect(runtimeEventTypes(newer)).resolves.toEqual(["empty-run"]);
   });
 
   it("retains the same newest runs when eviction spans several selection pages", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
-    vi.useFakeTimers();
-    vi.setSystemTime(now);
-    const current = createTrajectoryEvent({ type: "current", ts: new Date(now).toISOString() });
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [current]);
+    const current = startCurrent();
     await addSession("history");
     const count = 200;
     const payload = JSON.stringify({ type: "historical" });
@@ -734,21 +613,11 @@ describe("SQLite trajectory runtime retention", () => {
       { agentId: "main", path: sqlitePath() },
     );
     vi.advanceTimersByTime(60 * 60 * 1_000);
-    const trigger = createTrajectoryEvent({
-      type: "trigger",
-      ts: new Date(Date.now()).toISOString(),
-    });
-    const currentBytes = [current, trigger].reduce(
-      (bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1,
-      0,
-    );
-    appendSqliteTrajectoryRuntimeEvents(
-      {
-        sessionId: "session-1",
-        storePath,
-        maxGlobalRuntimeBytes: currentBytes + 3 * (Buffer.byteLength(payload) + 1),
-      },
+    const trigger = currentEvent("trigger");
+    append(
+      "session-1",
       [trigger],
+      eventBytes([current, trigger]) + 3 * (Buffer.byteLength(payload) + 1),
     );
     expect(
       loadSqliteTrajectoryRuntimeEventRowsSync({ sessionId: "history", storePath }).map(
@@ -758,12 +627,9 @@ describe("SQLite trajectory runtime retention", () => {
   });
 
   it("rate-limits the global sweep instead of running it on every insert", async () => {
-    const now = Date.parse("2026-07-26T00:00:00.000Z");
     vi.useFakeTimers();
     vi.setSystemTime(now);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "current" }),
-    ]);
+    append("session-1", [createTrajectoryEvent({ type: "current" })]);
     await addSession("old-session");
     const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath() });
     const scopes = [
@@ -773,16 +639,14 @@ describe("SQLite trajectory runtime retention", () => {
     using _ = { [Symbol.dispose]: retainAgentDatabase(database.db) };
     const token = readSqliteDatabaseScopedWriteToken(database.db, scopes);
     expect(token).toBeTypeOf("string");
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "old-session", storePath }, [
+    append("old-session", [
       createTrajectoryEvent({
         sessionId: "old-session",
         type: "old",
         ts: new Date(now - 15 * 24 * 60 * 60 * 1_000).toISOString(),
       }),
     ]);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "same-window" }),
-    ]);
+    append("session-1", [createTrajectoryEvent({ type: "same-window" })]);
     await expect(runtimeEventTypes("old-session")).resolves.toEqual(["old"]);
     expect(readSqliteDatabaseScopedWriteToken(database.db, scopes)).toBe(token);
 
@@ -790,25 +654,21 @@ describe("SQLite trajectory runtime retention", () => {
     expect(() =>
       runOpenClawAgentWriteTransaction(
         () => {
-          appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-            createTrajectoryEvent({ type: "rolled-back", ts: new Date(Date.now()).toISOString() }),
-          ]);
+          append("session-1", [currentEvent("rolled-back")]);
           throw new Error("synthetic enclosing rollback");
         },
         { agentId: "main", path: sqlitePath() },
       ),
     ).toThrow("synthetic enclosing rollback");
     await expect(runtimeEventTypes("old-session")).resolves.toEqual(["old"]);
-    appendSqliteTrajectoryRuntimeEvents({ sessionId: "session-1", storePath }, [
-      createTrajectoryEvent({ type: "next-window", ts: new Date(Date.now()).toISOString() }),
-    ]);
+    append("session-1", [currentEvent("next-window")]);
     await expect(runtimeEventTypes("old-session")).resolves.toEqual([]);
     expect(readSqliteDatabaseScopedWriteToken(database.db, scopes)).toBe(token);
   });
 
   function withCompetingSelectionWrite(
     mutate: (db: DatabaseSync) => void,
-    append: () => void,
+    runAppend: () => void,
     maxWrites = 1,
     managed = false,
   ) {
@@ -848,7 +708,7 @@ describe("SQLite trajectory runtime retention", () => {
       return statement;
     });
     try {
-      append();
+      runAppend();
       expect(writes).toBeGreaterThan(0);
     } finally {
       clearNodeSqliteKyselyCacheForDatabase(native);
