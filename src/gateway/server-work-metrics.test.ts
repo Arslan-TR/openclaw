@@ -146,15 +146,17 @@ it("bounds live projection over idle history through admission, progress, drain,
         next.resolve(snapshot);
       }
     });
-    const read = async (expected: GatewayWorkMetricsSnapshot) => {
+    const read = async (
+      running: number,
+      queuedSessions: number,
+      work = { agentRuns: 0, chatRuns: 0, queuedTurns: 0 },
+    ) => {
       inspectedKeys.clear();
       await vi.runOnlyPendingTimersAsync();
       const snapshot = await withinTest(next.promise, test.signal);
       next = createDeferredCore<GatewayWorkMetricsSnapshot>();
-      expect(snapshot.sessions.running).toBe(expected.sessions.running);
-      expect(snapshot.sessions.queued).toBe(expected.sessions.queued);
-      expect(snapshot.work).toEqual(expected.work);
-      expect(inspectedKeys.size).toBe(expected.sessions.running + expected.sessions.queued);
+      expect(snapshot).toEqual({ sessions: { running, queued: queuedSessions }, work });
+      expect(inspectedKeys.size).toBe(running + queuedSessions);
       const list = await listSessions({
         client,
         context,
@@ -176,30 +178,19 @@ it("bounds live projection over idle history through admission, progress, drain,
       expect(latest).toBeUndefined();
       setDiagnosticsEnabledForProcess(true);
       notifyGatewayWorkMetricsChanged();
-      await read({
-        sessions: { running: 1, queued: 1 },
-        work: { agentRuns: 1, chatRuns: 1, queuedTurns: 1 },
-      });
+      const liveWork = { agentRuns: 1, chatRuns: 1, queuedTurns: 1 };
+      await read(1, 1, liveWork);
       releaseWait?.();
       markReplyOperationExecutionStarted(reply);
-      await read({
-        sessions: { running: 2, queued: 0 },
-        work: { agentRuns: 1, chatRuns: 1, queuedTurns: 1 },
-      });
+      await read(2, 0, liveWork);
       retireQueuedChatTurnCancellation(context.chatQueuedTurns, "queued-turn", queued);
       queued.abort();
-      await read({
-        sessions: { running: 2, queued: 0 },
-        work: { agentRuns: 1, chatRuns: 1, queuedTurns: 0 },
-      });
+      await read(2, 0, { ...liveWork, queuedTurns: 0 });
       reply.complete();
       chat.cleanup();
       releaseAgentRunContext("agent-run", claim!);
       claim = undefined;
-      await read({
-        sessions: { running: 0, queued: 0 },
-        work: { agentRuns: 0, chatRuns: 0, queuedTurns: 0 },
-      });
+      await read(0, 0);
 
       const swarm = {
         runId: "swarm-run",
@@ -229,10 +220,7 @@ it("bounds live projection over idle history through admission, progress, drain,
       let hold: ReturnType<typeof holdQueuedSwarmRun>;
       try {
         bindSwarmRunReservation(swarm.runId, getSubagentRunRuntimeKey(swarm));
-        await read({
-          sessions: { running: 1, queued: 0 },
-          work: { agentRuns: 0, chatRuns: 0, queuedTurns: 0 },
-        });
+        await read(1, 0);
         activateSwarmRun({
           groupId: swarm.groupId,
           runId: swarm.runId,
@@ -240,20 +228,11 @@ it("bounds live projection over idle history through admission, progress, drain,
           onStartFailure: () => true,
           onRemoved: () => removal.promise,
         });
-        await read({
-          sessions: { running: 0, queued: 1 },
-          work: { agentRuns: 0, chatRuns: 0, queuedTurns: 0 },
-        });
+        await read(0, 1);
         hold = holdQueuedSwarmRun(swarm.runId);
-        await read({
-          sessions: { running: 1, queued: 0 },
-          work: { agentRuns: 0, chatRuns: 0, queuedTurns: 0 },
-        });
+        await read(1, 0);
         expect(hold?.withdraw()).toBe(true);
-        await read({
-          sessions: { running: 0, queued: 0 },
-          work: { agentRuns: 0, chatRuns: 0, queuedTurns: 0 },
-        });
+        await read(0, 0);
         expect(launch).not.toHaveBeenCalled();
         expect(changes).not.toHaveBeenCalled();
       } finally {

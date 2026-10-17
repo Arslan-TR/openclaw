@@ -116,6 +116,29 @@ function baseConfig(): OpenClawConfig {
   };
 }
 
+const envRef = (id: string) => ({ source: "env" as const, provider: "default", id });
+const vaultRef = (id: string) => ({ source: "exec" as const, provider: "vault", id });
+const openaiProvider = (apiKey: ReturnType<typeof envRef> | ReturnType<typeof vaultRef>) => ({
+  providers: { openai: { apiKey, baseUrl: "https://api.openai.com/v1", models: [] } },
+});
+const elevenlabs = (apiKey: ReturnType<typeof envRef> | ReturnType<typeof vaultRef>) => ({
+  providers: { elevenlabs: { apiKey } },
+});
+const googleSearch = (apiKey: ReturnType<typeof envRef> | ReturnType<typeof vaultRef>) => ({
+  enabled: true,
+  entries: { google: { enabled: true, config: { webSearch: { apiKey } } } },
+});
+
+function expectOwnerWarnings(warnings: unknown, paths: string[]) {
+  expect(warnings).toEqual(
+    expect.arrayContaining(
+      paths.map((configPath) =>
+        expect.objectContaining({ code: "SECRETS_OWNER_UNAVAILABLE", path: configPath }),
+      ),
+    ),
+  );
+}
+
 async function startVaultAclFixture() {
   const requests: string[] = [];
   const vault = createServer((request, response) => {
@@ -144,6 +167,18 @@ async function startVaultAclFixture() {
 describe("Gateway startup SecretRef owner isolation", () => {
   let server: Awaited<ReturnType<typeof startTestGatewayServer>> | undefined;
 
+  async function start(auth = true) {
+    const claim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+    server = await startTestGatewayServer(claim, auth ? { auth: { mode: "none" } } : undefined);
+    return claim.port;
+  }
+
+  async function expectReady(port: number) {
+    const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
+    expect(ready.status).toBe(200);
+    await expect(ready.json()).resolves.toMatchObject({ ready: true });
+  }
+
   afterEach(async () => {
     await server?.close();
     server = undefined;
@@ -162,18 +197,10 @@ describe("Gateway startup SecretRef owner isolation", () => {
         },
         session: { scope: "global" },
         secrets: { providers: { default: { source: "env" } } },
-        tts: {
-          providers: {
-            elevenlabs: {
-              apiKey: { source: "env", provider: "default", id: "SYSTEM_OWNER_SECRET" },
-            },
-          },
-        },
+        tts: elevenlabs(envRef("SYSTEM_OWNER_SECRET")),
       });
 
-      const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
-      server = await startTestGatewayServer(portClaim, { auth: { mode: "none" } });
-      const ws = await connectWebchatClient({ port: portClaim.port, scopes: ["operator.admin"] });
+      const ws = await connectWebchatClient({ port: await start(), scopes: ["operator.admin"] });
       try {
         deleteTestEnvValue("SYSTEM_OWNER_SECRET");
         const reload = await rpcReq<{ warningCount?: number }>(ws, "secrets.reload", {});
@@ -270,9 +297,7 @@ describe("Gateway startup SecretRef owner isolation", () => {
           throw new Error("Gateway test did not configure a config file path");
         }
         const originalConfig = readFileSync(configPath);
-        const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
-        server = await startTestGatewayServer(portClaim, { auth: { mode: "none" } });
-        const ws = await connectWebchatClient({ port: portClaim.port, scopes: ["operator.admin"] });
+        const ws = await connectWebchatClient({ port: await start(), scopes: ["operator.admin"] });
         try {
           const brokenStart = await rpcReq(ws, "channels.start", {
             channel: "telegram",
@@ -409,30 +434,12 @@ describe("Gateway startup SecretRef owner isolation", () => {
             bind: "loopback",
             auth: {
               mode: "token",
-              token: { source: "env", provider: "default", id: "GATEWAY_TOKEN_REF" },
+              token: envRef("GATEWAY_TOKEN_REF"),
             },
           },
           secrets: { providers: { default: { source: "env" } } },
-          tts: {
-            providers: {
-              elevenlabs: {
-                apiKey: { source: "env", provider: "default", id: "MISSING_TTS_KEY" },
-              },
-            },
-          },
-          models: {
-            providers: {
-              openai: {
-                apiKey: {
-                  source: "env",
-                  provider: "default",
-                  id: "MISSING_UNUSED_PROVIDER_KEY",
-                },
-                baseUrl: "https://api.openai.com/v1",
-                models: [],
-              },
-            },
-          },
+          tts: elevenlabs(envRef("MISSING_TTS_KEY")),
+          models: openaiProvider(envRef("MISSING_UNUSED_PROVIDER_KEY")),
           tools: {
             media: {
               models: [{ provider: "openai", capabilities: ["audio"] }],
@@ -443,7 +450,7 @@ describe("Gateway startup SecretRef owner isolation", () => {
           memory: {
             search: {
               remote: {
-                apiKey: { source: "env", provider: "default", id: "MISSING_MEMORY_KEY" },
+                apiKey: envRef("MISSING_MEMORY_KEY"),
               },
             },
           },
@@ -456,11 +463,7 @@ describe("Gateway startup SecretRef owner isolation", () => {
                 backend: "ssh",
                 ssh: {
                   target: "sandbox@example.com:22",
-                  identityData: {
-                    source: "env",
-                    provider: "default",
-                    id: "MISSING_SANDBOX_IDENTITY",
-                  },
+                  identityData: envRef("MISSING_SANDBOX_IDENTITY"),
                 },
               },
             },
@@ -468,11 +471,7 @@ describe("Gateway startup SecretRef owner isolation", () => {
               main: {
                 sandbox: {
                   ssh: {
-                    identityData: {
-                      source: "env",
-                      provider: "default",
-                      id: "HEALTHY_SANDBOX_IDENTITY",
-                    },
+                    identityData: envRef("HEALTHY_SANDBOX_IDENTITY"),
                   },
                 },
               },
@@ -480,130 +479,52 @@ describe("Gateway startup SecretRef owner isolation", () => {
                 memory: {
                   search: {
                     remote: {
-                      apiKey: {
-                        source: "env",
-                        provider: "default",
-                        id: "HEALTHY_MEMORY_KEY",
-                      },
+                      apiKey: envRef("HEALTHY_MEMORY_KEY"),
                     },
                   },
                 },
               },
             },
           },
-          cron: {
-            webhookToken: {
-              source: "env",
-              provider: "default",
-              id: "MISSING_WEBHOOK_TOKEN",
-            },
-          },
+          cron: { webhookToken: envRef("MISSING_WEBHOOK_TOKEN") },
           skills: {
             entries: {
               cold: {
-                apiKey: { source: "env", provider: "default", id: "MISSING_SKILL_KEY" },
+                apiKey: envRef("MISSING_SKILL_KEY"),
               },
             },
           },
-          plugins: {
-            enabled: true,
-            entries: {
-              google: {
-                enabled: true,
-                config: {
-                  webSearch: {
-                    apiKey: {
-                      source: "env",
-                      provider: "default",
-                      id: "OPENCLAW_TEST_ACTIVE_WEB_SEARCH_SECRET",
-                    },
-                  },
-                },
-              },
-            },
-          },
+          plugins: googleSearch(envRef("OPENCLAW_TEST_ACTIVE_WEB_SEARCH_SECRET")),
         });
         testState.gatewayAuth = undefined;
 
-        const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
-        server = await startTestGatewayServer(portClaim);
-        const ready = await fetch(`http://127.0.0.1:${portClaim.port}/readyz`);
-
-        expect(ready.status).toBe(200);
-        await expect(ready.json()).resolves.toMatchObject({ ready: true });
+        await expectReady(await start(false));
         const active = getActiveSecretsRuntimeSnapshot();
         expect(active?.config.gateway?.auth?.token).toBe("placeholder");
         expect(active?.degradedOwners).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              ownerKind: "provider",
-              ownerId: "openai",
-              state: "unavailable",
-            }),
-            expect.objectContaining({
-              ownerKind: "capability",
-              ownerId: "tts",
-              state: "unavailable",
-            }),
-            expect.objectContaining({
-              ownerKind: "capability",
-              ownerId: "memory-provider:main",
-              state: "unavailable",
-            }),
-            expect.objectContaining({
-              ownerKind: "capability",
-              ownerId: "agent-sandbox:cold",
-              state: "unavailable",
-            }),
-            expect.objectContaining({
-              ownerKind: "capability",
-              ownerId: "cron-webhook",
-              state: "unavailable",
-            }),
-            expect.objectContaining({
-              ownerKind: "capability",
-              ownerId: "skill:cold",
-              state: "unavailable",
-            }),
-            expect.objectContaining({
-              ownerKind: "capability",
-              ownerId: "web-search:gemini",
-              state: "unavailable",
-            }),
-          ]),
+          expect.arrayContaining(
+            [
+              ["provider", "openai"],
+              ["capability", "tts"],
+              ["capability", "memory-provider:main"],
+              ["capability", "agent-sandbox:cold"],
+              ["capability", "cron-webhook"],
+              ["capability", "skill:cold"],
+              ["capability", "web-search:gemini"],
+            ].map(([ownerKind, ownerId]) =>
+              expect.objectContaining({ ownerKind, ownerId, state: "unavailable" }),
+            ),
+          ),
         );
-        expect(active?.warnings).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "models.providers.openai.apiKey",
-            }),
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "tts.providers.elevenlabs.apiKey",
-            }),
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "memory.search.remote.apiKey",
-            }),
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "agents.defaults.sandbox.ssh.identityData",
-            }),
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "cron.webhookToken",
-            }),
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "skills.entries.cold.apiKey",
-            }),
-            expect.objectContaining({
-              code: "SECRETS_OWNER_UNAVAILABLE",
-              path: "plugins.entries.google.config.webSearch.apiKey",
-            }),
-          ]),
-        );
+        expectOwnerWarnings(active?.warnings, [
+          "models.providers.openai.apiKey",
+          "tts.providers.elevenlabs.apiKey",
+          "memory.search.remote.apiKey",
+          "agents.defaults.sandbox.ssh.identityData",
+          "cron.webhookToken",
+          "skills.entries.cold.apiKey",
+          "plugins.entries.google.config.webSearch.apiKey",
+        ]);
         if (!active) {
           throw new Error("Expected active secrets runtime snapshot");
         }
@@ -656,62 +577,25 @@ describe("Gateway startup SecretRef owner isolation", () => {
             vault: { source: "exec", command: commandPath, passEnv: ["PATH", "VAULT_ADDR"] },
           },
         },
-        models: {
-          providers: {
-            openai: {
-              apiKey: { source: "exec", provider: "vault", id: "models/openai" },
-              baseUrl: "https://api.openai.com/v1",
-              models: [],
-            },
-          },
-        },
-        tts: {
-          providers: {
-            elevenlabs: {
-              apiKey: { source: "exec", provider: "vault", id: "tts/elevenlabs" },
-            },
-          },
-        },
+        models: openaiProvider(vaultRef("models/openai")),
+        tts: elevenlabs(vaultRef("tts/elevenlabs")),
         tools: { web: { search: { provider: "gemini" } } },
-        plugins: {
-          enabled: true,
-          entries: {
-            google: {
-              enabled: true,
-              config: {
-                webSearch: {
-                  apiKey: { source: "exec", provider: "vault", id: "web/gemini" },
-                },
-              },
-            },
-          },
-        },
+        plugins: googleSearch(vaultRef("web/gemini")),
       });
 
-      const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
-      server = await startTestGatewayServer(portClaim, { auth: { mode: "none" } });
-      const ready = await fetch(`http://127.0.0.1:${portClaim.port}/readyz`);
-
-      expect(ready.status).toBe(200);
-      await expect(ready.json()).resolves.toMatchObject({ ready: true });
+      await expectReady(await start());
       expect(readFileSync(callLogPath, "utf8").trim().split("\n")).toHaveLength(2);
-      expect(getActiveSecretsRuntimeSnapshot()?.degradedOwners).toMatchObject([
-        {
-          ownerKind: "provider",
-          ownerId: "openai",
+      expect(getActiveSecretsRuntimeSnapshot()?.degradedOwners).toMatchObject(
+        [
+          ["provider", "openai"],
+          ["capability", "tts"],
+          ["capability", "web-search:gemini"],
+        ].map(([ownerKind, ownerId]) => ({
+          ownerKind,
+          ownerId,
           providerFailures: [{ source: "exec", provider: "vault" }],
-        },
-        {
-          ownerKind: "capability",
-          ownerId: "tts",
-          providerFailures: [{ source: "exec", provider: "vault" }],
-        },
-        {
-          ownerKind: "capability",
-          ownerId: "web-search:gemini",
-          providerFailures: [{ source: "exec", provider: "vault" }],
-        },
-      ]);
+        })),
+      );
     });
   });
 
@@ -743,30 +627,11 @@ describe("Gateway startup SecretRef owner isolation", () => {
                 },
               },
             },
-            models: {
-              providers: {
-                openai: {
-                  apiKey: { source: "exec", provider: "vault", id: "models/openai" },
-                  baseUrl: "https://api.openai.com/v1",
-                  models: [],
-                },
-              },
-            },
-            tts: {
-              providers: {
-                elevenlabs: {
-                  apiKey: { source: "exec", provider: "vault", id: "tts/elevenlabs" },
-                },
-              },
-            },
+            models: openaiProvider(vaultRef("models/openai")),
+            tts: elevenlabs(vaultRef("tts/elevenlabs")),
           });
 
-          const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
-          server = await startTestGatewayServer(portClaim, { auth: { mode: "none" } });
-          const ready = await fetch(`http://127.0.0.1:${portClaim.port}/readyz`);
-
-          expect(ready.status).toBe(200);
-          await expect(ready.json()).resolves.toMatchObject({ ready: true });
+          await expectReady(await start());
           const snapshot = getActiveSecretsRuntimeSnapshot();
           const degradedOwners = snapshot?.degradedOwners ?? [];
           expect(degradedOwners).toMatchObject([
@@ -774,18 +639,10 @@ describe("Gateway startup SecretRef owner isolation", () => {
             { ownerKind: "capability", ownerId: "tts", state: "unavailable" },
           ]);
           expect(degradedOwners.every((owner) => !owner.providerFailures)).toBe(true);
-          expect(snapshot?.warnings).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({
-                code: "SECRETS_OWNER_UNAVAILABLE",
-                path: "models.providers.openai.apiKey",
-              }),
-              expect.objectContaining({
-                code: "SECRETS_OWNER_UNAVAILABLE",
-                path: "tts.providers.elevenlabs.apiKey",
-              }),
-            ]),
-          );
+          expectOwnerWarnings(snapshot?.warnings, [
+            "models.providers.openai.apiKey",
+            "tts.providers.elevenlabs.apiKey",
+          ]);
           expect(
             vault.requests.filter((url) => url === "/v1/auth/token/lookup-self").length,
           ).toBeGreaterThan(0);
@@ -823,11 +680,7 @@ describe("Gateway startup SecretRef owner isolation", () => {
               [profileId]: {
                 type: "api_key",
                 provider: "openai",
-                keyRef: {
-                  source: "env",
-                  provider: "default",
-                  id: "MISSING_SELECTED_PROFILE_KEY",
-                },
+                keyRef: envRef("MISSING_SELECTED_PROFILE_KEY"),
               },
             },
           },
@@ -835,9 +688,8 @@ describe("Gateway startup SecretRef owner isolation", () => {
         );
         await writeConfig(config);
 
-        const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
-        server = await startTestGatewayServer(portClaim, { auth: { mode: "none" } });
-        const ready = await fetch(`http://127.0.0.1:${portClaim.port}/readyz`);
+        const port = await start();
+        const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
         expect(ready.status).toBe(200);
 
         const ownerId = resolveAuthProfileSecretOwnerId({ agentDir, profileId });
@@ -879,7 +731,7 @@ describe("Gateway startup SecretRef owner isolation", () => {
           bind: "loopback",
           auth: {
             mode: "token",
-            token: { source: "env", provider: "default", id: "MISSING_GATEWAY_TOKEN" },
+            token: envRef("MISSING_GATEWAY_TOKEN"),
           },
         },
       });

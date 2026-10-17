@@ -24,18 +24,16 @@ import { NodeWorkerPreparedWorkspaceStore } from "../node-host/node-worker-prepa
 import { NodeWorkerWorkspaceRuntime } from "../node-host/node-worker-workspace.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { parseNodeWorkerPreparedWorkspaceResult } from "../worker/node-workspace-prepared-protocol.js";
 import { NODE_WORKSPACE_DRAIN_COMMAND } from "../worker/node-workspace-protocol.js";
-import { createDesktopSessionRegistry } from "./desktop/session-registry.js";
 import { createNodeRegistryRuntime, updateNodeRunnerInventory } from "./node-registry-private.js";
 import { NodeRegistry } from "./node-registry.js";
+import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
 import {
-  createGatewayWorkerEnvironmentRuntime,
-  loadGatewayWorkerEnvironmentStartupState,
-} from "./server-worker-environment-startup.js";
+  createWorkerStartupRuntime,
+  workerStartupCredential,
+} from "./server-worker-environment-startup.runtime.test-support.js";
 import { withGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.state.test-support.js";
-import { hashWorkerCredential } from "./worker-environments/credential.js";
 import { createWorkerProjectPreparation } from "./worker-environments/project-preparation.js";
 import * as serviceModule from "./worker-environments/service.js";
 import { workerProjectSeedKey } from "./worker-environments/workspace-git-base.js";
@@ -47,7 +45,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
   const factory = vi.spyOn(serviceModule, "createWorkerEnvironmentService");
   const registry = createEmptyPluginRegistry();
   const owned: {
-    runtime?: Awaited<ReturnType<typeof createGatewayWorkerEnvironmentRuntime>>;
+    runtime?: Awaited<ReturnType<typeof createWorkerStartupRuntime>>;
     nodeRegistry?: NodeRegistry;
     server?: WebSocketServer;
     client?: WebSocket;
@@ -102,15 +100,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
     }
   };
   try {
-    const runtime = await createGatewayWorkerEnvironmentRuntime({
-      scheduler: createTestGatewayScheduler(),
-      getPluginRegistry: () => registry,
-      getPortalRuntime: () => undefined,
-      resolveGatewayContext: () => undefined,
-      desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
-      startup,
-      log: { child: () => ({ info: () => {}, warn: () => {} }) },
-    });
+    const runtime = await createWorkerStartupRuntime(startup, () => registry);
     owned.runtime = runtime;
     const options = factory.mock.calls.at(-1)?.[0];
     if (
@@ -376,12 +366,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
             protocolFeatures: [],
             installKind: "bundle",
           },
-          credential: {
-            credentialHash: hashWorkerCredential("prepared-ack-credential"),
-            sessionId: null,
-            rpcSetVersion: 1,
-            expiresAtMs: Date.now() + 60_000,
-          },
+          credential: workerStartupCredential("prepared-ack-credential"),
         },
       });
       const attached = await startup.store.transition({
@@ -390,12 +375,7 @@ async function createPreparedNodeAcknowledgement(root: string) {
         to: "attached",
         patch: {
           attachedSessionIds: [binding.sessionId],
-          credential: {
-            credentialHash: hashWorkerCredential("prepared-bound-credential"),
-            sessionId: binding.sessionId,
-            rpcSetVersion: 1,
-            expiresAtMs: Date.now() + 60_000,
-          },
+          credential: workerStartupCredential("prepared-bound-credential", binding.sessionId),
         },
       });
       binding.ownerEpoch = attached.ownerEpoch;

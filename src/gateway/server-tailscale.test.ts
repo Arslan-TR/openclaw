@@ -1,5 +1,3 @@
-// Tailscale exposure tests cover serve/funnel enablement, preserve-funnel mode,
-// hostname discovery, cleanup handles, and warning paths.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
@@ -35,9 +33,12 @@ import {
 
 const MANAGED_BACKEND_PORT = 19_000;
 function startGatewayTailscaleExposure(
-  params: Omit<Parameters<typeof startGatewayTailscaleExposureBase>[0], "backend">,
+  params: Partial<Omit<Parameters<typeof startGatewayTailscaleExposureBase>[0], "backend">> = {},
 ) {
   return startGatewayTailscaleExposureBase({
+    tailscaleMode: "serve",
+    port: 18789,
+    logTailscale: createLogger(),
     ...params,
     backend: { host: "127.0.0.1", port: MANAGED_BACKEND_PORT },
   });
@@ -49,6 +50,15 @@ function createLogger() {
 
 function resetTailscalePublishedOrigin() {
   prepareTailscalePublishedOrigin({ origin: "https://reset.test", mode: "serve" })();
+}
+
+function expectNoControlUiIdentity() {
+  expect(
+    resolveControlUiIdentity(
+      { gateway: { publicOrigin: "https://unrelated.test", tailscale: { mode: "serve" } } },
+      { mode: "token", allowTailscale: true },
+    ),
+  ).toBeUndefined();
 }
 
 beforeEach(resetSecretRedactionRegistryForTest);
@@ -99,13 +109,7 @@ describe("startGatewayTailscaleExposure", () => {
     const failure = new Error("tailscale unavailable");
     mocks.claimTailscaleRoute.mockRejectedValue(failure);
 
-    await expect(
-      startGatewayTailscaleExposure({
-        tailscaleMode: "serve",
-        port: 18789,
-        logTailscale: createLogger(),
-      }),
-    ).rejects.toBe(failure);
+    await expect(startGatewayTailscaleExposure()).rejects.toBe(failure);
   });
 
   it("fails startup when the route owner exits after reporting readiness", async () => {
@@ -115,13 +119,7 @@ describe("startGatewayTailscaleExposure", () => {
       stop: mocks.stopRouteClaim,
     });
 
-    await expect(
-      startGatewayTailscaleExposure({
-        tailscaleMode: "serve",
-        port: 18789,
-        logTailscale: createLogger(),
-      }),
-    ).rejects.toThrow("claim exited during startup");
+    await expect(startGatewayTailscaleExposure()).rejects.toThrow("claim exited during startup");
     expect(mocks.stopRouteClaim).toHaveBeenCalledOnce();
   });
 
@@ -137,10 +135,7 @@ describe("startGatewayTailscaleExposure", () => {
     });
     mocks.stopRouteClaim.mockImplementation(() => stopped.promise);
     const starting = startGatewayTailscaleExposure({
-      tailscaleMode: "serve",
-      port: 18789,
       signal: controller.signal,
-      logTailscale: createLogger(),
     });
     const result = starting.then(
       () => "started",
@@ -161,8 +156,6 @@ describe("startGatewayTailscaleExposure", () => {
     mocks.hasTailscaleFunnelRouteForPort.mockResolvedValue(true);
 
     const cleanup = await startGatewayTailscaleExposure({
-      tailscaleMode: "serve",
-      port: 18789,
       preserveFunnel: true,
       logTailscale,
     });
@@ -185,8 +178,6 @@ describe("startGatewayTailscaleExposure", () => {
 
     await expect(
       startGatewayTailscaleExposure({
-        tailscaleMode: "serve",
-        port: 18789,
         preserveFunnel: true,
         logTailscale,
       }),
@@ -200,8 +191,6 @@ describe("startGatewayTailscaleExposure", () => {
     mocks.hasTailscaleFunnelRouteForPort.mockResolvedValue(false);
 
     await startGatewayTailscaleExposure({
-      tailscaleMode: "serve",
-      port: 18789,
       preserveFunnel: true,
       logTailscale,
     });
@@ -219,11 +208,7 @@ describe("startGatewayTailscaleExposure", () => {
   it("prepares one tailnet-only Serve origin for the Gateway lifecycle", async () => {
     mocks.getTailnetHostnameAfterServe.mockResolvedValue("node.tailnet.ts.net");
 
-    const cleanup = await startGatewayTailscaleExposure({
-      tailscaleMode: "serve",
-      port: 18789,
-      logTailscale: createLogger(),
-    });
+    const cleanup = await startGatewayTailscaleExposure();
 
     expect(getTailscalePublishedOrigin()).toMatchObject({
       origin: "https://node.tailnet.ts.net",
@@ -234,12 +219,7 @@ describe("startGatewayTailscaleExposure", () => {
     );
     await cleanup?.();
     expect(getTailscalePublishedOrigin()).toBeUndefined();
-    expect(
-      resolveControlUiIdentity(
-        { gateway: { publicOrigin: "https://unrelated.test", tailscale: { mode: "serve" } } },
-        { mode: "token", allowTailscale: true },
-      ),
-    ).toBeUndefined();
+    expectNoControlUiIdentity();
   });
 
   it.each(["serve", "funnel"] as const)(
@@ -252,7 +232,6 @@ describe("startGatewayTailscaleExposure", () => {
 
       const cleanup = await startGatewayTailscaleExposure({
         tailscaleMode: mode,
-        port: 18789,
         logTailscale,
       });
 
@@ -274,23 +253,14 @@ describe("startGatewayTailscaleExposure", () => {
     mocks.getTailnetHostnameAfterServe.mockResolvedValue("node.tailnet.ts.net");
     const logTailscale = createLogger();
 
-    await startGatewayTailscaleExposure({
-      tailscaleMode: "serve",
-      port: 18789,
-      logTailscale,
-    });
+    await startGatewayTailscaleExposure({ logTailscale });
     resolveExit();
 
     await vi.waitFor(() => {
       expect(logTailscale.warn).toHaveBeenCalledWith(expect.stringContaining("claim exited"));
     });
     expect(getTailscalePublishedOrigin()).toBeUndefined();
-    expect(
-      resolveControlUiIdentity(
-        { gateway: { publicOrigin: "https://unrelated.test", tailscale: { mode: "serve" } } },
-        { mode: "token", allowTailscale: true },
-      ),
-    ).toBeUndefined();
+    expectNoControlUiIdentity();
   });
 
   it("never consults the Funnel route helper when running in funnel mode", async () => {
@@ -299,7 +269,6 @@ describe("startGatewayTailscaleExposure", () => {
 
     await startGatewayTailscaleExposure({
       tailscaleMode: "funnel",
-      port: 18789,
       preserveFunnel: true,
       logTailscale,
     });
@@ -309,12 +278,7 @@ describe("startGatewayTailscaleExposure", () => {
       origin: "https://node.tailnet.ts.net",
       mode: "funnel",
     });
-    expect(
-      resolveControlUiIdentity(
-        { gateway: { publicOrigin: "https://unrelated.test", tailscale: { mode: "serve" } } },
-        { mode: "token", allowTailscale: true },
-      ),
-    ).toBeUndefined();
+    expectNoControlUiIdentity();
     expect(mocks.claimTailscaleRoute).toHaveBeenCalledWith(
       "funnel",
       MANAGED_BACKEND_PORT,

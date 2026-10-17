@@ -19,20 +19,19 @@ import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
 } from "../state/openclaw-state-db.js";
-import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { createNodeDesktopStreamBroker } from "./desktop/node-stream-broker.js";
-import { createDesktopSessionRegistry } from "./desktop/session-registry.js";
 import type {
   NodeWorkerSupervisorNodeProof,
   NodeWorkerSupervisorTransport,
 } from "./node-registry-private.js";
-import {
-  createGatewayWorkerEnvironmentRuntime,
-  loadGatewayWorkerEnvironmentStartupState,
-} from "./server-worker-environment-startup.js";
+import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
 import { withPreparedNodeAcknowledgement } from "./server-worker-environment-startup.prepared.test-support.js";
+import {
+  createWorkerStartupRuntime,
+  workerStartupCredential,
+  workerStartupReceipt,
+} from "./server-worker-environment-startup.runtime.test-support.js";
 import { withGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.state.test-support.js";
-import { hashWorkerCredential } from "./worker-environments/credential.js";
 import {
   DEVICE_WORKER_PROVIDER_ID,
   reconcileDeviceWorker,
@@ -95,15 +94,7 @@ describe("gateway worker environment startup", () => {
           return service;
         });
         const registry = createEmptyPluginRegistry();
-        const creating = createGatewayWorkerEnvironmentRuntime({
-          scheduler: createTestGatewayScheduler(),
-          getPluginRegistry: () => registry,
-          getPortalRuntime: () => undefined,
-          resolveGatewayContext: () => undefined,
-          desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
-          startup,
-          log: { child: () => ({ info: () => {}, warn: () => {} }) },
-        });
+        const creating = createWorkerStartupRuntime(startup, () => registry);
         try {
           if (cleanupFails) {
             await expect(creating).rejects.toMatchObject({
@@ -200,15 +191,7 @@ describe("gateway worker environment startup", () => {
         },
       });
       const startup = await loadGatewayWorkerEnvironmentStartupState();
-      const runtime = await createGatewayWorkerEnvironmentRuntime({
-        scheduler: createTestGatewayScheduler(),
-        getPluginRegistry: () => registry,
-        getPortalRuntime: () => undefined,
-        resolveGatewayContext: () => undefined,
-        desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
-        startup,
-        log: { child: () => ({ info: () => {}, warn: () => {} }) },
-      });
+      const runtime = await createWorkerStartupRuntime(startup, () => registry);
       const service = runtime.workerEnvironmentService;
       if (!service) {
         throw new Error("worker environment service was not created");
@@ -261,31 +244,13 @@ describe("gateway worker environment startup", () => {
           nodeDeviceId: DEVICE_ID,
           sshEndpoint: null,
           sharedHost: true,
-          bootstrapReceipt: {
-            bundleHash: "a".repeat(64),
-            openclawVersion: "2026.8.14",
-            protocolFeatures: ["worker-heartbeat-v1"],
-            installKind: "bundle",
-          },
-          credential: {
-            credentialHash: hashWorkerCredential("device-credential"),
-            sessionId: null,
-            rpcSetVersion: 1,
-            expiresAtMs: Date.now() + 60_000,
-          },
+          bootstrapReceipt: workerStartupReceipt(),
+          credential: workerStartupCredential("device-credential"),
         },
       });
 
       const registry = createEmptyPluginRegistry();
-      const runtime = await createGatewayWorkerEnvironmentRuntime({
-        scheduler: createTestGatewayScheduler(),
-        getPluginRegistry: () => registry,
-        getPortalRuntime: () => undefined,
-        resolveGatewayContext: () => undefined,
-        desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
-        startup,
-        log: { child: () => ({ info: () => {}, warn: () => {} }) },
-      });
+      const runtime = await createWorkerStartupRuntime(startup, () => registry);
       const service = runtime.workerEnvironmentService;
       if (!service) {
         throw new Error("worker environment service was not created");
@@ -339,18 +304,8 @@ describe("gateway worker environment startup", () => {
           sshEndpoint: null,
           sharedHost: true,
           desktop: { protocol: "rfb", port: 5900, apps: [app] },
-          bootstrapReceipt: {
-            bundleHash: "a".repeat(64),
-            openclawVersion: "2026.8.14",
-            protocolFeatures: ["worker-heartbeat-v1"],
-            installKind: "bundle",
-          },
-          credential: {
-            credentialHash: hashWorkerCredential("node-desktop-credential"),
-            sessionId: null,
-            rpcSetVersion: 1,
-            expiresAtMs: Date.now() + 60_000,
-          },
+          bootstrapReceipt: workerStartupReceipt(),
+          credential: workerStartupCredential("node-desktop-credential"),
         },
       });
       const proof: NodeWorkerSupervisorNodeProof = {
@@ -376,15 +331,8 @@ describe("gateway worker environment startup", () => {
         },
       };
       const registry = createEmptyPluginRegistry();
-      const runtime = await createGatewayWorkerEnvironmentRuntime({
-        scheduler: createTestGatewayScheduler(),
-        getPluginRegistry: () => registry,
-        getPortalRuntime: () => undefined,
-        resolveGatewayContext: () => undefined,
-        desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
+      const runtime = await createWorkerStartupRuntime(startup, () => registry, {
         nodeDesktopStreamBroker: createNodeDesktopStreamBroker(),
-        startup,
-        log: { child: () => ({ info: () => {}, warn: () => {} }) },
       });
       const service = runtime.workerEnvironmentService;
       try {

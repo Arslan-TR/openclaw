@@ -1,3 +1,4 @@
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { applyRemoteModelCatalogUpdate } from "../agents/prepared-model-runtime.js";
@@ -112,17 +113,13 @@ describe("deferred Gateway update-check lifecycle", () => {
   it.each(["background", "early manual"])(
     "scopes %s update broadcasts to read-capable operator clients",
     async (source) => {
-      const clients = [
-        {
-          connId: "pairing",
-          connect: { role: "operator", scopes: ["operator.pairing"] },
-        },
-        { connId: "node", connect: { role: "node", scopes: ["node.read"] } },
-        {
-          connId: "operator-read",
-          connect: { role: "operator", scopes: ["operator.read"] },
-        },
-      ];
+      const clients = (
+        [
+          ["pairing", "operator", "operator.pairing"],
+          ["node", "node", "node.read"],
+          ["operator-read", "operator", "operator.read"],
+        ] as const
+      ).map(([connId, role, scope]) => ({ connId, connect: { role, scopes: [scope] } }));
       const broadcastToConnIds = vi.fn();
       const getClientConnIds: UpdateCheckStartupParams["getClientConnIds"] = (filter) =>
         new Set(
@@ -153,65 +150,41 @@ describe("deferred Gateway update-check lifecycle", () => {
         source === "background"
           ? createGatewayUpdateCheck.mock.calls[0]![0]
           : currentUpdateCheckLifecycle();
-      const updateAvailable = {
+      const publicUpdate = {
         currentVersion: "2026.8.7",
         latestVersion: "2026.8.8",
         channel: "dev" as const,
+      };
+      const gitTarget = {
         currentSha: "1111111111111111111111111111111111111111",
         upstreamRef: "origin/main",
         upstreamSha: "2222222222222222222222222222222222222222",
         commitsBehind: 1,
         commits: [{ sha: "2222222", subject: "Detailed commit subject" }],
       };
+      const updateAvailable = { ...publicUpdate, ...gitTarget };
       const schedule = {
         channel: "dev" as const,
         autoEnabled: true,
         install: { kind: "git" as const },
-        target: {
-          kind: "git" as const,
-          currentSha: updateAvailable.currentSha,
-          upstreamRef: updateAvailable.upstreamRef,
-          upstreamSha: updateAvailable.upstreamSha,
-          commitsBehind: updateAvailable.commitsBehind,
-          commits: updateAvailable.commits,
-        },
+        target: { kind: "git" as const, ...gitTarget },
       };
 
       updateCheckParams.onUpdateAvailableChange?.(updateAvailable);
       updateCheckParams.onUpdateScheduleChange?.(schedule);
 
+      const broadcast = (payload: unknown, ids: string[]) => [
+        "update.available",
+        payload,
+        new Set(ids),
+        { dropIfSlow: true },
+      ];
+      const publicBroadcast = broadcast({ updateAvailable: publicUpdate }, ["pairing", "node"]);
       expect(broadcastToConnIds.mock.calls).toEqual([
-        ["update.available", { updateAvailable }, new Set(["operator-read"]), { dropIfSlow: true }],
-        [
-          "update.available",
-          {
-            updateAvailable: {
-              currentVersion: updateAvailable.currentVersion,
-              latestVersion: updateAvailable.latestVersion,
-              channel: updateAvailable.channel,
-            },
-          },
-          new Set(["pairing", "node"]),
-          { dropIfSlow: true },
-        ],
-        [
-          "update.available",
-          { updateAvailable, schedule },
-          new Set(["operator-read"]),
-          { dropIfSlow: true },
-        ],
-        [
-          "update.available",
-          {
-            updateAvailable: {
-              currentVersion: updateAvailable.currentVersion,
-              latestVersion: updateAvailable.latestVersion,
-              channel: updateAvailable.channel,
-            },
-          },
-          new Set(["pairing", "node"]),
-          { dropIfSlow: true },
-        ],
+        broadcast({ updateAvailable }, ["operator-read"]),
+        publicBroadcast,
+        broadcast({ updateAvailable, schedule }, ["operator-read"]),
+        publicBroadcast,
       ]);
       await result.stop();
       ready.resolve();
@@ -275,9 +248,7 @@ describe("deferred Gateway update-check lifecycle", () => {
     try {
       expect(stopWatcher).toHaveBeenCalledOnce();
       expect(defaultUpdateCheck.stop).toHaveBeenCalledOnce();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await nextTurn();
       expect(stopped).toBe(false);
       notices.resolve();
       await stopping;
@@ -328,9 +299,7 @@ describe("deferred Gateway update-check lifecycle", () => {
       });
       expect(updateCheck.stop).toHaveBeenCalledOnce();
       cleanup.resolve();
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await nextTurn();
       expect(stopped).toBe(false);
       expect(updateCheck.start).not.toHaveBeenCalled();
     } finally {

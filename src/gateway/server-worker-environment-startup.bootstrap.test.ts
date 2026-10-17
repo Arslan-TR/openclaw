@@ -18,13 +18,9 @@ import {
   closeOpenClawStateDatabaseForTest,
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
-import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import * as version from "../version.js";
-import { createDesktopSessionRegistry } from "./desktop/session-registry.js";
-import {
-  createGatewayWorkerEnvironmentRuntime,
-  loadGatewayWorkerEnvironmentStartupState,
-} from "./server-worker-environment-startup.js";
+import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
+import { createWorkerStartupRuntime } from "./server-worker-environment-startup.runtime.test-support.js";
 import { withGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.state.test-support.js";
 import type { NodeBootstrapArtifact } from "./worker-environments/node-bootstrap-artifact-contract.js";
 import * as artifactModule from "./worker-environments/node-bootstrap-artifact.js";
@@ -45,6 +41,59 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
     cleanup();
   }),
 );
+
+function makeRegistry(
+  metadata: ReturnType<typeof createPluginMetadataSnapshotFixture>,
+  id: string,
+  source = `/source/extensions/${id}/index.js`,
+  command = `${id}.exec`,
+) {
+  const registry = createEmptyPluginRegistry();
+  registry.plugins = metadata.plugins.map((record) =>
+    createPluginRecord({ ...record, enabled: true, configSchema: true }),
+  );
+  registry.agentHarnesses.push({
+    pluginId: id,
+    source,
+    harness: {
+      id,
+      label: id,
+      cloudPlacement: {
+        mode: "remote-exec",
+        devicePlacement: { requiredNodeCommands: [command], consumesWorkerSlot: false },
+      },
+      supports: () => ({ supported: true }),
+      runAttempt: async () => {
+        throw new Error("not used");
+      },
+    },
+  });
+  registry.nodeHostCommands.push({
+    pluginId: id,
+    source,
+    command: { command, handle: async () => "{}" },
+  });
+  return registry;
+}
+
+async function provision(
+  startup: Awaited<ReturnType<typeof loadGatewayWorkerEnvironmentStartupState>>,
+  environmentId: string,
+) {
+  await startup.store.createIntent({
+    environmentId,
+    providerId: "fake-provider",
+    profileId: "test-profile",
+    profileSnapshot: { executionMode: "remote-exec", settings: {} },
+    provisionOperationId: `provision:${environmentId}`,
+  });
+  return startup.store.transition({
+    environmentId,
+    from: "requested",
+    to: "provisioning",
+    patch: { nodeDeviceId: `${environmentId}-node` },
+  });
+}
 
 describe("cloud bootstrap plugin generations", () => {
   it.skipIf(process.platform === "win32")(
@@ -72,34 +121,12 @@ describe("cloud bootstrap plugin generations", () => {
           },
         ],
       });
-      const registry = createEmptyPluginRegistry();
-      registry.plugins = metadata.plugins.map((record) =>
-        createPluginRecord({ ...record, enabled: true, configSchema: true }),
+      const registry = makeRegistry(
+        metadata,
+        plugin.id,
+        path.join(plugin.root, "index.js"),
+        "fixture.exec",
       );
-      registry.agentHarnesses.push({
-        pluginId: plugin.id,
-        source: path.join(plugin.root, "index.js"),
-        harness: {
-          id: plugin.id,
-          label: plugin.id,
-          cloudPlacement: {
-            mode: "remote-exec",
-            devicePlacement: {
-              requiredNodeCommands: ["fixture.exec"],
-              consumesWorkerSlot: false,
-            },
-          },
-          supports: () => ({ supported: true }),
-          runAttempt: async () => {
-            throw new Error("not used");
-          },
-        },
-      });
-      registry.nodeHostCommands.push({
-        pluginId: plugin.id,
-        source: path.join(plugin.root, "index.js"),
-        command: { command: "fixture.exec", handle: async () => "{}" },
-      });
       vi.spyOn(packageRoot, "resolveOpenClawPackageRootSync").mockReturnValue(
         installation.packageRoot,
       );
@@ -116,34 +143,14 @@ describe("cloud bootstrap plugin generations", () => {
         setRuntimeConfigSnapshot({ gateway: { publicOrigin: "https://gateway.example.test" } });
         const start = async (environmentId: string) => {
           const startup = await loadGatewayWorkerEnvironmentStartupState();
-          const runtime = await createGatewayWorkerEnvironmentRuntime({
-            scheduler: createTestGatewayScheduler(),
-            getPluginRegistry: () => registry,
-            getPortalRuntime: () => undefined,
-            resolveGatewayContext: () => undefined,
-            desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
-            startup,
-            log: { child: () => ({ info: () => {}, warn: () => {} }) },
-          });
+          const runtime = await createWorkerStartupRuntime(startup, () => registry);
           try {
             const managerResult = enrollmentFactory.mock.results.at(-1);
             const transferResult = transferFactory.mock.results.at(-1);
             if (managerResult?.type !== "return" || transferResult?.type !== "return") {
               throw new Error("Gateway managers were not created");
             }
-            await startup.store.createIntent({
-              environmentId,
-              providerId: "fake-provider",
-              profileId: "test-profile",
-              profileSnapshot: { executionMode: "remote-exec", settings: {} },
-              provisionOperationId: `provision:${environmentId}`,
-            });
-            const record = await startup.store.transition({
-              environmentId,
-              from: "requested",
-              to: "provisioning",
-              patch: { nodeDeviceId: `${environmentId}-node` },
-            });
+            const record = await provision(startup, environmentId);
             const enrollment = await managerResult.value.begin(record);
             return { runtime, enrollment, transfer: transferResult.value };
           } catch (error) {
@@ -210,38 +217,7 @@ describe("cloud bootstrap plugin generations", () => {
         packageVersion: "1.2.3",
       })),
     });
-    const makeRegistry = (runtimeId: string) => {
-      const registry = createEmptyPluginRegistry();
-      registry.plugins = metadata.plugins.map((record) =>
-        createPluginRecord({ ...record, enabled: true, configSchema: true }),
-      );
-      registry.agentHarnesses.push({
-        pluginId: runtimeId,
-        source: `/source/extensions/${runtimeId}/index.js`,
-        harness: {
-          id: runtimeId,
-          label: runtimeId,
-          cloudPlacement: {
-            mode: "remote-exec",
-            devicePlacement: {
-              requiredNodeCommands: [`${runtimeId}.exec`],
-              consumesWorkerSlot: false,
-            },
-          },
-          supports: () => ({ supported: true }),
-          runAttempt: async () => {
-            throw new Error("not used");
-          },
-        },
-      });
-      registry.nodeHostCommands.push({
-        pluginId: runtimeId,
-        source: `/source/extensions/${runtimeId}/index.js`,
-        command: { command: `${runtimeId}.exec`, handle: async () => "{}" },
-      });
-      return registry;
-    };
-    let registry = makeRegistry("runtime-a");
+    let registry = makeRegistry(metadata, "runtime-a");
     const metadataSnapshot = vi
       .spyOn(metadataState, "getGatewayPluginMetadataSnapshot")
       .mockReturnValue(metadata);
@@ -289,15 +265,7 @@ describe("cloud bootstrap plugin generations", () => {
     await withGatewayWorkerEnvironmentStartupState(stateDir, async () => {
       setRuntimeConfigSnapshot({ gateway: { publicOrigin: "https://gateway.example.test" } });
       const startup = await loadGatewayWorkerEnvironmentStartupState();
-      const runtime = await createGatewayWorkerEnvironmentRuntime({
-        scheduler: createTestGatewayScheduler(),
-        getPluginRegistry: () => registry,
-        getPortalRuntime: () => undefined,
-        resolveGatewayContext: () => undefined,
-        desktopSessionRegistry: createDesktopSessionRegistry({ lingerMs: 1 }),
-        startup,
-        log: { child: () => ({ info: () => {}, warn: () => {} }) },
-      });
+      const runtime = await createWorkerStartupRuntime(startup, () => registry);
       const enrollmentResult = enrollmentFactory.mock.results.at(-1);
       const service = runtime.workerEnvironmentService;
       if (enrollmentResult?.type !== "return" || !service) {
@@ -305,19 +273,7 @@ describe("cloud bootstrap plugin generations", () => {
       }
       const manager = enrollmentResult.value;
       const begin = async (id: string) => {
-        await startup.store.createIntent({
-          environmentId: id,
-          providerId: "fake-provider",
-          profileId: "test-profile",
-          profileSnapshot: { executionMode: "remote-exec", settings: {} },
-          provisionOperationId: `provision:${id}`,
-        });
-        const record = await startup.store.transition({
-          environmentId: id,
-          from: "requested",
-          to: "provisioning",
-          patch: { nodeDeviceId: `${id}-node` },
-        });
+        const record = await provision(startup, id);
         return await manager.begin(record);
       };
       let stopping: Promise<void> | undefined;
@@ -334,7 +290,7 @@ describe("cloud bootstrap plugin generations", () => {
         manager.close(sameGeneration);
         expect(first.signal?.aborted).toBe(false);
 
-        registry = makeRegistry("runtime-b");
+        registry = makeRegistry(metadata, "runtime-b");
         const replacement = await begin("replacement");
         expect(replacement.nodeBootstrap.enabledPluginIds).toEqual(["runtime-b"]);
         expect(replacement.nodeBootstrap.sha256).not.toBe(first.nodeBootstrap.sha256);
