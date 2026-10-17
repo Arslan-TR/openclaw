@@ -33,8 +33,6 @@ function applyEnterpriseGitHubIdentity(
     throw new UserProfileOwnerError("merge");
   }
   const principal = parseEnterpriseGitHubPrincipal(params.principal);
-  const accountId = principal?.accountId ?? Number.NaN;
-  const provider = principal ? `github:${principal.host}` : "";
   const login = normalizeGitHubLogin(params.metadata.login);
   const binding = executeSqliteQueryTakeFirstSync(
     db,
@@ -43,12 +41,7 @@ function applyEnterpriseGitHubIdentity(
       .select(["profile_id", "binding_id"])
       .where("email", "=", params.principal),
   );
-  if (
-    !Number.isSafeInteger(accountId) ||
-    !login ||
-    binding?.profile_id !== params.profileId ||
-    !binding.binding_id
-  ) {
+  if (!principal || !login || binding?.profile_id !== params.profileId || !binding.binding_id) {
     throw new Error("Enterprise GitHub identity is invalid");
   }
   const email = normalizeVerifiedEmail(params.metadata.email);
@@ -68,8 +61,8 @@ function applyEnterpriseGitHubIdentity(
     kysely
       .selectFrom("user_profile_identities")
       .select(["profile_id", "canonical_login", "verified_email_json"])
-      .where("provider", "=", provider)
-      .where("subject", "=", String(accountId)),
+      .where("provider", "=", `github:${principal.host}`)
+      .where("subject", "=", String(principal.accountId)),
   );
   if (
     before?.profile_id === params.profileId &&
@@ -91,8 +84,8 @@ function applyEnterpriseGitHubIdentity(
     kysely
       .insertInto("user_profile_identities")
       .values({
-        provider,
-        subject: String(accountId),
+        provider: `github:${principal.host}`,
+        subject: String(principal.accountId),
         ...values,
         created_at: now,
       })

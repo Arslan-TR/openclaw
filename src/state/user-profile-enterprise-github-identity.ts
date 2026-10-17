@@ -27,7 +27,7 @@ export function selectEnterpriseGitHubIdentities(
     query = query.where("provider", "=", `github:${host}`);
   }
   if (profileIds) {
-    query = query.where("profile_id", "in", [...profileIds]);
+    query = query.where("profile_id", "in", profileIds);
   }
   const rows = executeSqliteQuerySync(db, query).rows;
   if (!rows.length) {
@@ -50,7 +50,6 @@ export function selectEnterpriseGitHubIdentities(
   const ambiguous = new Set<string>();
   for (const row of rows) {
     const principal = parseEnterpriseGitHubPrincipal(`${row.provider}:${row.subject}`);
-    const accountId = principal?.accountId ?? Number.NaN;
     const login = row.canonical_login ? normalizeGitHubLogin(row.canonical_login) : undefined;
     let proof: unknown;
     try {
@@ -66,13 +65,11 @@ export function selectEnterpriseGitHubIdentities(
       !isRecord(proof) ||
       proof.version !== 1 ||
       proof.profileId !== row.profile_id ||
-      !login ||
-      !Number.isSafeInteger(accountId) ||
-      accountId <= 0
+      !login
     ) {
       continue;
     }
-    const binding = bindings.get(`${row.provider}:${accountId}`);
+    const binding = bindings.get(`${row.provider}:${principal.accountId}`);
     if (binding?.profile_id !== row.profile_id || binding.binding_id !== proof.bindingId) {
       continue;
     }
@@ -82,7 +79,7 @@ export function selectEnterpriseGitHubIdentities(
     }
     identities.set(row.profile_id, {
       host: principal.host,
-      accountId,
+      accountId: principal.accountId,
       login,
       ...(email ? { verifiedEmail: email } : {}),
     });
@@ -109,7 +106,7 @@ export function selectEnterpriseGitHubProfileIdsForMerge(
         .select("profile_id")
         .distinct()
         .where("provider", "like", "github:%")
-        .where("profile_id", "in", [...profileIds]),
+        .where("profile_id", "in", profileIds),
     ).rows.map((row) => row.profile_id),
   );
 }

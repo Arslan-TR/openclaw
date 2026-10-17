@@ -62,7 +62,7 @@ export function readUserProfileEmailBindings(
       ? query
       : typeof profileIds === "string"
         ? query.where("profile_id", "=", profileIds)
-        : query.where("profile_id", "in", [...profileIds]),
+        : query.where("profile_id", "in", profileIds),
   ).rows.map(({ email, profile_id, binding_id }) => ({
     email,
     profileId: profile_id,
@@ -229,19 +229,18 @@ export function selectUserProfileDisplaysInDatabase(
   const profiles = userProfilesDb(db).selectFrom("user_profiles");
   const rows = executeSqliteQuerySync(
     db,
-    profiles.select(userProfileDisplaySelection).where((eb) =>
-      eb.or([
-        eb("id", "in", [...ids]),
-        eb(
-          "id",
-          "in",
-          profiles
-            .select("merged_into")
-            .where("id", "in", [...ids])
-            .where("merged_into", "!=", ""),
-        ),
-      ]),
-    ),
+    profiles
+      .select(userProfileDisplaySelection)
+      .where((eb) =>
+        eb.or([
+          eb("id", "in", ids),
+          eb(
+            "id",
+            "in",
+            profiles.select("merged_into").where("id", "in", ids).where("merged_into", "!=", ""),
+          ),
+        ]),
+      ),
   ).rows;
   if (
     rows.some(

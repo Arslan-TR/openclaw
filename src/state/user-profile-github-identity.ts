@@ -76,7 +76,7 @@ export function selectStoredGitHubIdentities(
     .where("canonical_login", "is not", null)
     .orderBy("subject", "asc");
   if (profileIds) {
-    query = query.where("profile_id", "in", [...profileIds]);
+    query = query.where("profile_id", "in", profileIds);
   }
   if (accountIds) {
     query = query
@@ -334,7 +334,7 @@ function resolveUserProfileGitHubAttributionInDatabase(
         ? "profile.primary_github_account_id"
         : eb.val<number | null>(null).as("primary_github_account_id"),
     ])
-    .where("requested.id", "in", [...profileIds]);
+    .where("requested.id", "in", profileIds);
   const withPreferences = tableExists(db, "user_preferences")
     ? query
         .leftJoin("user_preferences as preference", (join) =>

@@ -67,7 +67,7 @@ export function selectUserPreferenceValues(
     getNodeSqliteKysely<UserPreferencesDatabase>(database)
       .selectFrom("user_preferences")
       .select(["profile_id", "value_json"])
-      .where("profile_id", "in", [...profileIds])
+      .where("profile_id", "in", profileIds)
       .where("pref_key", "=", key),
   ).rows;
   return new Map(
@@ -151,7 +151,7 @@ export function readUserPreferences(
     .where("profile_id", "=", profileId)
     .orderBy("pref_key", "asc");
   if (keys) {
-    query = query.where("pref_key", "in", [...keys]);
+    query = query.where("pref_key", "in", keys);
   }
   return Object.fromEntries(
     executeSqliteQuerySync(sqlite, query).rows.map((row) => [
