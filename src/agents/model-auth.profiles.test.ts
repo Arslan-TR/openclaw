@@ -9,6 +9,7 @@ import {
 } from "../config/runtime-snapshot.js";
 import type { ModelProviderConfig, OpenClawConfig } from "../config/types.js";
 import type { SecretRef } from "../config/types.secrets.js";
+import { snapshotReaderSlot } from "../plugins/plugin-metadata-snapshot-readers.js";
 import { writeConfigMachineState } from "../state/config-machine-state-write.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { withEnvAsync } from "../test-utils/env.js";
@@ -33,6 +34,7 @@ import type { AuthProfileCredential, OAuthCredential } from "./auth-profiles/typ
 import { upsertAuthProfileWithLockOrThrow } from "./auth-profiles/upsert-with-lock.js";
 import { resolveInlineProviderApiKeyUsageId } from "./auth-profiles/usage.js";
 import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
+import { listKnownProviderEnvApiKeyNames } from "./model-auth-env-vars.js";
 import {
   createRuntimeProviderAuthLookup,
   getApiKeyForModelCore as resolveModelAuth,
@@ -155,7 +157,11 @@ const cliCredentialMocks = vi.hoisted(() => ({
 
 vi.mock("./cli-credentials.js", () => cliCredentialMocks);
 
+let previousEnvNameReader: typeof snapshotReaderSlot.listKnownProviderAuthEnvVarNamesCore;
 beforeEach(() => {
+  previousEnvNameReader = snapshotReaderSlot.listKnownProviderAuthEnvVarNamesCore;
+  // Marker classification must use the same invented provider policy as auth lookup.
+  snapshotReaderSlot.listKnownProviderAuthEnvVarNamesCore = listKnownProviderEnvApiKeyNames;
   prepareSharedAuthStoreOwnershipForNative();
   clearRuntimeAuthProfileStoreSnapshots();
   cliCredentialMocks.readCodexCliCredentialsCached.mockReset().mockReturnValue(null);
@@ -163,6 +169,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  snapshotReaderSlot.listKnownProviderAuthEnvVarNamesCore = previousEnvNameReader;
   clearRuntimeAuthProfileStoreSnapshots();
   clearRuntimeConfigSnapshot();
 });

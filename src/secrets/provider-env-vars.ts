@@ -13,6 +13,7 @@ import {
   isWorkspacePluginAllowedByConfig,
   normalizePluginConfigId,
 } from "../plugins/plugin-config-trust.js";
+import { registerPluginMetadataSnapshotReaders } from "../plugins/plugin-metadata-snapshot-readers.js";
 import {
   loadPluginMetadataSnapshot,
   type PluginMetadataSnapshot,
@@ -393,3 +394,5 @@ export function omitEnvKeysCaseInsensitive(
   }
   return env;
 }
+
+registerPluginMetadataSnapshotReaders({ listKnownProviderAuthEnvVarNamesCore });
