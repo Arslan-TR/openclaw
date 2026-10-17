@@ -72,11 +72,6 @@
       "activation": ["tools.web.fetch.readability", "plugins.entries.web-readability.enabled"],
       "risk": ["parser", "untrusted-html"]
     },
-    "@mistralai/mistralai": {
-      "owner": "provider:mistral",
-      "class": "default-runtime-initially",
-      "risk": ["provider-sdk", "network"]
-    },
     "@openclaw/ai": {
       "owner": "core:ai-runtime",
       "class": "core-runtime",
