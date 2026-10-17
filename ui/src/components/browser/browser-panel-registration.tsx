@@ -27,8 +27,8 @@ function ownerFor(host: Host) {
   Object.defineProperty(host, "updateComplete", {
     configurable: true,
     get: () =>
-      Promise.resolve(Reflect.get(bridgePrototype, "updateComplete", host)).then(
-        () => owner.updateComplete,
+      Promise.resolve(Reflect.get(bridgePrototype, "updateComplete", host)).then(() =>
+        host.isConnected ? owner.updateComplete : false,
       ),
   });
   return owner;

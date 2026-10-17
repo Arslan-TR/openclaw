@@ -140,7 +140,9 @@ describe("normalizeBrowserUrlDraft", () => {
     const input = panel.querySelector(".bp-input");
     const previousSource = image?.getAttribute("src");
     refreshed = true;
-    panel.querySelector<HTMLButtonElement>('button[aria-label="Reload"]')!.click();
+    panel.handleToggleRequest(
+      new CustomEvent("openclaw:browser-toggle", { detail: { open: true } }),
+    );
     await waitForSolid(() => {
       expect(image?.getAttribute("src")).not.toBe(previousSource);
       expect(image?.getAttribute("alt")).toBe("Updated page");
@@ -167,7 +169,9 @@ describe("normalizeBrowserUrlDraft", () => {
       const preview = panel.querySelector(".bp-shot");
       const input = panel.querySelector<HTMLTextAreaElement>(".bp-input");
       input?.focus();
-      panel.querySelector<HTMLButtonElement>('button[aria-label="Reload"]')!.click();
+      panel.handleToggleRequest(
+        new CustomEvent("openclaw:browser-toggle", { detail: { open: true } }),
+      );
       await panel.updateComplete;
 
       expect(panel.querySelector(".bp-shot")).toBe(preview);
