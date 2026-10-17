@@ -33,8 +33,9 @@ vi.mock("../../logging/subsystem.js", () => ({
 }));
 vi.mock("../../logging/logger.js", () => ({ flushLogger: async () => {} }));
 
-// Acquire the runner's compiled subprocess generation before case deadlines.
+// Prepare transforms and compiled subprocesses before case deadlines; cases reset evaluation.
 await import("../../infra/runtime-process-entrypoints.js");
+await import("./run-loop.js");
 
 let activeCase: Promise<void> | undefined;
 afterEach(async () => {
