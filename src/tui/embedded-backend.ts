@@ -96,7 +96,6 @@ import {
 import { projectSessionsPatchEntry } from "../gateway/sessions-patch.js";
 import { waitForAbortSignal } from "../infra/abort-signal.js";
 import { type AgentEventRuntimePayload, onAgentEvent } from "../infra/agent-events.js";
-import { getAgentRunContext } from "../infra/agent-run-registry.js";
 import { setEmbeddedMode } from "../infra/embedded-mode.js";
 import {
   clearEmbeddedPluginApprovalBroker,
@@ -115,7 +114,6 @@ import {
   normalizeAgentId,
 } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
-import { createDeferredCore } from "../shared/deferred.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel.js";
 import { applyQueueDropPolicy, waitForQueueDebounce } from "../utils/queue-helpers.js";
 import {
@@ -128,6 +126,7 @@ import {
 import { ensureEmbeddedHistoryRuntimePluginsLoaded } from "./embedded-history-runtime.js";
 import {
   buildLocalQueuedPrompt,
+  createLocalRunState,
   timeoutSecondsFromMs,
   waitForLocalRunShutdown,
   waitForQueuedLocalRun,
@@ -385,33 +384,13 @@ export class EmbeddedTuiBackend implements TuiBackend {
         pendingQueue = queued.queue;
       }
     }
-    const controller = new AbortController();
-    const queuedRunReadiness = createDeferredCore();
-    const run: LocalRunState = {
+    const run = createLocalRunState(runId, {
       sessionKey: opts.sessionKey,
       agentId,
-      controller,
-      buffer: "",
-      managedMediaUrls: new Set(),
       question,
-      finishing: false,
-      lifecycleEnded: false,
-      registered: false,
       ...(pendingQueue ? { pendingQueue } : {}),
       ...(queuedAfter ? { queuedAfter } : {}),
-      queuedRunReady: queuedRunReadiness.promise,
-      markQueuedRunReady: queuedRunReadiness.resolve,
-    };
-    controller.signal.addEventListener(
-      "abort",
-      () => {
-        // Capture before downstream abort listeners clear the provider wait.
-        if (getAgentRunContext(runId)?.localModelWait) {
-          run.localModelMayStillBeFinishing = true;
-        }
-      },
-      { once: true },
-    );
+    });
     this.runs.set(runId, run);
 
     const runPromise = (run.promise = this.runTurn(runId, run, opts));
