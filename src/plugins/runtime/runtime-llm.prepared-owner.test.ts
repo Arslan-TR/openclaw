@@ -651,6 +651,7 @@ it.each([
           const controller = mode === "callback-drain" ? new AbortController() : undefined;
           const first = startSdk(0, firstHost, controller?.signal);
           await waitForRequest(0, first);
+          const firstResolved = await resolver.mock.results.at(-1)!.value;
           const firstBuilds = create.mock.calls.length;
           expect(firstBuilds).toBeGreaterThan(0);
           let closed = false;
@@ -689,11 +690,12 @@ it.each([
           }
           const second = startSdk(1, secondHost);
           await waitForRequest(1, second);
+          const secondResolved = await resolver.mock.results.at(-1)!.value;
           if (mode === "overlap" || drainMode) {
             expect.soft(create.mock.calls.length).toBe(firstBuilds);
           }
-          expect(fork.mock.calls).toHaveLength(2);
-          expect(fork.mock.calls[0]![0]).not.toBe(fork.mock.calls[1]![0]);
+          expect(secondResolved.authStorage).not.toBe(firstResolved.authStorage);
+          expect(secondResolved.modelRegistry).not.toBe(firstResolved.modelRegistry);
           if (drainMode) {
             expect.soft(closed).toBe(false);
             finishWork.resolve();
@@ -800,6 +802,7 @@ it.each([
           : start(0, abortController?.signal);
         await waitForRequest(0, first);
         const firstPreparationMs = performance.now() - firstStarted;
+        const firstResolved = await resolver.mock.results.at(-1)!.value;
         const firstBuilds = create.mock.calls.length;
         expect(firstBuilds).toBeGreaterThan(0);
         if (drainMode) {
@@ -824,14 +827,15 @@ it.each([
           });
           const second = start(1);
           await waitForRequest(1, second);
+          const secondResolved = await resolver.mock.results.at(-1)!.value;
           expect.soft(parentDrained).toBe(false);
           if (anthropicReadCancel) {
             expect.soft(cancelledInOrigin).toBe(true);
             await foreignWork.drain();
           }
           expect.soft(create.mock.calls.length).toBe(firstBuilds);
-          expect(fork.mock.calls).toHaveLength(2);
-          expect(fork.mock.calls[0]![0]).not.toBe(fork.mock.calls[1]![0]);
+          expect(secondResolved.authStorage).not.toBe(firstResolved.authStorage);
+          expect(secondResolved.modelRegistry).not.toBe(firstResolved.modelRegistry);
           finishWork.resolve();
           await workSettled.promise;
           await parentDrain;
@@ -903,11 +907,11 @@ it.each([
           }
         }
         const buildsBeforeSecond = create.mock.calls.length;
-        const forksBeforeSecond = fork.mock.calls.length;
         const secondStarted = performance.now();
         const second = start(1);
         await waitForRequest(1, second);
         const secondPreparationMs = performance.now() - secondStarted;
+        const secondResolved = await resolver.mock.results.at(-1)!.value;
         const secondBuilds = create.mock.calls.length;
         console.info("direct completion owner reuse", {
           mode,
@@ -920,10 +924,9 @@ it.each([
         if (mode === "overlap" || mode === "lru") {
           expect.soft(secondBuilds).toBe(buildsBeforeSecond);
         }
-        expect(fork.mock.calls.length).toBe(forksBeforeSecond + 1);
-        expect(fork.mock.calls[forksBeforeSecond - 1]![0]).not.toBe(
-          fork.mock.calls[forksBeforeSecond]![0],
-        );
+        // Published catalog overlays may fork twice while retaining one completion's auth store.
+        expect(secondResolved.authStorage).not.toBe(firstResolved.authStorage);
+        expect(secondResolved.modelRegistry).not.toBe(firstResolved.modelRegistry);
         finish(requests[0]!, 0);
         await expect(first).resolves.toMatchObject({
           text: "result-0|/A/v1/chat/completions|Bearer fixture-auth-A",
