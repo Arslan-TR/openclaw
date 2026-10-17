@@ -86,6 +86,22 @@ recorded predecessor, allowing retirement of a binding not yet transferred after
 compaction without adopting it during preparation. Ordinary compaction does not
 invoke this hook and continues to preserve native thread continuity.
 
+### Fresh native thread seeds
+
+The optional `hostCapabilities.prepareBoundedSeed({ assertCurrent, signal })`
+returns a readonly `AgentMessage[]` for a fresh native thread. Call it only
+after deciding not to reuse a native thread, before injecting history. The
+host fixes the session, byte budget, source authority, and atomic summary
+persistence. It attempts one host compaction only if bounding would omit
+unsummarized history, then returns the bounded view. Pass the native binding's
+current-authority assertion and cancellation signal. A retired capability
+rejects; it cannot target another session. Explicit context engines retain
+their own projections rather than receiving this host-history capability.
+
+This is additive to `AgentHarnessHostCapabilities` version 1. On older hosts
+without the capability, retain their bounded history selection without making
+a host summary request.
+
 ## Shared native binding lifecycle
 
 Official harnesses use the JavaScript-only private

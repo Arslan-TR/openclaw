@@ -53,7 +53,6 @@ import {
 } from "./compaction-runtime-context.js";
 import {
   prepareCompactionHarnessAuth,
-  projectCodexHostTranscriptBytePreflightConfig,
   resolveCompactionRuntimeSelection,
 } from "./compaction-runtime-preparation.js";
 import type { acceptCompactionSuccessor } from "./compaction-successor.js";
@@ -70,7 +69,6 @@ import {
   resolveActiveEmbeddedRunHandleSessionIdBySessionFile,
   setActiveEmbeddedRun,
 } from "./runs.js";
-import { resolveTranscriptBytePreflightAuthority } from "./transcript-byte-preflight-authority.js";
 import type { EmbeddedAgentCompactResult } from "./types.js";
 
 type QueuedCompactionParams = CompactEmbeddedAgentSessionParams & {
@@ -139,10 +137,6 @@ export async function compactEmbeddedAgentSession(
       ...input,
       ...(signals.length > 0 ? { abortSignal: AbortSignal.any(signals) } : {}),
     };
-    const projectedConfig = projectCodexHostTranscriptBytePreflightConfig(
-      params.config,
-      Boolean(host.transcriptBytePreflightHarness),
-    );
     const contextEngineAgentId =
       normalizeOptionalString(params.contextEngineAgentId) ??
       normalizeOptionalString(params.agentId);
@@ -171,7 +165,6 @@ export async function compactEmbeddedAgentSession(
       };
       const resolvedParams = {
         ...params,
-        config: projectedConfig,
         sessionEntry: entry ? projectPublicSessionEntry(entry) : undefined,
         agentHarnessId: resolveSessionPinnedHarnessId(entry) ?? params.agentHarnessId,
         modelSelectionLocked: entry?.modelSelectionLocked ?? params.modelSelectionLocked,
@@ -331,10 +324,7 @@ async function compactEmbeddedAgentSessionImpl(
           deriveRuntimePluginSelections: ({ config, metadataSnapshot }) => {
             const selected = resolveCompactionRuntimeSelection({
               ...requestedSelection,
-              config: projectCodexHostTranscriptBytePreflightConfig(
-                config,
-                Boolean(host.transcriptBytePreflightHarness),
-              ),
+              config,
               manifestPlugins: metadataSnapshot,
               allowPluginNormalization: false,
             });
@@ -356,10 +346,7 @@ async function compactEmbeddedAgentSessionImpl(
       ...inputParams,
       ...(placementSandbox ? { sandbox: placementSandbox } : {}),
       memorySandboxed: (placementSandbox ?? inputParams.sandbox)?.enabled === true,
-      config: projectCodexHostTranscriptBytePreflightConfig(
-        lease.snapshot.config,
-        Boolean(host.transcriptBytePreflightHarness),
-      ),
+      config: lease.snapshot.config,
       agentDir: lease.snapshot.agentDir,
     };
     assertQueuedCompactionPreparationActive(inputParams, host);
@@ -431,9 +418,7 @@ async function compactEmbeddedAgentSessionImpl(
       // Stock compaction prepares auth inside its fallback owner. Checking the primary
       // here would reject a cooled profile before that owner can select a healthy model.
       const preparedAuth =
-        contextEngine.info.ownsCompaction ||
-        selectedNativeHarnessCompaction ||
-        host.transcriptBytePreflightHarness
+        contextEngine.info.ownsCompaction || selectedNativeHarnessCompaction
           ? await prepareCompactionHarnessAuth({
               ...params,
               provider: ceProvider,
@@ -456,13 +441,6 @@ async function compactEmbeddedAgentSessionImpl(
       }
       const preparedHarnessRuntime =
         preparedAuth?.selectedPreparedHarness.id ?? selectedHarnessRuntime;
-      const transcriptBytePreflightAuthority =
-        preparedAuth && host.transcriptBytePreflightHarness === preparedHarnessRuntime
-          ? resolveTranscriptBytePreflightAuthority(preparedAuth.selectedPreparedHarness)
-          : undefined;
-      if (host.transcriptBytePreflightHarness && !transcriptBytePreflightAuthority) {
-        return lockedCompactionRuntimeFailure(host.transcriptBytePreflightHarness);
-      }
       const attemptNativeHarnessCompaction =
         selectedNativeHarnessCompaction && preparedHarnessRuntime !== "openclaw";
       const runtimeAuthPlan = preparedAuth?.runtimeAuthPreparation.plan ?? reusableRuntimeAuthPlan;
@@ -564,9 +542,7 @@ async function compactEmbeddedAgentSessionImpl(
       const contextEngineOwnsCompaction = contextEngine.info.ownsCompaction === true;
       let requiredPreflightNativeCapabilityUsed = false;
       const harnessResult =
-        attemptNativeHarnessCompaction &&
-        !transcriptBytePreflightAuthority &&
-        (!contextEngineOwnsCompaction || lockedNativeHarness)
+        attemptNativeHarnessCompaction && (!contextEngineOwnsCompaction || lockedNativeHarness)
           ? await runPrimaryNativeCompactionInLanes(
               preparedParams,
               expectedEntry,
@@ -603,7 +579,6 @@ async function compactEmbeddedAgentSessionImpl(
       // fallback for a locked harness; public result fields cannot escape the lock.
       if (
         lockedNativeHarness &&
-        !transcriptBytePreflightAuthority &&
         !(
           preparedParams.preflightRequired === true &&
           requiredPreflightNativeCapabilityUsed &&
@@ -700,7 +675,6 @@ async function compactEmbeddedAgentSessionImpl(
         preparedHarnessRuntime,
         contextTokenBudget,
         attemptNativeHarnessCompaction,
-        transcriptBytePreflightAuthority,
       });
     });
   });

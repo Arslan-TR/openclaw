@@ -123,7 +123,7 @@ export type CompactionBoundaryOperations = {
       prepared: Omit<PreparedCompactionAppend, "scope"> & {
         scope: Omit<PreparedCompactionAppend["scope"], "env">;
       };
-      transcriptByteCompactionLatch: NonNullable<
+      transcriptByteCompactionLatch?: NonNullable<
         InternalSessionEntry["transcriptByteCompactionLatch"]
       >;
       initialWriterRunId?: string;

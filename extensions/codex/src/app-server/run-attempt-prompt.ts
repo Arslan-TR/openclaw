@@ -84,7 +84,7 @@ export async function prepareCodexAttemptPrompt(context: CodexAttemptContext) {
   const configuredContextBudget =
     activeContextEngine &&
     !usesSupervisionConnection &&
-    params.authoredContextTokenCap &&
+    (params.authoredContextTokenCap || params.hostCapabilities.prepareBoundedSeed) &&
     effectiveContextTokenBudget
       ? effectiveContextTokenBudget
       : undefined;
@@ -235,6 +235,8 @@ export async function prepareCodexAttemptPrompt(context: CodexAttemptContext) {
         sandboxed: sandbox?.enabled === true,
         modelId: effectiveRuntimeModelId,
         contextEngineHostSupport: CODEX_APP_SERVER_CONTEXT_ENGINE_HOST,
+        // Without a seed capability, retain the older host's bounded assembly.
+        runtimeId: params.hostCapabilities.prepareBoundedSeed ? "codex" : undefined,
         providerId: effectiveRuntimeProviderId,
         requestedModelId: usesSupervisionConnection ? undefined : params.requestedModelId,
         fallbackReason: usesSupervisionConnection ? undefined : params.fallbackReason,

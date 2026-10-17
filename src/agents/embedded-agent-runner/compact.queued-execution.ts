@@ -57,12 +57,6 @@ import {
   attachCompactionAccountingRecorder,
   type CompactionAccountingReceipt,
 } from "./run/compaction-accounting-bridge.js";
-import {
-  setTranscriptBytePreflightClaim,
-  type TranscriptBytePreflightAuthority,
-  type TranscriptByteCompactionPersistence,
-  type TranscriptByteCompactionPersistenceAsync,
-} from "./transcript-byte-preflight-authority.js";
 import type { EmbeddedAgentCompactResult } from "./types.js";
 
 type QueuedCompactionHostCommit = {
@@ -75,12 +69,8 @@ type QueuedCompactionHostCommit = {
 export type QueuedCompactionHostOptions = CompactionRequestConstraints & {
   sourceAuthority: AgentHarnessCompactionSourceAuthority;
   assertActive?: SessionSourceAssertion;
-  transcriptBytePreflightHarness?: "codex";
-  withCompactionPersistence?: TranscriptByteCompactionPersistence;
-  withCompactionPersistenceAsync?: TranscriptByteCompactionPersistenceAsync;
   onCommitted?: (accepted: AcceptedCompactionSuccessor) => void;
   onHostCompactionCommitted?: (commit: QueuedCompactionHostCommit) => Promise<void> | void;
-  onHostCompactionTranscriptSettled?: (commit: QueuedCompactionHostCommit) => Promise<void> | void;
 };
 
 export function createQueuedCompactionAbortedResult(): EmbeddedAgentCompactResult {
@@ -181,7 +171,6 @@ export async function executeQueuedContextEngineCompaction(input: {
   preparedHarnessRuntime?: string;
   contextTokenBudget?: number;
   attemptNativeHarnessCompaction: boolean;
-  transcriptBytePreflightAuthority?: TranscriptBytePreflightAuthority;
 }): Promise<EmbeddedAgentCompactResult> {
   const {
     params,
@@ -199,7 +188,6 @@ export async function executeQueuedContextEngineCompaction(input: {
     preparedHarnessRuntime,
     contextTokenBudget,
     attemptNativeHarnessCompaction,
-    transcriptBytePreflightAuthority,
   } = input;
   const incognito = captureSessionActorStorageOwner(runtimeTarget, {
     assertCurrent() {
@@ -389,19 +377,13 @@ export async function executeQueuedContextEngineCompaction(input: {
               await assertPluginWriterActive(runtimeTarget, expectedEntry);
             }
             writeContext.assertCommitAllowed();
-            const clearClaim = setTranscriptBytePreflightClaim(
-              backendParams.runtimeContext,
-              transcriptBytePreflightAuthority,
-              host.withCompactionPersistence,
-              host.withCompactionPersistenceAsync,
-            );
             return withOwnedSessionTranscriptWrites(writeContext, async () => {
               commitCliHistoryCompaction = await prepareCliHistoryCompactionBoundary(
                 runtimeTarget,
                 writeContext.assertCommitAllowed,
               );
               return contextEngine.compact(backendParams);
-            }).finally(clearClaim);
+            });
           },
         };
         result = await compactContextEngineWithSafetyTimeout(
@@ -564,15 +546,7 @@ export async function executeQueuedContextEngineCompaction(input: {
             assertActive: rewriteContext.assertCommitAllowed,
             abortSignal: params.abortSignal,
           });
-          try {
-            await maintenance;
-          } finally {
-            if (hostCommit) {
-              // A rewrite can commit before cancellation is observed. Reconcile transcript
-              // state before hooks or native sync; the host callback keeps the writer fence.
-              await host.onHostCompactionTranscriptSettled?.(hostCommit);
-            }
-          }
+          await maintenance;
         }
         if (result.ok && result.compacted && canContinue()) {
           await commitCliHistoryCompaction?.();
@@ -606,7 +580,7 @@ export async function executeQueuedContextEngineCompaction(input: {
           );
         }
         if (
-          (engineOwnsCompaction || transcriptBytePreflightAuthority) &&
+          engineOwnsCompaction &&
           result.ok &&
           result.compacted &&
           canContinue() &&

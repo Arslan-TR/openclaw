@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   ApprovalTerminalReason,
 } from "../../../packages/gateway-protocol/src/schema/approvals.js";
+import type { AgentMessage } from "../runtime/index.js";
 import type { AnyAgentTool } from "../tools/common.js";
 
 type AgentHarnessHostApprovalResult = Readonly<{
@@ -42,6 +43,13 @@ export type AgentHarnessHostCapabilities = Readonly<{
   version: 1;
   /** Fails closed unless this exact admitted run capability remains active. */
   assertActive: () => void;
+  /** Prepare history only when a native thread must be freshly seeded, under this run's authority. */
+  prepareBoundedSeed?: (
+    request: Readonly<{
+      assertCurrent: () => void;
+      signal?: AbortSignal;
+    }>,
+  ) => Promise<readonly AgentMessage[]>;
   /**
    * Freeze the host continuation count before tools or inference, using the native
    * owner's admitted Gateway-local cwd. Never pass a remote/container path.

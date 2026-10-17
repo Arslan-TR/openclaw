@@ -67,6 +67,7 @@ import {
   withAgentQuestionAnswerAuthority,
 } from "./host-private-capabilities.js";
 import { buildHarnessHostRequester } from "./host-requester.js";
+import { bindBoundedSeed } from "./host-seed.js";
 import { bindHostSkillCatalog, prepareHostSkillLibraryResources } from "./host-skills.js";
 import { cloneHostSnapshot as cloneSnapshot } from "./host-snapshot.js";
 import {
@@ -461,6 +462,7 @@ export function createAgentHarnessHostCapabilities(params: {
     kind: "agent-harness-host-capability" as const,
     version: 1 as const,
     assertActive,
+    ...bindBoundedSeed(attempt, assertActive, withCaller, capabilityAbortController.signal),
     ...bindHostContinuationRetryCount(prepareContinuationRetryCount, assertActive),
     captureRequestCustody: () => {
       assertActive();

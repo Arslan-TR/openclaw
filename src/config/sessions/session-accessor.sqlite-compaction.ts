@@ -48,7 +48,9 @@ type CompactionScope = SessionTranscriptRuntimeTarget &
   >;
 type CompactionParams = {
   prepared: PreparedCompactionAppend;
-  transcriptByteCompactionLatch: NonNullable<InternalSessionEntry["transcriptByteCompactionLatch"]>;
+  transcriptByteCompactionLatch?: NonNullable<
+    InternalSessionEntry["transcriptByteCompactionLatch"]
+  >;
 };
 
 type CompactionWorkerContext = {
@@ -158,7 +160,7 @@ function persistCompactionBoundary(
         ...fresh!,
         ...projectCompactionAccountingPatch(fresh!, {
           compactionKind: "context-engine",
-          transcriptByteCompactionLatch: params.transcriptByteCompactionLatch,
+          transcriptByteCompactionLatch: params.transcriptByteCompactionLatch ?? null,
         }),
       });
       writeSessionEntry(database, resolved.sessionKey, entry, {

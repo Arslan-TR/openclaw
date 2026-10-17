@@ -19,6 +19,7 @@ import {
   projectContextEngineAssemblyForCodex,
 } from "./context-engine-projection.js";
 import { joinPresentSections } from "./developer-instruction-sections.js";
+import { sanitizeCodexHistoryImagePayloads } from "./image-payload-sanitizer.js";
 import type { CodexAttemptContext } from "./run-attempt-context.js";
 import type { CodexAppServerBindingIdentity, CodexBindingAuthority } from "./session-binding.js";
 import {
@@ -86,26 +87,30 @@ export async function prepareCodexContextEngineHistory(params: {
   assertCurrent: () => void;
 }) {
   const { assembled, projectionParams, startupBinding, assertCurrent } = params;
+  const prepareSeed = params.runtimeParams.hostCapabilities.prepareBoundedSeed;
+  const includeMessage = (message: AgentMessage) =>
+    (message.role !== "custom" || isCodexDurableCustomMessage(message)) &&
+    !(
+      message.role === "user" &&
+      projectionParams.currentUserTurnIdempotencyKey &&
+      Reflect.get(message, "idempotencyKey") === projectionParams.currentUserTurnIdempotencyKey
+    );
   const messages = [...assembled.messages, ...(params.continuationMessages ?? [])].filter(
-    (message) =>
-      (message.role !== "custom" || isCodexDurableCustomMessage(message)) &&
-      !(
-        message.role === "user" &&
-        projectionParams.currentUserTurnIdempotencyKey &&
-        Reflect.get(message, "idempotencyKey") === projectionParams.currentUserTurnIdempotencyKey
-      ),
+    includeMessage,
   );
   const configured = params.historyTokenBudget !== undefined;
-  const selection = configured
-    ? selectHistoryPrefix(
-        messages,
-        assembled.contextProjection,
-        startupBinding?.contextEngine?.projection?.fingerprint,
-      )
-    : undefined;
-  const contextEngineProjection =
-    selection?.projection ??
-    readContextEngineThreadBootstrapProjection(assembled.contextProjection);
+  const selection =
+    configured && !prepareSeed
+      ? selectHistoryPrefix(
+          messages,
+          assembled.contextProjection,
+          startupBinding?.contextEngine?.projection?.fingerprint,
+        )
+      : undefined;
+  const contextEngineProjection = prepareSeed
+    ? undefined
+    : (selection?.projection ??
+      readContextEngineThreadBootstrapProjection(assembled.contextProjection));
   const projectionDecision =
     contextEngineProjection && !params.hasContinuation
       ? resolveContextEngineBootstrapProjectionDecision({
@@ -124,13 +129,37 @@ export async function prepareCodexContextEngineHistory(params: {
       prepareFileContext: includeAttachments ? projectionParams.prepareFileContext : undefined,
     });
   const projection = await renderProjection(projectionDecision.project);
-  const historyBootstrapItems = configured
-    ? await buildCodexSelectedHistoryItems({
-        messages,
-        tokenBudget: params.historyTokenBudget,
-        prepareFileContext: projectionParams.prepareFileContext,
-      })
-    : undefined;
+  const buildSeed = (seedMessages: AgentMessage[]) =>
+    buildCodexSelectedHistoryItems({
+      messages: seedMessages,
+      tokenBudget: params.historyTokenBudget,
+      prepareFileContext: projectionParams.prepareFileContext,
+    });
+  const historyBootstrapItems = !configured
+    ? undefined
+    : prepareSeed
+      ? async (assertSeedCurrent: () => void) => {
+          const seed = Array.from(
+            await prepareSeed({
+              assertCurrent: assertSeedCurrent,
+              signal: params.runtimeParams.abortSignal,
+            }),
+            (message) => sanitizeCodexHistoryImagePayloads(message, "codex fresh thread seed"),
+          ).filter(includeMessage);
+          assertSeedCurrent();
+          if (seed.length < messages.length) {
+            seed.unshift({
+              role: "custom",
+              customType: "openclaw.history-omission",
+              content:
+                "Earlier history was summarized or omitted to bound this fresh thread's seed. Resend essential missing details.",
+              display: true,
+              timestamp: 0,
+            });
+          }
+          return buildSeed(seed);
+        }
+      : await buildSeed(messages);
   const historyDeltaItems =
     configured && selection?.prefixLength !== undefined && !projectionDecision.project
       ? await buildCodexSelectedHistoryItems({
@@ -277,8 +306,7 @@ export async function seedCodexHistory(
     assertCurrent: () => void;
   },
 ): Promise<void> {
-  const items = params.historyBootstrapItems;
-  if (items === undefined) {
+  if (params.historyBootstrapItems === undefined) {
     return;
   }
   const { response, expectedModel, expectedProvider, lifecycleTiming, assertCurrent } = options;
@@ -292,6 +320,10 @@ export async function seedCodexHistory(
       "Codex selected a different model than the assembled context policy; retry with that model's configured budget.",
     );
   }
+  const items =
+    typeof params.historyBootstrapItems === "function"
+      ? await params.historyBootstrapItems(assertCurrent)
+      : params.historyBootstrapItems;
   if (items.length) {
     await lifecycleTiming.measure("thread-start-seed-history", () =>
       params.client.request(

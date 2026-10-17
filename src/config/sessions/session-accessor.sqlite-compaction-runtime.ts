@@ -69,7 +69,9 @@ export async function persistCompactionBoundaryWithSessionEntryAsync(
   };
   const memory = captureSessionManagerIncognitoBinding(captured);
   const options = memory?.database ?? toDatabaseOptions(resolveSqliteTranscriptScope(captured));
-  const transcriptByteCompactionLatch = { ...params.transcriptByteCompactionLatch };
+  const transcriptByteCompactionLatch = params.transcriptByteCompactionLatch && {
+    ...params.transcriptByteCompactionLatch,
+  };
   const persist = async (
     database: OpenClawAgentDatabaseExecution | SessionManagerIncognitoDatabase,
   ) => {

@@ -307,7 +307,7 @@ export function createSessionActorMemoryMetadata(context: SessionActorMemoryStor
           ...state.hot.entry!,
           ...projectCompactionAccountingPatch(state.hot.entry!, {
             compactionKind: "context-engine",
-            transcriptByteCompactionLatch: command.input.transcriptByteCompactionLatch,
+            transcriptByteCompactionLatch: command.input.transcriptByteCompactionLatch ?? null,
           }),
         };
         return {
