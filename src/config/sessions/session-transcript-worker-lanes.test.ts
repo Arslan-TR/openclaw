@@ -10,12 +10,14 @@ import { SESSION_TRANSCRIPT_FOREGROUND_WORKERS } from "../../infra/worker-pool-s
 import { WorkerTaskPool } from "../../infra/worker-task-pool.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
+import type { SessionEntryReadWorkerResult } from "./session-entry-read.types.js";
 import { createSessionTranscriptHistoryPool } from "./session-transcript-read-pools.js";
 import {
   historyLane,
   maintenanceLane,
   projectionLane,
   rotateDatabaseWorkers,
+  targetDiscoveryLane,
   withSessionHistoryWorkerReadCandidates,
 } from "./session-transcript-worker-resources.js";
 import {
@@ -142,6 +144,61 @@ it.each(["deadline", "revocation"])(
     } finally {
       ready.resolve();
       await Promise.allSettled([writer, read, rejected]);
+    }
+  },
+);
+
+it.each(["release", "deadline", "revocation"] as const)(
+  "orders a known source after schema invalidation until %s",
+  async (outcome) => {
+    const request = input();
+    const retained = retainSessionHistoryWorkerDatabase(request.database);
+    const sourceReply = {
+      kind: "session-entry-read",
+      entry: undefined,
+      source: { ...request.database, databaseIdentity: "synthetic-known-source" },
+    } satisfies SessionEntryReadWorkerResult;
+    observed.run.mockResolvedValueOnce({ ok: true, value: sourceReply });
+    const ready = createDeferredCore();
+    const entered = createDeferredCore();
+    let writer: Promise<void> | undefined;
+    let read: Promise<boolean> | undefined;
+    try {
+      expect((await retained.owner.readEntryResult({ scope: request.scope })).source).toEqual(
+        sourceReply.source,
+      );
+      observed.preparedDatabase = false;
+      writer = runOpenClawAgentWriteAdmission(request.database, async () => {
+        entered.resolve();
+        await ready.promise;
+      });
+      await entered.promise;
+      observed.run.mockResolvedValue({ ok: true, value: false });
+      const historySequence = historyLane.nativeSequence;
+      const discoverySequence = targetDiscoveryLane.nativeSequence;
+      read = retained.owner.readEntryPresence(request.scope);
+      const result =
+        outcome === "release"
+          ? expect(read).resolves.toBe(false)
+          : expect(read).rejects.toThrow(outcome === "deadline" ? "timed out" : "revoked");
+      void result.catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observed.run).toHaveBeenCalledOnce();
+      if (outcome === "release") {
+        ready.resolve();
+      } else if (outcome === "deadline") {
+        await vi.advanceTimersByTimeAsync(60_000);
+      } else {
+        observed.resources.at(-1)!.revoke();
+      }
+      await result;
+      expect(targetDiscoveryLane.nativeSequence).toBe(discoverySequence);
+      expect(historyLane.nativeSequence).toBe(historySequence + (outcome === "release" ? 1 : 0));
+      expect(observed.run).toHaveBeenCalledTimes(outcome === "release" ? 2 : 1);
+    } finally {
+      ready.resolve();
+      await Promise.allSettled([writer, read]);
+      retained.release();
     }
   },
 );

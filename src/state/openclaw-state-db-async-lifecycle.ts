@@ -6,7 +6,6 @@ import {
   readDatabasePathIdentitySync,
   type DatabasePathIdentity,
 } from "../infra/sqlite-worker-identity.js";
-import { createDeferredCore } from "../shared/deferred.js";
 import { resolveDatabasePath } from "./openclaw-state-db.paths.js";
 import {
   getOpenClawDatabaseMaintenanceScope,
@@ -214,69 +213,69 @@ export function createOpenClawDatabaseMaintenanceScope(
       if (closing) {
         return closing;
       }
-      // A disposer can reenter admission before its first awaited cleanup.
-      const completion = createDeferredCore();
-      closing = completion.promise;
-      void maintenanceResources.current
-        .run({ scope, active: true }, async () => {
-          let beforeSharedResources = beforeResources;
-          while (pending.size || resources.size || beforeSharedResources) {
-            while (pending.size) {
-              await Promise.allSettled(pending);
-            }
-            // Agent lease release can create shared-state handles during cleanup.
-            for (const phase of [
-              "agent-resources",
-              "agent-handles",
-              "shared-leases",
-              "shared-resources",
-              "shared-references",
-              "shared-handles",
-            ] as const) {
-              if (phase === "shared-leases" && beforeSharedResources) {
-                // Retire scope-owned agent resources first, then drain any remaining
-                // cached handles while their shared-state lease authority is still live.
-                await beforeSharedResources();
-                beforeSharedResources = undefined;
+      // Publish the actual drain before a disposer can reenter admission.
+      closing = Promise.resolve()
+        .then(() =>
+          maintenanceResources.current.run({ scope, active: true }, async () => {
+            let beforeSharedResources = beforeResources;
+            while (pending.size || resources.size || beforeSharedResources) {
+              while (pending.size) {
+                await Promise.allSettled(pending);
               }
-              while ([...resources.values()].some((resource) => resource.phase === phase)) {
-                // Earlier cleanup can start tracked work using resources in this batch.
-                while (pending.size) {
-                  await Promise.allSettled(pending);
+              // Agent lease release can create shared-state handles during cleanup.
+              for (const phase of [
+                "agent-resources",
+                "agent-handles",
+                "shared-leases",
+                "shared-resources",
+                "shared-references",
+                "shared-handles",
+              ] as const) {
+                if (phase === "shared-leases" && beforeSharedResources) {
+                  // Retire scope-owned agent resources first, then drain any remaining
+                  // cached handles while their shared-state lease authority is still live.
+                  await beforeSharedResources();
+                  beforeSharedResources = undefined;
                 }
-                const batch = [...resources].filter(([, resource]) => resource.phase === phase);
-                const results = await Promise.allSettled(
-                  batch.map(async ([key, resource]) => {
-                    const claim = maintenanceResources.claims.get(key);
-                    await resource.close();
-                    if (resources.get(key) === resource) {
-                      resources.delete(key);
-                    }
-                    if (maintenanceResources.claims.get(key) === claim) {
-                      maintenanceResources.claims.delete(key);
-                    }
-                  }),
-                );
-                // A disposer can admit tracked cleanup before rejecting. Settle
-                // that work before reporting failure to its process owner.
-                while (pending.size) {
-                  await Promise.allSettled(pending);
+                while ([...resources.values()].some((resource) => resource.phase === phase)) {
+                  // Earlier cleanup can start tracked work using resources in this batch.
+                  while (pending.size) {
+                    await Promise.allSettled(pending);
+                  }
+                  const batch = [...resources].filter(([, resource]) => resource.phase === phase);
+                  const results = await Promise.allSettled(
+                    batch.map(async ([key, resource]) => {
+                      const claim = maintenanceResources.claims.get(key);
+                      await resource.close();
+                      if (resources.get(key) === resource) {
+                        resources.delete(key);
+                      }
+                      if (maintenanceResources.claims.get(key) === claim) {
+                        maintenanceResources.claims.delete(key);
+                      }
+                    }),
+                  );
+                  // A disposer can admit tracked cleanup before rejecting. Settle
+                  // that work before reporting failure to its process owner.
+                  while (pending.size) {
+                    await Promise.allSettled(pending);
+                  }
+                  const errors = results.flatMap((result) =>
+                    result.status === "rejected" ? [result.reason] : [],
+                  );
+                  throwSqliteLifecycleErrors(errors, "Maintenance resource cleanup failed");
                 }
-                const errors = results.flatMap((result) =>
-                  result.status === "rejected" ? [result.reason] : [],
-                );
-                throwSqliteLifecycleErrors(errors, "Maintenance resource cleanup failed");
               }
             }
-          }
-          schemaMigrationChecks.clear();
-          closed = true;
-        })
-        .then(completion.resolve, (error: unknown) => {
+            schemaMigrationChecks.clear();
+            closed = true;
+          }),
+        )
+        .catch((error: unknown) => {
           closing = undefined;
-          completion.reject(error);
+          throw error;
         });
-      return completion.promise;
+      return closing;
     },
   };
   if (parent) {

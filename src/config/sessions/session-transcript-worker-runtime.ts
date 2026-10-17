@@ -1,5 +1,4 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { runWithSqliteDatabaseAdmissionTurn } from "../../infra/sqlite-database-admission-turn.js";
 import { WorkerTaskError } from "../../infra/worker-task-pool.js";
 import type { WorkerTaskOptions, WorkerTaskResponse } from "../../infra/worker-task-pool.types.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
@@ -176,66 +175,60 @@ export function retainSessionHistoryWorkerDatabase(
                 database,
                 owned.nativeSequences.has(requestLane) ? "retained" : "admission",
               );
-              return runWithSqliteDatabaseAdmissionTurn(
-                [database.path],
-                () =>
-                  requestLane.pool.run(
-                    () => {
-                      assertCurrent();
-                      options.prepareRead?.();
-                      const input = prepare();
-                      const projection = projectionTarget(input);
-                      const projectionReceipt = projection?.sessionId
-                        ? readSessionActorProjectionReceipt({
-                            path: database.path,
-                            sessionKey: projection.sessionKey,
-                            sessionId: projection.sessionId,
-                          })
-                        : undefined;
-                      owned.nativeSequences.set(requestLane, ++requestLane.nativeSequence);
-                      return {
-                        ...input,
-                        database,
-                        validation: validation?.validation,
-                        projectionReceipt: projectionReceipt && {
-                          ...projectionReceipt,
-                          ...(input.kind === "history-page" && !projectionReceipt.entrySessionKey
-                            ? { contextOnly: true }
-                            : {}),
-                        },
-                      } satisfies SessionTranscriptWorkerRequest;
+              return requestLane.pool.run(
+                () => {
+                  assertCurrent();
+                  options.prepareRead?.();
+                  const input = prepare();
+                  const projection = projectionTarget(input);
+                  const projectionReceipt = projection?.sessionId
+                    ? readSessionActorProjectionReceipt({
+                        path: database.path,
+                        sessionKey: projection.sessionKey,
+                        sessionId: projection.sessionId,
+                      })
+                    : undefined;
+                  owned.nativeSequences.set(requestLane, ++requestLane.nativeSequence);
+                  return {
+                    ...input,
+                    database,
+                    validation: validation?.validation,
+                    projectionReceipt: projectionReceipt && {
+                      ...projectionReceipt,
+                      ...(input.kind === "history-page" && !projectionReceipt.entrySessionKey
+                        ? { contextOnly: true }
+                        : {}),
                     },
-                    {
-                      inputBytes: inputBytes + (validation?.inputBytes ?? 0),
-                      timeoutMs: remaining,
-                      signal: requestSignal,
-                      onRequest: onRequest
-                        ? (value, context) => {
-                            const effect = (async () => {
-                              context.signal.throwIfAborted();
-                              const response = await onRequest(value, context.signal);
-                              context.signal.throwIfAborted();
-                              return response ?? { input: null, timeoutMs };
-                            })();
-                            hostEffects.add(effect);
-                            owned.hostEffects.add(effect);
-                            const releaseEffect = () => {
-                              hostEffects.delete(effect);
-                              owned.hostEffects.delete(effect);
-                            };
-                            void effect.then(releaseEffect, releaseEffect);
-                            return effect;
-                          }
-                        : undefined,
-                      onExecutionSettled: ({ retired }) => {
-                        if (retired) {
-                          retirement = rotateDatabaseWorkers(requestLane);
-                        }
-                      },
-                    },
-                  ),
-                [],
-                requestSignal,
+                  } satisfies SessionTranscriptWorkerRequest;
+                },
+                {
+                  inputBytes: inputBytes + (validation?.inputBytes ?? 0),
+                  timeoutMs: remaining,
+                  signal: requestSignal,
+                  onRequest: onRequest
+                    ? (value, context) => {
+                        const effect = (async () => {
+                          context.signal.throwIfAborted();
+                          const response = await onRequest(value, context.signal);
+                          context.signal.throwIfAborted();
+                          return response ?? { input: null, timeoutMs };
+                        })();
+                        hostEffects.add(effect);
+                        owned.hostEffects.add(effect);
+                        const releaseEffect = () => {
+                          hostEffects.delete(effect);
+                          owned.hostEffects.delete(effect);
+                        };
+                        void effect.then(releaseEffect, releaseEffect);
+                        return effect;
+                      }
+                    : undefined,
+                  onExecutionSettled: ({ retired }) => {
+                    if (retired) {
+                      retirement = rotateDatabaseWorkers(requestLane);
+                    }
+                  },
+                },
               );
             });
             await retirement;

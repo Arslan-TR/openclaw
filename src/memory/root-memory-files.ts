@@ -41,11 +41,7 @@ export async function resolveCanonicalRootMemoryFile(workspaceDir: string): Prom
   try {
     const entries = await fs.readdir(workspaceDir, { withFileTypes: true });
     for (const entry of entries) {
-      if (
-        entry.name === CANONICAL_ROOT_MEMORY_FILENAME &&
-        entry.isFile() &&
-        !entry.isSymbolicLink()
-      ) {
+      if (entry.name === CANONICAL_ROOT_MEMORY_FILENAME && entry.isFile()) {
         return path.join(workspaceDir, entry.name);
       }
     }

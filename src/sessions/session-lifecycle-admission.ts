@@ -73,6 +73,7 @@ type SessionWorkAdmission = HandoffSessionWorkAdmission & {
 type SessionLifecycleMutationOwner = {
   identities: readonly string[];
   kind?: SessionLifecycleMutationKind;
+  settled: Promise<unknown>;
 };
 
 type SessionLifecycleAdmissionState = {
@@ -81,7 +82,6 @@ type SessionLifecycleAdmissionState = {
   activeAdmissions: Map<string, Set<SessionWorkAdmission>>;
   workReleaseListeners: Map<string, Set<() => void>>;
   activeMutationRuns: Set<SessionLifecycleMutationOwner>;
-  idleWaiters: Map<string, Set<() => void>>;
   currentAdmissions: AsyncLocalStorage<ReadonlySet<SessionWorkAdmission>>;
 };
 
@@ -110,7 +110,6 @@ const SESSION_LIFECYCLE_ADMISSION_STATE = resolveGlobalSingleton(
     activeAdmissions: new Map(),
     workReleaseListeners: new Map(),
     activeMutationRuns: new Set(),
-    idleWaiters: new Map(),
     currentAdmissions: new AsyncLocalStorage(),
   }),
 );
@@ -118,7 +117,6 @@ const {
   activeAdmissions: ACTIVE_SESSION_WORK_ADMISSIONS,
   workReleaseListeners: SESSION_WORK_RELEASE_LISTENERS,
   activeMutationRuns: ACTIVE_SESSION_LIFECYCLE_MUTATION_RUNS,
-  idleWaiters: SESSION_LIFECYCLE_IDLE_WAITERS,
   currentAdmissions: CURRENT_SESSION_WORK_ADMISSIONS,
 } = SESSION_LIFECYCLE_ADMISSION_STATE;
 const {
@@ -187,23 +185,14 @@ async function waitForNormalizedSessionLifecycleMutationIdle(
   identities: readonly string[],
   signal?: AbortSignal,
 ): Promise<void> {
-  const activeIdentities = identities.filter((identity) =>
-    hasActiveSessionLifecycleMutation([identity]),
+  const active = [...ACTIVE_SESSION_LIFECYCLE_MUTATION_RUNS].filter((run) =>
+    run.identities.some((identity) => identities.includes(identity)),
   );
-  if (activeIdentities.length === 0) {
+  if (active.length === 0) {
     return;
   }
   signal?.throwIfAborted();
-  const idle = Promise.all(
-    activeIdentities.map(
-      (identity) =>
-        new Promise<void>((resolve) => {
-          const waiters = SESSION_LIFECYCLE_IDLE_WAITERS.get(identity) ?? new Set();
-          waiters.add(resolve);
-          SESSION_LIFECYCLE_IDLE_WAITERS.set(identity, waiters);
-        }),
-    ),
-  );
+  const idle = Promise.allSettled(active.map((run) => run.settled));
   await racePromiseWithAbortSignal(idle, signal, sessionWorkAdmissionAbortError);
 }
 
@@ -266,11 +255,17 @@ export async function runExclusiveSessionLifecycleMutation<T>(
     signal,
     operation,
   );
-  const mutationRun: SessionLifecycleMutationOwner = { identities, kind: params.kind };
+  const mutationRun: SessionLifecycleMutationOwner = {
+    identities,
+    kind: params.kind,
+    get settled() {
+      return mutation;
+    },
+  };
   let mutationActivated = false;
   let removeAbortListener = () => {};
   let releaseWorkAdmissions: (() => void) | undefined;
-  const mutation = runWithSessionIdentityLocks(
+  const mutation: Promise<T> = runWithSessionIdentityLocks(
     identities,
     async () =>
       await CURRENT_SESSION_WORK_ADMISSIONS.run(callerAdmissions, async () => {
@@ -310,16 +305,6 @@ export async function runExclusiveSessionLifecycleMutation<T>(
               identities,
               async () => {
                 ACTIVE_SESSION_LIFECYCLE_MUTATION_RUNS.delete(mutationRun);
-                for (const identity of identities) {
-                  if (hasActiveSessionLifecycleMutation([identity])) {
-                    continue;
-                  }
-                  const waiters = SESSION_LIFECYCLE_IDLE_WAITERS.get(identity);
-                  SESSION_LIFECYCLE_IDLE_WAITERS.delete(identity);
-                  for (const resolve of waiters ?? []) {
-                    resolve();
-                  }
-                }
                 releaseWorkAdmissions?.();
               },
               diagnostic,

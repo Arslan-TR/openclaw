@@ -41,8 +41,8 @@ export async function withSessionHistoryReadAdmission<T>(
   };
   let additionalLane: SessionHistoryWorkerLane | undefined;
   try {
-    const cold = !request.knownSource && !hasSqliteDatabaseSchemaAdmissionForPath(options.path);
-    const lane = cold ? targetDiscoveryLane : requestedLane;
+    const needsAdmission = !hasSqliteDatabaseSchemaAdmissionForPath(options.path);
+    const lane = needsAdmission && !request.knownSource ? targetDiscoveryLane : requestedLane;
     if (lane !== requestedLane) {
       historyClearTimeout(lane.idleTimer);
       lane.pending++;
@@ -85,7 +85,7 @@ export async function withSessionHistoryReadAdmission<T>(
         }
       };
       // First creation shares schema admission; pure reads never reserve the writer.
-      return cold ? dispatchCold() : start(request.signal);
+      return needsAdmission ? dispatchCold() : start(request.signal);
     };
     return await run(admit, lane);
   } finally {
