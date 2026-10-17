@@ -12,13 +12,11 @@ function writeExecutable(path: string, lines: string[]) {
   chmodSync(path, 0o755);
 }
 
-function readLines(path: string) {
-  return readFileSync(path, "utf8").trim().split("\n");
-}
+const readLines = (path: string) => readFileSync(path, "utf8").trim().split("\n");
 
 function runRemoteGate(env: NodeJS.ProcessEnv, prepareScript?: string) {
-  const dir = tempDirs.make("openclaw-pr-gates-remote-");
-  const stubBin = join(dir, "bin");
+  const workDir = tempDirs.make("openclaw-pr-gates-remote-");
+  const stubBin = join(workDir, "bin");
   mkdirSync(stubBin);
   writeExecutable(join(stubBin, "node"), [
     `if [ "$1" != scripts/crabbox-wrapper.mjs ]; then exec '${process.execPath}' "$@"; fi`,
@@ -34,8 +32,6 @@ function runRemoteGate(env: NodeJS.ProcessEnv, prepareScript?: string) {
     `printf '{"provider":"blacksmith-testbox","leaseId":"tbx_stub","exitCode":0,"runStatus":"passed"}\\n' >&2`,
   ]);
 
-  const workDir = join(dir, "work");
-  mkdirSync(workDir);
   if (prepareScript) {
     mkdirSync(join(workDir, ".local"));
     writeFileSync(join(workDir, ".local", "pr-meta.env"), "PR_AUTHOR=fixture\n");
@@ -94,9 +90,8 @@ it.each([
 });
 
 it("rejects injected worker controls before remote dispatch", () => {
-  const name = "OPENCLAW_VITEST_MAX_WORKERS",
-    value = "2; touch injected";
-  const { result, workDir, logPath } = runRemoteGate({ [name]: value });
+  const name = "OPENCLAW_VITEST_MAX_WORKERS";
+  const { result, workDir, logPath } = runRemoteGate({ [name]: "2; touch injected" });
   expect(result.status).toBe(2);
   expect(result.stderr).toContain(`${name} must be a positive integer`);
   expect(existsSync(logPath)).toBe(false);
@@ -151,8 +146,7 @@ it.each([
         '  test "$*" = "rev-parse HEAD" || return 99',
         `  if [ '${failure}' = head ] && [ -f stages ]; then printf 'changed-head\\n'; else printf '%s\\n' '${head}'; fi`,
         "}",
-        // A conditional caller disables errexit inside functions: the gate owner
-        // must still refuse a failed command or missing receipt before stamping.
+        // Conditional callers disable errexit: failures and missing receipts must still prevent stamps.
         "prepare_local_gate_workspace() { echo unexpected-local-bootstrap >&2; return 97; }",
         "pnpm() { echo unexpected-local-pnpm >&2; return 96; }",
         "if prepare_gates 424242; then exit 0; else exit $?; fi",
@@ -182,8 +176,7 @@ it.each([
 );
 
 it("extracts the last successful blacksmith-testbox timing stamp", () => {
-  const dir = tempDirs.make("openclaw-pr-gates-stamp-");
-  const log = join(dir, "gates-test.log");
+  const log = join(tempDirs.make("openclaw-pr-gates-stamp-"), "gates-test.log");
   writeFileSync(
     log,
     `provider=blacksmith-testbox id=tbx_first sync=delegated auth=blacksmith

@@ -21,6 +21,7 @@ beforeEach(() => {
   f = makePublisherRepo();
 });
 const remoteHead = () => f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic");
+const gitHook = (...commands: string[]) => ["pr_git() {", ...commands, '  command git "$@"', "}"];
 function expectUnpublished(result: Run, remote = f.source, events = "") {
   expect(result.status, result.stdout + result.stderr).not.toBe(0);
   expect({ remote: remoteHead(), events: f.read("events"), prep: f.exists("prep.env") }).toEqual({
@@ -29,11 +30,13 @@ function expectUnpublished(result: Run, remote = f.source, events = "") {
     prep: false,
   });
 }
-function appendFixup(parent: string) {
-  f.git("checkout", "-B", "prep", parent);
-  f.git("commit", "-qm", "next reviewed fixup", "--allow-empty");
+function expectRetained(result: Run, receipts: Record<string, string>, events: string) {
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(f.read("events")).toBe(events);
+  for (const [name, contents] of Object.entries(receipts)) {
+    expect(f.read(name), name).toBe(contents);
+  }
 }
-
 function publishedPair(operation = "prepare_push", setup = graphql) {
   const result = runPublisher(f, `${operation} 4242`, setup);
   expect(result.status, result.stdout + result.stderr).toBe(0);
@@ -43,7 +46,8 @@ function publishedPair(operation = "prepare_push", setup = graphql) {
 function publicationChain(initial = "prepare_push") {
   const first = publishedPair(initial),
     completed = f.read("prep.env");
-  appendFixup(first);
+  f.git("checkout", "-B", "prep", first);
+  f.git("commit", "-qm", "next reviewed fixup", "--allow-empty");
   const latest = publishedPair(initial === "prepare_push" ? "prepare_sync_head" : "prepare_push");
   return { first, latest, completed };
 }
@@ -59,14 +63,7 @@ function commitTree(tree: string, parents: string[], message: string) {
 }
 
 function intermediateReceipt(head: string, local: string, from: string) {
-  return [
-    `PUSH_PREP_HEAD_SHA=${head}`,
-    `PUSH_LOCAL_PREP_HEAD_SHA=${local}`,
-    `PUSHED_FROM_SHA=${from}`,
-    "PUSH_REPLACED_HOSTED_ANCESTRY=false",
-    `PR_HEAD_SHA_AFTER_PUSH=${head}`,
-    "",
-  ].join("\n");
+  return `PUSH_PREP_HEAD_SHA=${head}\nPUSH_LOCAL_PREP_HEAD_SHA=${local}\nPUSHED_FROM_SHA=${from}\nPUSH_REPLACED_HOSTED_ANCESTRY=false\nPR_HEAD_SHA_AFTER_PUSH=${head}\n`;
 }
 
 describe("partial PR publication recovery", () => {
@@ -100,22 +97,22 @@ describe("partial PR publication recovery", () => {
     expect(f.read("events")).toBe("graphql\n");
   });
 
-  it("recovers prepare-push from either intermediate owner without a completed receipt", () => {
-    const { latest } = publicationChain();
-    unlinkSync(join(f.local, "prep.env"));
-    const latestResult = f.read("prepare-sync-result.env");
-    expect(publishedPair("prepare_push")).toBe(latest);
+  it.each(["missing", "older"])("recovers the latest publication with %s preparation", (prep) => {
+    const initial = prep === "missing" ? "prepare_push" : "prepare_sync_head";
+    const { latest, completed } = publicationChain(initial);
+    if (prep === "missing") {
+      unlinkSync(join(f.local, "prep.env"));
+    } else {
+      f.write("prep.env", completed);
+    }
+    const resultFile = prep === "missing" ? "prepare-sync-result.env" : "prepare-push-result.env";
+    const latestResult = f.read(resultFile);
+    expect(publishedPair(initial)).toBe(latest);
+    expect(f.read(resultFile)).toBe(latestResult);
     expect(f.read("events")).toBe("graphql\ngraphql\n");
-    expect(f.read("prepare-sync-result.env")).toBe(latestResult);
-    expect(f.read("prep.env")).toContain(`PREP_HEAD_SHA=${latest}\n`);
-  });
-  it("selects the latest intermediate publication over completed preparation", () => {
-    const { latest, completed } = publicationChain("prepare_sync_head");
-    f.write("prep.env", completed);
-    const latestResult = f.read("prepare-push-result.env");
-    expect(publishedPair("prepare_sync_head")).toBe(latest);
-    expect(f.read("prepare-push-result.env")).toBe(latestResult);
-    expect(f.read("events")).toBe("graphql\ngraphql\n");
+    if (prep === "missing") {
+      expect(f.read("prep.env")).toContain(`PREP_HEAD_SHA=${latest}\n`);
+    }
   });
   it("does not fall back to the older matching receipt when a newer publication exists", () => {
     const { latest } = publicationChain();
@@ -135,9 +132,7 @@ describe("partial PR publication recovery", () => {
     f.write("prepare-sync-result.env", invalid);
     f.git("checkout", "-B", "prep", alternate);
     const result = runPublisher(f, "prepare_push 4242", graphql);
-    expect(result.status, result.stdout + result.stderr).not.toBe(0);
-    expect(f.read("prep.env")).toBe(completed);
-    expect(f.read("events")).toBe("graphql\ngraphql\n");
+    expectRetained(result, { "prep.env": completed }, "graphql\ngraphql\n");
   });
 
   it("accepts duplicate native no-op receipts without inventing a different local mapping", () => {
@@ -175,12 +170,16 @@ describe("partial PR publication recovery", () => {
       f.git("checkout", "-B", "prep", completedLocal);
 
       const result = runPublisher(f, "prepare_push 4242", graphql);
-      expect(result.status, result.stdout + result.stderr).not.toBe(0);
+      expectRetained(
+        result,
+        {
+          "prep.env": receipt,
+          "prepare-push-result.env": firstResult,
+          "prepare-sync-result.env": secondResult,
+        },
+        "graphql\n",
+      );
       expect(result.stderr).toContain("Conflicting publication receipts");
-      expect(f.read("prep.env")).toBe(receipt);
-      expect(f.read("prepare-push-result.env")).toBe(firstResult);
-      expect(f.read("prepare-sync-result.env")).toBe(secondResult);
-      expect(f.read("events")).toBe("graphql\n");
       expect(remoteHead()).toBe(first);
     },
   );
@@ -216,11 +215,9 @@ describe("partial PR publication recovery", () => {
         f.write(resultFile, receipt);
       }
       const result = runPublisher(f, "prepare_push 4242", graphql);
-      expect(result.status, result.stdout + result.stderr).not.toBe(0);
-      expect(f.read(resultFile)).toBe(receipt);
+      expectRetained(result, { [resultFile]: receipt }, "graphql\n");
       expect(f.exists("executed")).toBe(false);
       expect(f.exists("prep.env")).toBe(false);
-      expect(f.read("events")).toBe("graphql\n");
     },
   );
 });
@@ -259,15 +256,14 @@ describe("PR publication ownership", () => {
         `OPENCLAW_PR_PUSH_MODE=${transport}`,
         "PR_HEAD_OWNER=fixture",
         "PR_HEAD_REPO_NAME=repo",
-        "pr_git() {",
-        `  if [ "$1" = verify-commit ] || [ "$*" = 'log -1 --format=%b HEAD' ]; then`,
-        "    jq '.headRepository.nameWithOwner = \"replacement/repo\"' .local/remote-observation.json > .local/changed-observation.json",
-        "    mv .local/changed-observation.json .local/remote-observation.json",
-        '    [ "$1" != verify-commit ] || return 0',
-        "  fi",
-        '  [ "$1" != push ] || echo push >> .local/events',
-        '  command git "$@"',
-        "}",
+        ...gitHook(
+          `  if [ "$1" = verify-commit ] || [ "$*" = 'log -1 --format=%b HEAD' ]; then`,
+          "    jq '.headRepository.nameWithOwner = \"replacement/repo\"' .local/remote-observation.json > .local/changed-observation.json",
+          "    mv .local/changed-observation.json .local/remote-observation.json",
+          '    [ "$1" != verify-commit ] || return 0',
+          "  fi",
+          '  [ "$1" != push ] || echo push >> .local/events',
+        ),
       ]);
       expectUnpublished(result);
       expect(result.stdout + result.stderr).toContain("PR identity changed");
@@ -321,13 +317,12 @@ describe("PR publication ownership", () => {
     const foreign = f.sameTree;
     f.git("push", "-q", "origin", `${foreign}:refs/heads/foreign`);
     const result = runPublisher(f, "prepare_push 4242", [
-      "pr_git() {",
-      '  if [ "$1" = push ]; then',
-      "    echo push >> .local/events",
-      `    command git --git-dir="$remote" update-ref refs/heads/topic ${foreign}`,
-      '  elif [ "$1" = rebase ]; then echo rebase >> .local/events; fi',
-      '  command git "$@"',
-      "}",
+      ...gitHook(
+        '  if [ "$1" = push ]; then',
+        "    echo push >> .local/events",
+        `    command git --git-dir="$remote" update-ref refs/heads/topic ${foreign}`,
+        '  elif [ "$1" = rebase ]; then echo rebase >> .local/events; fi',
+      ),
     ]);
     expectUnpublished(result, foreign, "push\n");
     expect(f.git("rev-parse", "HEAD")).toBe(f.candidate);
@@ -349,17 +344,14 @@ describe("PR publication ownership", () => {
               `  command git --git-dir="$remote" update-ref refs/heads/topic ${f.sameTree}`,
               "}",
             ]
-          : [
-              "pr_git() {",
+          : gitHook(
               '  if [ "$1" = push ]; then echo push >> .local/events; fi',
               '  for arg in "$@"; do',
               '    if [ "$arg" = fetch ]; then',
               `      command git --git-dir="$remote" update-ref refs/heads/topic ${f.sameTree}`,
               "    fi",
               "  done",
-              '  command git "$@"',
-              "}",
-            ],
+            ),
       );
       expect(result.status, result.stdout + result.stderr).not.toBe(0);
       expect(remoteHead()).toBe(f.sameTree);
@@ -381,8 +373,7 @@ describe("PR publication ownership", () => {
     receipt = f.read("prep.env");
     f.git("commit", "-qm", "fixup on the unhosted local commit", "--allow-empty");
     const rejected = runPublisher(f, "prepare_sync_head 4242", graphql);
-    expect(rejected.status, rejected.stdout + rejected.stderr).not.toBe(0);
-    expect(f.read("prep.env")).toBe(receipt);
+    expectRetained(rejected, { "prep.env": receipt }, "graphql\n");
     f.git("checkout", "-B", "prep", hosted);
     f.git("commit", "-qm", "fixup on the hosted commit", "--allow-empty");
     publishedPair("prepare_sync_head");
@@ -400,16 +391,13 @@ describe("PR publication ownership", () => {
               "OPENCLAW_PR_PUSH_MODE=graphql",
               'pr_gh_plain() { echo graphql >> .local/events; echo "403 forbidden" >&2; return 74; }',
             ]
-          : [
-              "pr_git() {",
+          : gitHook(
               '  if [ "$1" = push ]; then',
               "    echo push >> .local/events",
               '    echo "transport failed" >&2',
               "    return 73",
               "  fi",
-              '  command git "$@"',
-              "}",
-            ]),
+            )),
       ]);
       expect(result.status, result.stdout + result.stderr).toBe(failure === "git-failure" ? 73 : 1);
       expect(f.read("events")).toBe(failure === "git-failure" ? "push\n" : "graphql\n");
@@ -433,9 +421,7 @@ describe("PR publication ownership", () => {
       f.write("prep.env", changed);
       f.git("commit", "-qm", "appended fixup", "--allow-empty");
       const result = runPublisher(f);
-      expect(result.status, result.stdout + result.stderr).not.toBe(0);
-      expect(f.read("prep.env")).toBe(changed);
-      expect(f.read("events")).toBe("push\n");
+      expectRetained(result, { "prep.env": changed }, "push\n");
       expect(remoteHead()).toBe(f.candidate);
     },
   );

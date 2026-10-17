@@ -41,16 +41,13 @@ export function runGatesBash(
     gatesOnly?: boolean;
   } = {},
 ) {
-  const sources = ["common", "gates"];
-  if (!options.gatesOnly) {
-    sources.push("review");
-  }
-  if (options.sourcePush) {
-    sources.push("worktree", "push");
-  }
-  if (options.sourcePrepareCore) {
-    sources.push("prepare-core");
-  }
+  const sources = [
+    "common",
+    "gates",
+    ...(options.gatesOnly ? [] : ["review"]),
+    ...(options.sourcePush ? ["worktree", "push"] : []),
+    ...(options.sourcePrepareCore ? ["prepare-core"] : []),
+  ];
   const setup = options.gatesOnly
     ? []
     : ["mark_pr_operation_side_effects_started() { :; }", "require_prepared_review() { :; }"];
@@ -102,16 +99,17 @@ function createPublisherRepo(tempDirs: PublisherTempDirs) {
   git("init", "-q", "-b", "prep");
   git("config", "user.name", "Fixture");
   git("config", "user.email", "fixture@example.invalid");
-  git("commit", "-qm", "base", "--allow-empty");
-  const base = git("rev-parse", "HEAD");
-  writeFileSync(join(repoDir, "reviewed.txt"), "reviewed\n");
-  git("add", ".");
-  git("commit", "-qm", "reviewed");
-  const source = git("rev-parse", "HEAD");
-  writeFileSync(join(repoDir, "fixup.txt"), "fixup\n");
-  git("add", ".");
-  git("commit", "-qm", "fixup");
-  const candidate = git("rev-parse", "HEAD");
+  function commit(name: string, empty = false) {
+    if (!empty) {
+      writeFileSync(join(repoDir, `${name}.txt`), `${name}\n`);
+      git("add", ".");
+    }
+    git("commit", "-qm", name, ...(empty ? ["--allow-empty"] : []));
+    return git("rev-parse", "HEAD");
+  }
+  const base = commit("base", true);
+  const source = commit("reviewed");
+  const candidate = commit("fixup");
   const sameTree = git("commit-tree", `${candidate}^{tree}`, "-p", source, "-m", "foreign");
   const advance = git("commit-tree", `${source}^{tree}`, "-p", source, "-m", "foreign advance");
   git("init", "-q", "--bare", remote);
@@ -219,17 +217,15 @@ export function runPublisher(
       "run_prepare_push_retry_gates() { echo retry-gates >> .local/events; }",
       "pr_git() {",
       '  case "$1" in',
-      "    push) echo push >> .local/events;;",
-      "    rebase) echo rebase >> .local/events;;",
+      '    push|rebase) echo "$1" >> .local/events;;',
       "  esac",
       '  command git "$@"',
       "}",
       "pr_gh_plain() {",
       "  echo graphql >> .local/events",
-      "  local payload expected hosted",
+      "  local expected hosted",
       '  test "$4" != "-" && test -f "$4" || return 1',
-      '  payload=$(cat "$4") || return $?',
-      "  expected=$(printf '%s' \"$payload\" | jq -r .variables.input.expectedHeadOid)",
+      '  expected=$(jq -r .variables.input.expectedHeadOid "$4") || return $?',
       '  test "$expected" = "$(remote_head)" || return 75',
       '  hosted=$(command git commit-tree HEAD^{tree} -p "$expected" -m "Hosted verified commit")',
       '  command git push -q "$remote" "$hosted:refs/heads/topic" || return $?',

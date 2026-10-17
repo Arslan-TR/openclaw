@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
@@ -80,24 +80,17 @@ function runReviewShellFunction(
 }
 
 function runShell(fixtureRoot: string, script: string, commands: string[]) {
-  return spawnSync(
-    bash,
-    [
-      "-c",
-      [
-        "set -euo pipefail",
-        'source "$1"',
-        'fixture_root="$2"',
-        'enter_worktree() { cd "$fixture_root"; }',
-        'require_artifact() { [ -s "$1" ]; }',
-        ...commands,
-      ].join("\n"),
-      "pr-review-shell",
-      script,
-      fixtureRoot,
-    ],
-    { encoding: "utf8" },
-  );
+  const source = [
+    "set -euo pipefail",
+    'source "$1"',
+    'fixture_root="$2"',
+    'enter_worktree() { cd "$fixture_root"; }',
+    'require_artifact() { [ -s "$1" ]; }',
+    ...commands,
+  ].join("\n");
+  return spawnSync(bash, ["-c", source, "pr-review-shell", script, fixtureRoot], {
+    encoding: "utf8",
+  });
 }
 
 function expectRejected(result: ReturnType<typeof spawnSync>, ...messages: string[]) {
@@ -111,22 +104,11 @@ function readArtifact(localDir: string, name: string) {
   return readFileSync(join(localDir, name), "utf8");
 }
 
-function runArtifactsInit(existing: { review?: unknown; markdown?: string } = {}) {
+function runArtifactsInit(review: ReturnType<typeof validReview>, markdown: string) {
   const fixtureRoot = tempDirs.make("openclaw-pr-review-artifacts-init-");
   const localDir = join(fixtureRoot, ".local");
-  mkdirSync(localDir);
-  writeFileSync(join(localDir, "pr-meta.env"), `PR_NUMBER=${REVIEWED_PR}\n`);
-  writeFileSync(
-    join(localDir, "pr-meta.json"),
-    `${JSON.stringify({ number: REVIEWED_PR, headRefOid: REVIEWED_HEAD, files: [] })}\n`,
-  );
-  if (existing.review !== undefined) {
-    writeFileSync(join(localDir, "review.json"), `${JSON.stringify(existing.review)}\n`);
-  }
-  if (existing.markdown !== undefined) {
-    writeFileSync(join(localDir, "review.md"), existing.markdown);
-  }
-
+  writeReviewArtifacts(fixtureRoot, review);
+  writeFileSync(join(localDir, "review.md"), markdown);
   const result = runReviewShellFunction(fixtureRoot, `review_artifacts_init ${REVIEWED_PR}`);
   return { result, localDir };
 }
@@ -248,10 +230,7 @@ describePosix("scripts/pr review artifact validation", () => {
   it("moves foreign review artifacts aside and stamps a fresh template", () => {
     const foreign = validReadyReview();
     foreign.pr.number = 113928;
-    const { result, localDir } = runArtifactsInit({
-      review: foreign,
-      markdown: "A) Ship another PR\n",
-    });
+    const { result, localDir } = runArtifactsInit(foreign, "A) Ship another PR\n");
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("moved aside .local/review.json");
@@ -274,10 +253,7 @@ describePosix("scripts/pr review artifact validation", () => {
     const inProgress = validReadyReview();
     inProgress.issueValidation.summary = "Half-written review worth keeping.";
     const markdown = `${REVIEWED_IDENTITY_LINE}\n\nA) Half-written review worth keeping.\n`;
-    const { result, localDir } = runArtifactsInit({
-      review: inProgress,
-      markdown,
-    });
+    const { result, localDir } = runArtifactsInit(inProgress, markdown);
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain(

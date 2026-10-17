@@ -58,23 +58,44 @@ function publishedPreparation(alias = false) {
 }
 
 describePosix("prepare-push retained Crabbox finalization", () => {
-  it("finalizes legacy published preparation without pushing or refreshing", () => {
-    const f = publishedPreparation(true);
-    const result = f.run();
-    expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(result.stdout).toContain("prepare-push complete");
-    expect(f.read("events")).toBe("");
-    expect(f.git("rev-parse", "HEAD")).toBe(f.candidate);
-    expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.head);
-    const prep = f.read("prep.env");
-    expect(prep).toContain(`PREP_HEAD_SHA=${f.head}`);
-    expect(prep).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}`);
-    expect(prep).toContain(`PREP_MAINLINE_BASE_SHA=${f.base}`);
-    const gate = f.read("gates.env");
-    expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
-    expect(gate).toContain(`FULL_GATES_HEAD_SHA=${f.head}`);
-    expect(gate).not.toContain("PENDING_CRABBOX_");
-  });
+  it.each(["legacy publication", "interrupted writer", "legacy gate"])(
+    "finalizes %s without pushing or refreshing",
+    (mode) => {
+      const f = publishedPreparation(mode === "legacy publication");
+      if (mode === "interrupted writer") {
+        const first = f.run(undefined, [...f.setup, "complete_prepare_push() { return 77; }"]);
+        expect(first.status).toBe(77);
+        expect(f.exists("prep.env")).toBe(false);
+        const gate = f.read("gates.env");
+        expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
+        expect(gate).toContain(`REMOTE_GATES_BASE_SHA=${f.base}`);
+        expect(gate).toContain("REMOTE_GATES_ACTIONS_RUN_ATTEMPT=1");
+      } else if (mode === "legacy gate") {
+        // The old writer took eleven arguments, without controller provenance.
+        const written = runGatesBash(
+          `write_gates_env_stamp 4242 false false remote_crabbox_aws '${f.head}' '${f.head}' '' aws run_fixture cbx_fixture https://github.com/openclaw/openclaw/actions/runs/99`,
+          { cwd: f.repoDir },
+        );
+        expect(written.status, written.stderr).toBe(0);
+        expect(f.read("gates.env")).not.toContain("REMOTE_GATES_BASE_SHA");
+      }
+      const result = f.run();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(result.stdout).toContain("prepare-push complete");
+      expect(f.read("events")).toBe("");
+      expect(f.git("rev-parse", "HEAD")).toBe(f.candidate);
+      expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.head);
+      const prep = f.read("prep.env");
+      expect(prep).toContain(`PREP_HEAD_SHA=${f.head}`);
+      expect(prep).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}`);
+      expect(prep).toContain(`PREP_MAINLINE_BASE_SHA=${f.base}`);
+      const gate = f.read("gates.env");
+      expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
+      expect(gate).toContain(`FULL_GATES_HEAD_SHA=${f.head}`);
+      expect(gate).not.toContain("PENDING_CRABBOX_");
+      expect(gate).toContain(`REMOTE_GATES_BASE_SHA=${f.base}`);
+    },
+  );
   it.each([
     "remote-head",
     "closed",
@@ -140,39 +161,6 @@ describePosix("prepare-push retained Crabbox finalization", () => {
     expect(f.read("events")).toBe("");
     expect(f.exists("prep.env")).toBe(false);
   });
-  it("resumes after gate success when the preparation writer was interrupted", () => {
-    const f = publishedPreparation();
-    const first = f.run(undefined, [...f.setup, "complete_prepare_push() { return 77; }"]);
-    expect(first.status).toBe(77);
-    expect(f.exists("prep.env")).toBe(false);
-    const gate = f.read("gates.env");
-    expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
-    expect(gate).toContain(`REMOTE_GATES_BASE_SHA=${f.base}`);
-    expect(gate).toContain("REMOTE_GATES_ACTIONS_RUN_ATTEMPT=1");
-    const resumed = f.run();
-    expect(resumed.status, resumed.stdout + resumed.stderr).toBe(0);
-    expect(f.exists("prep.env")).toBe(true);
-    expect(f.read("events")).toBe("");
-  });
-
-  it("finalizes a pre-change completed gate using the retained preparation base", () => {
-    const f = publishedPreparation();
-    // The old writer took only eleven arguments, with no controller provenance.
-    const written = runGatesBash(
-      `write_gates_env_stamp 4242 false false remote_crabbox_aws '${f.head}' '${f.head}' '' aws run_fixture cbx_fixture https://github.com/openclaw/openclaw/actions/runs/99`,
-      { cwd: f.repoDir },
-    );
-    expect(written.status, written.stderr).toBe(0);
-    expect(f.read("gates.env")).not.toContain("REMOTE_GATES_BASE_SHA");
-    const result = f.run();
-    expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(f.read("prep.env")).toContain(`PREP_MAINLINE_BASE_SHA=${f.base}`);
-    expect(f.read("gates.env")).toContain(`REMOTE_GATES_BASE_SHA=${f.base}`);
-    expect(f.read("events")).toBe("");
-  });
-});
-
-describePosix("atomic gate receipt writes", () => {
   it.each([
     ["github_pending", 1],
     ["remote_crabbox_aws", 1],

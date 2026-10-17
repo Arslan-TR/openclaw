@@ -9,6 +9,7 @@ import {
 import { requireNodeTool } from "../helpers/node-toolchain.js";
 
 const shellQuote = (value: string) => `'${value.replace(/'/gu, `'\\''`)}'`;
+const readLines = (file: string) => readFileSync(file, "utf8").trim().split("\n").filter(Boolean);
 
 /** Own the binding until the supervisor and all its descendants have joined. */
 export function createProvisionIsolationFixture(directory: string, canonical: string) {
@@ -166,19 +167,13 @@ if (provisioner) {
     binding,
     nodeArgs,
     bin,
-    preload,
-    launches,
     observations,
     stateDatabase,
     path: (inheritedPath: string) => [bin, inheritedPath].join(delimiter),
     assertProvisioner() {
-      const pids = readFileSync(launches, "utf8").trim().split("\n").filter(Boolean).map(Number);
+      const pids = readLines(launches).map(Number);
       assert(pids.length > 0, "No provisioner launched through the bound Node entrypoint");
-      const rows = readFileSync(observations, "utf8")
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line));
+      const rows = readLines(observations).map((line) => JSON.parse(line));
       for (const pid of pids) {
         const probe = rows.find(
           (row) => row.pid === pid && row.kind === "store-and-config-custody-verified",
@@ -198,7 +193,6 @@ if (provisioner) {
           "No actual canonical-state consumer witness",
         );
       }
-      return { pids, rows };
     },
   };
 }
