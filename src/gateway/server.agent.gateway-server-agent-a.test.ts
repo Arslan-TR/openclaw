@@ -263,6 +263,8 @@ describe("gateway server agent", () => {
       idempotencyKey: runId,
     });
     expect(res.ok, JSON.stringify(res)).toBe(true);
+    const completed = await rpcReq(gatewaySuite.ws, "agent.wait", { runId });
+    expect(completed).toMatchObject({ ok: true, payload: { status: "ok" } });
     const call = await waitForAgentCommandCall(runId);
     expect(call.sessionKey).toBeUndefined();
     expect(call.media).toHaveLength(2);

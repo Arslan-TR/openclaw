@@ -3386,7 +3386,6 @@
 ["src/auto-reply/reply/commands-abort-trigger.test.ts","./abort-cutoff.js","6faf035003e1dea33223f6934077d39847990a4e83fb76157f8de3fbd4645119",1]
 ["src/auto-reply/reply/commands-abort-trigger.test.ts","./abort-primitives.js","8c81e817093d722cae1e10e01de51899734b4e252dab605718afada2ce44f861",1]
 ["src/auto-reply/reply/commands-abort-trigger.test.ts","./abort-trigger-text.js","789c40ad78c68c275b3e0de26910ad95cb75e0070412e386bb003936db727a74",1]
-["src/auto-reply/reply/commands-abort-trigger.test.ts","./abort.js","b823681a7d4b147a695a3abb2cec7ae5faf0ab06cf54b5f02a29c04ccf9d52b9",1]
 ["src/auto-reply/reply/commands-abort-trigger.test.ts","./commands-session-store.js","dc683aa72428c15231ce19f960155e0fee3ef03e5f2616fd84d83409c8a599bc",1]
 ["src/auto-reply/reply/commands-abort-trigger.test.ts","./reply-run-registry.js","3c4a809c8bec1e0360b44c165d1fd4f7c08920199af5c26afb75ee8a838a725f",1]
 ["src/auto-reply/reply/commands-acp.test.ts","../../acp/control-plane/spawn.js","1e18392a032d0306a4d46d4147ff8096091a0721b69296a96525594afb19417f",1]
