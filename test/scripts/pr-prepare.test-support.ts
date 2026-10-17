@@ -1,11 +1,26 @@
 import { spawnSync } from "node:child_process";
-import { constants as fsConstants, cpSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  constants as fsConstants,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { expect } from "vitest";
 import type { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const repoRoot = process.cwd();
 type PublisherTempDirs = ReturnType<typeof useAutoCleanupTempDirTracker>;
+
+function artifactFiles(directory: string) {
+  return {
+    read: (name: string) => readFileSync(join(directory, name), "utf8"),
+    write: (name: string, text: string) => writeFileSync(join(directory, name), text),
+    exists: (name: string) => existsSync(join(directory, name)),
+  };
+}
 
 function sanitizedEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -23,6 +38,7 @@ export function runGatesBash(
     env?: NodeJS.ProcessEnv;
     sourcePrepareCore?: boolean;
     sourcePush?: boolean;
+    gatesOnly?: boolean;
   } = {},
 ) {
   return spawnSync(
@@ -34,9 +50,13 @@ export function runGatesBash(
         `script_parent_dir='${repoRoot}/scripts'`,
         `source '${repoRoot}/scripts/pr-lib/common.sh'`,
         `source '${repoRoot}/scripts/pr-lib/gates.sh'`,
-        `source '${repoRoot}/scripts/pr-lib/review.sh'`,
-        "mark_pr_operation_side_effects_started() { :; }",
-        "require_prepared_review() { :; }",
+        ...(options.gatesOnly
+          ? []
+          : [
+              `source '${repoRoot}/scripts/pr-lib/review.sh'`,
+              "mark_pr_operation_side_effects_started() { :; }",
+              "require_prepared_review() { :; }",
+            ]),
         ...(options.sourcePush
           ? [
               `source '${repoRoot}/scripts/pr-lib/worktree.sh'`,
@@ -45,7 +65,9 @@ export function runGatesBash(
           : []),
         ...(options.sourcePrepareCore
           ? [`source '${repoRoot}/scripts/pr-lib/prepare-core.sh'`]
-          : ["refresh_prep_branch_for_reviewed_head() { :; }"]),
+          : options.gatesOnly
+            ? []
+            : ["refresh_prep_branch_for_reviewed_head() { :; }"]),
         script,
       ].join("\n"),
     ],
@@ -121,24 +143,20 @@ function createPublisherRepo(tempDirs: PublisherTempDirs) {
     headRepositoryOwner: { login: "fixture" },
     isCrossRepository: false,
   };
-  writeFileSync(join(local, "pr-meta.json"), JSON.stringify(observation));
-  writeFileSync(join(local, "remote-observation.json"), JSON.stringify(observation));
-  writeFileSync(join(local, "github-reads"), "");
-  writeFileSync(
-    join(local, "pr-meta.env"),
-    `PR_NUMBER=4242\nPR_AUTHOR=fixture\nPR_HEAD=topic\nPR_HEAD_SHA=${source}\n`,
-  );
-  writeFileSync(
-    join(local, "prep-context.env"),
+  const { write } = artifactFiles(local);
+  write("pr-meta.json", JSON.stringify(observation));
+  write("remote-observation.json", JSON.stringify(observation));
+  write("github-reads", "");
+  write("pr-meta.env", `PR_NUMBER=4242\nPR_AUTHOR=fixture\nPR_HEAD=topic\nPR_HEAD_SHA=${source}\n`);
+  write(
+    "prep-context.env",
     `PR_NUMBER=4242\nPR_HEAD=topic\nPR_HEAD_SHA_BEFORE=${source}\nPREP_BRANCH=prep\nPREP_STARTED_AT=2026-09-07T00:00:00Z\n`,
   );
-  writeFileSync(
-    join(local, "gates.env"),
-    `PR_NUMBER=4242\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${candidate}\n`,
-  );
-  writeFileSync(join(local, "prep.md"), "# Prepare\n");
-  writeFileSync(join(local, "events"), "");
+  write("gates.env", `PR_NUMBER=4242\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${candidate}\n`);
+  write("prep.md", "# Prepare\n");
+  write("events", "");
   return {
+    ...artifactFiles(local),
     repoDir,
     remote,
     local,
@@ -170,16 +188,13 @@ export function createPublisherRepoFactory(dirs: {
     const { env, git } = createPublisherGit(repoDir);
     git("remote", "set-url", "origin", remote);
     return {
+      ...template,
+      ...artifactFiles(join(repoDir, ".local")),
       repoDir,
       remote,
       local: join(repoDir, ".local"),
       env,
       git,
-      base: template.base,
-      source: template.source,
-      candidate: template.candidate,
-      sameTree: template.sameTree,
-      advance: template.advance,
       observation: structuredClone(template.observation),
     };
   };

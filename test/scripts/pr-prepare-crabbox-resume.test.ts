@@ -1,12 +1,5 @@
 import { spawnSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
@@ -25,20 +18,17 @@ function publishedPreparation(alias = false) {
   const f = createRepo();
   const head = alias ? f.sameTree : f.candidate;
   f.git("push", "-q", "origin", `${head}:refs/heads/topic`);
-  writeFileSync(
-    join(f.local, "pr-meta.json"),
-    JSON.stringify({ ...f.observation, baseRefOid: f.base }),
-  );
-  writeFileSync(
-    join(f.local, "remote-observation.json"),
+  f.write("pr-meta.json", JSON.stringify({ ...f.observation, baseRefOid: f.base }));
+  f.write(
+    "remote-observation.json",
     JSON.stringify({ ...f.observation, baseRefOid: f.advance, headRefOid: head }),
   );
-  writeFileSync(
-    join(f.local, "gates.env"),
+  f.write(
+    "gates.env",
     `PR_NUMBER=4242\nGATES_MODE=remote_crabbox_aws_pending\nLAST_VERIFIED_HEAD_SHA=${f.candidate}\nFULL_GATES_HEAD_SHA=''\n`,
   );
-  writeFileSync(
-    join(f.local, "prepare-push-result.env"),
+  f.write(
+    "prepare-push-result.env",
     [
       `PUSH_PREP_HEAD_SHA=${head}`,
       `PUSH_LOCAL_PREP_HEAD_SHA=${f.candidate}`,
@@ -68,27 +58,23 @@ function publishedPreparation(alias = false) {
 }
 
 describePosix("prepare-push retained Crabbox finalization", () => {
-  it.each([true])(
-    "finalizes legacy published preparation without pushing or refreshing, alias=%s",
-    (alias) => {
-      const f = publishedPreparation(alias);
-      const result = runPublisher(f, 'prepare_push 4242 "" 99', f.setup);
-      expect(result.status, result.stdout + result.stderr).toBe(0);
-      expect(result.stdout).toContain("prepare-push complete");
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
-      expect(f.git("rev-parse", "HEAD")).toBe(f.candidate);
-      expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.head);
-      const prep = readFileSync(join(f.local, "prep.env"), "utf8");
-      expect(prep).toContain(`PREP_HEAD_SHA=${f.head}`);
-      expect(prep).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}`);
-      expect(prep).toContain(`PREP_MAINLINE_BASE_SHA=${f.base}`);
-      const gate = readFileSync(join(f.local, "gates.env"), "utf8");
-      expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
-      expect(gate).toContain(`FULL_GATES_HEAD_SHA=${f.head}`);
-      expect(gate).not.toContain("PENDING_CRABBOX_");
-    },
-  );
-
+  it("finalizes legacy published preparation without pushing or refreshing", () => {
+    const f = publishedPreparation(true);
+    const result = runPublisher(f, 'prepare_push 4242 "" 99', f.setup);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(result.stdout).toContain("prepare-push complete");
+    expect(f.read("events")).toBe("");
+    expect(f.git("rev-parse", "HEAD")).toBe(f.candidate);
+    expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.head);
+    const prep = f.read("prep.env");
+    expect(prep).toContain(`PREP_HEAD_SHA=${f.head}`);
+    expect(prep).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}`);
+    expect(prep).toContain(`PREP_MAINLINE_BASE_SHA=${f.base}`);
+    const gate = f.read("gates.env");
+    expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
+    expect(gate).toContain(`FULL_GATES_HEAD_SHA=${f.head}`);
+    expect(gate).not.toContain("PENDING_CRABBOX_");
+  });
   it.each([
     "remote-head",
     "closed",
@@ -115,7 +101,7 @@ describePosix("prepare-push retained Crabbox finalization", () => {
     if (mode === "target") {
       remote.baseRefName = "other";
     }
-    writeFileSync(join(f.local, "remote-observation.json"), JSON.stringify(remote));
+    f.write("remote-observation.json", JSON.stringify(remote));
     if (mode === "branch") {
       f.git("checkout", "-qb", "other");
     }
@@ -123,10 +109,7 @@ describePosix("prepare-push retained Crabbox finalization", () => {
       writeFileSync(join(f.repoDir, "reviewed.txt"), "changed\n");
     }
     if (mode === "gate") {
-      writeFileSync(
-        join(f.local, "gates.env"),
-        `PR_NUMBER=4242\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${f.head}\n`,
-      );
+      f.write("gates.env", `PR_NUMBER=4242\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${f.head}\n`);
     }
     if (mode === "review") {
       setup.push("require_prepared_review() { return 1; }");
@@ -134,41 +117,33 @@ describePosix("prepare-push retained Crabbox finalization", () => {
     if (mode === "publisher") {
       setup.push("node() { return 1; }");
     }
-    const before = readFileSync(join(f.local, "gates.env"), "utf8");
+    const before = f.read("gates.env");
     const result = runPublisher(f, 'prepare_push 4242 "" 99', setup);
     expect(result.status).not.toBe(0);
-    expect(existsSync(join(f.local, "prep.env"))).toBe(false);
-    expect(readFileSync(join(f.local, "gates.env"), "utf8")).toBe(before);
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
+    expect(f.exists("prep.env")).toBe(false);
+    expect(f.read("gates.env")).toBe(before);
+    expect(f.read("events")).toBe("");
   });
 
-  it.each([true])(
-    "refuses ordinary prepare-push before refresh when dispatch acceptance is uncertain (restricted PATH=%s)",
-    (restrictedPath) => {
-      const f = publishedPreparation();
-      writeFileSync(
-        join(f.local, "gates.env"),
-        readFileSync(join(f.local, "gates.env"), "utf8") + "PENDING_CRABBOX_STATE=dispatching\n",
-      );
-      const setup = [...f.setup, "enter_worktree() { :; }"];
-      if (restrictedPath) {
-        const grep = spawnSync("bash", ["-c", "command -v grep"], { encoding: "utf8" });
-        expect(grep.status, grep.stderr).toBe(0);
-        const bin = join(f.local, "without-ripgrep");
-        mkdirSync(bin);
-        symlinkSync(grep.stdout.trim(), join(bin, "grep"));
-        setup.push(
-          `PATH='${bin.replaceAll("'", "'\\''")}'`,
-          "if type -P rg >/dev/null; then echo 'unexpected external rg' >&2; exit 99; fi",
-        );
-      }
-      const result = runPublisher(f, "prepare_push 4242", setup);
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("--resume-crabbox-run");
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
-      expect(existsSync(join(f.local, "prep.env"))).toBe(false);
-    },
-  );
+  it("refuses ordinary prepare-push before refresh when dispatch acceptance is uncertain", () => {
+    const f = publishedPreparation();
+    f.write("gates.env", f.read("gates.env") + "PENDING_CRABBOX_STATE=dispatching\n");
+    const setup = [...f.setup, "enter_worktree() { :; }"];
+    const grep = spawnSync("bash", ["-c", "command -v grep"], { encoding: "utf8" });
+    expect(grep.status, grep.stderr).toBe(0);
+    const bin = join(f.local, "without-ripgrep");
+    mkdirSync(bin);
+    symlinkSync(grep.stdout.trim(), join(bin, "grep"));
+    setup.push(
+      `PATH='${bin.replaceAll("'", "'\\''")}'`,
+      "if type -P rg >/dev/null; then echo 'unexpected external rg' >&2; exit 99; fi",
+    );
+    const result = runPublisher(f, "prepare_push 4242", setup);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("--resume-crabbox-run");
+    expect(f.read("events")).toBe("");
+    expect(f.exists("prep.env")).toBe(false);
+  });
   it("resumes after gate success when the preparation writer was interrupted", () => {
     const f = publishedPreparation();
     const first = runPublisher(f, 'prepare_push 4242 "" 99', [
@@ -176,15 +151,15 @@ describePosix("prepare-push retained Crabbox finalization", () => {
       "complete_prepare_push() { return 77; }",
     ]);
     expect(first.status).toBe(77);
-    expect(existsSync(join(f.local, "prep.env"))).toBe(false);
-    const gate = readFileSync(join(f.local, "gates.env"), "utf8");
+    expect(f.exists("prep.env")).toBe(false);
+    const gate = f.read("gates.env");
     expect(gate).toContain("GATES_MODE=remote_crabbox_aws");
     expect(gate).toContain(`REMOTE_GATES_BASE_SHA=${f.base}`);
     expect(gate).toContain("REMOTE_GATES_ACTIONS_RUN_ATTEMPT=1");
     const resumed = runPublisher(f, 'prepare_push 4242 "" 99', f.setup);
     expect(resumed.status, resumed.stdout + resumed.stderr).toBe(0);
-    expect(existsSync(join(f.local, "prep.env"))).toBe(true);
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
+    expect(f.exists("prep.env")).toBe(true);
+    expect(f.read("events")).toBe("");
   });
 
   it("finalizes a pre-change completed gate using the retained preparation base", () => {
@@ -195,34 +170,28 @@ describePosix("prepare-push retained Crabbox finalization", () => {
       { cwd: f.repoDir },
     );
     expect(written.status, written.stderr).toBe(0);
-    expect(readFileSync(join(f.local, "gates.env"), "utf8")).not.toContain("REMOTE_GATES_BASE_SHA");
+    expect(f.read("gates.env")).not.toContain("REMOTE_GATES_BASE_SHA");
     const result = runPublisher(f, 'prepare_push 4242 "" 99', f.setup);
     expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(readFileSync(join(f.local, "prep.env"), "utf8")).toContain(
-      `PREP_MAINLINE_BASE_SHA=${f.base}`,
-    );
-    expect(readFileSync(join(f.local, "gates.env"), "utf8")).toContain(
-      `REMOTE_GATES_BASE_SHA=${f.base}`,
-    );
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
+    expect(f.read("prep.env")).toContain(`PREP_MAINLINE_BASE_SHA=${f.base}`);
+    expect(f.read("gates.env")).toContain(`REMOTE_GATES_BASE_SHA=${f.base}`);
+    expect(f.read("events")).toBe("");
   });
 
-  it.each(["PENDING_CRABBOX_STATE=$(touch .local/evaluated)\n"])(
-    "rejects malformed provenance before shell evaluation: %s",
-    (extra) => {
-      const f = publishedPreparation();
-      const path = join(f.local, "gates.env");
-      const before = readFileSync(path, "utf8") + extra;
-      writeFileSync(path, before);
-      const result = runPublisher(f, 'prepare_push 4242 "" 99', f.setup);
-      expect(result.status).not.toBe(0);
-      expect(existsSync(join(f.local, "evaluated"))).toBe(false);
-      expect(existsSync(join(f.local, "observer-args"))).toBe(false);
-      expect(existsSync(join(f.local, "prep.env"))).toBe(false);
-      expect(readFileSync(path, "utf8")).toBe(before);
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
-    },
-  );
+  it("rejects malformed provenance before shell evaluation", () => {
+    const extra = "PENDING_CRABBOX_STATE=$(touch .local/evaluated)\n";
+    const f = publishedPreparation();
+    const path = join(f.local, "gates.env");
+    const before = readFileSync(path, "utf8") + extra;
+    writeFileSync(path, before);
+    const result = runPublisher(f, 'prepare_push 4242 "" 99', f.setup);
+    expect(result.status).not.toBe(0);
+    expect(f.exists("evaluated")).toBe(false);
+    expect(f.exists("observer-args")).toBe(false);
+    expect(f.exists("prep.env")).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(f.read("events")).toBe("");
+  });
 });
 
 describePosix("atomic gate receipt writes", () => {
@@ -255,7 +224,7 @@ describePosix("atomic gate receipt writes", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("injected gate write failure");
     expect(readFileSync(path, "utf8")).toBe(before);
-    expect(existsSync(join(f.local, "renamed"))).toBe(false);
+    expect(f.exists("renamed")).toBe(false);
     expect(readdirSync(f.local).filter((name) => name.startsWith("gates.env."))).toEqual([]);
   });
 });

@@ -1,39 +1,12 @@
 // Covers the native prepare-gates Testbox capsule boundary.
-import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { runGatesBash } from "./pr-prepare.test-support.js";
 
-const repoRoot = process.cwd();
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const capturedBase = "b".repeat(40);
-
-function runGatesBash(script: string, options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
-  const env = { ...process.env };
-  for (const name of [
-    "OPENCLAW_PR_GATES_REMOTE",
-    "OPENCLAW_TESTBOX",
-    "OPENCLAW_TEST_PROJECTS_PARALLEL",
-    "OPENCLAW_VITEST_MAX_WORKERS",
-  ]) {
-    delete env[name];
-  }
-  return spawnSync(
-    "/bin/bash",
-    [
-      "-c",
-      [
-        "set -euo pipefail",
-        `script_parent_dir='${repoRoot}/scripts'`,
-        `source '${repoRoot}/scripts/pr-lib/common.sh'`,
-        `source '${repoRoot}/scripts/pr-lib/gates.sh'`,
-        script,
-      ].join("\n"),
-    ],
-    { cwd: options.cwd ?? repoRoot, encoding: "utf8", env: { ...env, ...options.env } },
-  );
-}
 
 describe("remote testbox gate delegation", () => {
   function runRemoteGate(env: NodeJS.ProcessEnv, prepareScript?: string) {
@@ -81,6 +54,7 @@ describe("remote testbox gate delegation", () => {
         `run_remote_testbox_gates 'prepare gates (blacksmith-testbox)' .local/gates-test.log pr-424242-gates false ${capturedBase}`,
       {
         cwd: workDir,
+        gatesOnly: true,
         env: { PATH: `${stubBin}:${process.env.PATH ?? ""}`, ...env },
       },
     );
@@ -111,30 +85,15 @@ describe("remote testbox gate delegation", () => {
       .filter((line) => line.startsWith("ARG:"))
       .map((line) => line.slice(4));
     expect(args).toEqual([
-      "scripts/crabbox-wrapper.mjs",
-      "run",
-      "--provider",
-      "blacksmith-testbox",
-      "--blacksmith-org",
-      "openclaw",
-      "--blacksmith-workflow",
-      ".github/workflows/ci-check-high-memory-testbox.yml",
-      "--blacksmith-job",
-      "check",
-      "--blacksmith-ref",
-      "main",
-      "--idle-timeout",
-      "15m",
-      "--ttl",
-      "240m",
-      "--timing-json",
-      "--label",
-      "pr-424242-gates",
-      "--",
-      "env",
-      "CI=1",
-      "OPENCLAW_TESTBOX_REMOTE_RUN=1",
-      "PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false",
+      ..."scripts/crabbox-wrapper.mjs run --provider blacksmith-testbox --blacksmith-org openclaw".split(
+        " ",
+      ),
+      ..."--blacksmith-workflow .github/workflows/ci-check-high-memory-testbox.yml --blacksmith-job check --blacksmith-ref main".split(
+        " ",
+      ),
+      ..."--idle-timeout 15m --ttl 240m --timing-json --label pr-424242-gates -- env CI=1 OPENCLAW_TESTBOX_REMOTE_RUN=1 PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=false".split(
+        " ",
+      ),
       ...expected,
       "/bin/bash",
       "-c",
@@ -142,30 +101,25 @@ describe("remote testbox gate delegation", () => {
     ]);
   });
 
-  it.each([{ name: "OPENCLAW_VITEST_MAX_WORKERS", value: "2; touch injected" }])(
-    "rejects $name=$value before remote dispatch",
-    ({ name, value }) => {
-      const { result, workDir, logPath } = runRemoteGate({ [name]: value });
-      expect(result.status).toBe(2);
-      expect(result.stderr).toContain(`${name} must be a positive integer`);
-      expect(existsSync(logPath)).toBe(false);
-      expect(existsSync(join(workDir, "injected"))).toBe(false);
-    },
-  );
-
-  it.each([`${capturedBase}; touch injected`])(
-    "rejects an uncaptured base %j before remote dispatch",
-    (base) => {
-      const { result, logPath } = runRemoteGate(
-        {},
-        `run_remote_testbox_gates gates .local/gates-test.log pr-424242-gates false '${base}'`,
-      );
-      expect(result.status).toBe(2);
-      expect(result.stderr).toContain("require the captured check-base commit");
-      expect(existsSync(logPath)).toBe(false);
-    },
-  );
-
+  it("rejects injected worker controls before remote dispatch", () => {
+    const name = "OPENCLAW_VITEST_MAX_WORKERS",
+      value = "2; touch injected";
+    const { result, workDir, logPath } = runRemoteGate({ [name]: value });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`${name} must be a positive integer`);
+    expect(existsSync(logPath)).toBe(false);
+    expect(existsSync(join(workDir, "injected"))).toBe(false);
+  });
+  it("rejects an uncaptured base before remote dispatch", () => {
+    const base = `${capturedBase}; touch injected`;
+    const { result, logPath } = runRemoteGate(
+      {},
+      `run_remote_testbox_gates gates .local/gates-test.log pr-424242-gates false '${base}'`,
+    );
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("require the captured check-base commit");
+    expect(existsSync(logPath)).toBe(false);
+  });
   it.each([
     { failure: "", stages: ["build", "check", "test"], docsOnly: false },
     { failure: "build", stages: ["build"], docsOnly: false },

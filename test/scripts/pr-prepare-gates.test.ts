@@ -3,12 +3,12 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createTempDirTracker } from "../helpers/temp-dir.js";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { runGatesBash } from "./pr-prepare.test-support.js";
 
 const repoRoot = process.cwd();
 
-const tempDirs = createTempDirTracker();
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function fixtureGit(cwd: string, args: string[]) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -34,7 +34,7 @@ function makeRetryRepo(): { repoDir: string; headSha: string } {
   return { repoDir, headSha };
 }
 
-function makeSyncRepo(options: { needsRebase: boolean }): string {
+function makeSyncRepo(): string {
   const repoDir = join(tempDirs.make("openclaw-pr-sync-"), "repo");
   mkdirSync(repoDir);
 
@@ -54,11 +54,9 @@ function makeSyncRepo(options: { needsRebase: boolean }): string {
   git("add", "config.yml");
   git("commit", "-qm", "pr change");
   git("checkout", "-q", "main");
-  if (options.needsRebase) {
-    writeFileSync(join(repoDir, "config.yml"), mainChange);
-    git("add", "config.yml");
-    git("commit", "-qm", "upstream shared hunk");
-  }
+  writeFileSync(join(repoDir, "config.yml"), mainChange);
+  git("add", "config.yml");
+  git("commit", "-qm", "upstream shared hunk");
   git("remote", "add", "origin", ".");
   git("fetch", "-q", "origin", "main");
   git("checkout", "-q", "prep");
@@ -150,45 +148,36 @@ function prepareSyncHeadStubs(): string[] {
   ];
 }
 
-afterEach(() => {
-  tempDirs.cleanup();
-});
-
 describe("remote Crabbox AWS gate contract", () => {
-  it.each([true])(
-    "keeps pending evidence when the protected publisher fails, conditional=%s",
-    (conditional) => {
-      const workDir = join(tempDirs.make("openclaw-pr-gates-aws-failure-"), "work");
-      mkdirSync(workDir, { recursive: true });
-      mkdirSync(join(workDir, ".local"));
-      writeFileSync(join(workDir, ".local/gates.env"), "GATES_MODE=remote_crabbox_aws_pending\n");
-      const result = runGatesBash(
-        [
-          "require_active_org_admin_for_crabbox_gate() { :; }",
-          `read_crabbox_gate_pr_binding() { printf '%s\\n' '${"a".repeat(40)}'; }`,
-          `PR_HEAD=topic; LAST_VERIFIED_HEAD_SHA=${"b".repeat(40)}`,
-          `node() { printf '%s\\n' '${JSON.stringify({
-            actionsRunUrl: "https://github.com/openclaw/openclaw/actions/runs/99",
-            backend: "crabbox",
-            baseSha: "a".repeat(40),
-            headSha: "b".repeat(40),
-            leaseId: "cbx_stub",
-            provider: "aws",
-            runId: "run_stub",
-            target: "linux",
-          })}'; return 1; }`,
-          conditional
-            ? `if finalize_remote_crabbox_aws_gate 424242 '${"b".repeat(40)}'; then exit 99; else exit "$?"; fi`
-            : `finalize_remote_crabbox_aws_gate 424242 '${"b".repeat(40)}'`,
-        ].join("\n"),
-        { cwd: workDir },
-      );
-      expect(result.status).not.toBe(0);
-      expect(readFileSync(join(workDir, ".local/gates.env"), "utf8")).toBe(
-        "GATES_MODE=remote_crabbox_aws_pending\n",
-      );
-    },
-  );
+  it("keeps pending evidence when the protected publisher fails in a conditional caller", () => {
+    const workDir = join(tempDirs.make("openclaw-pr-gates-aws-failure-"), "work");
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(join(workDir, ".local"));
+    writeFileSync(join(workDir, ".local/gates.env"), "GATES_MODE=remote_crabbox_aws_pending\n");
+    const result = runGatesBash(
+      [
+        "require_active_org_admin_for_crabbox_gate() { :; }",
+        `read_crabbox_gate_pr_binding() { printf '%s\\n' '${"a".repeat(40)}'; }`,
+        `PR_HEAD=topic; LAST_VERIFIED_HEAD_SHA=${"b".repeat(40)}`,
+        `node() { printf '%s\\n' '${JSON.stringify({
+          actionsRunUrl: "https://github.com/openclaw/openclaw/actions/runs/99",
+          backend: "crabbox",
+          baseSha: "a".repeat(40),
+          headSha: "b".repeat(40),
+          leaseId: "cbx_stub",
+          provider: "aws",
+          runId: "run_stub",
+          target: "linux",
+        })}'; return 1; }`,
+        `if finalize_remote_crabbox_aws_gate 424242 '${"b".repeat(40)}'; then exit 99; else exit "$?"; fi`,
+      ].join("\n"),
+      { cwd: workDir },
+    );
+    expect(result.status).not.toBe(0);
+    expect(readFileSync(join(workDir, ".local/gates.env"), "utf8")).toBe(
+      "GATES_MODE=remote_crabbox_aws_pending\n",
+    );
+  });
 });
 
 describe("prepare gate changed-file plan", () => {
@@ -273,27 +262,16 @@ describe("private QA build scope", () => {
     return { result, commands, headSha, stamp: join(repoDir, ".local", "gates.env") };
   }
 
-  it.each([{ name: "explicit workers and caller QA value", qa: "0", workers: "2" }])(
-    "prepares local full-test artifacts without changing $name",
-    ({ qa, workers }) => {
-      const { result, commands, headSha, stamp } = runBuildGate({ qa, workers });
-      expect(result.status, result.stderr).toBe(0);
-      const inheritedQa = qa ?? "<unset>";
-      expect(commands).toEqual([
-        ["pnpm build", inheritedQa, "env", "OPENCLAW_BUILD_PRIVATE_QA=1", "pnpm", "build"],
-        ["pnpm check", inheritedQa, "pnpm", "check", "--base", headSha],
-        [
-          "pnpm test",
-          inheritedQa,
-          ...(workers ? ["env", `OPENCLAW_VITEST_MAX_WORKERS=${workers}`] : []),
-          "pnpm",
-          "test",
-        ],
-      ]);
-      expect(readFileSync(stamp, "utf8")).toContain(`FULL_GATES_HEAD_SHA=${headSha}\n`);
-    },
-  );
-
+  it("prepares local full-test artifacts without changing caller QA or explicit workers", () => {
+    const { result, commands, headSha, stamp } = runBuildGate({ qa: "0", workers: "2" });
+    expect(result.status, result.stderr).toBe(0);
+    expect(commands).toEqual([
+      ["pnpm build", "0", "env", "OPENCLAW_BUILD_PRIVATE_QA=1", "pnpm", "build"],
+      ["pnpm check", "0", "pnpm", "check", "--base", headSha],
+      ["pnpm test", "0", "env", "OPENCLAW_VITEST_MAX_WORKERS=2", "pnpm", "test"],
+    ]);
+    expect(readFileSync(stamp, "utf8")).toContain(`FULL_GATES_HEAD_SHA=${headSha}\n`);
+  });
   it.each([true])(
     "stops at build failure without a success stamp, conditional=%s",
     (conditional) => {
@@ -328,7 +306,7 @@ describe("prepare author access snapshot", () => {
 
 describe("prepare sync-head transitions", () => {
   it("publishes only appended fixups when main advances", () => {
-    const repoDir = makeSyncRepo({ needsRebase: true });
+    const repoDir = makeSyncRepo();
     const contextPath = join(repoDir, ".local", "prep-context.env");
     writeFileSync(
       contextPath,
@@ -514,43 +492,29 @@ describe("fork publication transport", () => {
 
 describe("prepare gate stamp transitions", () => {
   it.each([
-    {
-      name: "incorporated overlapping source changes",
-      evidence: "reuse",
-      incorporated: true,
-      mainPath: "src/subject.ts",
-      readable: true,
-      expected: 1,
-      diagnostic: "Hosted CI reuse declined",
-    },
-    {
-      name: "incorporated test shard ownership changes",
-      evidence: "reuse",
-      incorporated: true,
-      mainPath: "test/tsconfig/tsconfig.core.test.agents-tools.json",
-      readable: true,
-      expected: 1,
-      diagnostic: "Hosted CI reuse declined",
-    },
-    {
-      name: "unreadable incorporated change facts",
-      evidence: "reuse",
-      incorporated: true,
-      mainPath: "src/unrelated.ts",
-      readable: false,
-      expected: 1,
-      diagnostic: "unable to evaluate mainline input changes",
-    },
-  ])(
-    "qualifies selected hosted CI reuse: $name",
-    ({ evidence, incorporated, mainPath, readable, expected, diagnostic }) => {
+    ["overlapping source changes", "src/subject.ts", true, "Hosted CI reuse declined"],
+    [
+      "test shard ownership changes",
+      "test/tsconfig/tsconfig.core.test.agents-tools.json",
+      true,
+      "Hosted CI reuse declined",
+    ],
+    [
+      "unreadable change facts",
+      "src/unrelated.ts",
+      false,
+      "unable to evaluate mainline input changes",
+    ],
+  ] as const)(
+    "declines hosted CI reuse for incorporated %s",
+    (_name, mainPath, readable, diagnostic) => {
       const dir = tempDirs.make("openclaw-pr-reuse-context-");
       mkdirSync(join(dir, ".local"));
       const currentHead = "1".repeat(40);
       const reusedHead = "2".repeat(40);
       const reusedBase = "3".repeat(40);
       const mainSha = "4".repeat(40);
-      const currentBase = incorporated ? "5".repeat(40) : reusedBase;
+      const currentBase = "5".repeat(40);
       const remote = {
         headRefName: "topic",
         headRefOid: currentHead,
@@ -561,12 +525,11 @@ describe("prepare gate stamp transitions", () => {
         join(dir, ".local", "gates-hosted-checks.json"),
         JSON.stringify({
           headSha: currentHead,
-          ...(evidence === "reuse" ? { reusedFromSha: reusedHead } : {}),
-          ...(evidence === "recent-parent" ? { evidenceHeadSha: reusedHead } : {}),
+          reusedFromSha: reusedHead,
         }),
       );
       writeFileSync(join(dir, "main-paths.txt"), mainPath + "\n");
-      writeFileSync(join(dir, "incorporated-paths.txt"), incorporated ? mainPath + "\n" : "");
+      writeFileSync(join(dir, "incorporated-paths.txt"), mainPath + "\n");
       writeFileSync(join(dir, "prepared-paths.txt"), "src/subject.ts\n");
       const result = runGatesBash(
         `
@@ -595,10 +558,8 @@ fi
         { cwd: dir, env: { TMPDIR: dir } },
       );
       const output = result.stdout + result.stderr;
-      expect(result.status, output).toBe(expected);
-      if (diagnostic) {
-        expect(output).toContain(diagnostic);
-      }
+      expect(result.status, output).toBe(1);
+      expect(output).toContain(diagnostic);
     },
   );
 
@@ -638,37 +599,30 @@ fi
     expect(existsSync(join(dir, ".local", "gates.env"))).toBe(false);
   });
 
-  it.each([["changed.ts", false]])(
-    "derives recent parent evidence for a %s commit: %s",
-    (path, expected) => {
-      const { repoDir, headSha: parentSha } = makeRetryRepo();
-      writeFileSync(join(repoDir, path), "change\n");
-      fixtureGit(repoDir, ["add", path]);
-      fixtureGit(repoDir, ["commit", "-qm", "change"]);
-      const currentHead = fixtureGit(repoDir, ["rev-parse", "HEAD"]);
-      writeFileSync(
-        join(repoDir, ".local", "gates-hosted-checks.json"),
-        JSON.stringify({ headSha: currentHead }),
-      );
-      const result = runGatesBash(
-        [
-          `pr_gh() { test "$1" = pr || return 99; printf '{"headRefName":"topic","headRefOid":"${currentHead}","isCrossRepository":false,"baseRepository":{"nameWithOwner":"openclaw/openclaw"}}\\n'; }`,
-          "run_quiet_logged() { cat >/dev/null; printf 'ARG:%s\\n' \"$@\"; }",
-          "PR_MAIN_SHA=$(git rev-parse HEAD)",
-          `run_hosted_prepare_gates 100606 ${currentHead} false`,
-        ].join("\n"),
-        { cwd: repoDir },
-      );
+  it("does not derive recent-parent evidence for a runtime commit", () => {
+    const path = "changed.ts";
+    const { repoDir } = makeRetryRepo();
+    writeFileSync(join(repoDir, path), "change\n");
+    fixtureGit(repoDir, ["add", path]);
+    fixtureGit(repoDir, ["commit", "-qm", "change"]);
+    const currentHead = fixtureGit(repoDir, ["rev-parse", "HEAD"]);
+    writeFileSync(
+      join(repoDir, ".local", "gates-hosted-checks.json"),
+      JSON.stringify({ headSha: currentHead }),
+    );
+    const result = runGatesBash(
+      [
+        `pr_gh() { test "$1" = pr || return 99; printf '{"headRefName":"topic","headRefOid":"${currentHead}","isCrossRepository":false,"baseRepository":{"nameWithOwner":"openclaw/openclaw"}}\\n'; }`,
+        "run_quiet_logged() { cat >/dev/null; printf 'ARG:%s\\n' \"$@\"; }",
+        "PR_MAIN_SHA=$(git rev-parse HEAD)",
+        `run_hosted_prepare_gates 100606 ${currentHead} false`,
+      ].join("\n"),
+      { cwd: repoDir },
+    );
 
-      expect(result.status).toBe(0);
-      if (expected) {
-        expect(result.stdout).toContain(`ARG:--recent-sha\nARG:${parentSha}`);
-      } else {
-        expect(result.stdout).not.toContain("ARG:--recent-sha");
-      }
-    },
-  );
-
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("ARG:--recent-sha");
+  });
   it("clears remote stamps when fresh docs-only gates do not reuse prior proof", () => {
     const { repoDir } = makeRetryRepo();
     fixtureGit(repoDir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
