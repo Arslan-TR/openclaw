@@ -68,6 +68,12 @@ async function failedTurn(
   return projector.buildResult(telemetry);
 }
 
+async function deniedTurn(params: AttemptParams, telemetry = buildEmptyToolTelemetry()) {
+  const result = await failedTurn(params, "Unexpected status 403: forbidden", "other", telemetry);
+  expect([result.currentAttemptAssistant, result.lastAssistant]).toEqual([undefined, undefined]);
+  return result;
+}
+
 async function refusedTurn(params: AttemptParams) {
   return failedTurn(params, "The provider refused this request.", "cyberPolicy");
 }
@@ -105,12 +111,7 @@ describe("Codex fallback terminal results", () => {
           { runId: "child-run", childSessionKey: "agent:main:subagent:child" },
         ];
       }
-      const denied = await failedTurn(
-        params,
-        "Unexpected status 403: forbidden",
-        "other",
-        telemetry,
-      );
+      const denied = await deniedTurn(params, telemetry);
       if (effect === "abort") {
         denied.terminal = attemptTerminal.normalize({
           aborted: true,
@@ -118,13 +119,9 @@ describe("Codex fallback terminal results", () => {
           promptErrorSource: "prompt",
         });
       }
-      expect(denied.currentAttemptAssistant).toBeUndefined();
-      expect(denied.lastAssistant).toBeUndefined();
       params.onAgentEvent.mockClear();
       runAttempt.mockReset().mockResolvedValueOnce(refusal).mockResolvedValueOnce(denied);
-      const harness = createHarness();
-
-      await expect(harness.runAttempt?.(params)).resolves.toBe(denied);
+      await expect(createHarness().runAttempt?.(params)).resolves.toBe(denied);
       expect(runAttempt).toHaveBeenCalledTimes(2);
       expectNotice(params, "unavailable");
     },
@@ -155,9 +152,7 @@ describe("Codex fallback terminal results", () => {
     expect(denied.replayMetadata?.replaySafe).toBe(true);
     expect(denied.toolMetas).toHaveLength(1);
     runAttempt.mockReset().mockResolvedValueOnce(refusal).mockResolvedValueOnce(denied);
-    const harness = createHarness();
-
-    await expect(harness.runAttempt?.(params)).resolves.toBe(denied);
+    await expect(createHarness().runAttempt?.(params)).resolves.toBe(denied);
     expect(runAttempt).toHaveBeenCalledTimes(2);
   });
 
@@ -167,9 +162,7 @@ describe("Codex fallback terminal results", () => {
     refusal.runtimeContinuationStarted = true;
     expect(refusal.replayMetadata?.replaySafe).toBe(true);
     runAttempt.mockReset().mockResolvedValue(refusal);
-    const harness = createHarness();
-
-    await expect(harness.runAttempt?.(params)).resolves.toBe(refusal);
+    await expect(createHarness().runAttempt?.(params)).resolves.toBe(refusal);
     expect(runAttempt).toHaveBeenCalledTimes(1);
   });
 
@@ -181,9 +174,7 @@ describe("Codex fallback terminal results", () => {
       promptErrorSource: "prompt",
     });
     runAttempt.mockReset().mockResolvedValue(refusal);
-    const harness = createHarness();
-
-    await expect(harness.runAttempt?.(params)).resolves.toBe(refusal);
+    await expect(createHarness().runAttempt?.(params)).resolves.toBe(refusal);
     expect(runAttempt).toHaveBeenCalledTimes(1);
   });
 
@@ -192,14 +183,8 @@ describe("Codex fallback terminal results", () => {
     const nextParams = await paramsForWorkspace("denied", "next");
     const refusal = await refusedTurn(firstParams);
     const nextRefusal = await refusedTurn(nextParams);
-    const denied = await failedTurn(
-      firstParams,
-      "Unexpected status 403: configured target is not authorized",
-      "other",
-    );
+    const denied = await deniedTurn(firstParams);
     expect(denied.terminal).toMatchObject({ kind: "failed", source: "prompt" });
-    expect(denied.currentAttemptAssistant).toBeUndefined();
-    expect(denied.lastAssistant).toBeUndefined();
     firstParams.onAgentEvent.mockClear();
     nextParams.onAgentEvent.mockClear();
     runAttempt
