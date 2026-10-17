@@ -107,7 +107,7 @@ describe("typed restart recovery operator admission", () => {
             setUserProfileRole(profile.id, "changed-role");
           }
           const runtime = createGatewayInstanceRuntime({
-            getContext: () => context,
+            context,
             getMethodRegistry: () => createGatewayMethodRegistry([]),
             isDispatchAvailable: () => true,
           });
@@ -192,7 +192,7 @@ describe("typed restart recovery operator admission", () => {
           config: {},
         });
         const runtime = createGatewayInstanceRuntime({
-          getContext: () => context,
+          context,
           getMethodRegistry: () => createGatewayMethodRegistry([]),
           isDispatchAvailable: () => true,
         });
@@ -239,7 +239,7 @@ describe("typed restart recovery operator admission", () => {
           },
         ]);
         const runtime = createGatewayInstanceRuntime({
-          getContext: () => context,
+          context,
           getMethodRegistry: () => registry,
           isDispatchAvailable: () => true,
         });
@@ -287,11 +287,9 @@ describe("typed restart recovery operator admission", () => {
     "registration aborted",
     "lifecycle rotated",
     "Gateway closed",
-    "Gateway context replaced",
   ] as const)("refuses retained operator work after its exact %s", async (boundary) => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const context = createDirectChatContext({ trackExecution: trackAsyncWork });
-      let activeContext = context;
       const profile = ensureProfileForEmail("retained-runtime@example.test");
       const fixture = await createOperatorRecoveryFixture({
         stateDir: state.stateDir,
@@ -313,7 +311,7 @@ describe("typed restart recovery operator admission", () => {
         throw new Error("Expected a fresh controller registration");
       }
       const runtime = createGatewayInstanceRuntime({
-        getContext: () => activeContext,
+        context,
         getMethodRegistry: () => createGatewayMethodRegistry([]),
         isDispatchAvailable: () => true,
       });
@@ -371,8 +369,6 @@ describe("typed restart recovery operator admission", () => {
           rotateAgentEventLifecycleGeneration();
         } else if (boundary === "Gateway closed") {
           runtime.close();
-        } else {
-          activeContext = createDirectChatContext({ trackExecution: trackAsyncWork });
         }
         expect(authority.assertCurrent).toThrow();
         if (boundary === "registration replaced") {

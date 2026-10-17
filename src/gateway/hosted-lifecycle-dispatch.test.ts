@@ -67,7 +67,7 @@ function createContext(handlers: GatewayRequestHandlers): GatewayRequestContext 
     logGateway: { warn: vi.fn(), error: vi.fn() },
   } as unknown as GatewayRequestContext;
   const runtime = createGatewayInstanceRuntime({
-    getContext: () => context,
+    context,
     getMethodRegistry: () => registry,
     isDispatchAvailable: () => true,
   });

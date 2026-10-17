@@ -104,7 +104,7 @@ function createFixture(
   });
   let current = true;
   const runtime = createGatewayInstanceRuntime({
-    getContext: () => context,
+    context,
     getMethodRegistry: () => registry,
     isDispatchAvailable: () => current,
   });

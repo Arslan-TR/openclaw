@@ -59,7 +59,7 @@ describe("createGatewayInstanceRuntime", () => {
       const payload = { runId: "bound-recovery", status: "ok", summary: "completed" };
       context.dedupe.set("agent:bound-recovery", { ts: Date.now(), ok: true, payload });
       const runtime = createGatewayInstanceRuntime({
-        getContext: () => context,
+        context,
         getMethodRegistry: () => createRegistry({}),
         isDispatchAvailable: () => true,
       });
@@ -98,7 +98,7 @@ describe("createGatewayInstanceRuntime", () => {
     const context = createContext();
     const preparing = createDeferred<number | undefined>();
     const runtime = createGatewayInstanceRuntime({
-      getContext: () => context,
+      context,
       getMethodRegistry: () => registry,
       isDispatchAvailable: () => available,
       prepareRestartRecovery: () => preparing.promise,
@@ -227,7 +227,7 @@ describe("createGatewayInstanceRuntime", () => {
         getRuntimeConfig: () => ({ channels: { signal: { enabled: true } } }),
       } as GatewayRequestContext;
       const runtime = createGatewayInstanceRuntime({
-        getContext: () => context,
+        context,
         getMethodRegistry: () => createRegistry({}),
         isDispatchAvailable: () => true,
       });
@@ -307,12 +307,12 @@ describe("createGatewayInstanceRuntime", () => {
   it("keeps approval subscribers isolated by Gateway instance and unregisters exactly once", async () => {
     const registry = createRegistry({});
     const first = createGatewayInstanceRuntime({
-      getContext: createContext,
+      context: createContext(),
       getMethodRegistry: () => registry,
       isDispatchAvailable: () => true,
     });
     const second = createGatewayInstanceRuntime({
-      getContext: createContext,
+      context: createContext(),
       getMethodRegistry: () => registry,
       isDispatchAvailable: () => true,
     });
@@ -358,7 +358,7 @@ describe("createGatewayInstanceRuntime", () => {
   it("refuses synchronous publication before sending when a subscriber requires async eligibility", async () => {
     const logError = vi.fn();
     const runtime = createGatewayInstanceRuntime({
-      getContext: createContext,
+      context: createContext(),
       getMethodRegistry: () => createRegistry({}),
       isDispatchAvailable: () => true,
       logError,
@@ -401,7 +401,7 @@ describe("createGatewayInstanceRuntime", () => {
     async (retire) => {
       const eligibility = createDeferred<boolean>();
       const runtime = createGatewayInstanceRuntime({
-        getContext: createContext,
+        context: createContext(),
         getMethodRegistry: () => createRegistry({}),
         isDispatchAvailable: () => true,
       });
@@ -434,7 +434,7 @@ describe("createGatewayInstanceRuntime", () => {
 
   it("rejects methods outside each closed internal principal", async () => {
     const runtime = createGatewayInstanceRuntime({
-      getContext: createContext,
+      context: createContext(),
       getMethodRegistry: () => createRegistry({}),
       isDispatchAvailable: () => true,
     });
@@ -451,7 +451,7 @@ describe("createGatewayInstanceRuntime", () => {
   it("preserves a trusted approval resolver display name", async () => {
     const context = createContext();
     const runtime = createGatewayInstanceRuntime({
-      getContext: () => context,
+      context,
       getMethodRegistry: () =>
         createRegistry({
           "exec.approval.list": ({ client, respond }) =>
@@ -477,7 +477,7 @@ describe("createGatewayInstanceRuntime", () => {
       const { promise: handlerCanFinish, resolve: finishHandler } = createDeferred();
       const context = createContext();
       const runtime = createGatewayInstanceRuntime({
-        getContext: () => context,
+        context,
         getMethodRegistry: () =>
           createRegistry({
             send: async () => {

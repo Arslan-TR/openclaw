@@ -218,7 +218,7 @@ describe("cold restart recovery of native operator input", () => {
       rotateAgentEventLifecycleGeneration();
       const context = makeContext();
       const runtime = createGatewayInstanceRuntime({
-        getContext: () => context,
+        context,
         getMethodRegistry: () => createRequestGatewayMethodRegistry(),
         isDispatchAvailable: () => true,
       });

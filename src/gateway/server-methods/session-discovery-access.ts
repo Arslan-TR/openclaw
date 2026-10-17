@@ -55,37 +55,32 @@ export async function withSessionDiscoveryAccess(
       return target;
     };
     const selected = readCurrent();
-    const readEntry = <T>(consume: (entry: SessionEntry) => T) =>
-      withReadySessionRows(
-        projection,
-        () => [query],
-        (read) => {
-          readCurrent(selected);
-          const row = read.describe(query);
-          const entry = row?.storedEntry;
-          if (
-            !entry ||
-            (read.readSource(row)?.path ?? row.storeTarget.storePath) !==
-              (sourcePath ?? selected.storePath) ||
-            entry.sessionId !== selected.entry.sessionId ||
-            entry.lifecycleRevision !== selected.entry.lifecycleRevision
-          ) {
-            throw new SessionMutationAuthorizationChangedError(params.changedError);
-          }
-          return consume(entry);
-        },
-      );
-    const entry = await readEntry((current) => structuredClone(current));
+    const entry = await withReadySessionRows(
+      projection,
+      () => [query],
+      (read) => {
+        readCurrent(selected);
+        const row = read.describe(query);
+        const storedEntry = row?.storedEntry;
+        if (
+          !storedEntry ||
+          (read.readSource(row)?.path ?? row.storeTarget.storePath) !==
+            (sourcePath ?? selected.storePath) ||
+          storedEntry.sessionId !== selected.entry.sessionId ||
+          storedEntry.lifecycleRevision !== selected.entry.lifecycleRevision
+        ) {
+          throw new SessionMutationAuthorizationChangedError(params.changedError);
+        }
+        return structuredClone(storedEntry);
+      },
+    );
     readCurrent(selected);
     const result = await discover(entry);
-    // Refuse unresolved membership before row preparation can refresh it.
-    readCurrent(selected);
-    await readEntry((current) => {
-      if (!isDeepStrictEqual(current.skillLibrarySelections, entry.skillLibrarySelections)) {
-        throw new SessionMutationAuthorizationChangedError(params.changedError);
-      }
-      respond(true, result, undefined);
-    });
+    const current = readCurrent(selected);
+    if (!isDeepStrictEqual(current.entry.skillLibrarySelections, entry.skillLibrarySelections)) {
+      throw new SessionMutationAuthorizationChangedError(params.changedError);
+    }
+    respond(true, result, undefined);
   } catch (error) {
     respond(
       false,

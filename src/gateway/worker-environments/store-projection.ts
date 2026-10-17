@@ -1,6 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
 import type { DatabasePathIdentity } from "../../infra/sqlite-worker-identity.js";
 import { sessionChanges } from "../../sessions/session-row-changes.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
@@ -111,7 +110,6 @@ function createWorkerEnvironmentProjection() {
     reconcilable = undefined;
   };
   return {
-    incarnation: randomUUID(),
     get active() {
       return active;
     },
