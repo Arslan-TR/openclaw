@@ -8,6 +8,10 @@ export type GatewayConnectionTransport = {
   /** Uses the WebSocket ready-state values; 1 means open. */
   readonly readyState: number;
   readonly bufferedAmount: number;
+  /** Installed codec can reuse worker-produced raw deflate with the default 15-bit window. */
+  readonly acceptsDeflatedSegments?: boolean;
+  /** Physical WebSockets record accepted event frames using their encoded UTF-8 length. */
+  recordEventSent?(event: string, bytes: number): void;
   /** Combine writes until the next tick without changing frame order or callbacks. */
   batchWrites?(): void;
   /** Send a secret-bearing frame outside negotiated compression; transports that compress must provide it. */

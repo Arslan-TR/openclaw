@@ -18,15 +18,15 @@ import {
 import { sessionNavigationTarget } from "../lib/sessions/route-navigation.ts";
 import { parseAgentSessionKey, scopedSessionArtifactKey } from "../lib/sessions/session-key.ts";
 import type { ControlUiRegistration } from "../plugins/control-ui-capability.ts";
-import { SidebarCatalogMenuController } from "./app-sidebar-catalog-menu.tsx";
+import { createSidebarCatalogMenu } from "./app-sidebar-catalog-menu.tsx";
 import { isSidebarRouteActive, renderSidebarNavLink } from "./app-sidebar-nav-menus.tsx";
 import type {
   SidebarRecentSession,
   SidebarSessionGroupMenuState,
   SidebarSessionMenuState,
 } from "./app-sidebar-session-types.ts";
+import type { SessionMenuWork } from "./session-menu-solid.tsx";
 import { fetchSessionMenuWork } from "./session-menu-work.ts";
-import type { SessionMenuWork } from "./session-menu.ts";
 import { SESSION_MENU_OPEN_EVENT } from "./session-progress-hovercard-target.ts";
 import type { SidebarMenusControllerHost } from "./sidebar-menus-controller-types.ts";
 import { Icon } from "./solid/icon.tsx";
@@ -73,7 +73,6 @@ export class SidebarMenusController {
   catalogViewMenuPosition: CatalogMenuPosition | null = null;
   filterMenuView: SidebarFilterMenuView = "root";
   agentMenuPosition: { x: number; top: number } | null = null;
-  agentMenuQuery = "";
   // Anchored by its bottom edge so the footer menu grows upward regardless of height.
   identityMenuPosition: { x: number; bottom: number; width: number } | null = null;
 
@@ -102,14 +101,15 @@ export class SidebarMenusController {
       this.host.requestUpdate();
     },
   );
-  readonly catalogMenu: SidebarCatalogMenuController;
+  readonly catalogMenu: ReturnType<typeof createSidebarCatalogMenu>;
+  catalogMenuView!: ReturnType<ReturnType<typeof createSidebarCatalogMenu>["createView"]>;
   // Leases survive view-root replacement; render() owns their reactive projection.
   readonly agentMenuAvatars = createIdentityAvatars();
   pluginActionLifetime = new AbortController();
 
   constructor(readonly host: SidebarMenusControllerHost) {
     host.addController(this);
-    this.catalogMenu = new SidebarCatalogMenuController(host, () => {
+    this.catalogMenu = createSidebarCatalogMenu(host, () => {
       this.dismissTransientMenus();
     });
   }
@@ -178,7 +178,7 @@ export class SidebarMenusController {
       this.railPinMenuPosition ||
       this.pluginNavigationMenuPosition ||
       this.sessionMenu ||
-      this.catalogMenu.isOpen ||
+      this.catalogMenu.isOpen() ||
       this.sessionGroupMenu ||
       this.sessionSortMenuPosition ||
       this.peopleFilterMenuPosition ||
@@ -519,15 +519,10 @@ export class SidebarMenusController {
     }
   }
 
-  setAgentMenuQuery(query: string) {
-    this.updateState("agentMenuQuery", query);
-  }
-
   closeAgentMenu(options: { restoreFocus?: boolean } = {}) {
     const trigger = this.agentMenuTrigger;
     this.clearAgentMenuHoverTimers();
     this.agentMenuTrigger = null;
-    this.agentMenuQuery = "";
     this.agentMenuFocusBeforeHover = null;
     this.updateState("agentMenuInteractionState", "closed");
     this.updateState("agentMenuPosition", null);
@@ -601,7 +596,7 @@ export class SidebarMenusController {
       <Show when={this.menuRenderer && this.sessionMenu} keyed>
         {(_menu) => this.menuRenderer!.renderSidebarSessionMenuForController(this)}
       </Show>,
-      this.catalogMenu.render(),
+      this.catalogMenuView.render(),
       <Show when={this.menuRenderer && this.sessionGroupMenu} keyed>
         {(_menu) => this.menuRenderer!.renderSidebarSessionGroupMenuForController(this)}
       </Show>,
