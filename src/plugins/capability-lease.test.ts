@@ -24,14 +24,15 @@ describe("plugin runtime capability lease revoke", () => {
 
   it("aggregates failures when several cleanups throw", () => {
     const lease = createPluginRuntimeCapabilityLease("test plugin");
-    const errors = [new Error("first failed"), new Error("third failed")];
+    const firstError = new Error("first failed");
+    const thirdError = new Error("third failed");
     const last = vi.fn();
     lease.retain(() => {
-      throw errors[0];
+      throw firstError;
     });
     lease.retain(vi.fn());
     lease.retain(() => {
-      throw errors[1];
+      throw thirdError;
     });
     lease.retain(last);
 
@@ -43,7 +44,7 @@ describe("plugin runtime capability lease revoke", () => {
     }
 
     expect(thrown).toBeInstanceOf(AggregateError);
-    expect((thrown as AggregateError).errors).toEqual(errors);
+    expect((thrown as AggregateError).errors).toEqual([firstError, thirdError]);
     expect(last).toHaveBeenCalledTimes(1);
   });
 
